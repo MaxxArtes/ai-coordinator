@@ -4,15 +4,25 @@ on:
   push:
     tags:
       - "v*"
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Existing release tag to publish to GitHub Packages (for example v0.2.0)
+        required: true
+        type: string
 
 permissions:
   contents: write
+  packages: write
 
 jobs:
   build-release:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.release_tag || github.ref }}
+          fetch-depth: 0
 
       - uses: actions/setup-python@v5
         with:
@@ -21,16 +31,30 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: "22.22.2"
+          registry-url: "https://npm.pkg.github.com"
+          scope: "@maxxartes"
 
+      - name: Set GitHub Packages metadata
+        working-directory: plugins/opencode
+        run: |
+          node <<'NODE'
+          const fs = require("node:fs")
+          const path = "package.json"
+          const pkg = JSON.parse(fs.readFileSync(path, "utf8"))
+          pkg.repository = { type: "git", url: "https://github.com/MaxxArtes/ai-coordinator.git" }
+          pkg.publishConfig = { registry: "https://npm.pkg.github.com" }
+          fs.writeFileSync(path, `${JSON.stringify(pkg, null, 2)}\n`)
+          NODE
       - name: Verify package, tests, support matrix, and tag version
         env:
-          RELEASE_TAG: ${{ github.ref_name }}
+          RELEASE_TAG: ${{ inputs.release_tag || github.ref_name }}
         run: |
           python -m pip install --upgrade pip
           python -m pip install -e ".[mcp]" build
           python -m unittest discover -s tests -v
           python scripts/check_support_matrix.py
           python -c "import os,tomllib; from pathlib import Path; v=tomllib.loads(Path('pyproject.toml').read_text(encoding='utf-8'))['project']['version']; expected=os.environ['RELEASE_TAG'].removeprefix('v'); assert v == expected, f'tag {expected} != package {v}'"
+          test "$(git describe --tags --exact-match HEAD)" = "$RELEASE_TAG"
           npm pack --dry-run --ignore-scripts ./plugins/opencode
 
       - name: Build Python wheel and source archive
@@ -39,8 +63,9 @@ jobs:
 
       - name: Package skill, Claude plugin, and OpenCode plugin
         env:
-          RELEASE_VERSION: ${{ github.ref_name }}
+          RELEASE_TAG: ${{ inputs.release_tag || github.ref_name }}
         run: |
+          RELEASE_VERSION="${RELEASE_TAG#v}"
           staging="$RUNNER_TEMP/ai-coordinator-release"
           mkdir -p "$staging/skill" "$staging/claude" "$staging/opencode" dist
           cp -R skills/ai-coordinator "$staging/skill/ai-coordinator"
@@ -54,6 +79,7 @@ jobs:
           npm pack "$staging/opencode" --pack-destination dist
 
       - name: Publish GitHub Release with artifacts
+        if: github.event_name == 'push'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -63,3 +89,8 @@ jobs:
           else
             gh release create "$GITHUB_REF_NAME" dist/* --verify-tag --generate-notes
           fi
+
+      - name: Publish OpenCode npm package to GitHub Packages
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: npm publish --ignore-scripts ./plugins/opencode

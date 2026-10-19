@@ -29,3 +29,17 @@ Plugin options can override the CLI and data directory:
 The plugin uses `execFile` with an argument array and does not invoke a shell. Worker delegation calls configured local AI clients and may consume quota or balance.
 
 `create_task` can receive an `ai_memory_workstream_id`; if omitted, the CLI records `AI_MEMORY_WORKSTREAM_ID` when that variable is present. The plugin does not expose the benchmark command as a tool because a benchmark can schedule several external model calls. Run it deliberately from the CLI with an explicit `--max-calls` limit.
+
+## GitHub Packages
+
+The npm release is published to `https://npm.pkg.github.com` as `@maxxartes/ai-coordinator-opencode` when a version tag passes the release workflow. The workflow also accepts a tag through `workflow_dispatch`, so an existing GitHub Release can be published without creating it again.
+
+To install from GitHub Packages locally, create a classic GitHub personal access token with `read:packages`. Authenticate interactively so the token stays in your user npm configuration, outside this repository. The repository `.npmrc` routes the `@maxxartes` scope to GitHub Packages.
+
+```console
+npm login --scope=@maxxartes --auth-type=legacy --registry=https://npm.pkg.github.com
+npm view @maxxartes/ai-coordinator-opencode --registry=https://npm.pkg.github.com
+npm install @maxxartes/ai-coordinator-opencode@0.2.0 --registry=https://npm.pkg.github.com
+```
+
+GitHub Packages creates a newly published npm package as private by default. Package visibility and access can be managed on the package page in GitHub. After authentication, point the existing OpenCode V2 plugin entry at `@maxxartes/ai-coordinator-opencode@0.2.0`; keep its `options` values for the CLI command and shared `dataDir` so the installation continues using the same coordinator database.
