@@ -41,7 +41,7 @@
       "id": "opencode-v2-plugin",
       "status": "packaged",
       "verification": "ci-artifact",
-      "files": ["plugins/opencode/package.json", "plugins/opencode/src/index.ts", "plugins/opencode/LICENSE", "plugins/opencode/NOTICE"]
+      "files": ["plugins/opencode/package.json", "plugins/opencode/index.ts", "plugins/opencode/src/index.ts", "plugins/opencode/LICENSE", "plugins/opencode/NOTICE"]
     },
     {
       "id": "codex-generic-mcp-skill",

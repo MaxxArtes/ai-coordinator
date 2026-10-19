@@ -92,6 +92,16 @@ def check() -> list[str]:
     if version:
         claude = load_json("plugins/claude-code/.claude-plugin/plugin.json")
         opencode = load_json("plugins/opencode/package.json")
+        for field, target in (("main", opencode.get("main")),
+                              ("exports", opencode.get("exports", {}).get("."))):
+            if not isinstance(target, str) or not target:
+                errors.append(f"OpenCode package precisa declarar {field}")
+                continue
+            entrypoint = Path(target)
+            if entrypoint.is_absolute() or ".." in entrypoint.parts:
+                errors.append(f"OpenCode {field} aponta fora do pacote: {target}")
+            elif not (ROOT / "plugins/opencode" / entrypoint).is_file():
+                errors.append(f"OpenCode {field} aponta para arquivo ausente: {target}")
         marketplace = load_json(".claude-plugin/marketplace.json")
         marketplace_plugin = (marketplace.get("plugins") or [{}])[0]
         if any(item.get("version") != version for item in (claude, opencode, marketplace_plugin)):
