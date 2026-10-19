@@ -42,4 +42,4 @@ npm view @maxxartes/ai-coordinator-opencode --registry=https://npm.pkg.github.co
 npm install @maxxartes/ai-coordinator-opencode@0.2.0 --registry=https://npm.pkg.github.com
 ```
 
-GitHub Packages creates a newly published npm package as private by default. Package visibility and access can be managed on the package page in GitHub. After authentication, point the existing OpenCode V2 plugin entry at `@maxxartes/ai-coordinator-opencode@0.2.0`; keep its `options` values for the CLI command and shared `dataDir` so the installation continues using the same coordinator database.
+GitHub Packages creates a newly published npm package as private by default. This package links to the public source repository, so it inherits that repository’s read permissions while keeping its own visibility setting. To restrict access to selected accounts, disable inherited permissions in the package settings and grant explicit access. After authentication, point the existing OpenCode V2 plugin entry at `@maxxartes/ai-coordinator-opencode@0.2.0`; keep its `options` values for the CLI command and shared `dataDir` so the installation continues using the same coordinator database.
