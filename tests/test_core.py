@@ -8,6 +8,8 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
+from ai_coordinator import availability, runtime
+from ai_coordinator.api import Coordinator
 from ai_coordinator.cli import Store, benchmark_report
 from ai_coordinator.runtime import worker_environment
 
@@ -125,6 +127,113 @@ class BenchmarkReportTests(unittest.TestCase):
         self.assertEqual(result["scored_runs"], 1)
         self.assertIn("4.00", markdown)
         self.assertIn("sem nota", markdown)
+
+
+class AvailabilityAndRuntimeTests(unittest.TestCase):
+    def setUp(self):
+        self.conn = sqlite3.connect(":memory:")
+        self.health = availability.Health(self.conn)
+
+    def tearDown(self):
+        self.conn.close()
+
+    def test_403_and_429_block_only_model_while_quota_blocks_client_or_provider(self):
+        c_403 = availability.classify("codex", "gpt-4o", "HTTP 403: Forbidden - access denied")
+        self.assertEqual((c_403["kind"], c_403["scope"]), ("permission", "model"))
+
+        c_429 = availability.classify("codex", "gpt-4o", "HTTP 429: Too Many Requests (rate limit)")
+        self.assertEqual((c_429["kind"], c_429["scope"]), ("rate_limit", "model"))
+
+        c_quota = availability.classify("codex", "gpt-4o", "quota exceeded for account")
+        self.assertEqual((c_quota["kind"], c_quota["scope"]), ("quota", "client"))
+
+        c_credits = availability.classify("opencode", "zen/m1", "insufficient credits on balance")
+        self.assertEqual((c_credits["kind"], c_credits["scope"]), ("quota", "provider"))
+
+        self.health.record("opencode", "zen/m1", success=False, message="insufficient credits on balance", at=100.0)
+        eligible_zen, _ = self.health.eligible({"client": "opencode", "model": "zen/m2"}, at=105.0)
+        self.assertFalse(eligible_zen)
+        eligible_other, _ = self.health.eligible({"client": "opencode", "model": "openrouter/m3"}, at=105.0)
+        self.assertTrue(eligible_other)
+
+    def test_generic_access_word_in_404_or_timeout_does_not_trigger_403_permission(self):
+        res_404 = availability.classify("opencode", "zen/m1", "HTTP 404: model access not found")
+        self.assertEqual(res_404["kind"], "not_found")
+
+        res_timeout = availability.classify("opencode", "zen/m1", "network access timed out")
+        self.assertEqual(res_timeout["kind"], "timeout")
+
+    def test_catalog_fresh_excludes_missing_model_and_stale_or_empty_preserves_eligibility(self):
+        candidate_missing = {"client": "opencode", "model": "zen/unknown"}
+        candidate_present = {"client": "opencode", "model": "zen/m1"}
+
+        eligible_empty, _ = self.health.eligible(candidate_missing, at=500.0)
+        self.assertTrue(eligible_empty)
+
+        self.health.catalog("opencode", "zen", ["zen/m1", "zen/m2"], at=1000.0, ttl=3600)
+        eligible_fresh_missing, _ = self.health.eligible(candidate_missing, at=1000.0)
+        self.assertFalse(eligible_fresh_missing)
+        eligible_fresh_present, _ = self.health.eligible(candidate_present, at=1000.0)
+        self.assertTrue(eligible_fresh_present)
+
+        eligible_stale_missing, _ = self.health.eligible(candidate_missing, at=4601.0)
+        self.assertTrue(eligible_stale_missing)
+
+    def test_validate_output_json_python_and_truncation(self):
+        with self.assertRaises(ValueError):
+            runtime.validate_output('{"key": "val"}', {"response_format": "json"}, {"finish_reason": "length"})
+
+        valid_json = runtime.validate_output(
+            '{"answer": 42}',
+            {"response_format": "json", "required_keys": ["answer"]},
+            {},
+        )
+        self.assertEqual(json.loads(valid_json), {"answer": 42})
+
+        with self.assertRaises(ValueError):
+            runtime.validate_output(
+                '{"other": 42}',
+                {"response_format": "json", "required_keys": ["answer"]},
+                {},
+            )
+
+        fenced_code = "```python\ndef run():\n    return 1\n```"
+        stripped = runtime.validate_output(fenced_code, {"response_format": "python"}, {})
+        self.assertEqual(stripped, "def run():\n    return 1")
+
+    def test_aggregate_usage_distinguishes_complete_partial_and_unavailable(self):
+        self.assertEqual(runtime.aggregate_usage([])["accounting_status"], "unavailable")
+        self.assertEqual(
+            runtime.aggregate_usage([{"usage": {"total_tokens": 150}}])["accounting_status"],
+            "partial",
+        )
+        complete = runtime.aggregate_usage([
+            {"usage": {"total_tokens": 100, "cost": 0.002}},
+            {"usage": {"total_tokens": 50, "cost": 0.001}},
+        ])
+        self.assertEqual(complete["accounting_status"], "complete")
+        self.assertEqual(complete["total_tokens"], 150)
+        self.assertAlmostEqual(complete["cost"], 0.003)
+
+
+class McpAndApiParityTests(unittest.TestCase):
+    def test_coordinator_delegate_passes_exclude_clients(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir) / "data"
+            project = Path(tmp_dir) / "project"
+            project.mkdir()
+            with Coordinator(root) as coord:
+                task = coord.new_task(project, "Test task")
+                with patch("ai_coordinator.api._run_worker", return_value={"status": "complete"}) as mock_run:
+                    coord.delegate(
+                        task["id"],
+                        "code",
+                        "print('hello')",
+                        exclude_clients=["claude"],
+                    )
+                self.assertTrue(mock_run.called)
+                passed_config = mock_run.call_args.args[1]
+                self.assertIn("claude", passed_config.get("disabled_worker_clients", []))
 
 
 if __name__ == "__main__":

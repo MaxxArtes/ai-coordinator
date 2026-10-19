@@ -86,6 +86,7 @@ def create_server():
         input_text: str,
         max_attempts: int = 1,
         response_format: str | None = None,
+        exclude_clients: list[str] | None = None,
     ) -> dict[str, Any]:
         """Call configured external model workers; this may consume quota or balance."""
         if max_attempts not in {1, 2}:
@@ -95,7 +96,7 @@ def create_server():
         with Coordinator() as coordinator:
             return coordinator.delegate(
                 task_id, category, input_text, max_attempts=max_attempts,
-                response_format=response_format,
+                response_format=response_format, exclude_clients=exclude_clients,
             )
 
     return server

@@ -72,7 +72,8 @@ def classify(client: str, model: str, message: str) -> Dict[str, Any]:
         "403" in msg_lower
         or "forbidden" in msg_lower
         or "permission" in msg_lower
-        or "access" in msg_lower
+        or "access denied" in msg_lower
+        or "no access" in msg_lower
         or "harness" in msg_lower
     )
 

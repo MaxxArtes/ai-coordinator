@@ -34,17 +34,6 @@ jobs:
           registry-url: "https://npm.pkg.github.com"
           scope: "@maxxartes"
 
-      - name: Set GitHub Packages metadata
-        working-directory: plugins/opencode
-        run: |
-          node <<'NODE'
-          const fs = require("node:fs")
-          const path = "package.json"
-          const pkg = JSON.parse(fs.readFileSync(path, "utf8"))
-          pkg.repository = { type: "git", url: "https://github.com/MaxxArtes/ai-coordinator.git" }
-          pkg.publishConfig = { registry: "https://npm.pkg.github.com" }
-          fs.writeFileSync(path, `${JSON.stringify(pkg, null, 2)}\n`)
-          NODE
       - name: Verify package, tests, support matrix, and tag version
         env:
           RELEASE_TAG: ${{ inputs.release_tag || github.ref_name }}

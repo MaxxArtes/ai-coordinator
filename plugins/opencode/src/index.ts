@@ -192,6 +192,7 @@ export default Plugin.define({
             input_text: { type: "string", maxLength: 8000 },
             max_attempts: { type: "integer", minimum: 1, maximum: 2 },
             response_format: { type: "string", enum: ["text", "json", "python", "code"] },
+            exclude_clients: { type: "array", items: { type: "string" } },
           },
           required: ["task_id", "category", "input_text"],
           additionalProperties: false,
@@ -201,13 +202,21 @@ export default Plugin.define({
           const value = input as Input
           const args = [
             "run", "--task", stringValue(value, "task_id"),
-            "--category", stringValue(value, "category"), "--input",
+            "--category", stringValue(value, "category"),
           ]
           const attempts = positiveInteger(value, "max_attempts", 1)
           if (attempts > 2) throw new Error("max_attempts must be 1 or 2")
           args.push("--max-attempts", String(attempts))
           if (typeof value.response_format === "string") args.push("--response-format", value.response_format)
-          return output(await withTempFile(".md", stringValue(value, "input_text"), (path) => run([...args, path])))
+          if (Array.isArray(value.exclude_clients)) {
+            for (const client of value.exclude_clients) {
+              if (typeof client !== "string" || !client.trim()) {
+                throw new Error("exclude_clients must contain non-empty strings")
+              }
+              args.push("--exclude-client", client.trim())
+            }
+          }
+          return output(await withTempFile(".md", stringValue(value, "input_text"), (path) => run([...args, "--input", path])))
         },
       })
     })
