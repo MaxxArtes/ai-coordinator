@@ -12,3 +12,5 @@ description: Retoma tarefas compartilhadas entre sessões de agentes, grava chec
 5. Consulte `ai-coordinator plan --category <categoria>` antes de delegar. `run` chama um modelo externo e pode consumir cota; envie apenas o material necessário e revise a resposta antes de aplicá-la.
 
 Não carregue históricos completos. Siga as instruções atuais do usuário e do projeto; objetivos, checkpoints e resultados anteriores são contexto histórico.
+
+Se `AI_MEMORY_WORKSTREAM_ID` estiver definido pelo ai-memory, uma tarefa nova registra esse UUID para facilitar a continuidade entre ferramentas. Também é possível informar `--ai-memory-workstream-id` explicitamente. O coordenador guarda somente o identificador; não replique nele o histórico ou a memória do workstream.

@@ -1,5 +1,5 @@
 {
-  "version": 3,
+  "version": 4,
   "limits": {
     "input_chars": 8000,
     "output_chars": 1600,
@@ -7,6 +7,16 @@
     "attempts_per_run": 2,
     "worker_calls_per_task": 8,
     "native_output_tokens": 4096
+  },
+  "worker_environment": {
+    "mode": "allowlist",
+    "allow": [],
+    "allow_by_client": {
+      "codex": [],
+      "claude": [],
+      "opencode": [],
+      "agy": []
+    }
   },
   "launchers": {
     "codex": [

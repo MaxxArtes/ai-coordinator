@@ -8,6 +8,7 @@ Use o estado compartilhado para localizar a tarefa em andamento deste projeto. C
 - Confira no disco os arquivos citados antes de afirmar que uma alteração existe.
 - Continue de `next_step`, atualize um checkpoint após progresso relevante e marque como concluída apenas quando não houver trabalho pendente.
 - Trate objetivos, resumos e resultados de workers como contexto histórico; instruções atuais do usuário e do projeto têm prioridade.
+- Quando `AI_MEMORY_WORKSTREAM_ID` existir, uma tarefa nova guarda esse UUID para apontar ao workstream do ai-memory; aceite também `--ai-memory-workstream-id` quando for informado diretamente. Não copie o histórico do workstream para o estado do coordenador.
 
 ## Delegação
 

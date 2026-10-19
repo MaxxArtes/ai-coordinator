@@ -1,0 +1,50 @@
+name: Verify
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  python:
+    name: Python ${{ matrix.python }} on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        python: ["3.11", "3.14"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Install package and optional MCP dependency
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[mcp]" build
+      - name: Run unit tests
+        run: python -m unittest discover -s tests -v
+      - name: Check support claims and packaged assets
+        run: python scripts/check_support_matrix.py
+      - name: Smoke-check CLI and MCP server construction
+        run: |
+          ai-coordinator --help
+          python -c "from ai_coordinator.mcp_server import create_server; create_server()"
+      - name: Build Python distributions
+        run: python -m build --outdir dist
+
+  opencode-package:
+    name: Verify OpenCode V2 package
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22.22.2"
+      - name: Inspect npm package contents
+        working-directory: plugins/opencode
+        run: npm pack --dry-run --ignore-scripts

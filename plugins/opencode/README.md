@@ -27,3 +27,5 @@ Plugin options can override the CLI and data directory:
 ```
 
 The plugin uses `execFile` with an argument array and does not invoke a shell. Worker delegation calls configured local AI clients and may consume quota or balance.
+
+`create_task` can receive an `ai_memory_workstream_id`; if omitted, the CLI records `AI_MEMORY_WORKSTREAM_ID` when that variable is present. The plugin does not expose the benchmark command as a tool because a benchmark can schedule several external model calls. Run it deliberately from the CLI with an explicit `--max-calls` limit.

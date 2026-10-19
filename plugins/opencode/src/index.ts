@@ -121,6 +121,7 @@ export default Plugin.define({
           properties: {
             project_directory: { type: "string" },
             goal: { type: "string", maxLength: 1500 },
+            ai_memory_workstream_id: { type: "string", description: "Optional ai-memory workstream UUID; defaults to AI_MEMORY_WORKSTREAM_ID when omitted" },
           },
           required: ["project_directory", "goal"],
           additionalProperties: false,
@@ -128,7 +129,11 @@ export default Plugin.define({
         options: { namespace: "ai_coordinator" },
         execute: async (input) => {
           const value = input as Input
-          return output(await run(["new", "--project", stringValue(value, "project_directory"), "--goal", stringValue(value, "goal")]))
+          const args = ["new", "--project", stringValue(value, "project_directory"), "--goal", stringValue(value, "goal")]
+          if (value.ai_memory_workstream_id !== undefined) {
+            args.push("--ai-memory-workstream-id", stringValue(value, "ai_memory_workstream_id"))
+          }
+          return output(await run(args))
         },
       })
       editor.add({

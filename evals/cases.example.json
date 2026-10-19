@@ -1,0 +1,41 @@
+{
+  "version": 1,
+  "cases": [
+    {
+      "id": "extract-incident-json",
+      "category": "extract",
+      "response_format": "json",
+      "required_keys": ["tipo", "responsavel", "prazo"],
+      "prompt": "Leia: \"O relatório de fechamento falhou às 08:10. A equipe de dados, com a Ana responsável, vai corrigir até 10:30.\" Responda somente com JSON contendo tipo, responsavel e prazo. Não invente dados.",
+      "rubric": [
+        "JSON válido com todas as chaves obrigatórias",
+        "Classifica o evento como falha no relatório de fechamento",
+        "Identifica Ana como responsável e 10:30 como prazo",
+        "Não acrescenta informação que não aparece no texto"
+      ]
+    },
+    {
+      "id": "triage-timeout",
+      "category": "triage",
+      "prompt": "Um serviço que consulta o banco às vezes demora mais que 30 segundos. O usuário vê erro, mas o processo Python continua ocupado. Dê: causa provável, um risco e a primeira verificação prática. Use no máximo 5 linhas.",
+      "rubric": [
+        "Distingue timeout do cliente de cancelamento da consulta no banco",
+        "Aponta o risco de acumular threads ou conexões ocupadas",
+        "Sugere verificar timeout no driver e no banco",
+        "Resposta curta e acionável"
+      ]
+    },
+    {
+      "id": "code-validate-input",
+      "category": "code",
+      "response_format": "python",
+      "prompt": "Escreva uma função Python validate_limit(value) que aceite somente inteiro entre 1 e 100, rejeite bool, strings e floats, e lance ValueError com uma mensagem curta em português. Responda somente com o código da função.",
+      "rubric": [
+        "Rejeita bool apesar de bool ser subclasse de int em Python",
+        "Aceita somente int entre 1 e 100, inclusive",
+        "Lança ValueError para todos os valores inválidos",
+        "Não usa dependências nem código fora da função"
+      ]
+    }
+  ]
+}

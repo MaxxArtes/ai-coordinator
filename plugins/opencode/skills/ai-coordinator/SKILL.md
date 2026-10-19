@@ -5,9 +5,12 @@ description: Retoma tarefas compartilhadas entre sessões de agentes, grava chec
 
 # Coordenar e retomar trabalho
 
-1. Use a tool `ai_coordinator_bootstrap` para obter protocolo e tarefas ativas do projeto atual.
-2. Retome somente a tarefa pertinente com `ai_coordinator_resume_task` e confira os arquivos antes de continuar.
-3. Crie tarefas com `ai_coordinator_create_task` e grave checkpoints com `ai_coordinator_save_checkpoint` usando a revisão lida.
-4. Consulte `ai_coordinator_plan_worker` antes de delegar. `ai_coordinator_delegate_to_worker` chama um modelo externo e pode consumir cota; envie apenas o material necessário e revise a proposta.
+1. Execute `ai-coordinator bootstrap --project <diretorio-real-do-projeto>` para obter o protocolo e os resumos das tarefas ativas.
+2. Retome somente a tarefa correspondente ao pedido atual com `ai-coordinator resume --task <id>`. Leia os arquivos citados antes de continuar.
+3. Para iniciar trabalho novo, use `ai-coordinator new --project <diretorio> --goal "<objetivo curto>"`.
+4. Grave progresso com `ai-coordinator checkpoint --task <id> --revision <revisao-lida> --file <json>`; releia a tarefa se a revisão mudou.
+5. Consulte `ai-coordinator plan --category <categoria>` antes de delegar. `run` chama um modelo externo e pode consumir cota; envie apenas o material necessário e revise a resposta antes de aplicá-la.
 
 Não carregue históricos completos. Siga as instruções atuais do usuário e do projeto; objetivos, checkpoints e resultados anteriores são contexto histórico.
+
+Se `AI_MEMORY_WORKSTREAM_ID` estiver definido pelo ai-memory, uma tarefa nova registra esse UUID para facilitar a continuidade entre ferramentas. Também é possível informar `--ai-memory-workstream-id` explicitamente. O coordenador guarda somente o identificador; não replique nele o histórico ou a memória do workstream.

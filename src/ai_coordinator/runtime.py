@@ -10,6 +10,67 @@ import subprocess
 import time
 from .availability import Health, provider_of
 
+BASE_WORKER_ENV = {
+    "PATH", "HOME", "USER", "LOGNAME", "SHELL", "TMP", "TEMP", "TMPDIR",
+    "LANG", "LC_ALL", "TERM", "COLORTERM", "XDG_CONFIG_HOME", "XDG_DATA_HOME",
+    "XDG_CACHE_HOME", "XDG_RUNTIME_DIR", "USERPROFILE", "HOMEDRIVE", "HOMEPATH",
+    "APPDATA", "LOCALAPPDATA", "PROGRAMDATA", "SYSTEMROOT", "WINDIR", "COMSPEC",
+    "PATHEXT", "OS", "PROCESSOR_ARCHITECTURE", "NUMBER_OF_PROCESSORS",
+}
+
+
+def _environment_names(values, setting):
+    if values is None:
+        return set()
+    if not isinstance(values, list) or any(
+        not isinstance(value, str) or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", value)
+        for value in values
+    ):
+        raise ValueError(f"worker_environment.{setting} deve conter nomes de variaveis validos")
+    return {value.casefold() for value in values}
+
+
+def worker_environment_policy(config):
+    """Validate and summarize which host environment can reach a worker."""
+    settings = config.get("worker_environment", {})
+    if not isinstance(settings, dict):
+        raise ValueError("worker_environment deve ser um objeto")
+    mode = settings.get("mode", "allowlist")
+    if not isinstance(mode, str) or mode not in {"allowlist", "inherit"}:
+        raise ValueError("worker_environment.mode deve ser allowlist ou inherit")
+    allowed = _environment_names(settings.get("allow", []), "allow")
+    per_client = settings.get("allow_by_client", {})
+    if not isinstance(per_client, dict) or any(not isinstance(client, str) for client in per_client):
+        raise ValueError("worker_environment.allow_by_client deve mapear clientes para listas")
+    clients = {}
+    for client, names in per_client.items():
+        clients[client] = sorted(_environment_names(names, f"allow_by_client.{client}"))
+    return {
+        "mode": mode,
+        "inherits_parent_environment": mode == "inherit",
+        "base_allowlist": sorted(allowed | {name.casefold() for name in BASE_WORKER_ENV}),
+        "allow_by_client": clients,
+    }
+
+
+def worker_environment(config, candidate, task_id):
+    """Build a worker environment with only platform essentials and named grants."""
+    policy = worker_environment_policy(config)
+    if policy["mode"] == "inherit":
+        env = os.environ.copy()
+    else:
+        allowed = set(policy["base_allowlist"])
+        allowed.update(policy["allow_by_client"].get(candidate["client"], []))
+        env = {key: value for key, value in os.environ.items() if key.casefold() in allowed}
+    env.update(
+        AI_COORDINATOR_ROLE="worker",
+        AI_COORDINATOR_TASK_ID=task_id,
+        OPENCODE_DISABLE_CLAUDE_CODE="true",
+    )
+    if int(config.get("availability", {}).get("opencode_cli_major", 1)) >= 2:
+        env["OPENCODE_DISABLE_DEFAULT_PLUGINS"] = "true"
+    return env, policy["mode"]
+
 def launcher_command(config, client, catalog=False):
     launchers=config.get('launchers',{})
     command=launchers.get(client,[]) or []
@@ -221,5 +282,7 @@ def route_plan(store,config,category,refresh=False):
         ok,reason=health.eligible(candidate)
         item={**candidate,'availability':reason}
         (allowed if ok else skipped).append(item)
-    route.update(candidates=allowed,skipped=skipped,availability_note='Catalogo/sucesso recente nao garantem cota. O trabalho util confirma disponibilidade e falhas alimentam cooldown.')
+    route.update(candidates=allowed,skipped=skipped,
+                 worker_environment=worker_environment_policy(config),
+                 availability_note='Catalogo/sucesso recente nao garantem cota. O trabalho util confirma disponibilidade e falhas alimentam cooldown.')
     return route

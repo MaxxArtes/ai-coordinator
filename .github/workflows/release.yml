@@ -22,19 +22,36 @@ jobs:
         with:
           node-version: "22.22.2"
 
+      - name: Verify package, tests, support matrix, and tag version
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[mcp]" build
+          python -m unittest discover -s tests -v
+          python scripts/check_support_matrix.py
+          python -c "import os,tomllib; from pathlib import Path; v=tomllib.loads(Path('pyproject.toml').read_text(encoding='utf-8'))['project']['version']; expected=os.environ['RELEASE_TAG'].removeprefix('v'); assert v == expected, f'tag {expected} != package {v}'"
+          npm pack --dry-run --ignore-scripts ./plugins/opencode
+
       - name: Build Python wheel and source archive
         run: |
-          python -m pip install --upgrade build
           python -m build --outdir dist
 
       - name: Package skill, Claude plugin, and OpenCode plugin
         env:
           RELEASE_VERSION: ${{ github.ref_name }}
         run: |
-          mkdir -p dist
-          (cd skills && zip -qr "../dist/ai-coordinator-skill-${RELEASE_VERSION}.zip" ai-coordinator)
-          (cd plugins/claude-code && zip -qr "../../dist/ai-coordinator-claude-plugin-${RELEASE_VERSION}.zip" .)
-          npm pack ./plugins/opencode --pack-destination dist
+          staging="$RUNNER_TEMP/ai-coordinator-release"
+          mkdir -p "$staging/skill" "$staging/claude" "$staging/opencode" dist
+          cp -R skills/ai-coordinator "$staging/skill/ai-coordinator"
+          cp -R plugins/claude-code/. "$staging/claude/"
+          cp -R plugins/opencode/. "$staging/opencode/"
+          cp LICENSE NOTICE "$staging/skill/"
+          cp LICENSE NOTICE "$staging/claude/"
+          cp LICENSE NOTICE "$staging/opencode/"
+          (cd "$staging/skill" && zip -qr "$GITHUB_WORKSPACE/dist/ai-coordinator-skill-${RELEASE_VERSION}.zip" .)
+          (cd "$staging/claude" && zip -qr "$GITHUB_WORKSPACE/dist/ai-coordinator-claude-plugin-${RELEASE_VERSION}.zip" .)
+          npm pack "$staging/opencode" --pack-destination dist
 
       - name: Publish GitHub Release with artifacts
         env:

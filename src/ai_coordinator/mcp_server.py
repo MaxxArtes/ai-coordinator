@@ -39,10 +39,14 @@ def create_server():
             return coordinator.active_tasks(project_path)
 
     @server.tool()
-    def create_task(project_path: str, goal: str) -> dict[str, Any]:
-        """Create a shared task for a project; keep the goal free of secrets."""
+    def create_task(
+        project_path: str,
+        goal: str,
+        ai_memory_workstream_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Create a task and optionally link its ai-memory workstream UUID."""
         with Coordinator() as coordinator:
-            return coordinator.new_task(project_path, goal)
+            return coordinator.new_task(project_path, goal, ai_memory_workstream_id)
 
     @server.tool()
     def resume_task(task_id: str) -> dict[str, Any]:

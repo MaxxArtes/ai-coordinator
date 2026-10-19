@@ -32,8 +32,13 @@ class Coordinator:
     def __exit__(self, exc_type: Any, exc: Any, traceback: Any) -> None:
         self.close()
 
-    def new_task(self, project: str | Path, goal: str) -> dict[str, Any]:
-        return self.store.new(str(project), goal)
+    def new_task(
+        self,
+        project: str | Path,
+        goal: str,
+        ai_memory_workstream_id: str | None = None,
+    ) -> dict[str, Any]:
+        return self.store.new(str(project), goal, ai_memory_workstream_id)
 
     def active_tasks(self, project: str | Path) -> list[dict[str, Any]]:
         return self.store.context(str(project))

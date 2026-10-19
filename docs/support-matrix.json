@@ -1,0 +1,65 @@
+{
+  "schema_version": 1,
+  "platforms": [
+    {
+      "id": "python-core",
+      "status": "supported",
+      "verification": "ci-matrix",
+      "notes": "Core Python package and CLI are checked on Linux, macOS, and Windows."
+    }
+  ],
+  "integrations": [
+    {
+      "id": "python-library-cli",
+      "status": "supported",
+      "verification": "ci-smoke",
+      "files": ["pyproject.toml", "src/ai_coordinator/api.py", "src/ai_coordinator/cli.py"]
+    },
+    {
+      "id": "mcp-stdio",
+      "status": "supported",
+      "verification": "ci-extra",
+      "files": ["src/ai_coordinator/mcp_server.py", "pyproject.toml"]
+    },
+    {
+      "id": "agent-skill",
+      "status": "supported",
+      "verification": "ci-artifact",
+      "files": [
+        "skills/ai-coordinator/SKILL.md",
+        "plugins/claude-code/skills/ai-coordinator/SKILL.md",
+        "plugins/opencode/skills/ai-coordinator/SKILL.md"
+      ]
+    },
+    {
+      "id": "claude-code-plugin",
+      "status": "packaged",
+      "verification": "ci-artifact",
+      "files": ["plugins/claude-code/.claude-plugin/plugin.json", "plugins/claude-code/.mcp.json", "plugins/claude-code/LICENSE", "plugins/claude-code/NOTICE"]
+    },
+    {
+      "id": "opencode-v2-plugin",
+      "status": "packaged",
+      "verification": "ci-artifact",
+      "files": ["plugins/opencode/package.json", "plugins/opencode/src/index.ts", "plugins/opencode/LICENSE", "plugins/opencode/NOTICE"]
+    },
+    {
+      "id": "codex-generic-mcp-skill",
+      "status": "documented",
+      "verification": "manual-host-check",
+      "files": ["README.md", "skills/ai-coordinator/SKILL.md"]
+    },
+    {
+      "id": "agy-generic-mcp-skill",
+      "status": "documented",
+      "verification": "manual-host-check",
+      "files": ["README.md", "skills/ai-coordinator/SKILL.md"]
+    },
+    {
+      "id": "opencode-v1-plugin",
+      "status": "not-claimed",
+      "verification": "none",
+      "files": []
+    }
+  ]
+}
