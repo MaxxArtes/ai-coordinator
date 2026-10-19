@@ -45,7 +45,11 @@ class StoreTests(unittest.TestCase):
     def test_migrates_existing_task_database(self):
         self.store.db.close()
         self.root.mkdir(parents=True, exist_ok=True)
-        legacy = sqlite3.connect(self.root / "coordination.sqlite")
+        database = self.root / "coordination.sqlite"
+        for suffix in ("-wal", "-shm"):
+            Path(f"{database}{suffix}").unlink(missing_ok=True)
+        database.unlink(missing_ok=True)
+        legacy = sqlite3.connect(database)
         legacy.execute(
             "CREATE TABLE tasks (id TEXT PRIMARY KEY, project TEXT NOT NULL, goal TEXT NOT NULL, "
             "status TEXT NOT NULL, revision INTEGER NOT NULL, snapshot TEXT NOT NULL, "
