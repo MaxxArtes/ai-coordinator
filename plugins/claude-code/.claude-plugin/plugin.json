@@ -1,0 +1,11 @@
+{
+  "name": "ai-coordinator",
+  "displayName": "AI Coordinator",
+  "version": "0.1.0",
+  "description": "Retoma tarefas compartilhadas e conecta o Claude Code ao servidor MCP local do ai-coordinator.",
+  "author": {
+    "name": "MaxxArtes"
+  },
+  "repository": "https://github.com/MaxxArtes/ai-coordinator",
+  "keywords": ["coordination", "checkpoint", "mcp", "skills"]
+}

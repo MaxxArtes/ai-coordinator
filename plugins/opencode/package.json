@@ -1,0 +1,21 @@
+{
+  "name": "@maxxartes/ai-coordinator-opencode",
+  "version": "0.1.0",
+  "description": "OpenCode V2 plugin for the ai-coordinator task state and worker routes.",
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "files": [
+    "src/",
+    "skills/",
+    "README.md"
+  ],
+  "dependencies": {
+    "@opencode/plugin": "latest"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "typescript": "^5.0.0"
+  }
+}

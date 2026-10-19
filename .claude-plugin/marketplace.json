@@ -1,0 +1,15 @@
+{
+  "name": "ai-coordinator-marketplace",
+  "description": "Skill, MCP e integração Claude Code para o ai-coordinator.",
+  "owner": {
+    "name": "MaxxArtes"
+  },
+  "plugins": [
+    {
+      "name": "ai-coordinator",
+      "source": "./plugins/claude-code",
+      "description": "Retoma tarefas compartilhadas e conecta o Claude Code ao servidor MCP local.",
+      "version": "0.1.0"
+    }
+  ]
+}

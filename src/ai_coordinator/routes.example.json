@@ -1,0 +1,198 @@
+{
+  "version": 3,
+  "limits": {
+    "input_chars": 8000,
+    "output_chars": 1600,
+    "timeout_seconds": 150,
+    "attempts_per_run": 2,
+    "worker_calls_per_task": 8,
+    "native_output_tokens": 4096
+  },
+  "launchers": {
+    "codex": [
+      "codex"
+    ],
+    "claude": [
+      "claude"
+    ],
+    "opencode": [
+      "opencode"
+    ],
+    "agy": [
+      "agy"
+    ]
+  },
+  "routes": {
+    "triage": {
+      "candidates": [
+        {
+          "client": "agy",
+          "model": "gemini-3.8-flash-low"
+        },
+        {
+          "client": "opencode",
+          "model": "openrouter/cohere/north-mini-code:free"
+        },
+        {
+          "client": "codex",
+          "model": "gpt-6-luna",
+          "effort": "low"
+        },
+        {
+          "client": "claude",
+          "model": "haiku",
+          "effort": "low"
+        }
+      ]
+    },
+    "extract": {
+      "candidates": [
+        {
+          "client": "agy",
+          "model": "gemini-3.8-flash-low"
+        },
+        {
+          "client": "opencode",
+          "model": "openrouter/cohere/north-mini-code:free"
+        },
+        {
+          "client": "codex",
+          "model": "gpt-6-luna",
+          "effort": "low"
+        },
+        {
+          "client": "claude",
+          "model": "haiku",
+          "effort": "low"
+        }
+      ]
+    },
+    "summarize": {
+      "candidates": [
+        {
+          "client": "agy",
+          "model": "gemini-3.8-flash-low"
+        },
+        {
+          "client": "opencode",
+          "model": "openrouter/cohere/north-mini-code:free"
+        },
+        {
+          "client": "codex",
+          "model": "gpt-6-luna",
+          "effort": "low"
+        },
+        {
+          "client": "claude",
+          "model": "haiku",
+          "effort": "low"
+        }
+      ]
+    },
+    "code": {
+      "candidates": [
+        {
+          "client": "agy",
+          "model": "gemini-3.8-flash-medium"
+        },
+        {
+          "client": "opencode",
+          "model": "openrouter/cohere/north-mini-code:free"
+        },
+        {
+          "client": "codex",
+          "model": "gpt-6-luna",
+          "effort": "low"
+        },
+        {
+          "client": "claude",
+          "model": "sonnet",
+          "effort": "medium"
+        }
+      ]
+    },
+    "frontend": {
+      "candidates": [
+        {
+          "client": "agy",
+          "model": "gemini-3.8-flash-medium"
+        },
+        {
+          "client": "opencode",
+          "model": "openrouter/cohere/north-mini-code:free"
+        },
+        {
+          "client": "codex",
+          "model": "gpt-6-luna",
+          "effort": "low"
+        },
+        {
+          "client": "claude",
+          "model": "sonnet",
+          "effort": "medium"
+        }
+      ]
+    },
+    "analysis": {
+      "candidates": [
+        {
+          "client": "codex",
+          "model": "gpt-6.1-sol",
+          "effort": "medium"
+        },
+        {
+          "client": "agy",
+          "model": "gemini-3.1-pro-high"
+        },
+        {
+          "client": "claude",
+          "model": "sonnet",
+          "effort": "medium"
+        }
+      ]
+    },
+    "multimodal": {
+      "candidates": [
+        {
+          "client": "agy",
+          "model": "gemini-3.8-flash-medium"
+        },
+        {
+          "client": "codex",
+          "model": "gpt-6.1-sol",
+          "effort": "medium"
+        },
+        {
+          "client": "claude",
+          "model": "sonnet",
+          "effort": "medium"
+        }
+      ]
+    },
+    "expert": {
+      "candidates": [
+        {
+          "client": "codex",
+          "model": "gpt-6.1-sol",
+          "effort": "high"
+        },
+        {
+          "client": "agy",
+          "model": "gemini-3.1-pro-high"
+        },
+        {
+          "client": "claude",
+          "model": "opus",
+          "effort": "medium"
+        }
+      ]
+    }
+  },
+  "availability": {
+    "enabled": true,
+    "discover": true,
+    "catalog_ttl_seconds": 3600,
+    "opencode_cli_major": 2,
+    "codex_cache": "~/.codex/models_cache.json"
+  }
+}

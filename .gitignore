@@ -1,0 +1,25 @@
+# User state and configuration
+routes.json
+coordination.sqlite
+coordination.sqlite-shm
+coordination.sqlite-wal
+tasks/
+backups/
+.env
+.env.*
+!.env.example
+*.log
+
+# Python and package artifacts
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+build/
+dist/
+
+# Node and editor artifacts
+node_modules/
+.DS_Store
+.idea/
+.vscode/

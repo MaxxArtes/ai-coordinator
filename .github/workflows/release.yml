@@ -1,0 +1,42 @@
+name: Build release artifacts
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build-release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22.22.2"
+
+      - name: Build Python wheel and source archive
+        run: |
+          python -m pip install --upgrade build
+          python -m build --outdir dist
+
+      - name: Package skill, Claude plugin, and OpenCode plugin
+        env:
+          RELEASE_VERSION: ${{ github.ref_name }}
+        run: |
+          mkdir -p dist
+          (cd skills && zip -qr "../dist/ai-coordinator-skill-${RELEASE_VERSION}.zip" ai-coordinator)
+          (cd plugins/claude-code && zip -qr "../../dist/ai-coordinator-claude-plugin-${RELEASE_VERSION}.zip" .)
+          npm pack ./plugins/opencode --pack-destination dist
+
+      - name: Publish GitHub Release with artifacts
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" dist/* --verify-tag --generate-notes
