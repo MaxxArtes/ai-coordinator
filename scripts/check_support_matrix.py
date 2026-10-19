@@ -106,6 +106,9 @@ def check() -> list[str]:
         marketplace_plugin = (marketplace.get("plugins") or [{}])[0]
         if any(item.get("version") != version for item in (claude, opencode, marketplace_plugin)):
             errors.append("Versoes Python, Claude plugin, OpenCode plugin e marketplace divergem")
+        init_text = (ROOT / "src/ai_coordinator/__init__.py").read_text(encoding="utf-8")
+        if f'__version__ = "{version}"' not in init_text:
+            errors.append("src/ai_coordinator/__init__.py diverge da versao em pyproject.toml")
         if opencode.get("license") != "PolyForm-Noncommercial-1.0.0":
             errors.append("package.json do OpenCode precisa declarar a mesma licenca")
     if '"mode": "allowlist"' not in (ROOT / "src/ai_coordinator/routes.example.json").read_text(encoding="utf-8"):

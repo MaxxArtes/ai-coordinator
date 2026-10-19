@@ -1,6 +1,6 @@
 {
   "name": "@maxxartes/ai-coordinator-opencode",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "license": "PolyForm-Noncommercial-1.0.0",
   "description": "OpenCode V2 plugin for the ai-coordinator task state and worker routes.",
   "repository": {
