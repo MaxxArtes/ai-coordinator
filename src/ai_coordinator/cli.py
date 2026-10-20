@@ -96,163 +96,13 @@ def process_alive(pid, expected_create_time=None):
     from .process import safe_process_alive
     return safe_process_alive(pid, expected_create_time_ns=expected_create_time)
 
-class Store:
-    def __init__(self, root):
-        self.root = Path(root)
-        self.root.mkdir(parents=True, exist_ok=True)
-        self.db = sqlite3.connect(self.root / "coordination.sqlite", timeout=20)
-        self.db.row_factory = sqlite3.Row
-        self.db.execute("PRAGMA journal_mode=WAL")
-        self.db.executescript("""
-          CREATE TABLE IF NOT EXISTS tasks (
-            id TEXT PRIMARY KEY, project TEXT NOT NULL, goal TEXT NOT NULL,
-            status TEXT NOT NULL, revision INTEGER NOT NULL, snapshot TEXT NOT NULL,
-            created TEXT NOT NULL, updated TEXT NOT NULL, ai_memory_workstream_id TEXT);
-          CREATE TABLE IF NOT EXISTS runs (
-            id TEXT PRIMARY KEY, task_id TEXT NOT NULL, category TEXT NOT NULL,
-            status TEXT NOT NULL, client TEXT, model TEXT, started TEXT NOT NULL,
-            ended TEXT, attempts TEXT NOT NULL, input_path TEXT NOT NULL,
-            output_path TEXT, error TEXT, pid INTEGER, owner_pid INTEGER);
-        """)
-        columns = {r[1] for r in self.db.execute('PRAGMA table_info(runs)')}
-        if 'usage' not in columns:
-            try:
-                self.db.execute('ALTER TABLE runs ADD COLUMN usage TEXT')
-            except sqlite3.OperationalError as exc:
-                if 'duplicate column' not in str(exc).lower():
-                    raise
-            self.db.commit()
-        if 'process_create_time' not in columns:
-            try:
-                self.db.execute('ALTER TABLE runs ADD COLUMN process_create_time INTEGER')
-            except sqlite3.OperationalError as exc:
-                if 'duplicate column' not in str(exc).lower():
-                    raise
-            self.db.commit()
-        if 'owner_create_time' not in columns:
-            try:
-                self.db.execute('ALTER TABLE runs ADD COLUMN owner_create_time INTEGER')
-            except sqlite3.OperationalError as exc:
-                if 'duplicate column' not in str(exc).lower():
-                    raise
-            self.db.commit()
-        task_columns = {r[1] for r in self.db.execute('PRAGMA table_info(tasks)')}
-        if 'ai_memory_workstream_id' not in task_columns:
-            self.db.execute('ALTER TABLE tasks ADD COLUMN ai_memory_workstream_id TEXT')
-            self.db.commit()
-
-    def task(self, ident):
-        row = self.db.execute("SELECT * FROM tasks WHERE id=?", (validate_id(ident),)).fetchone()
-        if not row:
-            raise ValueError("Tarefa nao encontrada")
-        value = dict(row)
-        value["snapshot"] = json.loads(value["snapshot"])
-        value["ai_memory_workstream_id"] = validate_memory_workstream_id(
-            value.get("ai_memory_workstream_id")
-        )
-        return value
-
-    def mirror(self, value):
-        atomic_json(self.root / "tasks" / value["id"] / "state.json", value)
-
-    def new(self, project, goal, ai_memory_workstream_id=None):
-        if not goal.strip() or len(goal) > 1500:
-            raise ValueError("Objetivo deve ter 1 a 1500 caracteres")
-        if os.environ.get("AI_COORDINATOR_ROLE") == "worker":
-            raise ValueError("Worker nao pode criar tarefas")
-        if ai_memory_workstream_id is None:
-            ai_memory_workstream_id = os.environ.get("AI_MEMORY_WORKSTREAM_ID")
-        linked_workstream = validate_memory_workstream_id(
-            ai_memory_workstream_id
-        )
-        ident, stamp = uuid.uuid4().hex[:16], now()
-        snapshot = {"summary": "", "decisions": [], "changed_files": [], "checks": [], "pending": [], "next_step": ""}
-        with self.db:
-            self.db.execute(
-                "INSERT INTO tasks (id,project,goal,status,revision,snapshot,created,updated,ai_memory_workstream_id) VALUES (?,?,?,?,?,?,?,?,?)",
-                (ident, project_path(project), scrub(goal), "active", 1,
-                 json.dumps(snapshot), stamp, stamp, linked_workstream),
-            )
-            self.mirror(self.task(ident))
-        return self.task(ident)
-
-    def context(self, project):
-        rows = self.db.execute("SELECT id,goal,status,revision,updated,ai_memory_workstream_id FROM tasks WHERE project=? AND status='active' ORDER BY updated DESC LIMIT 8", (project_path(project),))
-        return [dict(row) for row in rows]
-
-    def checkpoint(self, ident, revision, patch, status=None):
-        if not isinstance(patch, dict) or set(patch) - FIELDS:
-            raise ValueError("Checkpoint possui campos desconhecidos")
-        for key, value in patch.items():
-            if key in ("summary", "next_step"):
-                if not isinstance(value, str) or len(value) > 5000:
-                    raise ValueError("Resumo/proximo passo: texto de ate 5000 caracteres")
-            elif not isinstance(value, list) or len(value) > 40 or any(not isinstance(x, str) or len(x) > 1500 for x in value):
-                raise ValueError("Listas: ate 40 textos curtos")
-        self.db.execute("BEGIN IMMEDIATE")
-        try:
-            current = self.task(ident)
-            if revision != current["revision"]:
-                raise ValueError("Revisao mudou: releia resume antes de gravar")
-            current["snapshot"].update(patch)
-            snapshot = scrub(json.dumps(current["snapshot"], ensure_ascii=False))
-            if len(snapshot) > 12000:
-                raise ValueError("Checkpoint excede 12000 caracteres; resuma e referencie arquivos")
-            self.db.execute("UPDATE tasks SET snapshot=?,revision=revision+1,status=?,updated=? WHERE id=?", (snapshot, status or current["status"], now(), ident))
-            self.mirror(self.task(ident))
-            self.db.commit()
-        except BaseException:
-            self.db.rollback()
-            raise
-        return self.task(ident)
-
-    def runs(self, ident):
-        self.task(ident)
-        return [dict(row) for row in self.db.execute("SELECT * FROM runs WHERE task_id=? ORDER BY started DESC LIMIT 8", (ident,))]
-
-    def reserve(self, ident, category, prompt, max_calls):
-        if self.task(ident)["status"] != "active":
-            raise ValueError("Tarefa encerrada")
-        self.db.execute("BEGIN IMMEDIATE")
-        try:
-            if self.db.execute("SELECT 1 FROM runs WHERE task_id=? AND status='running'", (ident,)).fetchone():
-                raise ValueError("Worker em execucao; consulte resume antes de repetir")
-            used = sum(len(json.loads(row[0])) for row in self.db.execute("SELECT attempts FROM runs WHERE task_id=?", (ident,)))
-            if used >= max_calls:
-                raise ValueError("Limite de chamadas da tarefa atingido; reveja a tarefa, nao repita em loop")
-            run_id = uuid.uuid4().hex[:16]
-            folder = self.root / "tasks" / ident / "runs" / run_id
-            folder.mkdir(parents=True)
-            inp = folder / "input.md"
-            inp.write_text(prompt, encoding="utf-8")
-            owner_pid = os.getpid()
-            from .process import ProcessSupervisor
-            owner_ident = ProcessSupervisor.capture_identity(owner_pid)
-            self.db.execute("INSERT INTO runs(id,task_id,category,status,started,attempts,input_path,owner_pid,owner_create_time) VALUES (?,?,?,?,?,?,?,?,?)", (run_id, ident, category, "running", now(), "[]", str(inp), owner_pid, owner_ident.create_time_ns))
-            self.db.commit()
-            return run_id, folder, max_calls - used
-        except BaseException:
-            self.db.rollback()
-            raise
-
-    def update_run(self, ident, **values):
-        if not values or set(values) - {"status", "client", "model", "ended", "attempts", "output_path", "error", "pid", "usage", "process_create_time", "owner_create_time"}:
-            raise ValueError("Atualizacao de worker invalida")
-        keys = list(values)
-        with self.db:
-            self.db.execute("UPDATE runs SET " + ",".join(k + "=?" for k in keys) + " WHERE id=?", [values[k] for k in keys] + [ident])
-
-    def recover(self, task, run):
-        self.task(task)
-        row = self.db.execute("SELECT * FROM runs WHERE id=? AND task_id=?", (validate_id(run), task)).fetchone()
-        if not row or row["status"] != "running":
-            raise ValueError("Execucao pendente nao encontrada")
-        row_dict = dict(row)
-        if process_alive(row_dict.get("owner_pid"), row_dict.get("owner_create_time")) or process_alive(row_dict.get("pid"), row_dict.get("process_create_time")):
-            raise ValueError("Processo ainda existe; nao recuperar nem repetir")
-        with self.db:
-            self.db.execute("UPDATE runs SET status='interrupted',ended=?,error='Processos ausentes; interrupcao confirmada',pid=NULL,process_create_time=NULL WHERE id=? AND status='running'", (now(), run))
-        return {"run": run, "status": "interrupted", "next_step": "Leia logs antes de decidir se precisa repetir"}
+from .storage import (
+    Store,
+    RunState,
+    ACTIVE_RUN_STATES,
+    TERMINAL_RUN_STATES,
+    VALID_STATUS_TRANSITIONS,
+)
 
 def launcher(config, client):
     command = runtime.launcher_command(config, client)
@@ -348,7 +198,14 @@ def run_worker(store, config, ident, category, input_file, max_attempts=None):
                 env['OPENCODE_EXPERIMENTAL_OUTPUT_TOKEN_MAX'] = str(candidate.get('max_tokens', limits.get('native_output_tokens', 4096)))
             attempts.append({**candidate, "started": now(), "status": "running",
                              "environment_policy": environment_policy})
-            store.update_run(run_id, attempts=json.dumps(attempts), client=candidate["client"], model=candidate["model"])
+            # Two-phase phase 1: transition to starting
+            store.transition_run(
+                run_id,
+                to_status=RunState.STARTING,
+                client=candidate["client"],
+                model=candidate["model"],
+                attempts=json.dumps(attempts),
+            )
             final, proc = folder / f"final-{index}.md", None
             try:
                 # plain_prompt: interface web, onde o mesmo cabecalho fixo em toda conversa denuncia automacao.
@@ -357,7 +214,16 @@ def run_worker(store, config, ident, category, input_file, max_attempts=None):
                 validate_headless_arguments(candidate["client"], "worker", cmd)
                 from .process import ProcessSupervisor
                 proc = ProcessSupervisor.spawn(cmd, cwd=folder, env=env, stdin=subprocess.PIPE if stdin is not None else subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, role="worker", use_job_object=True, text=True, encoding="utf-8", errors="replace")
-                store.update_run(run_id, pid=proc.pid, process_create_time=proc.identity.create_time_ns)
+                
+                # Two-phase phase 2: atomically persist process identity and transition to running
+                store.transition_run(
+                    run_id,
+                    to_status=RunState.RUNNING,
+                    pid=proc.pid,
+                    process_create_time=proc.identity.create_time_ns,
+                    details=f"Spawned {candidate['client']} worker PID {proc.pid}",
+                )
+                store.record_heartbeat(run_id)
                 
                 from .streaming import SafeStreamConsumer
                 timeout = min(600, candidate.get("timeout_seconds", limits["timeout_seconds"]))
@@ -367,6 +233,7 @@ def run_worker(store, config, ident, category, input_file, max_attempts=None):
                     max_log_bytes=limits.get("max_log_bytes", 1_048_576),
                 )
                 stream_res = consumer.consume(proc, timeout_seconds=timeout, stdin_data=stdin)
+                store.record_heartbeat(run_id)
                 stdout, stderr = stream_res.stdout, stream_res.stderr
                 result = response_text(candidate["client"], stdout, final) if stream_res.returncode == 0 else ""
                 metadata = runtime.usage(candidate['client'], stdout)
@@ -390,16 +257,28 @@ def run_worker(store, config, ident, category, input_file, max_attempts=None):
                     terminate_tree(proc)
                 store.update_run(run_id, attempts=json.dumps(attempts), pid=None, process_create_time=None)
         if result:
-            metadata=runtime.aggregate_usage(attempts)
+            metadata = runtime.aggregate_usage(attempts)
             output = folder / "result.md"
             output.write_text(scrub(result), encoding="utf-8")
-            store.update_run(run_id, status="complete", ended=now(), output_path=str(output), usage=json.dumps(metadata))
+            store.confirm_exit(
+                run_id,
+                exit_code=0,
+                output_path=str(output),
+                usage=json.dumps(metadata),
+                attempts=json.dumps(attempts),
+            )
             return {"task_id": ident, "run_id": run_id, "status": "complete", "client": attempts[-1]["client"], "model": attempts[-1]["model"], "output_file": str(output), "preview": scrub(result)[:limits["output_chars"]], "truncated_preview": len(result) > limits["output_chars"], 'usage': metadata, 'skipped': skipped}
         message = attempts[-1].get('error', 'Falha desconhecida') if attempts else 'Nenhum candidato elegivel neste momento; veja cooldown/catalogo'
-        store.update_run(run_id, status="failed", ended=now(), error=message, usage=json.dumps(runtime.aggregate_usage(attempts)))
+        store.confirm_exit(
+            run_id,
+            exit_code=stream_res.returncode if 'stream_res' in locals() and stream_res else 1,
+            error=message,
+            usage=json.dumps(runtime.aggregate_usage(attempts)),
+            attempts=json.dumps(attempts),
+        )
         return {"task_id": ident, "run_id": run_id, "status": "failed", "attempts": attempts, 'skipped': skipped, "next_step": "Inspecione disponibilidade e contrato; nao repita em loop"}
     except BaseException:
-        store.update_run(run_id, status="interrupted", ended=now(), pid=None, error="Coordenador interrompido; verificar logs antes de repetir")
+        store.update_run(run_id, status=RunState.INTERRUPTED, ended=now(), pid=None, error="Coordenador interrompido; verificar logs antes de repetir")
         raise
 
 def load_benchmark_cases(path, config):
@@ -702,6 +581,7 @@ def parser():
     w.add_argument('--response-format', choices=['text','json','python','code'])
     w.add_argument('--exclude-client', action='append', default=[])
     rc = sub.add_parser("recover"); rc.add_argument("--task", required=True); rc.add_argument("--run", required=True)
+    canc = sub.add_parser("cancel"); canc.add_argument("--task", required=True); canc.add_argument("--run", required=True)
     la = sub.add_parser("launch"); la.add_argument("--client", required=True, choices=["codex", "claude", "opencode", "agy"]); la.add_argument("--project", required=True); la.add_argument("--task"); la.add_argument("--model")
     sub.add_parser("routes")
     sc = sub.add_parser('scope'); sc.add_argument('--project', required=True); sc.add_argument('--init', action='store_true')
@@ -753,11 +633,13 @@ def main():
         elif args.command == "bootstrap":
             emit(bootstrap(store, args.project))
         elif args.command == "resume":
-            emit({"task": store.task(args.task), "recent_runs": store.runs(args.task)})
+            emit(store.resume(args.task))
         elif args.command == "checkpoint":
             emit(store.checkpoint(args.task, args.revision, read_json(args.file), args.status))
         elif args.command == "recover":
             emit(store.recover(args.task, args.run))
+        elif args.command == "cancel":
+            emit(store.request_cancel(args.run))
         elif args.command == 'export':
             emit(export_context(store, config, args.task, args.to))
         elif args.command == "benchmark":
