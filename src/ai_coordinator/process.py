@@ -500,7 +500,16 @@ class PosixProcessController:
         # Identity check
         if expected_create_time_ns is not None:
             cur_time = cls.get_creation_time(pid)
-            if cur_time is not None and cur_time != expected_create_time_ns:
+            if cur_time is None:
+                # Conservative principle: identity cannot be verified, fail-closed
+                return TerminationResult(
+                    success=False,
+                    exit_code=None,
+                    reason="identity_unknown",
+                    duration_seconds=time.monotonic() - start,
+                    detail=f"PID {pid} creation time cannot be verified; refusing destructive termination",
+                )
+            if cur_time != expected_create_time_ns:
                 return TerminationResult(
                     success=False,
                     exit_code=None,
@@ -627,20 +636,12 @@ class PosixProcessController:
 # ---------------------------------------------------------------------------
 
 def safe_process_alive(pid: int, expected_create_time_ns: Optional[int] = None) -> bool:
-    """Verify if a process is alive and matches the expected OS creation time."""
+    """Verify if a process is alive and matches the expected OS creation time without reaping."""
     if pid <= 0:
         return False
     if os.name == "nt":
         return WindowsProcessController.is_running(pid, expected_create_time_ns=expected_create_time_ns)
     else:
-        # If it is a child process that exited, reap it immediately
-        try:
-            wpid, _ = os.waitpid(pid, os.WNOHANG)
-            if wpid == pid:
-                return False
-        except (ChildProcessError, OSError):
-            pass
-
         try:
             os.kill(pid, 0)
         except (ProcessLookupError, ValueError):
@@ -652,7 +653,7 @@ def safe_process_alive(pid: int, expected_create_time_ns: Optional[int] = None) 
                 return cur_time == expected_create_time_ns
             return True
 
-        # Check if zombie/defunct on Linux
+        # Non-destructive zombie/defunct check on Linux (/proc) and macOS/BSD (ps)
         stat_file = Path(f"/proc/{pid}/stat")
         if stat_file.exists():
             try:
@@ -660,8 +661,20 @@ def safe_process_alive(pid: int, expected_create_time_ns: Optional[int] = None) 
                 rparen = content.rfind(")")
                 if rparen != -1:
                     state = content[rparen + 1:].split()[0]
-                    if state == "Z":  # Zombie is dead
+                    if state in ("Z", "X", "x"):  # Zombie or dead
                         return False
+            except Exception:
+                pass
+        else:
+            # Fallback for macOS and non-Linux POSIX using non-destructive `ps`
+            try:
+                out = subprocess.check_output(
+                    ["ps", "-p", str(pid), "-o", "state="],
+                    text=True,
+                    stderr=subprocess.DEVNULL,
+                ).strip()
+                if out and out.startswith("Z"):
+                    return False
             except Exception:
                 pass
 
