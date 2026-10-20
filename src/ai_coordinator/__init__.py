@@ -55,6 +55,17 @@ from .dag import (
     validate_dag,
     get_ready_nodes,
 )
+from .trajectory import (
+    TrajectoryStatus,
+    ConfidenceLevel,
+    TokenUsageQuality,
+    Recommendation,
+    TelemetrySnapshot,
+    BudgetProjection,
+    TrajectoryPrediction,
+    AlertDeduplicator,
+    TrajectoryPredictor,
+)
 
 __all__ = [
     "Coordinator",
@@ -102,5 +113,14 @@ __all__ = [
     "TrajectoryEvent",
     "validate_dag",
     "get_ready_nodes",
+    "TrajectoryStatus",
+    "ConfidenceLevel",
+    "TokenUsageQuality",
+    "Recommendation",
+    "TelemetrySnapshot",
+    "BudgetProjection",
+    "TrajectoryPrediction",
+    "AlertDeduplicator",
+    "TrajectoryPredictor",
 ]
 __version__ = "0.3.0"

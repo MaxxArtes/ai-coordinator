@@ -562,3 +562,22 @@ class MissionControl:
             "drift_status": task_row["drift_status"] or DriftStatus.NOMINAL,
             "recent_events": [dict(e) for e in events],
         }
+
+    def predict_trajectory(
+        self,
+        task_id: str,
+        plan_revision: Optional[int] = None,
+        current_node_id: Optional[str] = None,
+        horizon_depth: int = 3,
+    ) -> Any:
+        """Deterministic predictive evaluation of flight trajectory risk."""
+        from .trajectory import TrajectoryPredictor
+        predictor = TrajectoryPredictor(self.store)
+        plan = self.get_flight_plan(task_id)
+        return predictor.predict(
+            task_id=task_id,
+            plan_revision=plan_revision,
+            current_node_id=current_node_id,
+            horizon_depth=horizon_depth,
+            flight_plan=plan,
+        )

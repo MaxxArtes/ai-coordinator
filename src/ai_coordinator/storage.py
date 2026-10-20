@@ -336,6 +336,18 @@ class Store:
             created_at TEXT NOT NULL
           );
 
+          CREATE TABLE IF NOT EXISTS trajectory_predictions (
+            id TEXT PRIMARY KEY,
+            task_id TEXT NOT NULL,
+            plan_revision INTEGER NOT NULL,
+            current_node TEXT,
+            status TEXT NOT NULL,
+            confidence TEXT NOT NULL,
+            prediction_data TEXT NOT NULL,
+            recommendation TEXT NOT NULL,
+            created_at TEXT NOT NULL
+          );
+
           CREATE INDEX IF NOT EXISTS idx_run_events_run ON run_events(run_id);
           CREATE INDEX IF NOT EXISTS idx_runs_task_status ON runs(task_id, status);
           CREATE INDEX IF NOT EXISTS idx_landing_checks_task ON landing_checks(task_id);
@@ -344,6 +356,7 @@ class Store:
           CREATE INDEX IF NOT EXISTS idx_plan_edges_task_rev ON plan_edges(task_id, revision);
           CREATE INDEX IF NOT EXISTS idx_trajectory_proposals_task ON trajectory_proposals(task_id, status);
           CREATE INDEX IF NOT EXISTS idx_trajectory_events_task ON trajectory_events(task_id);
+          CREATE INDEX IF NOT EXISTS idx_trajectory_predictions_task_rev ON trajectory_predictions(task_id, plan_revision);
         """)
 
         # Dynamic migrations for any existing columns
@@ -1469,3 +1482,88 @@ class Store:
             )
             for r in rows
         ]
+
+    def record_trajectory_prediction(self, prediction: Any) -> str:
+        """Persist a trajectory prediction and corresponding audit event."""
+        pred_dict = prediction.to_dict() if hasattr(prediction, "to_dict") else dict(prediction)
+        task_id = validate_id(pred_dict.get("task_id", ""))
+        stamp = now()
+        pred_id = pred_dict.get("id") or uuid.uuid4().hex[:16]
+        rev = int(pred_dict.get("plan_revision", 1))
+        status = str(pred_dict.get("status", "nominal"))
+        confidence = str(pred_dict.get("confidence", "unknown"))
+        rec = str(pred_dict.get("recommendation", "continue"))
+        curr_node = pred_dict.get("current_node")
+
+        severity = "warning" if status == "at_risk" else ("error" if status == "deviated" else "info")
+        reason = str(pred_dict.get("reason", ""))
+
+        with self.transaction():
+            self.db.execute(
+                """INSERT OR REPLACE INTO trajectory_predictions(
+                    id, task_id, plan_revision, current_node, status, confidence,
+                    prediction_data, recommendation, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    pred_id,
+                    task_id,
+                    rev,
+                    curr_node,
+                    status,
+                    confidence,
+                    json.dumps(pred_dict),
+                    rec,
+                    stamp,
+                )
+            )
+
+            self._record_trajectory_event(
+                task_id=task_id,
+                revision=rev,
+                event_type="trajectory_prediction",
+                severity=severity,
+                details=f"Predicao {status} ({confidence}): {reason}",
+            )
+
+        return pred_id
+
+    def get_trajectory_prediction(self, prediction_id: str) -> Optional[Dict[str, Any]]:
+        """Fetch trajectory prediction by ID."""
+        row = self.db.execute(
+            "SELECT * FROM trajectory_predictions WHERE id=?",
+            (prediction_id,)
+        ).fetchone()
+        if not row:
+            return None
+        return json.loads(row["prediction_data"] or "{}")
+
+    def list_trajectory_predictions(
+        self,
+        task_id: str,
+        revision: Optional[int] = None,
+        limit: int = 10,
+    ) -> List[Dict[str, Any]]:
+        """List historical trajectory predictions for task and optional revision."""
+        task_id = validate_id(task_id)
+        if revision is not None:
+            rows = self.db.execute(
+                "SELECT prediction_data FROM trajectory_predictions WHERE task_id=? AND plan_revision=? ORDER BY created_at DESC LIMIT ?",
+                (task_id, revision, limit)
+            ).fetchall()
+        else:
+            rows = self.db.execute(
+                "SELECT prediction_data FROM trajectory_predictions WHERE task_id=? ORDER BY created_at DESC LIMIT ?",
+                (task_id, limit)
+            ).fetchall()
+        return [json.loads(r["prediction_data"]) for r in rows]
+
+    def get_latest_trajectory_prediction(self, task_id: str) -> Optional[Dict[str, Any]]:
+        """Fetch the most recent trajectory prediction for task."""
+        task_id = validate_id(task_id)
+        row = self.db.execute(
+            "SELECT prediction_data FROM trajectory_predictions WHERE task_id=? ORDER BY created_at DESC LIMIT 1",
+            (task_id,)
+        ).fetchone()
+        if not row:
+            return None
+        return json.loads(row["prediction_data"])

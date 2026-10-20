@@ -588,6 +588,8 @@ def parser():
     la = sub.add_parser("launch"); la.add_argument("--client", required=True, choices=["codex", "claude", "opencode", "agy"]); la.add_argument("--project", required=True); la.add_argument("--task"); la.add_argument("--model")
     dr = sub.add_parser("dag-revision"); dr.add_argument("--task", required=True); dr.add_argument("--set"); dr.add_argument("--summary"); dr.add_argument("--parent-revision", type=int); dr.add_argument("--show", action="store_true"); dr.add_argument("--revision", type=int); dr.add_argument("--history", action="store_true")
     dp = sub.add_parser("dag-proposal"); dp.add_argument("--task"); dp.add_argument("--proposal"); dp.add_argument("--propose"); dp.add_argument("--base-revision", type=int); dp.add_argument("--reason"); dp.add_argument("--diff-summary", default=""); dp.add_argument("--list", action="store_true"); dp.add_argument("--status"); dp.add_argument("--resolve", choices=["approved", "rejected", "cancelled"]); dp.add_argument("--activate", action="store_true"); dp.add_argument("--expected-base-revision", type=int)
+    tp = sub.add_parser("trajectory-predict"); tp.add_argument("--task", required=True); tp.add_argument("--revision", type=int); tp.add_argument("--node"); tp.add_argument("--horizon", type=int, default=3); tp.add_argument("--save", action="store_true")
+    th = sub.add_parser("trajectory-history"); th.add_argument("--task", required=True); th.add_argument("--revision", type=int); th.add_argument("--limit", type=int, default=10)
     sub.add_parser("routes")
     sc = sub.add_parser('scope'); sc.add_argument('--project', required=True); sc.add_argument('--init', action='store_true')
     ex = sub.add_parser('export'); ex.add_argument('--task', required=True); ex.add_argument('--to', required=True)
@@ -717,6 +719,24 @@ def main():
             elif getattr(args, "proposal", None):
                 prop = store.get_trajectory_proposal(args.proposal)
                 emit(prop.to_dict() if prop else None)
+        elif args.command == "trajectory-predict":
+            from .trajectory import TrajectoryPredictor
+            predictor = TrajectoryPredictor(store)
+            pred = predictor.predict(
+                task_id=args.task,
+                plan_revision=args.revision,
+                current_node_id=args.node,
+                horizon_depth=args.horizon,
+            )
+            if getattr(args, "save", False):
+                saved_id = predictor.record_prediction(pred, force=True)
+                d = pred.to_dict()
+                d["saved_id"] = saved_id
+                emit(d)
+            else:
+                emit(pred.to_dict())
+        elif args.command == "trajectory-history":
+            emit(store.list_trajectory_predictions(args.task, revision=args.revision, limit=args.limit))
         return 0
     finally:
         store.db.close()
