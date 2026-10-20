@@ -67,14 +67,15 @@ def classify(client: str, model: str, message: str) -> Dict[str, Any]:
         or "unauthorized" in msg_lower
     )
 
-    # Permissão / Forbidden
+    # Permissão / Forbidden: apenas status HTTP 403 ou códigos de autorizacao estruturados de API
     is_forbidden = (
-        "403" in msg_lower
-        or "forbidden" in msg_lower
-        or "permission" in msg_lower
-        or "access denied" in msg_lower
-        or "no access" in msg_lower
-        or "harness" in msg_lower
+        bool(re.search(r"\b403\b", msg_lower))
+        or "status: 403" in msg_lower
+        or "http 403" in msg_lower
+        or "forbidden: access denied" in msg_lower
+        or "permission_denied" in msg_lower
+        or "access denied to model" in msg_lower
+        or "insufficient permissions for model" in msg_lower
     )
 
     # Not found / Endpoints

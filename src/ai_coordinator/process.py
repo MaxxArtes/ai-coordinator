@@ -535,7 +535,7 @@ class PosixProcessController:
         except PermissionError:
             return TerminationResult(False, None, "permission_denied", time.monotonic() - start, "Permission denied")
 
-        # Use pidfd if available
+        # Use pidfd if available and keep it open across the entire termination cycle
         pidfd = cls.open_pidfd(pid)
         try:
             if pidfd is not None and hasattr(signal, "pidfd_send_signal"):
@@ -546,64 +546,93 @@ class PosixProcessController:
             else:
                 os.kill(pid, signal.SIGTERM)
         except ProcessLookupError:
+            if pidfd is not None:
+                os.close(pidfd)
             return TerminationResult(True, None, "normal", time.monotonic() - start, "Exited before signal")
+
+        try:
+            # Poll with timeout, reaping child zombies
+            deadline = time.monotonic() + timeout_seconds
+            while time.monotonic() < deadline:
+                try:
+                    wpid, status = os.waitpid(pid, os.WNOHANG)
+                    if wpid == pid:
+                        exit_code = os.waitstatus_to_exitcode(status) if hasattr(os, "waitstatus_to_exitcode") else (status >> 8)
+                        return TerminationResult(True, exit_code, "terminated", time.monotonic() - start, "Terminated gracefully with SIGTERM")
+                except (ChildProcessError, OSError):
+                    pass
+
+                try:
+                    os.kill(pid, 0)
+                    stat_file = Path(f"/proc/{pid}/stat")
+                    if stat_file.exists():
+                        try:
+                            content = stat_file.read_text(encoding="ascii", errors="replace")
+                            rparen = content.rfind(")")
+                            if rparen != -1 and content[rparen + 1:].split()[0] == "Z":
+                                return TerminationResult(True, None, "terminated", time.monotonic() - start, "Terminated gracefully with SIGTERM (zombie)")
+                        except Exception:
+                            pass
+                    time.sleep(0.05)
+                except ProcessLookupError:
+                    return TerminationResult(True, None, "terminated", time.monotonic() - start, "Terminated gracefully with SIGTERM")
+
+            # Force SIGKILL if still running, re-checking identity to prevent TOCTOU races
+            if expected_create_time_ns is not None and pidfd is None:
+                cur_time = cls.get_creation_time(pid)
+                if cur_time is None:
+                    return TerminationResult(
+                        success=False,
+                        exit_code=None,
+                        reason="identity_unknown",
+                        duration_seconds=time.monotonic() - start,
+                        detail=f"PID {pid} identity cannot be re-verified before SIGKILL; aborting destructive escalation",
+                    )
+                if cur_time != expected_create_time_ns:
+                    return TerminationResult(
+                        success=False,
+                        exit_code=None,
+                        reason="identity_mismatch",
+                        duration_seconds=time.monotonic() - start,
+                        detail=f"PID {pid} was recycled before SIGKILL escalation",
+                    )
+
+            try:
+                if pidfd is not None and hasattr(signal, "pidfd_send_signal"):
+                    try:
+                        signal.pidfd_send_signal(pidfd, signal.SIGKILL)
+                    except Exception:
+                        os.kill(pid, signal.SIGKILL)
+                else:
+                    os.kill(pid, signal.SIGKILL)
+
+                time.sleep(0.1)
+                try:
+                    wpid, status = os.waitpid(pid, os.WNOHANG)
+                    if wpid == pid:
+                        exit_code = os.waitstatus_to_exitcode(status) if hasattr(os, "waitstatus_to_exitcode") else (status >> 8)
+                        return TerminationResult(True, exit_code, "terminated", time.monotonic() - start, "Terminated forcefully with SIGKILL")
+                except (ChildProcessError, OSError):
+                    pass
+                try:
+                    os.kill(pid, 0)
+                    stat_file = Path(f"/proc/{pid}/stat")
+                    if stat_file.exists():
+                        try:
+                            content = stat_file.read_text(encoding="ascii", errors="replace")
+                            rparen = content.rfind(")")
+                            if rparen != -1 and content[rparen + 1:].split()[0] == "Z":
+                                return TerminationResult(True, None, "terminated", time.monotonic() - start, "Terminated forcefully with SIGKILL (zombie)")
+                        except Exception:
+                            pass
+                    return TerminationResult(False, None, "timeout", time.monotonic() - start, "Process required SIGKILL and may linger")
+                except ProcessLookupError:
+                    return TerminationResult(True, None, "terminated", time.monotonic() - start, "Terminated forcefully with SIGKILL")
+            except ProcessLookupError:
+                return TerminationResult(True, None, "terminated", time.monotonic() - start, "Terminated forcefully with SIGKILL")
         finally:
             if pidfd is not None:
                 os.close(pidfd)
-
-        # Poll with timeout, reaping child zombies
-        deadline = time.monotonic() + timeout_seconds
-        while time.monotonic() < deadline:
-            try:
-                wpid, status = os.waitpid(pid, os.WNOHANG)
-                if wpid == pid:
-                    exit_code = os.waitstatus_to_exitcode(status) if hasattr(os, "waitstatus_to_exitcode") else (status >> 8)
-                    return TerminationResult(True, exit_code, "terminated", time.monotonic() - start, "Terminated gracefully with SIGTERM")
-            except (ChildProcessError, OSError):
-                pass
-
-            try:
-                os.kill(pid, 0)
-                stat_file = Path(f"/proc/{pid}/stat")
-                if stat_file.exists():
-                    try:
-                        content = stat_file.read_text(encoding="ascii", errors="replace")
-                        rparen = content.rfind(")")
-                        if rparen != -1 and content[rparen + 1:].split()[0] == "Z":
-                            return TerminationResult(True, None, "terminated", time.monotonic() - start, "Terminated gracefully with SIGTERM (zombie)")
-                    except Exception:
-                        pass
-                time.sleep(0.05)
-            except ProcessLookupError:
-                return TerminationResult(True, None, "terminated", time.monotonic() - start, "Terminated gracefully with SIGTERM")
-
-        # Force SIGKILL if still running
-        try:
-            os.kill(pid, signal.SIGKILL)
-            time.sleep(0.1)
-            try:
-                wpid, status = os.waitpid(pid, os.WNOHANG)
-                if wpid == pid:
-                    exit_code = os.waitstatus_to_exitcode(status) if hasattr(os, "waitstatus_to_exitcode") else (status >> 8)
-                    return TerminationResult(True, exit_code, "terminated", time.monotonic() - start, "Terminated forcefully with SIGKILL")
-            except (ChildProcessError, OSError):
-                pass
-            try:
-                os.kill(pid, 0)
-                stat_file = Path(f"/proc/{pid}/stat")
-                if stat_file.exists():
-                    try:
-                        content = stat_file.read_text(encoding="ascii", errors="replace")
-                        rparen = content.rfind(")")
-                        if rparen != -1 and content[rparen + 1:].split()[0] == "Z":
-                            return TerminationResult(True, None, "terminated", time.monotonic() - start, "Terminated forcefully with SIGKILL (zombie)")
-                    except Exception:
-                        pass
-                return TerminationResult(False, None, "timeout", time.monotonic() - start, "Process required SIGKILL and may linger")
-            except ProcessLookupError:
-                return TerminationResult(True, None, "terminated", time.monotonic() - start, "Terminated forcefully with SIGKILL")
-        except ProcessLookupError:
-            return TerminationResult(True, None, "terminated", time.monotonic() - start, "Terminated forcefully with SIGKILL")
 
     @classmethod
     def terminate_process_group(cls, pgid: int, timeout_seconds: float = 5.0) -> TerminationResult:
@@ -699,25 +728,38 @@ def safe_terminate_tree(
         return TerminationResult(False, None, "not_found", 0.0, "Invalid target")
 
     if os.name == "nt":
-        # First enumerate child PIDs while parent is still open
+        # First enumerate child PIDs and capture their creation timestamps while parent is still open
         child_pids = WindowsProcessController.find_child_pids(pid)
+        child_records = [
+            (c_pid, WindowsProcessController.get_creation_time(c_pid))
+            for c_pid in child_pids
+        ]
         res = WindowsProcessController.terminate_by_handle(
             pid,
             expected_create_time_ns=expected_create_time_ns,
             timeout_seconds=timeout_seconds,
         )
-        # Terminate any surviving children
-        for c_pid in child_pids:
+        # Terminate any surviving children using verified creation times to prevent PID recycling accidents
+        for c_pid, c_time in child_records:
             try:
-                WindowsProcessController.terminate_by_handle(c_pid, timeout_seconds=1.0)
+                WindowsProcessController.terminate_by_handle(
+                    c_pid,
+                    expected_create_time_ns=c_time,
+                    timeout_seconds=1.0,
+                )
             except Exception:
                 pass
         return res
     else:
+        # On POSIX: terminate entire process group first to prevent orphan descendants, then leader
+        try:
+            PosixProcessController.terminate_process_group(pid, timeout_seconds=timeout_seconds / 2)
+        except Exception:
+            pass
         return PosixProcessController.terminate_process(
             pid,
             expected_create_time_ns=expected_create_time_ns,
-            timeout_seconds=timeout_seconds,
+            timeout_seconds=timeout_seconds / 2,
         )
 
 
@@ -817,10 +859,15 @@ class SupervisedProcess:
             self.close()
             return res
         else:
+            if self.role == "worker":
+                try:
+                    PosixProcessController.terminate_process_group(self.pid, timeout_seconds=timeout_seconds / 2)
+                except Exception:
+                    pass
             res = PosixProcessController.terminate_process(
                 self.pid,
                 expected_create_time_ns=self.identity.create_time_ns,
-                timeout_seconds=timeout_seconds,
+                timeout_seconds=timeout_seconds / 2 if self.role == "worker" else timeout_seconds,
             )
             try:
                 self.proc.wait(timeout=0.1)

@@ -30,8 +30,25 @@ SECRET_PATTERNS = [
 ]
 
 
+# Candidate prefixes that can introduce a sensitive secret
+SENSITIVE_PREFIX_CANDIDATE = re.compile(
+    r"(?i)\b(?:Bearer\s*|sk-|AIza|gh[pousr]_|glpat-|(?:senha|password|passwd|pwd|secret|api[_-]?key|token)\s*[=:]\s*['\"]?|\"(?:authorization|set-cookie|cookie|x-api-key|api_key|password)\"\s*:\s*['\"]?|://[^:/@\s]+:)"
+)
+
+# Incomplete partial prefixes that might be forming at the buffer boundary
+PARTIAL_PREFIX_TOKENS = (
+    "bearer", "sk-", "aiza", "ghp_", "gho_", "ghu_", "ghs_", "ghr_", "glpat-",
+    "password", "passwd", "senha", "secret", "token", "authorization", "x-api-key", "api_key"
+)
+
+
 class StreamingScrubber:
-    """Incrementally scrubs text streams while retaining boundary overlap."""
+    """Incrementally scrubs text streams while retaining boundary overlap.
+
+    Guarantees stateful incremental scrubbing: sensitive prefix candidates are
+    held back until their closing boundary is reached, preventing credential leaks
+    across chunks even when delimiters appear within the prefix itself (e.g. 'Bearer ').
+    """
 
     def __init__(
         self,
@@ -68,22 +85,64 @@ class StreamingScrubber:
     def feed(self, chunk: str) -> str:
         """Feed a new chunk of output and return the sanitized prefix."""
         self.buffer += chunk
-        if len(self.buffer) <= self.overlap_size:
+        # Always run scrub on the entire buffer so any complete secrets are redacted immediately
+        self.buffer = self.scrub(self.buffer)
+
+        # Check if there are any candidate uncompleted sensitive prefixes in the buffer
+        uncompleted_start = None
+        for m in SENSITIVE_PREFIX_CANDIDATE.finditer(self.buffer):
+            start = m.start()
+            end = m.end()
+            tail = self.buffer[end:]
+            # Look for closing delimiter after prefix
+            delims = [tail.find(c) for c in ("\n", "\r", " ", "\t", '"', "'", ";", ",")]
+            found = [d for d in delims if d != -1]
+            if not found:
+                # No delimiter after prefix yet -> uncompleted!
+                if uncompleted_start is None or start < uncompleted_start:
+                    uncompleted_start = start
+
+        # Check buffer tail for partial prefix (e.g. ends with "Bear" or "pass")
+        buf_lower = self.buffer.lower()
+        tail_32 = buf_lower[-32:] if len(buf_lower) >= 32 else buf_lower
+        for tok in PARTIAL_PREFIX_TOKENS:
+            for l in range(2, len(tok) + 1):
+                sub = tok[:l]
+                if tail_32.endswith(sub):
+                    pos = len(self.buffer) - len(sub)
+                    if pos == 0 or not self.buffer[pos - 1].isalnum():
+                        if uncompleted_start is None or pos < uncompleted_start:
+                            uncompleted_start = pos
+
+        max_safe_idx = len(self.buffer)
+        if uncompleted_start is not None:
+            max_safe_idx = min(max_safe_idx, uncompleted_start)
+        else:
+            max_safe_idx = max_safe_idx - self.overlap_size
+
+        if max_safe_idx <= 0:
+            # Check if buffer has grown excessively beyond max_word_size without delimiters
+            if len(self.buffer) > self.max_word_size * 2:
+                to_emit = self.buffer[:self.max_word_size]
+                self.buffer = self.buffer[self.max_word_size:]
+                if SENSITIVE_PREFIX_CANDIDATE.search(to_emit):
+                    return "[REDACTED_OVERSIZED_CREDENTIAL]"
+                return self.scrub(to_emit)
             return ""
 
-        # Search for a delimiter boundary in the safe zone
-        search_zone = self.buffer[:-self.overlap_size]
+        search_zone = self.buffer[:max_safe_idx]
         delims = [search_zone.rfind(c) for c in ("\n", " ", "\t", '"', "'", ";", ",")]
         last_delim = max(delims)
 
         if last_delim != -1:
             to_emit = self.buffer[:last_delim + 1]
             self.buffer = self.buffer[last_delim + 1:]
-            return self.scrub(to_emit)
-        elif len(self.buffer) > self.max_word_size:
-            # Output is a single token exceeding maximum secret length without whitespace
+            return to_emit
+        elif len(search_zone) > self.max_word_size:
             to_emit = self.buffer[:self.max_word_size]
             self.buffer = self.buffer[self.max_word_size:]
+            if SENSITIVE_PREFIX_CANDIDATE.search(to_emit):
+                return "[REDACTED_OVERSIZED_CREDENTIAL]"
             return self.scrub(to_emit)
 
         return ""
@@ -183,23 +242,28 @@ class SafeStreamConsumer:
         t_out.start()
         t_err.start()
 
-        # Feed stdin if provided
-        if stdin_data is not None and proc.stdin:
-            try:
-                proc.stdin.write(stdin_data)
-                proc.stdin.flush()
-            except (BrokenPipeError, OSError):
-                pass
-            finally:
-                try:
-                    proc.stdin.close()
-                except Exception:
-                    pass
-
-        # Wait with deadline
+        # Wait with global deadline encompassing stdin write, output consumption and process exit
         start = time.monotonic()
         deadline = start + timeout_seconds
         timed_out = False
+
+        # Feed stdin concurrently bounded by the global deadline
+        if stdin_data is not None and proc.stdin:
+            def _write_stdin():
+                try:
+                    proc.stdin.write(stdin_data)
+                    proc.stdin.flush()
+                except (BrokenPipeError, OSError):
+                    pass
+                finally:
+                    try:
+                        proc.stdin.close()
+                    except Exception:
+                        pass
+
+            t_stdin = threading.Thread(target=_write_stdin)
+            t_stdin.daemon = True
+            t_stdin.start()
 
         while time.monotonic() < deadline:
             if not t_out.is_alive() and not t_err.is_alive():

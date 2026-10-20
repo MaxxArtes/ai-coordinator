@@ -62,16 +62,25 @@ class DriftStatus:
 
 
 def is_path_allowed(target_path: Union[str, Path], allowed_paths: List[Union[str, Path]]) -> bool:
-    """Deterministic path boundary check supporting Windows and POSIX path resolution."""
+    """Deterministic path boundary check resolving symlinks and real canonical paths."""
     if not allowed_paths:
         return False
-    target_norm = os.path.normcase(os.path.abspath(str(target_path)))
+
+    try:
+        target_resolved = os.path.normcase(os.path.realpath(str(target_path)))
+    except Exception:
+        target_resolved = os.path.normcase(os.path.abspath(str(target_path)))
+
     for allowed in allowed_paths:
-        allowed_norm = os.path.normcase(os.path.abspath(str(allowed)))
-        if target_norm == allowed_norm:
+        try:
+            allowed_resolved = os.path.normcase(os.path.realpath(str(allowed)))
+        except Exception:
+            allowed_resolved = os.path.normcase(os.path.abspath(str(allowed)))
+
+        if target_resolved == allowed_resolved:
             return True
-        # Check subpath containment
-        if target_norm.startswith(allowed_norm + os.sep) or target_norm.startswith(allowed_norm + "/"):
+        # Check subpath containment with directory separator
+        if target_resolved.startswith(allowed_resolved + os.sep) or target_resolved.startswith(allowed_resolved + "/"):
             return True
     return False
 
@@ -412,13 +421,20 @@ class MissionControl:
         status: str,
         evidence: Optional[str] = None
     ) -> Dict[str, Any]:
-        """Record the outcome of a landing verification check."""
+        """Record the outcome of a landing verification check with substantive evidence."""
         if not check_name or not isinstance(check_name, str):
             raise ValueError("Nome da verificacao de pouso invalido")
         if status not in ("passed", "failed", "pending"):
             raise ValueError("Status da verificacao deve ser 'passed', 'failed' ou 'pending'")
-        if status == "passed" and (not evidence or not isinstance(evidence, str) or not evidence.strip()):
-            raise ValueError("Evidencia obrigatoria para verificacao com status 'passed'")
+
+        if status == "passed":
+            if not evidence or not isinstance(evidence, str) or not evidence.strip():
+                raise ValueError("Evidencia obrigatoria para verificacao com status 'passed'")
+            stripped = evidence.strip()
+            if len(stripped) < 8 or stripped.lower() in ("ok", "pass", "passed", "true", "yes", "sim", "concluido"):
+                raise ValueError(
+                    f"Evidencia superficial rejeitada: forneca comprovacao tecnica detalhada, contagem de testes ou referencia a artefato"
+                )
 
         with self.store.transaction():
             task_row = self.db.execute("SELECT id FROM tasks WHERE id=?", (task_id,)).fetchone()
@@ -462,7 +478,7 @@ class MissionControl:
         return [dict(r) for r in rows]
 
     def verify_landing(self, task_id: str) -> Tuple[bool, List[str]]:
-        """Evaluate whether all mandatory landing checks specified in flight plan are passed."""
+        """Evaluate whether all mandatory landing checks specified in flight plan are passed and verified."""
         plan = self.get_flight_plan(task_id)
         if not plan or not plan.mandatory_landing_checks:
             # No flight plan or no mandatory checks required
@@ -479,6 +495,43 @@ class MissionControl:
             if not record or record["status"] != "passed":
                 status_str = record["status"] if record else "not_recorded"
                 unmet.append(f"{check} (status: {status_str})")
+                continue
+
+            # Deterministic evidence verification
+            ev = record.get("evidence") or ""
+
+            # 1. Check if evidence references an artifact / file path
+            file_match = re.search(r"(?:artifact|file|path|arquivo|log):\s*([^\s,;]+)", ev, re.IGNORECASE)
+            if not file_match:
+                # Check for direct file paths with common extensions (.log, .txt, .json, .md, .xml)
+                file_match = re.search(r"([a-zA-Z0-9_\-\./\\]+\.(?:log|txt|json|md|xml))", ev)
+
+            if file_match:
+                candidate_path = Path(file_match.group(1))
+                if not candidate_path.is_absolute():
+                    # Resolve relative to store root or task dir
+                    candidate_path = self.store.root / "tasks" / task_id / candidate_path
+                if not candidate_path.exists():
+                    unmet.append(f"{check} (artefato de evidencia nao encontrado: {file_match.group(1)})")
+                    continue
+                elif candidate_path.stat().st_size == 0:
+                    unmet.append(f"{check} (artefato de evidencia esta vazio: {file_match.group(1)})")
+                    continue
+
+            # 2. Check if evidence references a run_id
+            run_match = re.search(r"(?:run_id|run):\s*([0-9a-f]{8,32})", ev, re.IGNORECASE)
+            if run_match:
+                target_run_id = run_match.group(1)
+                run_row = self.db.execute(
+                    "SELECT status, exit_code FROM runs WHERE id=? AND task_id=?",
+                    (target_run_id, task_id)
+                ).fetchone()
+                if not run_row:
+                    unmet.append(f"{check} (run {target_run_id} nao encontrado para esta tarefa)")
+                    continue
+                if run_row["status"] != "complete" or run_row["exit_code"] != 0:
+                    unmet.append(f"{check} (run {target_run_id} nao concluiu com sucesso; exit_code={run_row['exit_code']})")
+                    continue
 
         return len(unmet) == 0, unmet
 

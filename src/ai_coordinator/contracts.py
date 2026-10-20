@@ -127,7 +127,7 @@ def get_client_contract(client: str, role: str = "worker") -> Optional[HeadlessC
 
 
 def validate_headless_arguments(client: str, role: str, command: List[str]) -> None:
-    """Validate that command line flags satisfy safety constraints and do not use forbidden flags."""
+    """Validate that command line flags satisfy safety constraints, include required security flags, and prevent overrides."""
     contract = CLIENT_CONTRACTS.get(client)
     if not contract:
         raise ValueError(f"Cliente desconhecido para execucao headless: {client}")
@@ -137,6 +137,49 @@ def validate_headless_arguments(client: str, role: str, command: List[str]) -> N
         raise ValueError(f"Cliente '{client}' nao suporta execucao como coordinator_headless")
 
     cmd_joined = " ".join(command)
+
+    # 1. Prohibited flags check
     for forbidden in contract.disallowed_flags:
         if forbidden in command or forbidden in cmd_joined:
             raise ValueError(f"Flag proibida em execucao segura: {forbidden} ({client})")
+
+    # 2. Mandatory positive requirements check
+    if contract.required_flags:
+        # Check that required flags/tokens appear in command arguments
+        for req in contract.required_flags:
+            if not req:
+                continue
+            found = False
+            for arg in command:
+                if arg == req or req in arg:
+                    found = True
+                    break
+            if not found and req not in cmd_joined:
+                raise ValueError(
+                    f"Contrato headless violado: argumento de seguranca obrigatorio '{req}' ausente no comando ({client})"
+                )
+
+    # 3. Security neutralization and override checks
+    if client == "codex":
+        # Ensure sandbox is strictly read-only and not overridden later
+        for idx, arg in enumerate(command):
+            if arg in ("--sandbox", "-s") and idx + 1 < len(command):
+                val = command[idx + 1]
+                if val != "read-only":
+                    raise ValueError(f"Override de sandbox proibido em execucao segura: {val} (codex)")
+            elif arg.startswith("--sandbox="):
+                val = arg.split("=", 1)[1]
+                if val != "read-only":
+                    raise ValueError(f"Override de sandbox proibido em execucao segura: {val} (codex)")
+
+    elif client == "claude":
+        # Ensure tools remain empty/disabled
+        for idx, arg in enumerate(command):
+            if arg == "--tools" and idx + 1 < len(command):
+                val = command[idx + 1]
+                if val != "":
+                    raise ValueError(f"Habilitacao de ferramentas proibida para worker headless: {val} (claude)")
+            elif arg.startswith("--tools="):
+                val = arg.split("=", 1)[1]
+                if val not in ('""', "''", ""):
+                    raise ValueError(f"Habilitacao de ferramentas proibida para worker headless: {val} (claude)")
