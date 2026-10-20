@@ -590,6 +590,9 @@ def parser():
     dp = sub.add_parser("dag-proposal"); dp.add_argument("--task"); dp.add_argument("--proposal"); dp.add_argument("--propose"); dp.add_argument("--base-revision", type=int); dp.add_argument("--reason"); dp.add_argument("--diff-summary", default=""); dp.add_argument("--list", action="store_true"); dp.add_argument("--status"); dp.add_argument("--resolve", choices=["approved", "rejected", "cancelled"]); dp.add_argument("--activate", action="store_true"); dp.add_argument("--expected-base-revision", type=int)
     tp = sub.add_parser("trajectory-predict"); tp.add_argument("--task", required=True); tp.add_argument("--revision", type=int); tp.add_argument("--node"); tp.add_argument("--horizon", type=int, default=3); tp.add_argument("--save", action="store_true")
     th = sub.add_parser("trajectory-history"); th.add_argument("--task", required=True); th.add_argument("--revision", type=int); th.add_argument("--limit", type=int, default=10)
+    ic = sub.add_parser("invariant-check"); ic.add_argument("--task", required=True); ic.add_argument("--revision", type=int)
+    rl = sub.add_parser("resource-ledger"); rl.add_argument("--task", required=True); rl.add_argument("--revision", type=int); rl.add_argument("--status")
+    rr = sub.add_parser("resource-reconcile"); rr.add_argument("--task", required=True)
     sub.add_parser("routes")
     sc = sub.add_parser('scope'); sc.add_argument('--project', required=True); sc.add_argument('--init', action='store_true')
     ex = sub.add_parser('export'); ex.add_argument('--task', required=True); ex.add_argument('--to', required=True)
@@ -737,6 +740,23 @@ def main():
                 emit(pred.to_dict())
         elif args.command == "trajectory-history":
             emit(store.list_trajectory_predictions(args.task, revision=args.revision, limit=args.limit))
+        elif args.command == "invariant-check":
+            from .invariants import InvariantOracle
+            invariants = store.get_invariants(args.task)
+            active_rev = args.revision
+            if active_rev is None:
+                rev_row = store.get_plan_revision(args.task)
+                active_rev = rev_row.revision if rev_row else 1
+            evals = store.get_invariant_evaluations(args.task, plan_revision=active_rev)
+            oracle = InvariantOracle()
+            report = oracle.evaluate_revision(args.task, active_rev, invariants, evals)
+            emit(report.to_dict())
+        elif args.command == "resource-ledger":
+            resources = store.list_resources(args.task, plan_revision=args.revision, status=args.status)
+            emit([r.to_dict() for r in resources])
+        elif args.command == "resource-reconcile":
+            reconciled = store.reconcile_resources(args.task)
+            emit([r.to_dict() for r in reconciled])
         return 0
     finally:
         store.db.close()

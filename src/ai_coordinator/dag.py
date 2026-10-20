@@ -35,6 +35,11 @@ class ActiveWorkerFencingError(DagError):
     pass
 
 
+class ProposalNotApprovedError(DagError):
+    """Raised when an unapproved trajectory proposal is submitted for activation."""
+    pass
+
+
 # ---------------------------------------------------------------------------
 # Data Models
 # ---------------------------------------------------------------------------

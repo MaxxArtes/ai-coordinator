@@ -305,6 +305,7 @@ class DagVersioningTests(unittest.TestCase):
             proposed_edges=[{"from_node": "a", "to_node": "b"}],
             reason="Adicionar B",
         )
+        self.store.resolve_trajectory_proposal(prop.id, "approved")
 
         # Start a worker run in task
         run_id, _, _ = self.store.reserve(self.task_id, "code", "worker prompt", 5)
@@ -344,6 +345,7 @@ class DagVersioningTests(unittest.TestCase):
             proposed_edges=[{"from_node": "a", "to_node": "b"}],
             reason="Proposta baseada em R1",
         )
+        self.store.resolve_trajectory_proposal(prop.id, "approved")
 
         # Another revision (R2) is committed in the meantime
         self.store.create_plan_revision(self.task_id, nodes=[{"node_id": "a", "title": "A2"}], edges=[], summary="R2", parent_revision=1)
@@ -434,6 +436,14 @@ class DagVersioningTests(unittest.TestCase):
             mock_emit.assert_called()
             prop_id = mock_emit.call_args[0][0]["id"]
             self.assertEqual(mock_emit.call_args[0][0]["status"], "proposed")
+
+        # CLI: dag-proposal resolve approved
+        with patch.object(cli, "emit") as mock_emit, patch("sys.argv", [
+            "cli.py", "--root", str(self.root), "dag-proposal", "--proposal", prop_id, "--resolve", "approved"
+        ]):
+            cli.main()
+            mock_emit.assert_called()
+            self.assertEqual(mock_emit.call_args[0][0]["status"], "approved")
 
         # CLI: dag-proposal activate
         with patch.object(cli, "emit") as mock_emit, patch("sys.argv", [

@@ -33,6 +33,7 @@ from .dag import (
     DagValidationError,
     StaleRevisionError,
     ActiveWorkerFencingError,
+    ProposalNotApprovedError,
     PlanNode,
     PlanEdge,
     PlanRevision,
@@ -40,6 +41,22 @@ from .dag import (
     TrajectoryEvent,
     validate_dag,
     get_ready_nodes,
+)
+from .invariants import (
+    InvariantDefinition,
+    InvariantEvaluation,
+    InvariantStatus,
+    InvariantVerificationError,
+    compute_sha256,
+)
+from .resource_ledger import (
+    ResourceRecord,
+    ResourceEvent,
+    ResourceState,
+    ResourceType,
+    ResourceAction,
+    ResourceLedger,
+    UnresolvedResourceError,
 )
 
 now = lambda: dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
@@ -188,6 +205,7 @@ class Store:
         self.db.execute("PRAGMA busy_timeout=20000")
         self._init_schema()
         self.mission_control = MissionControl(self)
+        self.resource_ledger = ResourceLedger(self.db)
 
     def _init_schema(self) -> None:
         self.db.executescript("""
@@ -348,6 +366,63 @@ class Store:
             created_at TEXT NOT NULL
           );
 
+          CREATE TABLE IF NOT EXISTS invariants (
+            id TEXT PRIMARY KEY,
+            task_id TEXT NOT NULL,
+            description TEXT NOT NULL,
+            required INTEGER NOT NULL DEFAULT 1,
+            verifier_type TEXT NOT NULL,
+            target_artifact TEXT,
+            created_at TEXT NOT NULL
+          );
+
+          CREATE TABLE IF NOT EXISTS invariant_evaluations (
+            id TEXT PRIMARY KEY,
+            task_id TEXT NOT NULL,
+            plan_revision INTEGER NOT NULL,
+            invariant_id TEXT NOT NULL,
+            status TEXT NOT NULL,
+            evidence TEXT,
+            verified INTEGER NOT NULL DEFAULT 0,
+            waiver_authorized INTEGER NOT NULL DEFAULT 0,
+            waiver_reason TEXT,
+            evaluated_at TEXT NOT NULL,
+            details TEXT
+          );
+
+          CREATE TABLE IF NOT EXISTS resource_ledger (
+            id TEXT PRIMARY KEY,
+            task_id TEXT NOT NULL,
+            plan_revision INTEGER NOT NULL,
+            run_id TEXT,
+            resource_type TEXT NOT NULL,
+            canonical_id TEXT NOT NULL,
+            action TEXT NOT NULL,
+            pre_hash TEXT,
+            post_hash TEXT,
+            compensable INTEGER NOT NULL DEFAULT 1,
+            compensation_action TEXT,
+            requires_authorization INTEGER NOT NULL DEFAULT 0,
+            idempotency_key TEXT NOT NULL,
+            status TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            metadata TEXT,
+            UNIQUE(task_id, idempotency_key)
+          );
+
+          CREATE TABLE IF NOT EXISTS resource_ledger_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            resource_id TEXT NOT NULL,
+            task_id TEXT NOT NULL,
+            plan_revision INTEGER NOT NULL,
+            from_status TEXT,
+            to_status TEXT NOT NULL,
+            event_type TEXT NOT NULL,
+            details TEXT,
+            created_at TEXT NOT NULL
+          );
+
           CREATE INDEX IF NOT EXISTS idx_run_events_run ON run_events(run_id);
           CREATE INDEX IF NOT EXISTS idx_runs_task_status ON runs(task_id, status);
           CREATE INDEX IF NOT EXISTS idx_landing_checks_task ON landing_checks(task_id);
@@ -357,6 +432,11 @@ class Store:
           CREATE INDEX IF NOT EXISTS idx_trajectory_proposals_task ON trajectory_proposals(task_id, status);
           CREATE INDEX IF NOT EXISTS idx_trajectory_events_task ON trajectory_events(task_id);
           CREATE INDEX IF NOT EXISTS idx_trajectory_predictions_task_rev ON trajectory_predictions(task_id, plan_revision);
+          CREATE INDEX IF NOT EXISTS idx_invariants_task ON invariants(task_id);
+          CREATE INDEX IF NOT EXISTS idx_invariant_evals_task_rev ON invariant_evaluations(task_id, plan_revision);
+          CREATE INDEX IF NOT EXISTS idx_resource_ledger_task_rev ON resource_ledger(task_id, plan_revision);
+          CREATE INDEX IF NOT EXISTS idx_resource_ledger_status ON resource_ledger(task_id, status);
+          CREATE INDEX IF NOT EXISTS idx_resource_events_res ON resource_ledger_events(resource_id);
         """)
 
         # Dynamic migrations for any existing columns
@@ -1323,19 +1403,29 @@ class Store:
     def activate_trajectory_proposal(
         self,
         proposal_id: str,
-        expected_base_revision: Optional[int] = None
+        expected_base_revision: Optional[int] = None,
+        require_approval: bool = True,
+        enforce_invariants: bool = True,
+        enforce_clean_resources: bool = True,
     ) -> PlanRevision:
-        """Safely activate a trajectory proposal, enforcing optimistic fencing and worker isolation."""
+        """Safely activate a trajectory proposal, enforcing approval, optimistic fencing, worker isolation, clean resources, and invariant verification."""
         with self.transaction():
             proposal = self.get_trajectory_proposal(proposal_id)
             if not proposal:
                 raise ValueError("Proposta nao encontrada")
-            if proposal.status not in ("proposed", "approved"):
-                raise ValueError(f"Proposta em status '{proposal.status}' nao pode ser ativada")
 
             task_id = proposal.task_id
 
-            # 1. Optimistic fencing check against current active revision
+            # 1. Require formal approval
+            if require_approval and proposal.status != "approved":
+                raise ProposalNotApprovedError(
+                    f"Proposta em status '{proposal.status}' nao pode ser ativada. "
+                    "A proposta deve ser formalmente aprovada ('approved') antes da ativacao."
+                )
+            elif proposal.status not in ("proposed", "approved"):
+                raise ValueError(f"Proposta em status '{proposal.status}' nao pode ser ativada")
+
+            # 2. Optimistic fencing check against current active revision
             current_active = self.get_plan_revision(task_id)
             active_rev_num = current_active.revision if current_active else 0
             if expected_base_revision is not None and expected_base_revision != active_rev_num:
@@ -1347,7 +1437,7 @@ class Store:
                     f"A proposta foi formulada sobre revisao {proposal.base_revision}, mas a ativa e {active_rev_num}"
                 )
 
-            # 2. Process Safety Fencing: verify no active worker runs are lingering
+            # 3. Process Safety Fencing: verify no active worker runs are lingering
             placeholders = ",".join("?" for _ in ACTIVE_RUN_STATES)
             active_runs = self.db.execute(
                 f"SELECT id, status, pid FROM runs WHERE task_id=? AND status IN ({placeholders})",
@@ -1361,7 +1451,42 @@ class Store:
                     f"[{', '.join(running_ids)}]. Encerre ou reconcilie os processos antes de ativar nova trajetoria."
                 )
 
-            # 3. Create the new immutable plan revision
+            # 4. Resource Ledger Cleanliness Fencing (Scenario 12)
+            if enforce_clean_resources:
+                uncertain_count = self.db.execute(
+                    "SELECT COUNT(*) FROM resource_ledger WHERE task_id=? AND status=?",
+                    (task_id, ResourceState.UNCERTAIN),
+                ).fetchone()[0]
+                if uncertain_count > 0:
+                    raise UnresolvedResourceError(
+                        f"Ativacao bloqueada: existem {uncertain_count} recurso(s) em estado incerto ('uncertain') "
+                        f"na tarefa {task_id}. Reconcilie os recursos antes de ativar nova trajetoria."
+                    )
+
+            # 5. Invariant Oracle Verification Fencing (Scenario 12)
+            if enforce_invariants:
+                req_invariants = self.db.execute(
+                    "SELECT id, description FROM invariants WHERE task_id=? AND required=1",
+                    (task_id,),
+                ).fetchall()
+                for inv in req_invariants:
+                    inv_id = inv["id"]
+                    eval_row = self.db.execute(
+                        "SELECT status, verified FROM invariant_evaluations WHERE task_id=? AND plan_revision=? AND invariant_id=? ORDER BY evaluated_at DESC LIMIT 1",
+                        (task_id, active_rev_num, inv_id),
+                    ).fetchone()
+                    if not eval_row:
+                        raise InvariantVerificationError(
+                            f"Ativacao bloqueada por oraculo de invariantes: invariante obrigatorio '{inv_id}' "
+                            f"nao possui avaliacao para a revisao ativa {active_rev_num}."
+                        )
+                    if eval_row["status"] not in (InvariantStatus.PASS, InvariantStatus.NOT_APPLICABLE) or not eval_row["verified"]:
+                        raise InvariantVerificationError(
+                            f"Ativacao bloqueada por oraculo de invariantes: invariante obrigatorio '{inv_id}' "
+                            f"possui status '{eval_row['status']}' (verificado={bool(eval_row['verified'])})."
+                        )
+
+            # 6. Create the new immutable plan revision
             new_rev = self.create_plan_revision(
                 task_id=task_id,
                 nodes=list(proposal.nodes.values()),
@@ -1567,3 +1692,214 @@ class Store:
         if not row:
             return None
         return json.loads(row["prediction_data"])
+
+    # -------------------------------------------------------------------------
+    # Invariant Oracle Storage Methods
+    # -------------------------------------------------------------------------
+    def create_invariant(
+        self,
+        task_id: str,
+        description: str,
+        required: bool = True,
+        verifier_type: str = "trusted_test_runner",
+        target_artifact: Optional[str] = None,
+        invariant_id: Optional[str] = None,
+    ) -> InvariantDefinition:
+        """Register an invariant constraint for a task."""
+        task_id = validate_id(task_id)
+        inv_id = invariant_id or f"inv-{uuid.uuid4().hex[:8]}"
+        stamp = now()
+        with self.transaction():
+            self.db.execute(
+                """
+                INSERT OR REPLACE INTO invariants (
+                    id, task_id, description, required, verifier_type, target_artifact, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    inv_id,
+                    task_id,
+                    description,
+                    1 if required else 0,
+                    verifier_type,
+                    target_artifact,
+                    stamp,
+                ),
+            )
+        return InvariantDefinition(
+            id=inv_id,
+            task_id=task_id,
+            description=description,
+            required=required,
+            verifier_type=verifier_type,
+            target_artifact=target_artifact,
+            created_at=stamp,
+        )
+
+    def get_invariants(self, task_id: str) -> List[InvariantDefinition]:
+        """Fetch all invariants registered for a task."""
+        task_id = validate_id(task_id)
+        rows = self.db.execute(
+            "SELECT * FROM invariants WHERE task_id=? ORDER BY created_at ASC",
+            (task_id,),
+        ).fetchall()
+        return [
+            InvariantDefinition(
+                id=r["id"],
+                task_id=r["task_id"],
+                description=r["description"],
+                required=bool(r["required"]),
+                verifier_type=r["verifier_type"],
+                target_artifact=r["target_artifact"],
+                created_at=r["created_at"],
+            )
+            for r in rows
+        ]
+
+    def record_invariant_evaluation(self, evaluation: InvariantEvaluation) -> InvariantEvaluation:
+        """Persist an invariant evaluation result in SQLite."""
+        ev_json = json.dumps(evaluation.evidence) if evaluation.evidence else None
+        with self.transaction():
+            self.db.execute(
+                """
+                INSERT OR REPLACE INTO invariant_evaluations (
+                    id, task_id, plan_revision, invariant_id, status, evidence,
+                    verified, waiver_authorized, waiver_reason, evaluated_at, details
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    evaluation.id,
+                    evaluation.task_id,
+                    evaluation.plan_revision,
+                    evaluation.invariant_id,
+                    evaluation.status,
+                    ev_json,
+                    1 if evaluation.verified else 0,
+                    1 if evaluation.waiver_authorized else 0,
+                    evaluation.waiver_reason,
+                    evaluation.evaluated_at,
+                    evaluation.details,
+                ),
+            )
+        return evaluation
+
+    def get_invariant_evaluations(
+        self, task_id: str, plan_revision: Optional[int] = None
+    ) -> List[InvariantEvaluation]:
+        """Fetch invariant evaluations for a task and optional plan revision."""
+        task_id = validate_id(task_id)
+        if plan_revision is not None:
+            rows = self.db.execute(
+                "SELECT * FROM invariant_evaluations WHERE task_id=? AND plan_revision=? ORDER BY evaluated_at ASC",
+                (task_id, plan_revision),
+            ).fetchall()
+        else:
+            rows = self.db.execute(
+                "SELECT * FROM invariant_evaluations WHERE task_id=? ORDER BY evaluated_at ASC",
+                (task_id,),
+            ).fetchall()
+
+        results: List[InvariantEvaluation] = []
+        for r in rows:
+            ev_data = json.loads(r["evidence"]) if r["evidence"] else None
+            results.append(
+                InvariantEvaluation(
+                    id=r["id"],
+                    task_id=r["task_id"],
+                    plan_revision=int(r["plan_revision"]),
+                    invariant_id=r["invariant_id"],
+                    status=r["status"],
+                    evidence=ev_data,
+                    verified=bool(r["verified"]),
+                    waiver_authorized=bool(r["waiver_authorized"]),
+                    waiver_reason=r["waiver_reason"],
+                    evaluated_at=r["evaluated_at"],
+                    details=r["details"],
+                )
+            )
+        return results
+
+    # -------------------------------------------------------------------------
+    # Resource Ledger Storage Methods
+    # -------------------------------------------------------------------------
+    def record_resource_intent(
+        self,
+        task_id: str,
+        plan_revision: int,
+        resource_type: str,
+        raw_id: str,
+        action: str,
+        idempotency_key: str,
+        run_id: Optional[str] = None,
+        pre_hash: Optional[str] = None,
+        compensable: bool = True,
+        compensation_action: Optional[str] = None,
+        requires_authorization: bool = False,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> ResourceRecord:
+        """Phase 1: Record intent prior to executing any mutation or external action."""
+        with self.transaction():
+            return self.resource_ledger.record_intent(
+                task_id=task_id,
+                plan_revision=plan_revision,
+                resource_type=resource_type,
+                raw_id=raw_id,
+                action=action,
+                idempotency_key=idempotency_key,
+                run_id=run_id,
+                pre_hash=pre_hash,
+                compensable=compensable,
+                compensation_action=compensation_action,
+                requires_authorization=requires_authorization,
+                metadata=metadata,
+            )
+
+    def confirm_resource_applied(
+        self,
+        resource_id: str,
+        post_hash: Optional[str] = None,
+    ) -> ResourceRecord:
+        """Phase 2: Confirm operation completed and record physical verification."""
+        with self.transaction():
+            return self.resource_ledger.confirm_applied(resource_id=resource_id, post_hash=post_hash)
+
+    def reconcile_resources(self, task_id: str) -> List[ResourceRecord]:
+        """Detect and reconcile any resources stuck in 'intent_recorded'."""
+        with self.transaction():
+            return self.resource_ledger.reconcile_resources(task_id=task_id)
+
+    def prepare_resource_compensation(
+        self,
+        resource_id: str,
+        authorized: bool = False,
+    ) -> ResourceRecord:
+        """Prepare resource compensation, checking authorization for irreversible actions."""
+        with self.transaction():
+            return self.resource_ledger.prepare_compensation(resource_id=resource_id, authorized=authorized)
+
+    def apply_resource_compensation_step(
+        self,
+        resource_id: str,
+        authorized: bool = False,
+    ) -> ResourceRecord:
+        """Execute compensation step idempotently and with third-party modification guards."""
+        with self.transaction():
+            return self.resource_ledger.apply_compensation_step(resource_id=resource_id, authorized=authorized)
+
+    def retain_resource(self, resource_id: str) -> ResourceRecord:
+        """Mark a resource as retained for future revisions without compensation."""
+        with self.transaction():
+            return self.resource_ledger.retain_resource(resource_id=resource_id)
+
+    def list_resources(
+        self,
+        task_id: str,
+        plan_revision: Optional[int] = None,
+        status: Optional[str] = None,
+    ) -> List[ResourceRecord]:
+        """List tracked resources matching task, revision, and status filters."""
+        return self.resource_ledger.list_resources(task_id=task_id, plan_revision=plan_revision, status=status)
+
+    def get_resource_events(self, resource_id: str) -> List[ResourceEvent]:
+        """Retrieve audit event ledger for a specific resource."""
+        return self.resource_ledger.get_events(resource_id=resource_id)
