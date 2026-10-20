@@ -751,7 +751,28 @@ def safe_terminate_tree(
                 pass
         return res
     else:
-        # On POSIX: terminate entire process group first to prevent orphan descendants, then leader
+        # On POSIX: verify identity FIRST before sending any signals to process group or leader
+        start_time = time.monotonic()
+        if expected_create_time_ns is not None:
+            cur_time = PosixProcessController.get_creation_time(pid)
+            if cur_time is None:
+                return TerminationResult(
+                    success=False,
+                    exit_code=None,
+                    reason="identity_unknown",
+                    duration_seconds=time.monotonic() - start_time,
+                    detail=f"PID {pid} creation time cannot be verified; refusing destructive termination",
+                )
+            if cur_time != expected_create_time_ns:
+                return TerminationResult(
+                    success=False,
+                    exit_code=None,
+                    reason="identity_mismatch",
+                    duration_seconds=time.monotonic() - start_time,
+                    detail=f"PID {pid} was recycled",
+                )
+
+        # Identity verified: safely terminate process group then leader
         try:
             PosixProcessController.terminate_process_group(pid, timeout_seconds=timeout_seconds / 2)
         except Exception:
