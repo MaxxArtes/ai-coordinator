@@ -47,7 +47,7 @@ class ProcessLifecycleTests(unittest.TestCase):
         self.assertTrue(proc.is_alive())
         pid = proc.pid
         real_time = proc.identity.create_time_ns
-        fake_time = real_time + 77777777
+        fake_time = real_time + 10_000_000_000
 
         # Attempt terminate with forged creation time
         res = safe_terminate_tree(pid, expected_create_time_ns=fake_time)

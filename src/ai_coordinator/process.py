@@ -444,7 +444,7 @@ class PosixProcessController:
 
     @staticmethod
     def get_creation_time(pid: int) -> Optional[int]:
-        """Read starttime from /proc/{pid}/stat on Linux, or ctime on other Unix."""
+        """Read starttime from /proc/{pid}/stat on Linux, or ps on macOS/Unix."""
         if pid <= 0 or os.name == "nt":
             return None
         stat_file = Path(f"/proc/{pid}/stat")
@@ -458,6 +458,18 @@ class PosixProcessController:
                         return int(fields[19])  # starttime in jiffies
             except Exception:
                 pass
+        # Fallback for macOS and non-Linux POSIX using `ps`
+        try:
+            out = subprocess.check_output(
+                ["ps", "-p", str(pid), "-o", "lstart="],
+                text=True,
+                stderr=subprocess.DEVNULL,
+            ).strip()
+            if out:
+                parsed_dt = dt.datetime.strptime(out, "%a %b %d %H:%M:%S %Y")
+                return int(parsed_dt.timestamp() * 1_000_000_000)
+        except Exception:
+            pass
         try:
             return Path(f"/proc/{pid}").stat().st_ctime_ns
         except Exception:
@@ -497,6 +509,15 @@ class PosixProcessController:
                     detail=f"PID {pid} was recycled",
                 )
 
+        # Check if already exited or reapable child
+        try:
+            wpid, status = os.waitpid(pid, os.WNOHANG)
+            if wpid == pid:
+                exit_code = os.waitstatus_to_exitcode(status) if hasattr(os, "waitstatus_to_exitcode") else (status >> 8)
+                return TerminationResult(True, exit_code, "normal", time.monotonic() - start, "Process already exited")
+        except (ChildProcessError, OSError):
+            pass
+
         # Check alive
         try:
             os.kill(pid, 0)
@@ -521,11 +542,28 @@ class PosixProcessController:
             if pidfd is not None:
                 os.close(pidfd)
 
-        # Poll with timeout
+        # Poll with timeout, reaping child zombies
         deadline = time.monotonic() + timeout_seconds
         while time.monotonic() < deadline:
             try:
+                wpid, status = os.waitpid(pid, os.WNOHANG)
+                if wpid == pid:
+                    exit_code = os.waitstatus_to_exitcode(status) if hasattr(os, "waitstatus_to_exitcode") else (status >> 8)
+                    return TerminationResult(True, exit_code, "terminated", time.monotonic() - start, "Terminated gracefully with SIGTERM")
+            except (ChildProcessError, OSError):
+                pass
+
+            try:
                 os.kill(pid, 0)
+                stat_file = Path(f"/proc/{pid}/stat")
+                if stat_file.exists():
+                    try:
+                        content = stat_file.read_text(encoding="ascii", errors="replace")
+                        rparen = content.rfind(")")
+                        if rparen != -1 and content[rparen + 1:].split()[0] == "Z":
+                            return TerminationResult(True, None, "terminated", time.monotonic() - start, "Terminated gracefully with SIGTERM (zombie)")
+                    except Exception:
+                        pass
                 time.sleep(0.05)
             except ProcessLookupError:
                 return TerminationResult(True, None, "terminated", time.monotonic() - start, "Terminated gracefully with SIGTERM")
@@ -534,8 +572,27 @@ class PosixProcessController:
         try:
             os.kill(pid, signal.SIGKILL)
             time.sleep(0.1)
-            os.kill(pid, 0)
-            return TerminationResult(False, None, "timeout", time.monotonic() - start, "Process required SIGKILL and may linger")
+            try:
+                wpid, status = os.waitpid(pid, os.WNOHANG)
+                if wpid == pid:
+                    exit_code = os.waitstatus_to_exitcode(status) if hasattr(os, "waitstatus_to_exitcode") else (status >> 8)
+                    return TerminationResult(True, exit_code, "terminated", time.monotonic() - start, "Terminated forcefully with SIGKILL")
+            except (ChildProcessError, OSError):
+                pass
+            try:
+                os.kill(pid, 0)
+                stat_file = Path(f"/proc/{pid}/stat")
+                if stat_file.exists():
+                    try:
+                        content = stat_file.read_text(encoding="ascii", errors="replace")
+                        rparen = content.rfind(")")
+                        if rparen != -1 and content[rparen + 1:].split()[0] == "Z":
+                            return TerminationResult(True, None, "terminated", time.monotonic() - start, "Terminated forcefully with SIGKILL (zombie)")
+                    except Exception:
+                        pass
+                return TerminationResult(False, None, "timeout", time.monotonic() - start, "Process required SIGKILL and may linger")
+            except ProcessLookupError:
+                return TerminationResult(True, None, "terminated", time.monotonic() - start, "Terminated forcefully with SIGKILL")
         except ProcessLookupError:
             return TerminationResult(True, None, "terminated", time.monotonic() - start, "Terminated forcefully with SIGKILL")
 
@@ -576,6 +633,14 @@ def safe_process_alive(pid: int, expected_create_time_ns: Optional[int] = None) 
     if os.name == "nt":
         return WindowsProcessController.is_running(pid, expected_create_time_ns=expected_create_time_ns)
     else:
+        # If it is a child process that exited, reap it immediately
+        try:
+            wpid, _ = os.waitpid(pid, os.WNOHANG)
+            if wpid == pid:
+                return False
+        except (ChildProcessError, OSError):
+            pass
+
         try:
             os.kill(pid, 0)
         except (ProcessLookupError, ValueError):
@@ -586,6 +651,20 @@ def safe_process_alive(pid: int, expected_create_time_ns: Optional[int] = None) 
                 cur_time = PosixProcessController.get_creation_time(pid)
                 return cur_time == expected_create_time_ns
             return True
+
+        # Check if zombie/defunct on Linux
+        stat_file = Path(f"/proc/{pid}/stat")
+        if stat_file.exists():
+            try:
+                content = stat_file.read_text(encoding="ascii", errors="replace")
+                rparen = content.rfind(")")
+                if rparen != -1:
+                    state = content[rparen + 1:].split()[0]
+                    if state == "Z":  # Zombie is dead
+                        return False
+            except Exception:
+                pass
+
         if expected_create_time_ns is not None:
             cur_time = PosixProcessController.get_creation_time(pid)
             if cur_time is not None and cur_time != expected_create_time_ns:
