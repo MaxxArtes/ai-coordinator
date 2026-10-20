@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ai-coordinator"
-version = "0.2.1"
+version = "0.3.0"
 description = "Portable shared task state and bounded routing for local AI coding agents"
 readme = "README.md"
 license = "PolyForm-Noncommercial-1.0.0"
