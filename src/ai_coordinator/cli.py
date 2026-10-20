@@ -90,19 +90,11 @@ def scope(project, initialize=False):
         return scope(project)
     return {'workspace': os.environ.get('AI_MEMORY_WORKSPACE', 'local'), 'project': name, 'marker': str(marker), 'created': True}
 
-def process_alive(pid):
+def process_alive(pid, expected_create_time=None):
     if not pid:
         return False
-    if os.name == "nt":
-        r = subprocess.run(["tasklist", "/FI", f"PID eq {pid}", "/FO", "CSV", "/NH"], capture_output=True, text=True, errors="replace", creationflags=subprocess.CREATE_NO_WINDOW)
-        return r.returncode != 0 or f'","{pid}",' in r.stdout
-    try:
-        os.kill(pid, 0)
-        return True
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True
+    from .process import safe_process_alive
+    return safe_process_alive(pid, expected_create_time_ns=expected_create_time)
 
 class Store:
     def __init__(self, root):
@@ -126,6 +118,20 @@ class Store:
         if 'usage' not in columns:
             try:
                 self.db.execute('ALTER TABLE runs ADD COLUMN usage TEXT')
+            except sqlite3.OperationalError as exc:
+                if 'duplicate column' not in str(exc).lower():
+                    raise
+            self.db.commit()
+        if 'process_create_time' not in columns:
+            try:
+                self.db.execute('ALTER TABLE runs ADD COLUMN process_create_time INTEGER')
+            except sqlite3.OperationalError as exc:
+                if 'duplicate column' not in str(exc).lower():
+                    raise
+            self.db.commit()
+        if 'owner_create_time' not in columns:
+            try:
+                self.db.execute('ALTER TABLE runs ADD COLUMN owner_create_time INTEGER')
             except sqlite3.OperationalError as exc:
                 if 'duplicate column' not in str(exc).lower():
                     raise
@@ -219,7 +225,10 @@ class Store:
             folder.mkdir(parents=True)
             inp = folder / "input.md"
             inp.write_text(prompt, encoding="utf-8")
-            self.db.execute("INSERT INTO runs(id,task_id,category,status,started,attempts,input_path,owner_pid) VALUES (?,?,?,?,?,?,?,?)", (run_id, ident, category, "running", now(), "[]", str(inp), os.getpid()))
+            owner_pid = os.getpid()
+            from .process import ProcessSupervisor
+            owner_ident = ProcessSupervisor.capture_identity(owner_pid)
+            self.db.execute("INSERT INTO runs(id,task_id,category,status,started,attempts,input_path,owner_pid,owner_create_time) VALUES (?,?,?,?,?,?,?,?,?)", (run_id, ident, category, "running", now(), "[]", str(inp), owner_pid, owner_ident.create_time_ns))
             self.db.commit()
             return run_id, folder, max_calls - used
         except BaseException:
@@ -227,7 +236,7 @@ class Store:
             raise
 
     def update_run(self, ident, **values):
-        if not values or set(values) - {"status", "client", "model", "ended", "attempts", "output_path", "error", "pid", "usage"}:
+        if not values or set(values) - {"status", "client", "model", "ended", "attempts", "output_path", "error", "pid", "usage", "process_create_time", "owner_create_time"}:
             raise ValueError("Atualizacao de worker invalida")
         keys = list(values)
         with self.db:
@@ -238,10 +247,11 @@ class Store:
         row = self.db.execute("SELECT * FROM runs WHERE id=? AND task_id=?", (validate_id(run), task)).fetchone()
         if not row or row["status"] != "running":
             raise ValueError("Execucao pendente nao encontrada")
-        if process_alive(row["owner_pid"]) or process_alive(row["pid"]):
+        row_dict = dict(row)
+        if process_alive(row_dict.get("owner_pid"), row_dict.get("owner_create_time")) or process_alive(row_dict.get("pid"), row_dict.get("process_create_time")):
             raise ValueError("Processo ainda existe; nao recuperar nem repetir")
         with self.db:
-            self.db.execute("UPDATE runs SET status='interrupted',ended=?,error='Processos ausentes; interrupcao confirmada',pid=NULL WHERE id=? AND status='running'", (now(), run))
+            self.db.execute("UPDATE runs SET status='interrupted',ended=?,error='Processos ausentes; interrupcao confirmada',pid=NULL,process_create_time=NULL WHERE id=? AND status='running'", (now(), run))
         return {"run": run, "status": "interrupted", "next_step": "Leia logs antes de decidir se precisa repetir"}
 
 def launcher(config, client):
@@ -292,11 +302,9 @@ def response_text(client, stdout, final_path):
             texts.append(obj["part"].get("text", ""))
     return "\n".join(texts).strip()
 
-def terminate_tree(proc):
-    if os.name == "nt":
-        subprocess.run(["taskkill", "/PID", str(proc.pid), "/T", "/F"], capture_output=True, creationflags=subprocess.CREATE_NO_WINDOW)
-    else:
-        proc.kill()
+def terminate_tree(proc, timeout=5.0):
+    from .process import safe_terminate_tree
+    return safe_terminate_tree(proc, timeout_seconds=timeout)
 
 def run_worker(store, config, ident, category, input_file, max_attempts=None):
     if os.environ.get("AI_COORDINATOR_ROLE") == "worker":
@@ -345,8 +353,9 @@ def run_worker(store, config, ident, category, input_file, max_attempts=None):
             try:
                 # plain_prompt: interface web, onde o mesmo cabecalho fixo em toda conversa denuncia automacao.
                 cmd, stdin = worker_args(config, candidate, final, plain if candidate.get("plain_prompt") else prompt)
-                proc = subprocess.Popen(cmd, stdin=subprocess.PIPE if stdin is not None else subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding="utf-8", errors="replace", cwd=folder, env=env, creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0)
-                store.update_run(run_id, pid=proc.pid)
+                from .process import ProcessSupervisor
+                proc = ProcessSupervisor.spawn(cmd, cwd=folder, env=env, stdin=subprocess.PIPE if stdin is not None else subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, role="worker", use_job_object=True, text=True, encoding="utf-8", errors="replace")
+                store.update_run(run_id, pid=proc.pid, process_create_time=proc.identity.create_time_ns)
                 try:
                     # Candidato lento (ex.: Gemini web) pode pedir prazo proprio, com teto de 10 min.
                     stdout, stderr = proc.communicate(stdin, timeout=min(600, candidate.get("timeout_seconds", limits["timeout_seconds"])))
@@ -378,7 +387,7 @@ def run_worker(store, config, ident, category, input_file, max_attempts=None):
             finally:
                 if proc is not None and proc.poll() is None:
                     terminate_tree(proc)
-                store.update_run(run_id, attempts=json.dumps(attempts), pid=None)
+                store.update_run(run_id, attempts=json.dumps(attempts), pid=None, process_create_time=None)
         if result:
             metadata=runtime.aggregate_usage(attempts)
             output = folder / "result.md"
