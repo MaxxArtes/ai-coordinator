@@ -586,6 +586,8 @@ def parser():
     rc = sub.add_parser("recover"); rc.add_argument("--task", required=True); rc.add_argument("--run", required=True)
     canc = sub.add_parser("cancel"); canc.add_argument("--task", required=True); canc.add_argument("--run", required=True)
     la = sub.add_parser("launch"); la.add_argument("--client", required=True, choices=["codex", "claude", "opencode", "agy"]); la.add_argument("--project", required=True); la.add_argument("--task"); la.add_argument("--model")
+    dr = sub.add_parser("dag-revision"); dr.add_argument("--task", required=True); dr.add_argument("--set"); dr.add_argument("--summary"); dr.add_argument("--parent-revision", type=int); dr.add_argument("--show", action="store_true"); dr.add_argument("--revision", type=int); dr.add_argument("--history", action="store_true")
+    dp = sub.add_parser("dag-proposal"); dp.add_argument("--task"); dp.add_argument("--proposal"); dp.add_argument("--propose"); dp.add_argument("--base-revision", type=int); dp.add_argument("--reason"); dp.add_argument("--diff-summary", default=""); dp.add_argument("--list", action="store_true"); dp.add_argument("--status"); dp.add_argument("--resolve", choices=["approved", "rejected", "cancelled"]); dp.add_argument("--activate", action="store_true"); dp.add_argument("--expected-base-revision", type=int)
     sub.add_parser("routes")
     sc = sub.add_parser('scope'); sc.add_argument('--project', required=True); sc.add_argument('--init', action='store_true')
     ex = sub.add_parser('export'); ex.add_argument('--task', required=True); ex.add_argument('--to', required=True)
@@ -681,6 +683,40 @@ def main():
             return 0 if result["status"] == "complete" else 2
         elif args.command == "launch":
             return launch(store, config, args.client, args.project, args.task, args.model)
+        elif args.command == "dag-revision":
+            if getattr(args, "set", None):
+                rev_data = read_json(args.set)
+                nodes = rev_data.get("nodes", {})
+                edges = rev_data.get("edges", [])
+                summary = args.summary or rev_data.get("summary", "Revisao criada via CLI")
+                rev = store.create_plan_revision(args.task, nodes, edges, summary, parent_revision=args.parent_revision)
+                emit(rev.to_dict())
+            elif getattr(args, "history", False):
+                emit(store.list_plan_revisions(args.task))
+            else:
+                rev = store.get_plan_revision(args.task, revision=args.revision)
+                emit(rev.to_dict() if rev else None)
+        elif args.command == "dag-proposal":
+            if getattr(args, "propose", None):
+                prop_data = read_json(args.propose)
+                nodes = prop_data.get("nodes", {})
+                edges = prop_data.get("edges", [])
+                reason = args.reason or prop_data.get("reason", "Proposta via CLI")
+                diff = args.diff_summary or prop_data.get("diff_summary", "")
+                prop = store.propose_trajectory(args.task, args.base_revision, nodes, edges, reason, diff)
+                emit(prop.to_dict())
+            elif getattr(args, "list", False):
+                props = store.list_trajectory_proposals(args.task, status=args.status)
+                emit([p.to_dict() for p in props])
+            elif getattr(args, "resolve", None):
+                prop = store.resolve_trajectory_proposal(args.proposal, args.resolve)
+                emit(prop.to_dict())
+            elif getattr(args, "activate", False):
+                new_rev = store.activate_trajectory_proposal(args.proposal, expected_base_revision=args.expected_base_revision)
+                emit(new_rev.to_dict())
+            elif getattr(args, "proposal", None):
+                prop = store.get_trajectory_proposal(args.proposal)
+                emit(prop.to_dict() if prop else None)
         return 0
     finally:
         store.db.close()

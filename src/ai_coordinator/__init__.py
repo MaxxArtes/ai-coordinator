@@ -41,6 +41,20 @@ from .mission import (
     DriftStatus,
     is_path_allowed,
 )
+from .dag import (
+    DagError,
+    CycleDetectedError,
+    DagValidationError,
+    StaleRevisionError,
+    ActiveWorkerFencingError,
+    PlanNode,
+    PlanEdge,
+    PlanRevision,
+    TrajectoryProposal,
+    TrajectoryEvent,
+    validate_dag,
+    get_ready_nodes,
+)
 
 __all__ = [
     "Coordinator",
@@ -76,5 +90,17 @@ __all__ = [
     "DeviationType",
     "DriftStatus",
     "is_path_allowed",
+    "DagError",
+    "CycleDetectedError",
+    "DagValidationError",
+    "StaleRevisionError",
+    "ActiveWorkerFencingError",
+    "PlanNode",
+    "PlanEdge",
+    "PlanRevision",
+    "TrajectoryProposal",
+    "TrajectoryEvent",
+    "validate_dag",
+    "get_ready_nodes",
 ]
 __version__ = "0.3.0"

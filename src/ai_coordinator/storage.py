@@ -27,6 +27,20 @@ from .mission import (
     DeviationType,
     DriftStatus,
 )
+from .dag import (
+    DagError,
+    CycleDetectedError,
+    DagValidationError,
+    StaleRevisionError,
+    ActiveWorkerFencingError,
+    PlanNode,
+    PlanEdge,
+    PlanRevision,
+    TrajectoryProposal,
+    TrajectoryEvent,
+    validate_dag,
+    get_ready_nodes,
+)
 
 now = lambda: dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
 
@@ -262,10 +276,74 @@ class Store:
             created_at TEXT NOT NULL
           );
 
+          CREATE TABLE IF NOT EXISTS plan_revisions (
+            task_id TEXT NOT NULL,
+            revision INTEGER NOT NULL,
+            parent_revision INTEGER,
+            summary TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'active',
+            created_at TEXT NOT NULL,
+            metadata TEXT,
+            PRIMARY KEY (task_id, revision)
+          );
+
+          CREATE TABLE IF NOT EXISTS plan_nodes (
+            task_id TEXT NOT NULL,
+            revision INTEGER NOT NULL,
+            node_id TEXT NOT NULL,
+            title TEXT NOT NULL,
+            description TEXT DEFAULT '',
+            entry_criteria TEXT NOT NULL DEFAULT '[]',
+            exit_criteria TEXT NOT NULL DEFAULT '[]',
+            deliverables TEXT NOT NULL DEFAULT '[]',
+            status TEXT NOT NULL DEFAULT 'pending',
+            assigned_role TEXT DEFAULT 'worker',
+            metadata TEXT,
+            PRIMARY KEY (task_id, revision, node_id)
+          );
+
+          CREATE TABLE IF NOT EXISTS plan_edges (
+            task_id TEXT NOT NULL,
+            revision INTEGER NOT NULL,
+            from_node TEXT NOT NULL,
+            to_node TEXT NOT NULL,
+            edge_type TEXT NOT NULL DEFAULT 'depends_on',
+            metadata TEXT,
+            PRIMARY KEY (task_id, revision, from_node, to_node)
+          );
+
+          CREATE TABLE IF NOT EXISTS trajectory_proposals (
+            id TEXT PRIMARY KEY,
+            task_id TEXT NOT NULL,
+            base_revision INTEGER NOT NULL,
+            proposed_revision INTEGER,
+            reason TEXT NOT NULL,
+            diff_summary TEXT NOT NULL,
+            proposal_data TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'proposed',
+            created_at TEXT NOT NULL,
+            resolved_at TEXT,
+            metadata TEXT
+          );
+
+          CREATE TABLE IF NOT EXISTS trajectory_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            task_id TEXT NOT NULL,
+            revision INTEGER,
+            event_type TEXT NOT NULL,
+            severity TEXT NOT NULL DEFAULT 'info',
+            details TEXT,
+            created_at TEXT NOT NULL
+          );
+
           CREATE INDEX IF NOT EXISTS idx_run_events_run ON run_events(run_id);
           CREATE INDEX IF NOT EXISTS idx_runs_task_status ON runs(task_id, status);
           CREATE INDEX IF NOT EXISTS idx_landing_checks_task ON landing_checks(task_id);
           CREATE INDEX IF NOT EXISTS idx_telemetry_events_task ON telemetry_events(task_id);
+          CREATE INDEX IF NOT EXISTS idx_plan_nodes_task_rev ON plan_nodes(task_id, revision);
+          CREATE INDEX IF NOT EXISTS idx_plan_edges_task_rev ON plan_edges(task_id, revision);
+          CREATE INDEX IF NOT EXISTS idx_trajectory_proposals_task ON trajectory_proposals(task_id, status);
+          CREATE INDEX IF NOT EXISTS idx_trajectory_events_task ON trajectory_events(task_id);
         """)
 
         # Dynamic migrations for any existing columns
@@ -844,3 +922,550 @@ class Store:
 
     def telemetry_summary(self, ident: str) -> Dict[str, Any]:
         return self.mission_control.telemetry_summary(ident)
+
+    # -------------------------------------------------------------------------
+    # Fase 3A: DAG Versionada e Propostas de Trajetoria
+    # -------------------------------------------------------------------------
+
+    def create_plan_revision(
+        self,
+        task_id: str,
+        nodes: Union[List[PlanNode], List[Dict[str, Any]], Dict[str, Any]],
+        edges: Union[List[PlanEdge], List[Dict[str, Any]]],
+        summary: str,
+        parent_revision: Optional[int] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> PlanRevision:
+        """Atomically create an immutable plan revision after validating DAG integrity."""
+        task_id = validate_id(task_id)
+        if not summary:
+            raise DagValidationError("summary obrigatorio para criacao de revisao do plano")
+
+        # Normalize nodes
+        nodes_dict: Dict[str, PlanNode] = {}
+        if isinstance(nodes, dict):
+            for k, v in nodes.items():
+                if isinstance(v, PlanNode):
+                    nodes_dict[k] = v
+                else:
+                    d = dict(v)
+                    if "node_id" not in d:
+                        d["node_id"] = k
+                    nodes_dict[k] = PlanNode.from_dict(d)
+        elif isinstance(nodes, list):
+            for item in nodes:
+                node = item if isinstance(item, PlanNode) else PlanNode.from_dict(item)
+                nodes_dict[node.node_id] = node
+
+        # Normalize edges
+        edges_list: List[PlanEdge] = []
+        for e in edges:
+            edge = e if isinstance(e, PlanEdge) else PlanEdge.from_dict(e)
+            edges_list.append(edge)
+
+        # Validate DAG (detects dangling edges, self-loops, and cycles)
+        validate_dag(nodes_dict, edges_list)
+
+        with self.transaction():
+            task = self.task(task_id)
+            if not task:
+                raise ValueError("Tarefa nao encontrada")
+
+            # Determine new revision number and check optimistic fencing
+            row = self.db.execute(
+                "SELECT revision, status FROM plan_revisions WHERE task_id=? ORDER BY revision DESC LIMIT 1",
+                (task_id,)
+            ).fetchone()
+
+            if row:
+                latest_rev = row["revision"]
+                if parent_revision is not None and parent_revision != latest_rev:
+                    raise StaleRevisionError(
+                        f"Revisao base obsoleta: revisao ativa e {latest_rev}, mas foi informada {parent_revision}"
+                    )
+                new_rev = latest_rev + 1
+                resolved_parent = latest_rev
+            else:
+                if parent_revision is not None and parent_revision != 0:
+                    raise StaleRevisionError(f"Revisao pai {parent_revision} informada, mas plano ainda nao possui revisoes")
+                new_rev = 1
+                resolved_parent = None
+
+            stamp = now()
+
+            # Mark previous active revision as superseded
+            if row:
+                self.db.execute(
+                    "UPDATE plan_revisions SET status='superseded' WHERE task_id=? AND status='active'",
+                    (task_id,)
+                )
+
+            # Insert immutable plan_revisions
+            self.db.execute(
+                """INSERT INTO plan_revisions(
+                    task_id, revision, parent_revision, summary, status, created_at, metadata
+                ) VALUES (?, ?, ?, ?, 'active', ?, ?)""",
+                (task_id, new_rev, resolved_parent, summary, stamp, json.dumps(metadata or {}))
+            )
+
+            # Insert plan_nodes
+            for nid, node in nodes_dict.items():
+                self.db.execute(
+                    """INSERT INTO plan_nodes(
+                        task_id, revision, node_id, title, description, entry_criteria,
+                        exit_criteria, deliverables, status, assigned_role, metadata
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        task_id,
+                        new_rev,
+                        node.node_id,
+                        node.title,
+                        node.description,
+                        json.dumps(node.entry_criteria),
+                        json.dumps(node.exit_criteria),
+                        json.dumps(node.deliverables),
+                        node.status,
+                        node.assigned_role,
+                        json.dumps(node.metadata),
+                    )
+                )
+
+            # Insert plan_edges
+            for edge in edges_list:
+                self.db.execute(
+                    """INSERT INTO plan_edges(
+                        task_id, revision, from_node, to_node, edge_type, metadata
+                    ) VALUES (?, ?, ?, ?, ?, ?)""",
+                    (task_id, new_rev, edge.from_node, edge.to_node, edge.edge_type, json.dumps(edge.metadata))
+                )
+
+            # Record trajectory event
+            self._record_trajectory_event(
+                task_id=task_id,
+                revision=new_rev,
+                event_type="plan_revision_created",
+                severity="info",
+                details=f"Criada revisao {new_rev} com {len(nodes_dict)} nós e {len(edges_list)} arestas. Resumo: {summary}",
+            )
+
+            return PlanRevision(
+                task_id=task_id,
+                revision=new_rev,
+                parent_revision=resolved_parent,
+                summary=summary,
+                status="active",
+                created_at=stamp,
+                nodes=nodes_dict,
+                edges=edges_list,
+                metadata=metadata or {},
+            )
+
+    def get_plan_revision(self, task_id: str, revision: Optional[int] = None) -> Optional[PlanRevision]:
+        """Fetch a specific or the latest active immutable plan revision."""
+        task_id = validate_id(task_id)
+        if revision is not None:
+            rev_row = self.db.execute(
+                "SELECT * FROM plan_revisions WHERE task_id=? AND revision=?",
+                (task_id, revision)
+            ).fetchone()
+        else:
+            rev_row = self.db.execute(
+                "SELECT * FROM plan_revisions WHERE task_id=? ORDER BY revision DESC LIMIT 1",
+                (task_id,)
+            ).fetchone()
+
+        if not rev_row:
+            return None
+
+        rev = rev_row["revision"]
+        node_rows = self.db.execute(
+            "SELECT * FROM plan_nodes WHERE task_id=? AND revision=? ORDER BY node_id ASC",
+            (task_id, rev)
+        ).fetchall()
+
+        nodes: Dict[str, PlanNode] = {}
+        for r in node_rows:
+            nodes[r["node_id"]] = PlanNode(
+                node_id=r["node_id"],
+                title=r["title"],
+                description=r["description"] or "",
+                entry_criteria=json.loads(r["entry_criteria"] or "[]"),
+                exit_criteria=json.loads(r["exit_criteria"] or "[]"),
+                deliverables=json.loads(r["deliverables"] or "[]"),
+                status=r["status"],
+                assigned_role=r["assigned_role"] or "worker",
+                metadata=json.loads(r["metadata"] or "{}"),
+            )
+
+        edge_rows = self.db.execute(
+            "SELECT * FROM plan_edges WHERE task_id=? AND revision=? ORDER BY from_node, to_node ASC",
+            (task_id, rev)
+        ).fetchall()
+
+        edges = [
+            PlanEdge(
+                from_node=r["from_node"],
+                to_node=r["to_node"],
+                edge_type=r["edge_type"] or "depends_on",
+                metadata=json.loads(r["metadata"] or "{}"),
+            )
+            for r in edge_rows
+        ]
+
+        return PlanRevision(
+            task_id=task_id,
+            revision=rev,
+            parent_revision=rev_row["parent_revision"],
+            summary=rev_row["summary"],
+            status=rev_row["status"],
+            created_at=rev_row["created_at"],
+            nodes=nodes,
+            edges=edges,
+            metadata=json.loads(rev_row["metadata"] or "{}"),
+        )
+
+    def list_plan_revisions(self, task_id: str) -> List[Dict[str, Any]]:
+        """List all immutable plan revisions in historical chronological order."""
+        task_id = validate_id(task_id)
+        rows = self.db.execute(
+            "SELECT task_id, revision, parent_revision, summary, status, created_at FROM plan_revisions WHERE task_id=? ORDER BY revision ASC",
+            (task_id,)
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def propose_trajectory(
+        self,
+        task_id: str,
+        base_revision: int,
+        proposed_nodes: Union[List[PlanNode], List[Dict[str, Any]], Dict[str, Any]],
+        proposed_edges: Union[List[PlanEdge], List[Dict[str, Any]]],
+        reason: str,
+        diff_summary: str = "",
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> TrajectoryProposal:
+        """Create an unactivated candidate trajectory proposal without altering execution."""
+        task_id = validate_id(task_id)
+        if not reason:
+            raise DagValidationError("reason obrigatoria para proposta de trajetoria")
+
+        # Validate base revision exists
+        base_rev = self.get_plan_revision(task_id, revision=base_revision)
+        if not base_rev:
+            raise DagValidationError(f"Revisao base {base_revision} nao encontrada para a tarefa '{task_id}'")
+
+        # Normalize and validate proposed DAG
+        nodes_dict: Dict[str, PlanNode] = {}
+        if isinstance(proposed_nodes, dict):
+            for k, v in proposed_nodes.items():
+                if isinstance(v, PlanNode):
+                    nodes_dict[k] = v
+                else:
+                    d = dict(v)
+                    if "node_id" not in d:
+                        d["node_id"] = k
+                    nodes_dict[k] = PlanNode.from_dict(d)
+        elif isinstance(proposed_nodes, list):
+            for item in proposed_nodes:
+                node = item if isinstance(item, PlanNode) else PlanNode.from_dict(item)
+                nodes_dict[node.node_id] = node
+
+        edges_list: List[PlanEdge] = []
+        for e in proposed_edges:
+            edge = e if isinstance(e, PlanEdge) else PlanEdge.from_dict(e)
+            edges_list.append(edge)
+
+        # Validate DAG constraints (cycles, dangling edges)
+        validate_dag(nodes_dict, edges_list)
+
+        proposal_id = uuid.uuid4().hex[:16]
+        stamp = now()
+        payload = {
+            "nodes": {nid: n.to_dict() for nid, n in nodes_dict.items()},
+            "edges": [e.to_dict() for e in edges_list],
+        }
+
+        with self.transaction():
+            self.db.execute(
+                """INSERT INTO trajectory_proposals(
+                    id, task_id, base_revision, proposed_revision, reason,
+                    diff_summary, proposal_data, status, created_at, metadata
+                ) VALUES (?, ?, ?, NULL, ?, ?, ?, 'proposed', ?, ?)""",
+                (
+                    proposal_id,
+                    task_id,
+                    base_revision,
+                    reason,
+                    diff_summary,
+                    json.dumps(payload),
+                    stamp,
+                    json.dumps(metadata or {}),
+                )
+            )
+
+            self._record_trajectory_event(
+                task_id=task_id,
+                revision=base_revision,
+                event_type="trajectory_proposed",
+                severity="info",
+                details=f"Proposta {proposal_id} criada sobre revisao {base_revision}: {reason}",
+            )
+
+        return TrajectoryProposal(
+            id=proposal_id,
+            task_id=task_id,
+            base_revision=base_revision,
+            proposed_revision=None,
+            reason=reason,
+            diff_summary=diff_summary,
+            nodes=nodes_dict,
+            edges=edges_list,
+            status="proposed",
+            created_at=stamp,
+            metadata=metadata or {},
+        )
+
+    def get_trajectory_proposal(self, proposal_id: str) -> Optional[TrajectoryProposal]:
+        """Fetch trajectory proposal by ID."""
+        row = self.db.execute(
+            "SELECT * FROM trajectory_proposals WHERE id=?",
+            (proposal_id,)
+        ).fetchone()
+        if not row:
+            return None
+
+        payload = json.loads(row["proposal_data"] or "{}")
+        nodes = {nid: PlanNode.from_dict(nd) for nid, nd in payload.get("nodes", {}).items()}
+        edges = [PlanEdge.from_dict(ed) for ed in payload.get("edges", [])]
+
+        return TrajectoryProposal(
+            id=row["id"],
+            task_id=row["task_id"],
+            base_revision=row["base_revision"],
+            proposed_revision=row["proposed_revision"],
+            reason=row["reason"],
+            diff_summary=row["diff_summary"],
+            nodes=nodes,
+            edges=edges,
+            status=row["status"],
+            created_at=row["created_at"],
+            resolved_at=row["resolved_at"],
+            metadata=json.loads(row["metadata"] or "{}"),
+        )
+
+    def list_trajectory_proposals(self, task_id: str, status: Optional[str] = None) -> List[TrajectoryProposal]:
+        """List proposals for a given task, optionally filtered by status."""
+        task_id = validate_id(task_id)
+        if status:
+            rows = self.db.execute(
+                "SELECT id FROM trajectory_proposals WHERE task_id=? AND status=? ORDER BY created_at ASC",
+                (task_id, status)
+            ).fetchall()
+        else:
+            rows = self.db.execute(
+                "SELECT id FROM trajectory_proposals WHERE task_id=? ORDER BY created_at ASC",
+                (task_id,)
+            ).fetchall()
+
+        proposals = []
+        for r in rows:
+            p = self.get_trajectory_proposal(r["id"])
+            if p:
+                proposals.append(p)
+        return proposals
+
+    def resolve_trajectory_proposal(
+        self,
+        proposal_id: str,
+        decision: str,
+        notes: str = ""
+    ) -> TrajectoryProposal:
+        """Resolve a trajectory proposal (approved or rejected)."""
+        valid_decisions = {"approved", "rejected", "cancelled"}
+        if decision not in valid_decisions:
+            raise ValueError(f"Decisao '{decision}' invalida. Use uma de: {valid_decisions}")
+
+        with self.transaction():
+            p = self.get_trajectory_proposal(proposal_id)
+            if not p:
+                raise ValueError("Proposta nao encontrada")
+            if p.status in ("activated", "cancelled"):
+                raise ValueError(f"Proposta em status terminal '{p.status}' nao pode ser alterada")
+
+            stamp = now()
+            self.db.execute(
+                "UPDATE trajectory_proposals SET status=?, resolved_at=? WHERE id=?",
+                (decision, stamp, proposal_id)
+            )
+
+            self._record_trajectory_event(
+                task_id=p.task_id,
+                revision=p.base_revision,
+                event_type=f"trajectory_proposal_{decision}",
+                severity="info",
+                details=f"Proposta {proposal_id} marcada como '{decision}'. Notas: {notes}",
+            )
+
+        return self.get_trajectory_proposal(proposal_id)  # type: ignore
+
+    def activate_trajectory_proposal(
+        self,
+        proposal_id: str,
+        expected_base_revision: Optional[int] = None
+    ) -> PlanRevision:
+        """Safely activate a trajectory proposal, enforcing optimistic fencing and worker isolation."""
+        with self.transaction():
+            proposal = self.get_trajectory_proposal(proposal_id)
+            if not proposal:
+                raise ValueError("Proposta nao encontrada")
+            if proposal.status not in ("proposed", "approved"):
+                raise ValueError(f"Proposta em status '{proposal.status}' nao pode ser ativada")
+
+            task_id = proposal.task_id
+
+            # 1. Optimistic fencing check against current active revision
+            current_active = self.get_plan_revision(task_id)
+            active_rev_num = current_active.revision if current_active else 0
+            if expected_base_revision is not None and expected_base_revision != active_rev_num:
+                raise StaleRevisionError(
+                    f"Revisao base obsoleta: revisao ativa e {active_rev_num}, mas esperada {expected_base_revision}"
+                )
+            if proposal.base_revision != active_rev_num:
+                raise StaleRevisionError(
+                    f"A proposta foi formulada sobre revisao {proposal.base_revision}, mas a ativa e {active_rev_num}"
+                )
+
+            # 2. Process Safety Fencing: verify no active worker runs are lingering
+            placeholders = ",".join("?" for _ in ACTIVE_RUN_STATES)
+            active_runs = self.db.execute(
+                f"SELECT id, status, pid FROM runs WHERE task_id=? AND status IN ({placeholders})",
+                [task_id] + list(ACTIVE_RUN_STATES)
+            ).fetchall()
+
+            if active_runs:
+                running_ids = [f"{r['id']} ({r['status']})" for r in active_runs]
+                raise ActiveWorkerFencingError(
+                    f"Ativacao bloqueada por seguranca de processos: existem {len(active_runs)} worker(s) ativos "
+                    f"[{', '.join(running_ids)}]. Encerre ou reconcilie os processos antes de ativar nova trajetoria."
+                )
+
+            # 3. Create the new immutable plan revision
+            new_rev = self.create_plan_revision(
+                task_id=task_id,
+                nodes=list(proposal.nodes.values()),
+                edges=proposal.edges,
+                summary=f"Ativacao da proposta {proposal_id}: {proposal.reason}",
+                parent_revision=active_rev_num if active_rev_num > 0 else None,
+                metadata={"activated_from_proposal": proposal_id},
+            )
+
+            # 4. Mark proposal as activated
+            stamp = now()
+            self.db.execute(
+                "UPDATE trajectory_proposals SET status='activated', proposed_revision=?, resolved_at=? WHERE id=?",
+                (new_rev.revision, stamp, proposal_id)
+            )
+
+            self._record_trajectory_event(
+                task_id=task_id,
+                revision=new_rev.revision,
+                event_type="trajectory_activated",
+                severity="info",
+                details=f"Proposta {proposal_id} ativada gerando revisao {new_rev.revision}",
+            )
+
+            return new_rev
+
+    def update_node_status(
+        self,
+        task_id: str,
+        revision: int,
+        node_id: str,
+        status: str,
+        deliverables: Optional[List[str]] = None,
+    ) -> PlanNode:
+        """Update node execution status and deliverables within a plan revision."""
+        task_id = validate_id(task_id)
+        valid_statuses = {"pending", "ready", "in_progress", "completed", "blocked", "skipped"}
+        if status not in valid_statuses:
+            raise DagValidationError(f"Status '{status}' invalido")
+
+        with self.transaction():
+            row = self.db.execute(
+                "SELECT * FROM plan_nodes WHERE task_id=? AND revision=? AND node_id=?",
+                (task_id, revision, node_id)
+            ).fetchone()
+            if not row:
+                raise ValueError(f"No '{node_id}' nao encontrado na revisao {revision}")
+
+            deliv = deliverables if deliverables is not None else json.loads(row["deliverables"] or "[]")
+            self.db.execute(
+                "UPDATE plan_nodes SET status=?, deliverables=? WHERE task_id=? AND revision=? AND node_id=?",
+                (status, json.dumps(deliv), task_id, revision, node_id)
+            )
+
+            self._record_trajectory_event(
+                task_id=task_id,
+                revision=revision,
+                event_type="node_status_updated",
+                severity="info",
+                details=f"No '{node_id}' atualizado para status '{status}'",
+            )
+
+            updated_row = self.db.execute(
+                "SELECT * FROM plan_nodes WHERE task_id=? AND revision=? AND node_id=?",
+                (task_id, revision, node_id)
+            ).fetchone()
+
+            return PlanNode(
+                node_id=updated_row["node_id"],
+                title=updated_row["title"],
+                description=updated_row["description"] or "",
+                entry_criteria=json.loads(updated_row["entry_criteria"] or "[]"),
+                exit_criteria=json.loads(updated_row["exit_criteria"] or "[]"),
+                deliverables=json.loads(updated_row["deliverables"] or "[]"),
+                status=updated_row["status"],
+                assigned_role=updated_row["assigned_role"] or "worker",
+                metadata=json.loads(updated_row["metadata"] or "{}"),
+            )
+
+    def _record_trajectory_event(
+        self,
+        task_id: str,
+        revision: Optional[int],
+        event_type: str,
+        severity: str = "info",
+        details: str = ""
+    ) -> None:
+        self.db.execute(
+            """INSERT INTO trajectory_events(
+                task_id, revision, event_type, severity, details, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?)""",
+            (task_id, revision, event_type, severity, scrub(details), now())
+        )
+
+    def get_trajectory_events(self, task_id: str, revision: Optional[int] = None) -> List[TrajectoryEvent]:
+        """Fetch audit events for trajectory decisions."""
+        task_id = validate_id(task_id)
+        if revision is not None:
+            rows = self.db.execute(
+                "SELECT * FROM trajectory_events WHERE task_id=? AND revision=? ORDER BY id ASC",
+                (task_id, revision)
+            ).fetchall()
+        else:
+            rows = self.db.execute(
+                "SELECT * FROM trajectory_events WHERE task_id=? ORDER BY id ASC",
+                (task_id,)
+            ).fetchall()
+
+        return [
+            TrajectoryEvent(
+                id=r["id"],
+                task_id=r["task_id"],
+                revision=r["revision"],
+                event_type=r["event_type"],
+                severity=r["severity"],
+                details=r["details"] or "",
+                created_at=r["created_at"],
+            )
+            for r in rows
+        ]
