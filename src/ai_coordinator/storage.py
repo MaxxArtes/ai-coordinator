@@ -14,6 +14,19 @@ from typing import Any, Dict, List, Optional, Set, Tuple, Union
 import uuid
 
 from .process import safe_process_alive, ProcessSupervisor
+from .mission import (
+    FlightBudget,
+    FlightPlan,
+    LandingCheck,
+    MissionControl,
+    MissionControlError,
+    RadioSilenceError,
+    BudgetExceededError,
+    UnauthorizedPathError,
+    LandingVerificationError,
+    DeviationType,
+    DriftStatus,
+)
 
 now = lambda: dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
 
@@ -160,6 +173,7 @@ class Store:
         self.db.execute("PRAGMA synchronous=NORMAL")
         self.db.execute("PRAGMA busy_timeout=20000")
         self._init_schema()
+        self.mission_control = MissionControl(self)
 
     def _init_schema(self) -> None:
         self.db.executescript("""
@@ -172,7 +186,11 @@ class Store:
             snapshot TEXT NOT NULL,
             created TEXT NOT NULL,
             updated TEXT NOT NULL,
-            ai_memory_workstream_id TEXT
+            ai_memory_workstream_id TEXT,
+            flight_plan_id TEXT,
+            step_count INTEGER DEFAULT 0,
+            uncheckpointed_steps INTEGER DEFAULT 0,
+            drift_status TEXT DEFAULT 'nominal'
           );
 
           CREATE TABLE IF NOT EXISTS runs (
@@ -212,8 +230,42 @@ class Store:
             created_at TEXT NOT NULL
           );
 
+          CREATE TABLE IF NOT EXISTS flight_plans (
+            task_id TEXT PRIMARY KEY,
+            goal TEXT NOT NULL,
+            acceptance_criteria TEXT NOT NULL,
+            allowed_paths TEXT NOT NULL,
+            budget TEXT NOT NULL,
+            mandatory_landing_checks TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+          );
+
+          CREATE TABLE IF NOT EXISTS landing_checks (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            task_id TEXT NOT NULL,
+            check_name TEXT NOT NULL,
+            status TEXT NOT NULL,
+            evidence TEXT,
+            verified_at TEXT NOT NULL,
+            UNIQUE(task_id, check_name)
+          );
+
+          CREATE TABLE IF NOT EXISTS telemetry_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            task_id TEXT NOT NULL,
+            step_number INTEGER NOT NULL,
+            uncheckpointed_steps INTEGER NOT NULL,
+            event_type TEXT NOT NULL,
+            severity TEXT NOT NULL,
+            details TEXT,
+            created_at TEXT NOT NULL
+          );
+
           CREATE INDEX IF NOT EXISTS idx_run_events_run ON run_events(run_id);
           CREATE INDEX IF NOT EXISTS idx_runs_task_status ON runs(task_id, status);
+          CREATE INDEX IF NOT EXISTS idx_landing_checks_task ON landing_checks(task_id);
+          CREATE INDEX IF NOT EXISTS idx_telemetry_events_task ON telemetry_events(task_id);
         """)
 
         # Dynamic migrations for any existing columns
@@ -238,13 +290,21 @@ class Store:
         self.db.commit()
 
         task_columns = {r[1] for r in self.db.execute("PRAGMA table_info(tasks)")}
-        if "ai_memory_workstream_id" not in task_columns:
-            try:
-                self.db.execute("ALTER TABLE tasks ADD COLUMN ai_memory_workstream_id TEXT")
-            except sqlite3.OperationalError as exc:
-                if "duplicate column" not in str(exc).lower():
-                    raise
-            self.db.commit()
+        needed_task_columns = {
+            "ai_memory_workstream_id": "TEXT",
+            "flight_plan_id": "TEXT",
+            "step_count": "INTEGER DEFAULT 0",
+            "uncheckpointed_steps": "INTEGER DEFAULT 0",
+            "drift_status": "TEXT DEFAULT 'nominal'",
+        }
+        for col, col_type in needed_task_columns.items():
+            if col not in task_columns:
+                try:
+                    self.db.execute(f"ALTER TABLE tasks ADD COLUMN {col} {col_type}")
+                except sqlite3.OperationalError as exc:
+                    if "duplicate column" not in str(exc).lower():
+                        raise
+        self.db.commit()
 
     @contextlib.contextmanager
     def transaction(self):
@@ -292,12 +352,21 @@ class Store:
         value["ai_memory_workstream_id"] = validate_memory_workstream_id(
             value.get("ai_memory_workstream_id")
         )
+        fp = self.mission_control.get_flight_plan(ident)
+        value["flight_plan"] = fp.to_dict() if fp else None
+        value["landing_checks"] = self.mission_control.get_landing_checks(ident)
         return value
 
     def mirror(self, value: Dict[str, Any]) -> None:
         atomic_json(self.root / "tasks" / value["id"] / "state.json", value)
 
-    def new(self, project: Union[str, Path], goal: str, ai_memory_workstream_id: Optional[str] = None) -> Dict[str, Any]:
+    def new(
+        self,
+        project: Union[str, Path],
+        goal: str,
+        ai_memory_workstream_id: Optional[str] = None,
+        flight_plan: Optional[Union[Dict[str, Any], FlightPlan]] = None
+    ) -> Dict[str, Any]:
         if not goal.strip() or len(goal) > 1500:
             raise ValueError("Objetivo deve ter 1 a 1500 caracteres")
         if os.environ.get("AI_COORDINATOR_ROLE") == "worker":
@@ -316,10 +385,20 @@ class Store:
         }
         with self.transaction():
             self.db.execute(
-                "INSERT INTO tasks (id,project,goal,status,revision,snapshot,created,updated,ai_memory_workstream_id) VALUES (?,?,?,?,?,?,?,?,?)",
+                "INSERT INTO tasks (id,project,goal,status,revision,snapshot,created,updated,ai_memory_workstream_id,step_count,uncheckpointed_steps,drift_status) VALUES (?,?,?,?,?,?,?,?,?,0,0,'nominal')",
                 (ident, project_path(project), scrub(goal), "active", 1,
                  json.dumps(snapshot), stamp, stamp, linked_workstream),
             )
+            if flight_plan:
+                if isinstance(flight_plan, dict):
+                    fp_dict = dict(flight_plan)
+                    fp_dict["task_id"] = ident
+                    if "goal" not in fp_dict:
+                        fp_dict["goal"] = goal
+                    self.mission_control.set_flight_plan(fp_dict)
+                elif isinstance(flight_plan, FlightPlan):
+                    flight_plan.task_id = ident
+                    self.mission_control.set_flight_plan(flight_plan)
             created_task = self.task(ident)
             self.mirror(created_task)
         return created_task
@@ -344,6 +423,8 @@ class Store:
             current = self.task(ident)
             if revision != current["revision"]:
                 raise ValueError("Revisao mudou: releia resume antes de gravar")
+            if status == "complete":
+                self.mission_control.validate_landing_gate(ident)
             current["snapshot"].update(patch)
             snapshot = scrub(json.dumps(current["snapshot"], ensure_ascii=False))
             if len(snapshot) > 12000:
@@ -352,6 +433,7 @@ class Store:
                 "UPDATE tasks SET snapshot=?,revision=revision+1,status=?,updated=? WHERE id=?",
                 (snapshot, status or current["status"], now(), ident)
             )
+            self.mission_control.on_checkpoint_recorded(ident)
             updated_task = self.task(ident)
             self.mirror(updated_task)
         return updated_task
@@ -367,6 +449,9 @@ class Store:
             if task["status"] != "active":
                 raise ValueError("Tarefa encerrada")
 
+            # Deterministic mission control clearance check (silence, budget, drift)
+            self.mission_control.check_clearance(ident)
+
             # Check if any run is currently active for this task
             placeholders = ",".join("?" for _ in ACTIVE_RUN_STATES)
             active_runs = self.db.execute(
@@ -379,6 +464,9 @@ class Store:
             used = sum(len(json.loads(row[0])) for row in self.db.execute("SELECT attempts FROM runs WHERE task_id=?", (ident,)))
             if used >= max_calls:
                 raise ValueError("Limite de chamadas da tarefa atingido; reveja a tarefa, nao repita em loop")
+
+            # Record step in mission control telemetry
+            self.mission_control.record_step(ident, action_name=f"reserve_{category}", details=f"Prompt: {prompt[:60]}")
 
             run_id = uuid.uuid4().hex[:16]
             folder = self.root / "tasks" / ident / "runs" / run_id
@@ -723,3 +811,36 @@ class Store:
         with self.transaction():
             self.reconcile(task_id=task_id)
             return {"task": self.task(task_id), "recent_runs": self.runs(task_id)}
+
+    def set_flight_plan(self, plan: Union[FlightPlan, Dict[str, Any]]) -> FlightPlan:
+        return self.mission_control.set_flight_plan(plan)
+
+    def get_flight_plan(self, ident: str) -> Optional[FlightPlan]:
+        return self.mission_control.get_flight_plan(ident)
+
+    def record_landing_check(
+        self,
+        ident: str,
+        check_name: str,
+        status: str,
+        evidence: Optional[str] = None
+    ) -> Dict[str, Any]:
+        return self.mission_control.record_landing_check(ident, check_name, status, evidence)
+
+    def get_landing_checks(self, ident: str) -> List[Dict[str, Any]]:
+        return self.mission_control.get_landing_checks(ident)
+
+    def record_step(
+        self,
+        ident: str,
+        action_name: str,
+        details: str = "",
+        paths: Optional[List[str]] = None
+    ) -> Dict[str, Any]:
+        return self.mission_control.record_step(ident, action_name, details, paths)
+
+    def verify_landing(self, ident: str) -> Tuple[bool, List[str]]:
+        return self.mission_control.verify_landing(ident)
+
+    def telemetry_summary(self, ident: str) -> Dict[str, Any]:
+        return self.mission_control.telemetry_summary(ident)

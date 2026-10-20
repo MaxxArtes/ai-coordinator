@@ -570,11 +570,14 @@ def parser():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--root", default=str(default_data_dir()))
     sub = p.add_subparsers(dest="command", required=True)
-    n = sub.add_parser("new"); n.add_argument("--project", required=True); n.add_argument("--goal", required=True); n.add_argument("--ai-memory-workstream-id")
+    n = sub.add_parser("new"); n.add_argument("--project", required=True); n.add_argument("--goal", required=True); n.add_argument("--ai-memory-workstream-id"); n.add_argument("--flight-plan")
     c = sub.add_parser("context"); c.add_argument("--project", required=True)
     b = sub.add_parser("bootstrap"); b.add_argument("--project", required=True)
     r = sub.add_parser("resume"); r.add_argument("--task", required=True)
     cp = sub.add_parser("checkpoint"); cp.add_argument("--task", required=True); cp.add_argument("--revision", type=int, required=True); cp.add_argument("--file", required=True); cp.add_argument("--status", choices=["active", "complete", "blocked"])
+    fp = sub.add_parser("flight-plan"); fp.add_argument("--task", required=True); fp.add_argument("--set"); fp.add_argument("--show", action="store_true")
+    lc = sub.add_parser("landing-check"); lc.add_argument("--task", required=True); lc.add_argument("--check"); lc.add_argument("--status", choices=["passed", "failed", "pending"]); lc.add_argument("--evidence"); lc.add_argument("--verify", action="store_true")
+    st = sub.add_parser("step"); st.add_argument("--task", required=True); st.add_argument("--action", required=True); st.add_argument("--details", default=""); st.add_argument("--paths", nargs="*", default=[])
     pl = sub.add_parser("plan"); pl.add_argument("--category", required=True); pl.add_argument('--refresh', action='store_true')
     av = sub.add_parser('availability'); av.add_argument('--refresh', action='store_true')
     w = sub.add_parser("run"); w.add_argument("--task", required=True); w.add_argument("--category", required=True); w.add_argument("--input", required=True); w.add_argument("--max-attempts", type=int, choices=[1, 2])
@@ -627,7 +630,26 @@ def main():
                 catalogs.append(item)
             emit({'health':health.snapshot(),'catalogs':catalogs,'discovery':discoveries,'note':'Sem chamadas de IA para sondagem. Catalogo nao confirma saldo/cota; acesso confirmado somente pelo trabalho util.'})
         elif args.command == "new":
-            emit(store.new(args.project, args.goal, args.ai_memory_workstream_id))
+            fp_data = read_json(args.flight_plan) if getattr(args, "flight_plan", None) else None
+            emit(store.new(args.project, args.goal, args.ai_memory_workstream_id, flight_plan=fp_data))
+        elif args.command == "flight-plan":
+            if getattr(args, "set", None):
+                plan_data = read_json(args.set)
+                plan_data["task_id"] = args.task
+                emit(store.set_flight_plan(plan_data).to_dict())
+            else:
+                plan = store.get_flight_plan(args.task)
+                emit(plan.to_dict() if plan else None)
+        elif args.command == "landing-check":
+            if getattr(args, "verify", False):
+                passed, unmet = store.verify_landing(args.task)
+                emit({"task": args.task, "passed": passed, "unmet": unmet})
+            elif getattr(args, "check", None):
+                emit(store.record_landing_check(args.task, args.check, args.status or "passed", args.evidence))
+            else:
+                emit(store.get_landing_checks(args.task))
+        elif args.command == "step":
+            emit(store.record_step(args.task, args.action, args.details, args.paths or None))
         elif args.command == "context":
             emit({"project": project_path(args.project), "active_tasks": store.context(args.project)})
         elif args.command == "bootstrap":
