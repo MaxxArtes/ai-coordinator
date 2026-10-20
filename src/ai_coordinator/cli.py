@@ -353,26 +353,27 @@ def run_worker(store, config, ident, category, input_file, max_attempts=None):
             try:
                 # plain_prompt: interface web, onde o mesmo cabecalho fixo em toda conversa denuncia automacao.
                 cmd, stdin = worker_args(config, candidate, final, plain if candidate.get("plain_prompt") else prompt)
+                from .contracts import validate_headless_arguments
+                validate_headless_arguments(candidate["client"], "worker", cmd)
                 from .process import ProcessSupervisor
                 proc = ProcessSupervisor.spawn(cmd, cwd=folder, env=env, stdin=subprocess.PIPE if stdin is not None else subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, role="worker", use_job_object=True, text=True, encoding="utf-8", errors="replace")
                 store.update_run(run_id, pid=proc.pid, process_create_time=proc.identity.create_time_ns)
-                try:
-                    # Candidato lento (ex.: Gemini web) pode pedir prazo proprio, com teto de 10 min.
-                    stdout, stderr = proc.communicate(stdin, timeout=min(600, candidate.get("timeout_seconds", limits["timeout_seconds"])))
-                except subprocess.TimeoutExpired:
-                    terminate_tree(proc)
-                    stdout, stderr = proc.communicate()
-                    (folder / f"stdout-{index}.log").write_text(scrub(stdout), encoding="utf-8")
-                    (folder / f"stderr-{index}.log").write_text(scrub(stderr), encoding="utf-8")
-                    raise TimeoutError("Tempo limite atingido; nao repetir automaticamente")
-                (folder / f"stdout-{index}.log").write_text(scrub(stdout), encoding="utf-8")
-                (folder / f"stderr-{index}.log").write_text(scrub(stderr), encoding="utf-8")
-                result = response_text(candidate["client"], stdout, final) if proc.returncode == 0 else ""
+                
+                from .streaming import SafeStreamConsumer
+                timeout = min(600, candidate.get("timeout_seconds", limits["timeout_seconds"]))
+                consumer = SafeStreamConsumer(
+                    stdout_path=folder / f"stdout-{index}.log",
+                    stderr_path=folder / f"stderr-{index}.log",
+                    max_log_bytes=limits.get("max_log_bytes", 1_048_576),
+                )
+                stream_res = consumer.consume(proc, timeout_seconds=timeout, stdin_data=stdin)
+                stdout, stderr = stream_res.stdout, stream_res.stderr
+                result = response_text(candidate["client"], stdout, final) if stream_res.returncode == 0 else ""
                 metadata = runtime.usage(candidate['client'], stdout)
                 attempts[-1]['usage'] = metadata
                 store.update_run(run_id, usage=json.dumps(metadata))
                 if not isinstance(result, str) or not result.strip():
-                    message, retry_after = runtime.safe_message(stdout, stderr, proc.returncode)
+                    message, retry_after = runtime.safe_message(stdout, stderr, stream_res.returncode)
                     health.record(candidate['client'], candidate['model'], False, scrub(message), retry_after=retry_after)
                     raise RuntimeError(message)
                 result = runtime.validate_output(result, candidate, metadata)

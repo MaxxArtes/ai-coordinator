@@ -10,6 +10,16 @@ from .process import (
     safe_process_alive,
     safe_terminate_tree,
 )
+from .streaming import (
+    StreamingScrubber,
+    SafeStreamConsumer,
+    StreamConsumeResult,
+)
+from .contracts import (
+    HeadlessContract,
+    get_client_contract,
+    validate_headless_arguments,
+)
 
 __all__ = [
     "Coordinator",
@@ -22,5 +32,11 @@ __all__ = [
     "PosixProcessController",
     "safe_process_alive",
     "safe_terminate_tree",
+    "StreamingScrubber",
+    "SafeStreamConsumer",
+    "StreamConsumeResult",
+    "HeadlessContract",
+    "get_client_contract",
+    "validate_headless_arguments",
 ]
 __version__ = "0.2.1"
