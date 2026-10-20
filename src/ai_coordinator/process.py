@@ -728,6 +728,26 @@ def safe_terminate_tree(
         return TerminationResult(False, None, "not_found", 0.0, "Invalid target")
 
     if os.name == "nt":
+        start_time = time.monotonic()
+        if expected_create_time_ns is not None:
+            cur_time = WindowsProcessController.get_creation_time(pid)
+            if cur_time is None:
+                return TerminationResult(
+                    success=False,
+                    exit_code=None,
+                    reason="identity_unknown",
+                    duration_seconds=time.monotonic() - start_time,
+                    detail=f"PID {pid} creation time cannot be verified; refusing destructive termination",
+                )
+            if cur_time != expected_create_time_ns:
+                return TerminationResult(
+                    success=False,
+                    exit_code=None,
+                    reason="identity_mismatch",
+                    duration_seconds=time.monotonic() - start_time,
+                    detail=f"PID {pid} was recycled (expected={expected_create_time_ns}, actual={cur_time})",
+                )
+
         # First enumerate child PIDs and capture their creation timestamps while parent is still open
         child_pids = WindowsProcessController.find_child_pids(pid)
         child_records = [
@@ -739,6 +759,9 @@ def safe_terminate_tree(
             expected_create_time_ns=expected_create_time_ns,
             timeout_seconds=timeout_seconds,
         )
+        if not res.success:
+            return res
+
         # Terminate any surviving children using verified creation times to prevent PID recycling accidents
         for c_pid, c_time in child_records:
             try:
