@@ -233,4 +233,4 @@ __all__ = [
     "splice_alternative_route",
     "TrajectoryReconstructor",
 ]
-__version__ = "0.3.0"
+__version__ = "0.4.0"

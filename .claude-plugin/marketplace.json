@@ -9,7 +9,7 @@
       "name": "ai-coordinator",
       "source": "./plugins/claude-code",
       "description": "Retoma tarefas compartilhadas e conecta o Claude Code ao servidor MCP local.",
-      "version": "0.3.0"
+      "version": "0.4.0"
     }
   ]
 }
