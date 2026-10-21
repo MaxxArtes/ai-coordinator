@@ -622,8 +622,11 @@ def parser():
     ins.add_argument("--presentation", choices=["now", "contextual", "review"])
     ins.add_argument("--promote")
     ins.add_argument("--route", default="A")
+    ins.add_argument("--attach-to-node")
     ins.add_argument("--base-revision", type=int)
     ins.add_argument("--archive")
+    ins.add_argument("--evaluate-relevance", action="store_true")
+    ins.add_argument("--autonomy-level", choices=["manual", "contextual", "proactive"])
     ins.add_argument("--caller-role", choices=["human", "agent", "worker"], default="human")
 
     rec = sub.add_parser("route-reconstruct")
@@ -802,7 +805,13 @@ def main():
             reconciled = store.reconcile_resources(args.task)
             emit([r.to_dict() for r in reconciled])
         elif args.command == "experience":
-            proj = project_path(args.project) if getattr(args, "project", None) and args.project != "." else (project_path(".") if Path(".").is_dir() else args.project)
+            def _resolve_proj(p):
+                if not p: return "."
+                try:
+                    return project_path(p)
+                except Exception:
+                    return str(p)
+            proj = _resolve_proj(args.project)
             if getattr(args, "record", None):
                 record_data = read_json(args.record) if Path(args.record).is_file() else json.loads(args.record)
                 rec = store.record_experience(
@@ -849,7 +858,16 @@ def main():
                 )
                 emit([r.to_dict() for r in recs])
         elif args.command == "insight":
-            proj = project_path(args.project) if getattr(args, "project", None) and args.project != "." else (project_path(".") if Path(".").is_dir() else args.project)
+            def _resolve_proj(p):
+                if not p: return "."
+                try:
+                    return project_path(p)
+                except Exception:
+                    return str(p)
+            proj = _resolve_proj(args.project)
+            if getattr(args, "autonomy_level", None):
+                store.set_insight_autonomy_level(args.autonomy_level)
+
             if getattr(args, "explore", None):
                 ins = store.insight_engine.explore(
                     project_id=proj,
@@ -859,8 +877,8 @@ def main():
                 )
                 emit(ins.to_dict())
             elif getattr(args, "connect", None):
-                src_proj = project_path(args.from_project) if getattr(args, "from_project", None) else proj
-                tgt_proj = project_path(args.to_project) if getattr(args, "to_project", None) else proj
+                src_proj = _resolve_proj(args.from_project) if getattr(args, "from_project", None) else proj
+                tgt_proj = _resolve_proj(args.to_project) if getattr(args, "to_project", None) else proj
                 ins = store.insight_engine.connect(
                     source_project_id=src_proj,
                     target_project_id=tgt_proj,
@@ -884,6 +902,7 @@ def main():
                     task_id=args.task,
                     base_revision=args.base_revision or 1,
                     route_choice=args.route or "A",
+                    attach_to_node_id=getattr(args, "attach_to_node", None),
                     caller_role=args.caller_role,
                 )
                 emit(prop.to_dict())
@@ -894,6 +913,12 @@ def main():
                     caller_role=args.caller_role,
                 )
                 emit(ins.to_dict())
+            elif getattr(args, "evaluate_relevance", False):
+                evals = store.evaluate_incubator_relevance(
+                    project_id=proj,
+                    caller_role=args.caller_role,
+                )
+                emit(evals)
             else:
                 insights = store.list_incubator(
                     project_id=proj if getattr(args, "project", None) else None,

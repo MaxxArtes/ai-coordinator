@@ -621,6 +621,266 @@ class Phase3DAdaptiveReconstructionAndInsightsTests(unittest.TestCase):
             self.assertTrue(data["is_valid_dag"])
             self.assertEqual(data["reconnection_points"], ["n3"])
 
+    # -------------------------------------------------------------------------
+    # Scenario 15: Upstream reconnection point strictly rejected as invalid
+    # -------------------------------------------------------------------------
+    def test_upstream_reconnection_point_rejected_with_reconnection_not_found_error(self):
+        reconstructor = TrajectoryReconstructor(self.store)
+        rep = [PlanNode(node_id="alt_loop", title="Loop Step")]
+
+        # n1 is upstream predecessor of n2 -> must be rejected as an invalid reconnection point
+        with self.assertRaises(ReconnectionPointNotFoundError) as ctx:
+            reconstructor.preview_alternative_route(
+                task_id=self.task_id,
+                base_revision=1,
+                failed_node_id="n2",
+                replacement_nodes=rep,
+                reconnection_node_id="n1",
+            )
+        self.assertIn("a montante", str(ctx.exception).lower())
+
+    # -------------------------------------------------------------------------
+    # Scenario 16: Splice alternative route deduplicates internal & bridge edges
+    # -------------------------------------------------------------------------
+    def test_splice_alternative_route_deduplicates_edges(self):
+        reconstructor = TrajectoryReconstructor(self.store)
+        rep = [
+            PlanNode(node_id="alt_d1", title="Dedup Step 1"),
+            PlanNode(node_id="alt_d2", title="Dedup Step 2"),
+        ]
+        # Intentionally pass redundant edges matching natural linear wiring
+        rep_edges = [
+            PlanEdge(from_node="alt_d1", to_node="alt_d2"),
+            PlanEdge(from_node="alt_d1", to_node="alt_d2"),
+        ]
+
+        preview = reconstructor.preview_alternative_route(
+            task_id=self.task_id,
+            base_revision=1,
+            failed_node_id="n2",
+            replacement_nodes=rep,
+            replacement_edges=rep_edges,
+        )
+        self.assertTrue(preview.is_valid_dag)
+
+        # Propose and activate to verify SQLite UNIQUE constraint on plan_edges is preserved
+        proposal = reconstructor.propose_alternative_route(
+            task_id=self.task_id,
+            base_revision=1,
+            failed_node_id="n2",
+            replacement_nodes=rep,
+            replacement_edges=rep_edges,
+            reason="Test Dedup Activation",
+        )
+        self.store.resolve_trajectory_proposal(proposal.id, "approved")
+        new_rev = self.store.activate_trajectory_proposal(proposal.id)
+        self.assertEqual(new_rev.revision, 2)
+        # Check no duplicate edges in database
+        edge_tuples = [(e.from_node, e.to_node) for e in new_rev.edges]
+        self.assertEqual(len(edge_tuples), len(set(edge_tuples)))
+
+    # -------------------------------------------------------------------------
+    # Scenario 17: Promote insight avoids node ID collisions and supports attachment
+    # -------------------------------------------------------------------------
+    def test_promote_insight_avoids_collisions_and_supports_attachment(self):
+        # Create base plan revision with an existing node named 'pragmatic_step_1'
+        nodes = [
+            PlanNode(node_id="pragmatic_step_1", title="Existing Essential Step", status="completed"),
+            PlanNode(node_id="core_work", title="Core Processing", status="pending"),
+        ]
+        edges = [PlanEdge(from_node="pragmatic_step_1", to_node="core_work")]
+        rev = self.store.create_plan_revision(self.task_id, nodes, edges, "Plan with collision node")
+
+        engine = self.store.insight_engine
+        insight = engine.explore(
+            project_id=str(self.proj_dir),
+            topic_or_goal="Refatoracao da camada de dados",
+            task_id=self.task_id,
+        )
+
+        # Promote Route A attaching after 'core_work'
+        proposal = engine.promote_to_trajectory_proposal(
+            store=self.store,
+            insight_id=insight.id,
+            task_id=self.task_id,
+            base_revision=rev.revision,
+            route_choice="A",
+            attach_to_node_id="core_work",
+        )
+
+        # The existing node 'pragmatic_step_1' must NOT be overwritten!
+        self.assertIn("pragmatic_step_1", proposal.nodes)
+        self.assertEqual(proposal.nodes["pragmatic_step_1"].title, "Existing Essential Step")
+
+        # Newly generated nodes must exist with distinct IDs
+        new_step_nodes = [nid for nid in proposal.nodes if nid.startswith("pragmatic_step_1_")]
+        self.assertEqual(len(new_step_nodes), 1)
+
+        # Attachment edge must connect 'core_work' to the new node
+        attached_edges = [
+            e for e in proposal.edges
+            if e.from_node == "core_work" and e.to_node == new_step_nodes[0]
+        ]
+        self.assertEqual(len(attached_edges), 1)
+
+    # -------------------------------------------------------------------------
+    # Scenario 18: Strict cross-project authorization bounding (No self-authorization)
+    # -------------------------------------------------------------------------
+    def test_cross_project_authorization_bounding_find_and_incubator(self):
+        exp_store = self.store.experience_store
+        engine = self.store.insight_engine
+
+        proj_authorized = str(self.proj_dir)
+        proj_unauthorized = str(Path(self.tmp.name) / "secret_vault")
+
+        # Record record in unauthorized project
+        rec_unauth = exp_store.record_experience(
+            project_id=proj_unauthorized,
+            problem_pattern="Vazamento de segredo em rota nao protegida",
+            solution_pattern="Gating estrito em todas as fronteiras",
+            visibility=ExperienceVisibility.PROJECT_SHARED,
+        )
+
+        # Record insight in unauthorized project
+        ins_unauth = engine.record_insight(
+            Insight(
+                id="ins-secret-01",
+                project_id=proj_unauthorized,
+                task_id=None,
+                type=InsightType.HYPOTHESIS,
+                author="agent",
+                origin="cli",
+                visibility=ExperienceVisibility.PROJECT_SHARED,
+                content="Ideia confidencial do projeto secreto",
+            )
+        )
+
+        # 1. Agent only authorized for proj_authorized attempts to query proj_unauthorized in find_experiences
+        leaked_exps = exp_store.find_experiences(
+            project_id=proj_unauthorized,
+            caller_role="agent",
+            caller_authorized_projects=[proj_authorized],
+        )
+        self.assertEqual(len(leaked_exps), 0)
+
+        # 2. Agent attempts to query proj_unauthorized in list_incubator
+        leaked_ins = engine.list_incubator(
+            project_id=proj_unauthorized,
+            caller_role="agent",
+            caller_authorized_projects=[proj_authorized],
+        )
+        self.assertEqual(len(leaked_ins), 0)
+
+        # 3. Agent queries get_experience by ID for an unauthorized project
+        self.assertIsNone(
+            exp_store.get_experience(
+                rec_unauth.id,
+                caller_role="agent",
+                caller_authorized_projects=[proj_authorized],
+            )
+        )
+
+    # -------------------------------------------------------------------------
+    # Scenario 19: Mutual project authorization required in connect()
+    # -------------------------------------------------------------------------
+    def test_connect_requires_mutual_project_authorization(self):
+        engine = self.store.insight_engine
+        source_p = str(self.proj_dir)
+        target_p = str(Path(self.tmp.name) / "unauthorized_target")
+
+        self.store.record_experience(
+            project_id=source_p,
+            problem_pattern="Padrao de resiliencia em conexoes",
+            solution_pattern="Retry exponencial deterministico",
+            category=ExperienceCategory.ARCHITECTURE_DECISION,
+        )
+
+        # Caller is authorized ONLY for source_p, not target_p
+        conn = engine.connect(
+            source_project_id=source_p,
+            target_project_id=target_p,
+            topic="Conexao de resiliencia",
+            caller_role="agent",
+            caller_authorized_projects=[source_p],
+        )
+        self.assertIsNone(conn)
+
+    # -------------------------------------------------------------------------
+    # Scenario 20: Autonomy level and contextual suggestions on resume
+    # -------------------------------------------------------------------------
+    def test_autonomy_level_and_contextual_suggestions_on_resume(self):
+        engine = self.store.insight_engine
+
+        # Create contextual insight for this task
+        ins = engine.explore(
+            project_id=str(self.proj_dir),
+            topic_or_goal="Otimizacao de pipeline em lote",
+            task_id=self.task_id,
+            presentation=InsightPresentation.CONTEXTUAL,
+        )
+
+        # 1. In manual mode: contextual insights must be suppressed
+        engine.set_autonomy_level("manual")
+        ctx_manual = self.store.get_contextual_insights(str(self.proj_dir), task_id=self.task_id)
+        self.assertEqual(len(ctx_manual), 0)
+
+        # 2. In contextual mode: suggestions are surfaced
+        engine.set_autonomy_level("contextual")
+        ctx_contextual = self.store.get_contextual_insights(str(self.proj_dir), task_id=self.task_id)
+        self.assertEqual(len(ctx_contextual), 1)
+        self.assertEqual(ctx_contextual[0].id, ins.id)
+
+        # 3. Store.resume returns contextual_insights in dictionary
+        resume_data = self.store.resume(self.task_id)
+        self.assertIn("contextual_insights", resume_data)
+        self.assertEqual(len(resume_data["contextual_insights"]), 1)
+        self.assertEqual(resume_data["contextual_insights"][0]["id"], ins.id)
+
+    # -------------------------------------------------------------------------
+    # Scenario 21: Incubator relevance evaluation & ExperienceRecord validation
+    # -------------------------------------------------------------------------
+    def test_incubator_relevance_evaluation_and_experience_validation(self):
+        engine = self.store.insight_engine
+
+        ins = engine.explore(
+            project_id=str(self.proj_dir),
+            topic_or_goal="Tratamento de timeout de workers",
+            context_tags=["timeout", "workers"],
+        )
+
+        # Before any new experience
+        evals_before = self.store.evaluate_incubator_relevance(str(self.proj_dir))
+        self.assertEqual(len(evals_before), 1)
+        self.assertFalse(evals_before[0]["gained_relevance"])
+
+        # Record experience that reinforces the hypothesis
+        self.store.record_experience(
+            project_id=str(self.proj_dir),
+            problem_pattern="Tratamento de timeout de workers com grace period",
+            solution_pattern="Ajustar timeout para 60s com heartbeat",
+            context_tags=["timeout", "workers"],
+            category=ExperienceCategory.TOOL_FIX,
+        )
+
+        # Now relevance evaluation identifies the connection
+        evals_after = self.store.evaluate_incubator_relevance(str(self.proj_dir))
+        self.assertEqual(len(evals_after), 1)
+        self.assertTrue(evals_after[0]["gained_relevance"])
+        self.assertIn("experiencia(s) com solucoes comprovadas", evals_after[0]["justification"])
+
+        # ExperienceRecord validation tests
+        with self.assertRaises(ValueError):
+            ExperienceRecord(
+                id="e-inv", project_id="p", task_id=None, category="invalid_cat",
+                problem_pattern="prob", solution_pattern="sol"
+            ).validate()
+
+        with self.assertRaises(ValueError):
+            ExperienceRecord(
+                id="e-inv2", project_id="p", task_id=None, category=ExperienceCategory.TOOL_FIX,
+                problem_pattern="prob", solution_pattern="sol", confidence="ultra_high"
+            ).validate()
+
 
 if __name__ == "__main__":
     unittest.main()

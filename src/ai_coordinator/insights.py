@@ -184,9 +184,23 @@ class InsightEngine:
     4. Divergent exploration with 3 canonical routes (Pragmatic, Structural, Investigative).
     """
 
-    def __init__(self, db: sqlite3.Connection, experience_store: Optional[ExperienceStore] = None):
+    def __init__(
+        self,
+        db: sqlite3.Connection,
+        experience_store: Optional[ExperienceStore] = None,
+        autonomy_level: str = AutonomyLevel.CONTEXTUAL,
+    ):
         self.db = db
         self.experience_store = experience_store or ExperienceStore(db)
+        if autonomy_level not in AutonomyLevel.ALL:
+            raise ValueError(f"autonomy_level '{autonomy_level}' invalido. Opcoes: {AutonomyLevel.ALL}")
+        self.autonomy_level = autonomy_level
+
+    def set_autonomy_level(self, level: str) -> None:
+        """Configure proactive autonomy level (manual, contextual, proactive)."""
+        if level not in AutonomyLevel.ALL:
+            raise ValueError(f"autonomy_level '{level}' invalido. Opcoes: {AutonomyLevel.ALL}")
+        self.autonomy_level = level
 
     def record_insight(self, insight: Insight) -> Insight:
         """Persist an insight into the incubator."""
@@ -254,17 +268,23 @@ class InsightEngine:
             clauses.append("visibility != ?")
             params.append(ExperienceVisibility.PRIVATE_HUMAN)
 
-        if project_id:
-            if caller_authorized_projects:
-                allowed = set(caller_authorized_projects) | {project_id}
-                placeholders = ",".join("?" for _ in allowed)
-                clauses.append(f"(project_id IN ({placeholders}) OR visibility = ?)")
-                params.extend(list(allowed))
+        if caller_role in ("worker", "agent") and caller_authorized_projects is not None:
+            if project_id and project_id not in caller_authorized_projects:
+                clauses.append("visibility = ?")
                 params.append(ExperienceVisibility.GLOBAL_AUTHORIZED)
             else:
-                clauses.append("(project_id = ? OR visibility = ?)")
-                params.append(project_id)
-                params.append(ExperienceVisibility.GLOBAL_AUTHORIZED)
+                if caller_authorized_projects:
+                    placeholders = ",".join("?" for _ in caller_authorized_projects)
+                    clauses.append(f"(project_id IN ({placeholders}) OR visibility = ?)")
+                    params.extend(caller_authorized_projects)
+                    params.append(ExperienceVisibility.GLOBAL_AUTHORIZED)
+                else:
+                    clauses.append("visibility = ?")
+                    params.append(ExperienceVisibility.GLOBAL_AUTHORIZED)
+        elif project_id:
+            clauses.append("(project_id = ? OR visibility = ?)")
+            params.append(project_id)
+            params.append(ExperienceVisibility.GLOBAL_AUTHORIZED)
         elif caller_authorized_projects:
             placeholders = ",".join("?" for _ in caller_authorized_projects)
             clauses.append(f"(project_id IN ({placeholders}) OR visibility = ?)")
@@ -317,6 +337,92 @@ class InsightEngine:
         ins.metadata = meta
         return ins
 
+    def get_contextual_insights(
+        self,
+        project_id: str,
+        task_id: Optional[str] = None,
+        caller_role: str = "agent",
+        caller_authorized_projects: Optional[List[str]] = None,
+    ) -> List[Insight]:
+        """Fetch incubating insights relevant for contextual suggestion upon task resume or milestone.
+        
+        Honors autonomy level:
+        - In 'manual' mode: returns empty list (no proactive interruptions).
+        - In 'contextual' or 'proactive' mode: returns contextual/now insights for project.
+        """
+        if self.autonomy_level == AutonomyLevel.MANUAL:
+            return []
+
+        incubating = self.list_incubator(
+            project_id=project_id,
+            status=InsightStatus.INCUBATING,
+            caller_role=caller_role,
+            caller_authorized_projects=caller_authorized_projects,
+        )
+        contextual = [
+            i for i in incubating
+            if i.presentation in (InsightPresentation.CONTEXTUAL, InsightPresentation.NOW)
+            and (not task_id or not i.related_tasks or task_id in i.related_tasks or not i.task_id or i.task_id == task_id)
+        ]
+        return contextual
+
+    def evaluate_incubator_relevance(
+        self,
+        project_id: str,
+        since_timestamp: Optional[str] = None,
+        caller_role: str = "human",
+        caller_authorized_projects: Optional[List[str]] = None,
+    ) -> List[Dict[str, Any]]:
+        """Evaluate which incubating ideas in project have gained relevance since last work.
+        
+        Cross-references incubating hypotheses against newly recorded successful experiences,
+        changes, and solutions, returning only relevant connections with clear justifications.
+        """
+        incubating = self.list_incubator(
+            project_id=project_id,
+            status=InsightStatus.INCUBATING,
+            caller_role=caller_role,
+            caller_authorized_projects=caller_authorized_projects,
+        )
+        evaluations: List[Dict[str, Any]] = []
+
+        for ins in incubating:
+            check_since = since_timestamp or ins.created_at
+            recent_exps = self.experience_store.find_experiences(
+                project_id=project_id,
+                query_text=ins.content,
+                tags=ins.metadata.get("context_tags"),
+                outcome=ExperienceOutcome.SUCCESS,
+                caller_role=caller_role,
+                caller_authorized_projects=caller_authorized_projects,
+                limit=5,
+            )
+            new_reinforcing = [
+                e for e in recent_exps
+                if e.created_at >= check_since or e.id in ins.provenance.get("past_experience_ids", [])
+            ]
+            gained = len(new_reinforcing) > 0
+
+            reason = (
+                f"Foram identificadas {len(new_reinforcing)} experiencia(s) com solucoes comprovadas "
+                f"relevantes para a hipotese '{ins.id}'."
+                if gained
+                else "Nenhuma nova evidencia ou experiencia coincidente identificada no periodo."
+            )
+
+            evaluations.append({
+                "insight_id": ins.id,
+                "project_id": ins.project_id,
+                "type": ins.type,
+                "content_preview": ins.content[:100],
+                "gained_relevance": gained,
+                "justification": reason,
+                "reinforcing_experiences": [e.id for e in new_reinforcing],
+                "evaluated_at": now(),
+            })
+
+        return evaluations
+
     # -------------------------------------------------------------------------
     # Core Modality 1: Explorar (Active / On-Demand Exploration)
     # -------------------------------------------------------------------------
@@ -349,7 +455,7 @@ class InsightEngine:
             lesson_summaries = [f"[{l['experience_id']}] {l['problem']} -> {l['proven_solution']}" for l in past_lessons]
             lessons_context = " Baseado em licoes anteriores: " + "; ".join(lesson_summaries) + "."
 
-        slug = re.sub(r"[^a-zA-Z0-9_-]", "_", topic_or_goal[:30]).strip("_")
+        slug = re.sub(r"[^a-zA-Z0-9_-]", "_", topic_or_goal[:30]).strip("_") or "topic"
         insight_id = f"insight-{slug}-{uuid.uuid4().hex[:6]}"
 
         alternatives = [
@@ -445,8 +551,8 @@ class InsightEngine:
         - Filtra estritamente registros privados antes da busca.
         """
         # Verify access authorization for both projects
-        if caller_role in ("worker", "agent") and caller_authorized_projects:
-            if source_project_id not in caller_authorized_projects:
+        if caller_role in ("worker", "agent") and caller_authorized_projects is not None:
+            if source_project_id not in caller_authorized_projects or target_project_id not in caller_authorized_projects:
                 return None
 
         # Look for successful patterns in the source project
@@ -606,6 +712,7 @@ class InsightEngine:
         task_id: str,
         base_revision: int,
         route_choice: str = "A",
+        attach_to_node_id: Optional[str] = None,
         caller_role: str = "human",
     ) -> TrajectoryProposal:
         """Convert an incubating alternative route into a formal, unactivated TrajectoryProposal.
@@ -613,6 +720,7 @@ class InsightEngine:
         Guarantees:
         - The resulting proposal is unactivated (status='proposed').
         - Requires explicit human approval before activation.
+        - Existing nodes are never overwritten; node collisions are safely avoided.
         - DAG aciclicity and dependency integrity guaranteed via validate_dag.
         """
         ins = self.get_insight(insight_id, caller_role=caller_role)
@@ -649,22 +757,39 @@ class InsightEngine:
         new_nodes: Dict[str, PlanNode] = dict(base_rev.nodes)
         new_edges: List[PlanEdge] = list(base_rev.edges)
 
-        # Inject alternative steps as a linear or independent sequence
-        prev_node_id: Optional[str] = None
+        # Validate attach_to_node_id if specified
+        if attach_to_node_id and attach_to_node_id not in new_nodes:
+            raise ValueError(f"No para anexo '{attach_to_node_id}' nao existe no plano")
+
+        # Inject alternative steps ensuring no collisions with existing nodes
+        prev_node_id: Optional[str] = attach_to_node_id
         for step in raw_steps:
-            nid = str(step["id"])
+            raw_nid = str(step["id"])
+            nid = raw_nid
+            if nid in new_nodes:
+                nid = f"{raw_nid}_{uuid.uuid4().hex[:6]}"
             title = str(step["title"])
             node = PlanNode(
                 node_id=nid,
                 title=title,
                 description=f"Gerado a partir do insight {insight_id} ({selected_alt.get('name', route_choice)})",
                 status="pending",
-                metadata={"origin_insight": insight_id, "route": route_choice},
+                metadata={"origin_insight": insight_id, "route": route_choice, "original_step_id": raw_nid},
             )
             new_nodes[nid] = node
             if prev_node_id:
                 new_edges.append(PlanEdge(from_node=prev_node_id, to_node=nid))
             prev_node_id = nid
+
+        # Deduplicate edges by (from_node, to_node)
+        seen_edges: Set[Tuple[str, str]] = set()
+        deduped_edges: List[PlanEdge] = []
+        for e in new_edges:
+            key = (e.from_node, e.to_node)
+            if key not in seen_edges:
+                seen_edges.add(key)
+                deduped_edges.append(e)
+        new_edges = deduped_edges
 
         diff_summary = (
             f"Proposta derivada do Insight {insight_id} ({selected_alt.get('name', route_choice)}): "

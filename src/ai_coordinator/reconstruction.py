@@ -135,6 +135,10 @@ def splice_alternative_route(
             raise ReconnectionPointNotFoundError(
                 f"O ponto de reconexao nao pode ser o proprio no com falha '{failed_node_id}'"
             )
+        if reconnection_node_id in upstream:
+            raise ReconnectionPointNotFoundError(
+                f"O ponto de reconexao '{reconnection_node_id}' nao pode ser um no a montante (predecessor) do no com falha"
+            )
         reconnection_points = [reconnection_node_id]
     else:
         reconnection_points = natural_reconnections
@@ -200,6 +204,16 @@ def splice_alternative_route(
     for exit_node in exit_nodes:
         for rec_node in reconnection_points:
             new_edges.append(PlanEdge(from_node=exit_node, to_node=rec_node))
+
+    # Deduplicate edges preserving insertion order
+    seen_edge_keys: Set[Tuple[str, str]] = set()
+    deduped_edges: List[PlanEdge] = []
+    for e in new_edges:
+        key = (e.from_node, e.to_node)
+        if key not in seen_edge_keys:
+            seen_edge_keys.add(key)
+            deduped_edges.append(e)
+    new_edges = deduped_edges
 
     # 5. Strict DAG Validation (cycle detection and topological order check)
     validate_dag(new_nodes, new_edges)

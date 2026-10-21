@@ -79,14 +79,16 @@ class ExperienceRecord:
             raise ValueError("id da experiencia deve ser uma string nao vazia")
         if not self.project_id or not isinstance(self.project_id, str):
             raise ValueError("project_id deve ser uma string nao vazia")
-        if not self.category or not isinstance(self.category, str):
-            raise ValueError("category deve ser uma string nao vazia")
+        if not self.category or self.category not in ExperienceCategory.ALL:
+            raise ValueError(f"category '{self.category}' invalida. Opcoes: {ExperienceCategory.ALL}")
         if not self.problem_pattern or not isinstance(self.problem_pattern, str):
             raise ValueError("problem_pattern deve ser uma string nao vazia")
         if not self.solution_pattern or not isinstance(self.solution_pattern, str):
             raise ValueError("solution_pattern deve ser uma string nao vazia")
         if self.outcome not in ExperienceOutcome.ALL:
             raise ValueError(f"outcome '{self.outcome}' invalido. Opcoes: {ExperienceOutcome.ALL}")
+        if self.confidence not in ("high", "medium", "low"):
+            raise ValueError(f"confidence '{self.confidence}' invalido. Opcoes: ('high', 'medium', 'low')")
         if self.visibility not in ExperienceVisibility.ALL:
             raise ValueError(f"visibility '{self.visibility}' invalido. Opcoes: {ExperienceVisibility.ALL}")
         if self.author not in ExperienceAuthor.ALL:
@@ -221,8 +223,13 @@ class ExperienceStore:
         self.db.commit()
         return rec
 
-    def get_experience(self, record_id: str, caller_role: str = "agent") -> Optional[ExperienceRecord]:
-        """Fetch an experience record by ID, applying privacy gating."""
+    def get_experience(
+        self,
+        record_id: str,
+        caller_role: str = "agent",
+        caller_authorized_projects: Optional[List[str]] = None,
+    ) -> Optional[ExperienceRecord]:
+        """Fetch an experience record by ID, applying privacy gating and project scope bounding."""
         row = self.db.execute(
             "SELECT * FROM experience_records WHERE id=?",
             (record_id,),
@@ -232,9 +239,12 @@ class ExperienceStore:
 
         rec = self._row_to_record(row)
         # Privacy filter: workers/agents cannot access private human records
-        if caller_role == "worker" or caller_role == "agent":
+        if caller_role in ("worker", "agent"):
             if rec.visibility == ExperienceVisibility.PRIVATE_HUMAN:
                 return None
+            if caller_authorized_projects is not None and rec.visibility != ExperienceVisibility.GLOBAL_AUTHORIZED:
+                if rec.project_id not in caller_authorized_projects:
+                    return None
         return rec
 
     def find_experiences(
@@ -264,18 +274,24 @@ class ExperienceStore:
             clauses.append("visibility != ?")
             params.append(ExperienceVisibility.PRIVATE_HUMAN)
 
-        # 2. Scope filter
-        if project_id:
-            if caller_authorized_projects:
-                allowed = set(caller_authorized_projects) | {project_id}
-                placeholders = ",".join("?" for _ in allowed)
-                clauses.append(f"(project_id IN ({placeholders}) OR visibility = ?)")
-                params.extend(list(allowed))
+        # 2. Scope filter with strict authorization bounding
+        if caller_role in ("worker", "agent") and caller_authorized_projects is not None:
+            if project_id and project_id not in caller_authorized_projects:
+                clauses.append("visibility = ?")
                 params.append(ExperienceVisibility.GLOBAL_AUTHORIZED)
             else:
-                clauses.append("(project_id = ? OR visibility = ?)")
-                params.append(project_id)
-                params.append(ExperienceVisibility.GLOBAL_AUTHORIZED)
+                if caller_authorized_projects:
+                    placeholders = ",".join("?" for _ in caller_authorized_projects)
+                    clauses.append(f"(project_id IN ({placeholders}) OR visibility = ?)")
+                    params.extend(caller_authorized_projects)
+                    params.append(ExperienceVisibility.GLOBAL_AUTHORIZED)
+                else:
+                    clauses.append("visibility = ?")
+                    params.append(ExperienceVisibility.GLOBAL_AUTHORIZED)
+        elif project_id:
+            clauses.append("(project_id = ? OR visibility = ?)")
+            params.append(project_id)
+            params.append(ExperienceVisibility.GLOBAL_AUTHORIZED)
         elif caller_authorized_projects:
             placeholders = ",".join("?" for _ in caller_authorized_projects)
             clauses.append(f"(project_id IN ({placeholders}) OR visibility = ?)")

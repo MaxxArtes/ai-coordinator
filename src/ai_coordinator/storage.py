@@ -1050,7 +1050,17 @@ class Store:
         task_id = validate_id(task_id)
         with self.transaction():
             self.reconcile(task_id=task_id)
-            return {"task": self.task(task_id), "recent_runs": self.runs(task_id)}
+            task_data = self.task(task_id)
+            contextual = self.insight_engine.get_contextual_insights(
+                project_id=task_data["project"],
+                task_id=task_id,
+                caller_role="agent",
+            )
+            return {
+                "task": task_data,
+                "recent_runs": self.runs(task_id),
+                "contextual_insights": [i.to_dict() for i in contextual],
+            }
 
     def set_flight_plan(self, plan: Union[FlightPlan, Dict[str, Any]]) -> FlightPlan:
         return self.mission_control.set_flight_plan(plan)
@@ -2007,9 +2017,18 @@ class Store:
             record_id=record_id,
         )
 
-    def get_experience(self, record_id: str, caller_role: str = "agent") -> Optional[ExperienceRecord]:
-        """Fetch experience record with privacy gating."""
-        return self.experience_store.get_experience(record_id, caller_role=caller_role)
+    def get_experience(
+        self,
+        record_id: str,
+        caller_role: str = "agent",
+        caller_authorized_projects: Optional[List[str]] = None,
+    ) -> Optional[ExperienceRecord]:
+        """Fetch experience record with privacy gating and scope bounding."""
+        return self.experience_store.get_experience(
+            record_id,
+            caller_role=caller_role,
+            caller_authorized_projects=caller_authorized_projects,
+        )
 
     def find_experiences(
         self,
@@ -2078,6 +2097,60 @@ class Store:
             insight_id=insight_id,
             new_status=new_status,
             reason=reason,
+            caller_role=caller_role,
+        )
+
+    def get_contextual_insights(
+        self,
+        project_id: str,
+        task_id: Optional[str] = None,
+        caller_role: str = "agent",
+        caller_authorized_projects: Optional[List[str]] = None,
+    ) -> List[Insight]:
+        """Fetch incubating insights relevant for contextual suggestion."""
+        return self.insight_engine.get_contextual_insights(
+            project_id=project_id,
+            task_id=task_id,
+            caller_role=caller_role,
+            caller_authorized_projects=caller_authorized_projects,
+        )
+
+    def evaluate_incubator_relevance(
+        self,
+        project_id: str,
+        since_timestamp: Optional[str] = None,
+        caller_role: str = "human",
+        caller_authorized_projects: Optional[List[str]] = None,
+    ) -> List[Dict[str, Any]]:
+        """Evaluate which incubating ideas in project have gained relevance since last work."""
+        return self.insight_engine.evaluate_incubator_relevance(
+            project_id=project_id,
+            since_timestamp=since_timestamp,
+            caller_role=caller_role,
+            caller_authorized_projects=caller_authorized_projects,
+        )
+
+    def set_insight_autonomy_level(self, level: str) -> None:
+        """Set autonomy level on the insight engine."""
+        self.insight_engine.set_autonomy_level(level)
+
+    def promote_insight_to_proposal(
+        self,
+        insight_id: str,
+        task_id: str,
+        base_revision: int,
+        route_choice: str = "A",
+        attach_to_node_id: Optional[str] = None,
+        caller_role: str = "human",
+    ) -> TrajectoryProposal:
+        """Promote an incubating insight into a trajectory proposal with collision safety."""
+        return self.insight_engine.promote_to_trajectory_proposal(
+            store=self,
+            insight_id=insight_id,
+            task_id=task_id,
+            base_revision=base_revision,
+            route_choice=route_choice,
+            attach_to_node_id=attach_to_node_id,
             caller_role=caller_role,
         )
 
