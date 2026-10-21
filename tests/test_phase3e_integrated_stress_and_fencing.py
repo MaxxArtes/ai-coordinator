@@ -1,0 +1,686 @@
+"""Tests for Phase 3E.1: Integrated Mission, Stress Fencing, Evidence Authenticity, and Failure Recovery."""
+from __future__ import annotations
+
+import datetime as dt
+import json
+import os
+from pathlib import Path
+import shutil
+import tempfile
+import unittest
+from unittest.mock import patch
+
+from ai_coordinator import (
+    Store,
+    FlightPlan,
+    FlightBudget,
+    RunState,
+    ACTIVE_RUN_STATES,
+    UNCERTAIN_RUN_STATES,
+    TERMINAL_RUN_STATES,
+    DagError,
+    CycleDetectedError,
+    StaleRevisionError,
+    ActiveWorkerFencingError,
+    ProposalNotApprovedError,
+    UnauthorizedOverrideError,
+    PlanNode,
+    PlanEdge,
+    PlanRevision,
+    TrajectoryProposal,
+    TrajectoryReconstructor,
+    TrajectoryStatus,
+    TrajectoryPredictor,
+    TelemetrySnapshot,
+    InvariantDefinition,
+    InvariantEvidence,
+    InvariantEvaluation,
+    InvariantStatus,
+    InvariantOracle,
+    compute_sha256,
+    generate_verification_token,
+    ResourceState,
+    ResourceType,
+    ResourceAction,
+    ResourceLedgerError,
+    ResourceConflictError,
+    UnresolvedResourceError,
+    ExperienceStore,
+    ExperienceRecord,
+    ExperienceCategory,
+    ExperienceOutcome,
+    ExperienceVisibility,
+    ExperienceAuthor,
+    InsightEngine,
+    InsightPresentation,
+    splice_alternative_route,
+)
+
+
+class Phase3E1IntegratedStressAndFencingTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name) / "coordinator_data"
+        self.proj_dir = Path(self.tmp.name) / "primary_project"
+        self.proj_dir.mkdir(parents=True, exist_ok=True)
+        self.store = Store(self.root)
+        self.task_id = "task-3e1-mission"
+
+        self.store.new(self.proj_dir, "Missao Integrada 3E.1")
+        self.store.db.execute(
+            "UPDATE tasks SET id=? WHERE project=?",
+            (self.task_id, str(self.proj_dir.resolve())),
+        )
+        self.store.db.commit()
+
+    def tearDown(self):
+        try:
+            self.store.db.close()
+        except Exception:
+            pass
+        try:
+            self.tmp.cleanup()
+        except Exception:
+            pass
+
+    # -------------------------------------------------------------------------
+    # Scenario 1: Missão Integrada Completa com Desvio, Reconstrução e Recuperação
+    # -------------------------------------------------------------------------
+    def test_end_to_end_mission_with_deviation_reconstruction_and_recovery(self):
+        """Validates the full 7-step lifecycle:
+        1. Experience retrieval with RBAC
+        2. DAG execution until real deviation flagged by TrajectoryPredictor
+        3. Alternative generation via Insight Engine and reconstructor
+        4. DAG proposal registration without automatic mutation
+        5. Fencing checks (Oracle veto, uncertain resources, lingering workers)
+        6. Resolution of blockers, formal approval, and activation verifying Join Point
+        7. Storing outcome in Experience Store to guide future decisions.
+        """
+        # Step 1: Seed and retrieve previous solution in ExperienceStore respecting RBAC
+        self.store.record_experience(
+            project_id=str(self.proj_dir),
+            problem_pattern="timeout na etapa de compilacao rust",
+            solution_pattern="adicionar flag incremental e cache local sccache",
+            category=ExperienceCategory.TOOL_FIX,
+            outcome=ExperienceOutcome.SUCCESS,
+            author=ExperienceAuthor.AGENT,
+            visibility=ExperienceVisibility.PROJECT_SHARED,
+        )
+        # Agent authorized for primary_project can retrieve it
+        priors = self.store.find_experiences(
+            project_id=str(self.proj_dir),
+            query_text="timeout compilacao",
+            caller_role="agent",
+            caller_authorized_projects=[str(self.proj_dir)],
+        )
+        self.assertEqual(len(priors), 1)
+        self.assertIn("sccache", priors[0].solution_pattern)
+
+        # Step 2: Establish initial DAG Revision 1 (build -> test -> deploy)
+        initial_nodes = [
+            {"node_id": "build", "title": "Compilar Codigo", "status": "completed"},
+            {"node_id": "test", "title": "Executar Testes", "status": "in_progress"},
+            {"node_id": "deploy", "title": "Deploy Producao", "status": "pending"},
+        ]
+        initial_edges = [
+            {"from_node": "build", "to_node": "test"},
+            {"from_node": "test", "to_node": "deploy"},
+        ]
+        r1 = self.store.create_plan_revision(
+            self.task_id,
+            nodes=initial_nodes,
+            edges=initial_edges,
+            summary="R1: Pipeline padrao inicial",
+        )
+        self.assertEqual(r1.revision, 1)
+
+        # Register mandatory invariant for the mission
+        self.store.create_invariant(
+            task_id=self.task_id,
+            description="Todos os testes de integracao aprovados com codigo 0",
+            invariant_id="integration_suite",
+            required=True,
+            verifier_type="trusted_test_runner",
+        )
+
+        # Step 2b: Trajectory Predictor detects real risk (budget ceiling warning)
+        self.store.db.execute("UPDATE tasks SET step_count=75 WHERE id=?", (self.task_id,))
+        budget = FlightBudget(max_steps=82, max_uncheckpointed_steps=10)
+        flight_plan = FlightPlan(
+            task_id=self.task_id,
+            goal="Pipeline com orcamento restrito",
+            acceptance_criteria=["Conclusao com orcamento"],
+            allowed_paths=[str(self.proj_dir)],
+            budget=budget,
+        )
+        predictor = TrajectoryPredictor(self.store)
+        prediction = predictor.predict(self.task_id, flight_plan=flight_plan)
+        self.assertEqual(prediction.status, TrajectoryStatus.AT_RISK)
+        self.assertIn("excedem o orcamento maximo", prediction.reason)
+
+        # Step 3: Produce alternative route via InsightEngine and reconstructor
+        # Explore alternatives given the budget/timeout risk
+        insight = self.store.insight_engine.explore(
+            project_id=str(self.proj_dir),
+            topic_or_goal="Otimizacao de pipeline sob restricao severa de passos",
+            task_id=self.task_id,
+            presentation=InsightPresentation.CONTEXTUAL,
+        )
+        self.assertIsNotNone(insight)
+
+        # Reconstruct alternative route replacing 'test' with 'test_fast' and reconnecting to 'deploy'
+        reconstructor = TrajectoryReconstructor(self.store)
+        preview = reconstructor.preview_alternative_route(
+            task_id=self.task_id,
+            base_revision=1,
+            failed_node_id="test",
+            replacement_nodes=[PlanNode(node_id="test_fast", title="Testes Otimizados em Paralelo")],
+            reconnection_node_id="deploy",
+        )
+        self.assertTrue(preview.is_valid_dag)
+        self.assertIn("deploy", preview.reconnection_points)
+
+        # Step 4: Propose trajectory in DAG without automatic activation
+        proposal = reconstructor.propose_alternative_route(
+            task_id=self.task_id,
+            base_revision=1,
+            failed_node_id="test",
+            replacement_nodes=[PlanNode(node_id="test_fast", title="Testes Otimizados em Paralelo")],
+            reconnection_node_id="deploy",
+            reason="Rota alternativa com testes paralelos para evitar estouro de passos",
+        )
+        self.assertEqual(proposal.status, "proposed")
+        # Ensure active revision is still 1!
+        self.assertEqual(self.store.get_plan_revision(self.task_id).revision, 1)
+
+        # Step 5: Test Fencing and Gates
+        # 5a: Unapproved proposal activation rejected
+        with self.assertRaises(ProposalNotApprovedError):
+            self.store.activate_trajectory_proposal(proposal.id)
+
+        # Approve proposal formally
+        self.store.resolve_trajectory_proposal(proposal.id, "approved")
+
+        # 5b: Gate blocked by missing/unverified Invariant Oracle
+        with self.assertRaises(Exception) as ctx_inv:
+            self.store.activate_trajectory_proposal(proposal.id)
+        self.assertIn("oraculo de invariantes", str(ctx_inv.exception).lower())
+
+        # Record a failing invariant evaluation -> still blocked
+        fail_eval = InvariantEvaluation(
+            id="eval-fail-1",
+            task_id=self.task_id,
+            plan_revision=1,
+            invariant_id="integration_suite",
+            status=InvariantStatus.FAIL,
+            verified=True,
+            details="Falha detectada nos testes",
+        )
+        self.store.record_invariant_evaluation(fail_eval)
+        with self.assertRaises(Exception) as ctx_fail:
+            self.store.activate_trajectory_proposal(proposal.id)
+        self.assertIn("bloqueada por oraculo de invariantes", str(ctx_fail.exception).lower())
+
+        # 5c: Record a passing invariant evaluation
+        pass_eval = InvariantEvaluation(
+            id="eval-pass-1",
+            task_id=self.task_id,
+            plan_revision=1,
+            invariant_id="integration_suite",
+            status=InvariantStatus.PASS,
+            verified=True,
+            details="Todos os testes aprovados com sucesso",
+        )
+        self.store.record_invariant_evaluation(pass_eval)
+
+        # 5d: Gate blocked by resource in 'uncertain' state in Resource Ledger
+        test_file = self.proj_dir / "artifact.txt"
+        test_file.write_text("conteudo inicial", encoding="utf-8")
+        rec = self.store.resource_ledger.record_intent(
+            task_id=self.task_id,
+            plan_revision=1,
+            resource_type=ResourceType.FILE,
+            raw_id=str(test_file),
+            action=ResourceAction.MODIFY,
+            idempotency_key="intent-artifact-1",
+        )
+        # Transition resource directly to UNCERTAIN to simulate crash/unconfirmed write
+        self.store.db.execute(
+            "UPDATE resource_ledger SET status=? WHERE id=?",
+            (ResourceState.UNCERTAIN, rec.id),
+        )
+        with self.assertRaises(UnresolvedResourceError):
+            self.store.activate_trajectory_proposal(proposal.id)
+
+        # Compensate the uncertain resource using its automatic backup
+        test_file.write_text("conteudo corrompido durante desvio", encoding="utf-8")
+        comp_rec = self.store.resource_ledger.compensate(rec.id)
+        self.assertEqual(comp_rec.status, ResourceState.COMPENSATED)
+        self.assertEqual(test_file.read_text(encoding="utf-8"), "conteudo inicial")
+
+        # 5e: Gate blocked by lingering worker in 'identity_unknown'
+        run_id, _, _ = self.store.reserve(self.task_id, "code", "worker prompt", 5)
+        self.store.transition_run(run_id, to_status=RunState.STARTING, pid=7777, process_create_time=999)
+        self.store.transition_run(run_id, to_status=RunState.IDENTITY_UNKNOWN, error="OS lookup failed")
+
+        with self.assertRaises(ActiveWorkerFencingError) as ctx_worker:
+            self.store.activate_trajectory_proposal(proposal.id)
+        self.assertIn("identidade incerta", str(ctx_worker.exception).lower())
+
+        # Step 6: Resolve lingering worker safely by operator reconciliation to INTERRUPTED
+        self.store.transition_run(run_id, to_status=RunState.INTERRUPTED, error="Processo confirmado encerrado")
+
+        # Now activation MUST succeed!
+        new_rev = self.store.activate_trajectory_proposal(proposal.id)
+        self.assertEqual(new_rev.revision, 2)
+        self.assertEqual(new_rev.parent_revision, 1)
+        self.assertIn("test_fast", new_rev.nodes)
+
+        # Verify Join Point / Reconnection Node connectivity
+        self.assertIn("deploy", new_rev.nodes)
+        edges = [(e.from_node, e.to_node) for e in new_rev.edges]
+        self.assertIn(("test_fast", "deploy"), edges)
+
+        # Step 7: Record final outcome in ExperienceStore to guide future missions
+        self.store.record_experience(
+            project_id=str(self.proj_dir),
+            task_id=self.task_id,
+            problem_pattern="Risco de estouro de passos em pipeline com testes seriais",
+            solution_pattern="Substituir por testes paralelos otimizados com reconciliacao limpa",
+            category=ExperienceCategory.ARCHITECTURE_DECISION,
+            outcome=ExperienceOutcome.SUCCESS,
+            author=ExperienceAuthor.AGENT,
+            visibility=ExperienceVisibility.PROJECT_SHARED,
+        )
+        resolved_priors = self.store.find_experiences(
+            project_id=str(self.proj_dir),
+            query_text="estouro passos",
+            category=ExperienceCategory.ARCHITECTURE_DECISION,
+            caller_role="agent",
+            caller_authorized_projects=[str(self.proj_dir)],
+        )
+        self.assertEqual(len(resolved_priors), 1)
+        self.assertEqual(resolved_priors[0].outcome, ExperienceOutcome.SUCCESS)
+        self.assertIn("testes paralelos", resolved_priors[0].solution_pattern)
+
+    # -------------------------------------------------------------------------
+    # Scenario 2: Falha Crítica 1 — Queda após Escrita Física e antes do Commit
+    # -------------------------------------------------------------------------
+    def test_failure_after_physical_write_before_commit_reconciliation(self):
+        """Simulates crash after physical file mutation before commit:
+        Resource is uncertain -> activation blocked -> rollback restores file -> unblocked.
+        """
+        f = self.proj_dir / "critical_config.json"
+        f.write_text('{"mode": "v1"}', encoding="utf-8")
+        original_hash = compute_sha256(f)
+
+        # 1. Record intent to modify
+        rec = self.store.resource_ledger.record_intent(
+            task_id=self.task_id,
+            plan_revision=1,
+            resource_type=ResourceType.FILE,
+            raw_id=str(f),
+            action=ResourceAction.MODIFY,
+            idempotency_key="intent-cfg-mod",
+        )
+        self.assertEqual(rec.pre_hash, original_hash)
+        self.assertIn("backup_path", rec.metadata)
+
+        # 2. Worker mutates file on disk, but process crashes before calling mark_applied()
+        f.write_text('{"mode": "v2_corrupted"}', encoding="utf-8")
+
+        # 3. Crash recovery reconciliation runs
+        uncertain_records = self.store.resource_ledger.reconcile_uncertain(self.task_id)
+        self.assertEqual(len(uncertain_records), 1)
+        self.assertEqual(uncertain_records[0].status, ResourceState.UNCERTAIN)
+
+        # 4. Attempting to activate any plan proposal must be BLOCKED
+        self.store.create_plan_revision(self.task_id, nodes=[{"node_id": "a", "title": "A"}], edges=[], summary="Plano A")
+        prop = self.store.propose_trajectory(
+            self.task_id,
+            base_revision=1,
+            proposed_nodes=[{"node_id": "a", "title": "A"}, {"node_id": "b", "title": "B"}],
+            proposed_edges=[{"from_node": "a", "to_node": "b"}],
+            reason="Adicionar B",
+        )
+        self.store.resolve_trajectory_proposal(prop.id, "approved")
+
+        with self.assertRaises(UnresolvedResourceError) as ctx:
+            self.store.activate_trajectory_proposal(prop.id)
+        self.assertIn("estado incerto", str(ctx.exception))
+
+        # 5. Compensate restores the physical file to exact v1 content and hash
+        comp = self.store.resource_ledger.compensate(rec.id)
+        self.assertEqual(comp.status, ResourceState.COMPENSATED)
+        self.assertEqual(f.read_text(encoding="utf-8"), '{"mode": "v1"}')
+        self.assertEqual(compute_sha256(f), original_hash)
+
+        # 6. Now proposal activation succeeds
+        rev2 = self.store.activate_trajectory_proposal(prop.id)
+        self.assertEqual(rev2.revision, 2)
+
+    # -------------------------------------------------------------------------
+    # Scenario 3: Falha Crítica 2 — Cancelamento Concorrente e Identidade Desconhecida
+    # -------------------------------------------------------------------------
+    def test_failure_during_cancellation_and_identity_unknown_fencing(self):
+        """Validates that identity_unknown runs block activation, cannot be ignored,
+        and transition cleanly to INTERRUPTED upon cancel/reconcile.
+        """
+        self.store.create_plan_revision(self.task_id, nodes=[{"node_id": "a", "title": "A"}], edges=[], summary="Plano Cancel")
+        prop = self.store.propose_trajectory(
+            self.task_id,
+            base_revision=1,
+            proposed_nodes=[{"node_id": "a", "title": "A"}, {"node_id": "b", "title": "B"}],
+            proposed_edges=[{"from_node": "a", "to_node": "b"}],
+            reason="Proposta com cancelamento",
+        )
+        self.store.resolve_trajectory_proposal(prop.id, "approved")
+
+        # Start a worker that loses identity during supervisor lookup
+        run_id, _, _ = self.store.reserve(self.task_id, "code", "prompt", 5)
+        self.store.transition_run(run_id, to_status=RunState.STARTING, pid=4321, process_create_time=123)
+        self.store.transition_run(run_id, to_status=RunState.IDENTITY_UNKNOWN, error="Permissao negada no SO")
+
+        # Ensure IDENTITY_UNKNOWN is NOT in TERMINAL_RUN_STATES
+        self.assertNotIn(RunState.IDENTITY_UNKNOWN, TERMINAL_RUN_STATES)
+        self.assertIn(RunState.IDENTITY_UNKNOWN, UNCERTAIN_RUN_STATES)
+
+        # Activation strictly blocked
+        with self.assertRaises(ActiveWorkerFencingError):
+            self.store.activate_trajectory_proposal(prop.id)
+
+        # Operator requests cancel on the unknown run
+        self.store.request_cancel(run_id)
+        # Supervisor confirms process is terminated, moving to INTERRUPTED
+        self.store.transition_run(run_id, to_status=RunState.INTERRUPTED, error="Processo finalizado")
+
+        # Activation now unblocked
+        rev = self.store.activate_trajectory_proposal(prop.id)
+        self.assertEqual(rev.revision, 2)
+
+    # -------------------------------------------------------------------------
+    # Scenario 4: Falha Crítica 3 — Falhas Durante Compensação Física
+    # -------------------------------------------------------------------------
+    def test_failure_during_physical_compensation(self):
+        """Validates that compensation cannot advance to 'compensated' when:
+        a) file modification has no backup available,
+        b) file was modified by a third party after the original operation,
+        and succeeds only when backup is verified.
+        """
+        test_file = self.proj_dir / "target_modify.txt"
+        test_file.write_text("versao 1 original", encoding="utf-8")
+
+        # 4a: Modify without backup -> must FAIL to compensate and NOT advance to compensated
+        rec_no_bak = self.store.resource_ledger.record_intent(
+            task_id=self.task_id,
+            plan_revision=1,
+            resource_type=ResourceType.FILE,
+            raw_id=str(test_file),
+            action=ResourceAction.MODIFY,
+            idempotency_key="intent-no-bak",
+            metadata={},  # explicit empty metadata without backup
+        )
+        # Artificially remove backup_path if auto-created to simulate unbacked modification
+        self.store.db.execute("UPDATE resource_ledger SET metadata='{}' WHERE id=?", (rec_no_bak.id,))
+        test_file.write_text("versao 2 modificada", encoding="utf-8")
+
+        with self.assertRaises(ResourceLedgerError) as ctx_no_bak:
+            self.store.resource_ledger.compensate(rec_no_bak.id)
+        self.assertIn("nenhum backup", str(ctx_no_bak.exception))
+
+        # Check database: status MUST NOT be 'compensated'
+        row = self.store.db.execute("SELECT status FROM resource_ledger WHERE id=?", (rec_no_bak.id,)).fetchone()
+        self.assertNotEqual(row["status"], ResourceState.COMPENSATED)
+
+        # 4b: Third party modification detection
+        test_file_3p = self.proj_dir / "third_party.txt"
+        test_file_3p.write_text("original 3p", encoding="utf-8")
+        rec_3p = self.store.resource_ledger.record_intent(
+            task_id=self.task_id,
+            plan_revision=1,
+            resource_type=ResourceType.FILE,
+            raw_id=str(test_file_3p),
+            action=ResourceAction.MODIFY,
+            idempotency_key="intent-3p",
+        )
+        # Mark applied with post_hash
+        test_file_3p.write_text("worker modified", encoding="utf-8")
+        applied_hash = compute_sha256(test_file_3p)
+        self.store.resource_ledger.confirm_applied(rec_3p.id, post_hash=applied_hash)
+
+        # Third party modifies file outside system knowledge
+        test_file_3p.write_text("tampered by external actor", encoding="utf-8")
+
+        with self.assertRaises(ResourceConflictError) as ctx_conflict:
+            self.store.resource_ledger.compensate(rec_3p.id)
+        self.assertIn("modificado por terceiro", str(ctx_conflict.exception))
+
+        row_3p = self.store.db.execute("SELECT status FROM resource_ledger WHERE id=?", (rec_3p.id,)).fetchone()
+        self.assertNotEqual(row_3p["status"], ResourceState.COMPENSATED)
+
+        # 4c: Successful physical compensation with backup
+        test_file_ok = self.proj_dir / "file_ok.txt"
+        test_file_ok.write_text("ok versao original", encoding="utf-8")
+        orig_hash = compute_sha256(test_file_ok)
+        rec_ok = self.store.resource_ledger.record_intent(
+            task_id=self.task_id,
+            plan_revision=1,
+            resource_type=ResourceType.FILE,
+            raw_id=str(test_file_ok),
+            action=ResourceAction.MODIFY,
+            idempotency_key="intent-ok",
+        )
+        test_file_ok.write_text("ok versao alterada", encoding="utf-8")
+        self.store.resource_ledger.confirm_applied(rec_ok.id, post_hash=compute_sha256(test_file_ok))
+
+        comp_ok = self.store.resource_ledger.compensate(rec_ok.id)
+        self.assertEqual(comp_ok.status, ResourceState.COMPENSATED)
+        self.assertEqual(test_file_ok.read_text(encoding="utf-8"), "ok versao original")
+        self.assertEqual(compute_sha256(test_file_ok), orig_hash)
+
+    # -------------------------------------------------------------------------
+    # Scenario 5: Falha Crítica 4 — Falhas Entre Aprovação e Ativação
+    # -------------------------------------------------------------------------
+    def test_failure_between_proposal_approval_and_activation(self):
+        """Validates that a proposal approved on revision 1 cannot be activated if:
+        a) active revision advances in the meantime (StaleRevisionError),
+        b) a new worker starts in the meantime (ActiveWorkerFencingError).
+        """
+        self.store.create_plan_revision(self.task_id, nodes=[{"node_id": "a", "title": "A"}], edges=[], summary="Plano Base")
+        prop = self.store.propose_trajectory(
+            self.task_id,
+            base_revision=1,
+            proposed_nodes=[{"node_id": "a", "title": "A"}, {"node_id": "b", "title": "B"}],
+            proposed_edges=[{"from_node": "a", "to_node": "b"}],
+            reason="Proposta aprovada",
+        )
+        self.store.resolve_trajectory_proposal(prop.id, "approved")
+
+        # 5a: Concurrent revision committed directly
+        self.store.create_plan_revision(self.task_id, nodes=[{"node_id": "a", "title": "A"}], edges=[], summary="Plano Concorrente R2")
+        self.assertEqual(self.store.get_plan_revision(self.task_id).revision, 2)
+
+        # Attempting activation with proposal based on revision 1 is rejected
+        with self.assertRaises(StaleRevisionError) as ctx_stale:
+            self.store.activate_trajectory_proposal(prop.id)
+        self.assertIn("A proposta foi formulada sobre revisao 1, mas a ativa e 2", str(ctx_stale.exception))
+
+        # 5b: New worker started between approval and activation
+        prop2 = self.store.propose_trajectory(
+            self.task_id,
+            base_revision=2,
+            proposed_nodes=[{"node_id": "a", "title": "A"}, {"node_id": "c", "title": "C"}],
+            proposed_edges=[{"from_node": "a", "to_node": "c"}],
+            reason="Proposta baseada em R2",
+        )
+        self.store.resolve_trajectory_proposal(prop2.id, "approved")
+
+        # A worker is reserved and starts running
+        run_id, _, _ = self.store.reserve(self.task_id, "code", "worker", 5)
+        self.store.transition_run(run_id, to_status=RunState.STARTING, pid=999, process_create_time=111)
+
+        with self.assertRaises(ActiveWorkerFencingError):
+            self.store.activate_trajectory_proposal(prop2.id)
+
+        # Conclude worker safely (transition to running then exit)
+        self.store.transition_run(run_id, to_status=RunState.RUNNING)
+        self.store.confirm_exit(run_id, exit_code=0)
+        rev3 = self.store.activate_trajectory_proposal(prop2.id)
+        self.assertEqual(rev3.revision, 3)
+
+    # -------------------------------------------------------------------------
+    # Scenario 6: Autenticidade das Evidências e Bloqueio de Falsificação
+    # -------------------------------------------------------------------------
+    def test_evidence_authenticity_and_forgery_prevention(self):
+        """Validates that:
+        a) Unauthenticated textual claim with source='trusted_test_runner' is rejected when authenticity proof required,
+        b) Forged verification token is rejected as UNKNOWN,
+        c) Non-existent or failed run_id is rejected as UNKNOWN,
+        d) Authentic token and verified run record are accepted as PASS.
+        """
+        oracle = InvariantOracle(run_lookup=self.store.get_run_for_task)
+
+        inv_strict = InvariantDefinition(
+            id="strict_security",
+            task_id=self.task_id,
+            description="Verificacao rigorosa de autenticidade",
+            require_authenticity_proof=True,
+        )
+
+        # 6a: Pure textual self-declaration without proof token or run linkage -> UNKNOWN
+        unverified_ev = InvariantEvidence(
+            source="trusted_test_runner",
+            exit_code=0,
+        )
+        res_unverified = oracle.evaluate(
+            task_id=self.task_id,
+            plan_revision=1,
+            invariant=inv_strict,
+            evidence=unverified_ev,
+        )
+        self.assertEqual(res_unverified.status, InvariantStatus.UNKNOWN)
+        self.assertFalse(res_unverified.verified)
+        self.assertIn("exige comprovacao formal de autenticidade", res_unverified.details)
+
+        # 6b: Forged verification token -> UNKNOWN
+        forged_ev = InvariantEvidence(
+            source="trusted_test_runner",
+            exit_code=0,
+            verification_token="bad_token_12345",
+        )
+        res_forged = oracle.evaluate(
+            task_id=self.task_id,
+            plan_revision=1,
+            invariant=inv_strict,
+            evidence=forged_ev,
+        )
+        self.assertEqual(res_forged.status, InvariantStatus.UNKNOWN)
+        self.assertFalse(res_forged.verified)
+        self.assertIn("token criptografico de verificacao invalido", res_forged.details)
+
+        # 6c: Valid cryptographic verification token -> PASS
+        valid_token = generate_verification_token(
+            task_id=self.task_id,
+            plan_revision=1,
+            invariant_id="strict_security",
+            source="trusted_test_runner",
+            exit_code=0,
+            secret=oracle.secret,
+        )
+        authentic_token_ev = InvariantEvidence(
+            source="trusted_test_runner",
+            exit_code=0,
+            verification_token=valid_token,
+        )
+        res_token_pass = oracle.evaluate(
+            task_id=self.task_id,
+            plan_revision=1,
+            invariant=inv_strict,
+            evidence=authentic_token_ev,
+        )
+        self.assertEqual(res_token_pass.status, InvariantStatus.PASS)
+        self.assertTrue(res_token_pass.verified)
+
+        # 6d: Run linkage: claiming a non-existent run_id -> UNKNOWN
+        fake_run_ev = InvariantEvidence(
+            source="trusted_test_runner",
+            run_id="fake-run-999",
+            exit_code=0,
+        )
+        res_fake_run = oracle.evaluate(
+            task_id=self.task_id,
+            plan_revision=1,
+            invariant=inv_strict,
+            evidence=fake_run_ev,
+        )
+        self.assertEqual(res_fake_run.status, InvariantStatus.UNKNOWN)
+        self.assertIn("nao existe no registro de execucoes", res_fake_run.details)
+
+        # 6e: Run linkage: genuine completed run with matching exit_code 0 -> PASS
+        real_run_id, _, _ = self.store.reserve(self.task_id, "code", "run prompt", 5)
+        self.store.transition_run(real_run_id, to_status=RunState.STARTING, pid=5555, process_create_time=777)
+        self.store.transition_run(real_run_id, to_status=RunState.RUNNING)
+        self.store.confirm_exit(real_run_id, exit_code=0)
+
+        real_run_ev = InvariantEvidence(
+            source="trusted_test_runner",
+            run_id=real_run_id,
+            exit_code=0,
+        )
+        res_real_run = oracle.evaluate(
+            task_id=self.task_id,
+            plan_revision=1,
+            invariant=inv_strict,
+            evidence=real_run_ev,
+        )
+        self.assertEqual(res_real_run.status, InvariantStatus.PASS)
+        self.assertTrue(res_real_run.verified)
+
+    # -------------------------------------------------------------------------
+    # Scenario 7: Proteção Administrativa de Barreiras de Ativação
+    # -------------------------------------------------------------------------
+    def test_administrative_override_protection(self):
+        """Validates that disabling safety barriers (require_approval=False,
+        enforce_invariants=False, enforce_clean_resources=False) strictly requires
+        caller_role in ('admin', 'operator') and an admin_override_reason.
+        """
+        self.store.create_plan_revision(self.task_id, nodes=[{"node_id": "a", "title": "A"}], edges=[], summary="Plano Admin")
+        prop = self.store.propose_trajectory(
+            self.task_id,
+            base_revision=1,
+            proposed_nodes=[{"node_id": "a", "title": "A"}, {"node_id": "b", "title": "B"}],
+            proposed_edges=[{"from_node": "a", "to_node": "b"}],
+            reason="Proposta sem aprovacao",
+        )
+        # Note: proposal is in 'proposed', NOT approved
+
+        # 7a: Unprivileged call trying require_approval=False -> UnauthorizedOverrideError
+        with self.assertRaises(UnauthorizedOverrideError) as ctx_unauth:
+            self.store.activate_trajectory_proposal(
+                prop.id,
+                require_approval=False,
+                caller_role="worker",
+            )
+        self.assertIn("requer papel administrativo", str(ctx_unauth.exception))
+
+        # 7b: Default call with require_approval=False without admin reason -> UnauthorizedOverrideError
+        with self.assertRaises(UnauthorizedOverrideError):
+            self.store.activate_trajectory_proposal(
+                prop.id,
+                require_approval=False,
+                caller_role="admin",
+                admin_override_reason="",  # empty justification
+            )
+
+        # 7c: Privileged admin with explicit justification -> SUCCEEDS
+        rev_admin = self.store.activate_trajectory_proposal(
+            prop.id,
+            require_approval=False,
+            caller_role="admin",
+            admin_override_reason="Homologacao emergencial auditada pelo comite de seguranca",
+        )
+        self.assertEqual(rev_admin.revision, 2)
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -40,6 +40,11 @@ class ProposalNotApprovedError(DagError):
     pass
 
 
+class UnauthorizedOverrideError(DagError):
+    """Raised when an unauthorized caller attempts to bypass activation safety fencing."""
+    pass
+
+
 # ---------------------------------------------------------------------------
 # Data Models
 # ---------------------------------------------------------------------------

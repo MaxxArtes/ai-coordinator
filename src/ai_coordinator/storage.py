@@ -34,6 +34,7 @@ from .dag import (
     StaleRevisionError,
     ActiveWorkerFencingError,
     ProposalNotApprovedError,
+    UnauthorizedOverrideError,
     PlanNode,
     PlanEdge,
     PlanRevision,
@@ -47,6 +48,7 @@ from .invariants import (
     InvariantEvaluation,
     InvariantStatus,
     InvariantVerificationError,
+    InvariantOracle,
     compute_sha256,
 )
 from .resource_ledger import (
@@ -145,12 +147,15 @@ ACTIVE_RUN_STATES: Set[str] = {
     RunState.UNSUPERVISED,
 }
 
+UNCERTAIN_RUN_STATES: Set[str] = {
+    RunState.IDENTITY_UNKNOWN,
+}
+
 TERMINAL_RUN_STATES: Set[str] = {
     RunState.COMPLETE,
     RunState.FAILED,
     RunState.CANCELLED,
     RunState.INTERRUPTED,
-    RunState.IDENTITY_UNKNOWN,
 }
 
 VALID_STATUS_TRANSITIONS: Dict[str, Set[str]] = {
@@ -209,6 +214,8 @@ VALID_STATUS_TRANSITIONS: Dict[str, Set[str]] = {
     RunState.IDENTITY_UNKNOWN: {
         RunState.RUNNING,
         RunState.INTERRUPTED,
+        RunState.CANCEL_REQUESTED,
+        RunState.CANCELLED,
     },
     RunState.INTERRUPTED: set(),
     RunState.COMPLETE: set(),
@@ -230,10 +237,16 @@ class Store:
         self.db.execute("PRAGMA busy_timeout=20000")
         self._init_schema()
         self.mission_control = MissionControl(self)
-        self.resource_ledger = ResourceLedger(self.db)
+        self.resource_ledger = ResourceLedger(self.db, backup_dir=self.root / "backups")
         self.experience_store = ExperienceStore(self.db)
         self.insight_engine = InsightEngine(self.db, self.experience_store)
         self.reconstructor = TrajectoryReconstructor(self)
+        self.oracle = InvariantOracle(run_lookup=self.get_run_for_task)
+
+    def get_run_for_task(self, task_id: str, run_id: str) -> Optional[Dict[str, Any]]:
+        """Lookup execution run record for a specific task."""
+        row = self.db.execute("SELECT * FROM runs WHERE id=? AND task_id=?", (run_id, task_id)).fetchone()
+        return dict(row) if row else None
 
     def _init_schema(self) -> None:
         self.db.executescript("""
@@ -1488,9 +1501,19 @@ class Store:
         require_approval: bool = True,
         enforce_invariants: bool = True,
         enforce_clean_resources: bool = True,
+        caller_role: Optional[str] = None,
+        admin_override_reason: Optional[str] = None,
     ) -> PlanRevision:
         """Safely activate a trajectory proposal, enforcing approval, optimistic fencing, worker isolation, clean resources, and invariant verification."""
         with self.transaction():
+            # Administrative override check: disabling safety fencing requires explicit admin role and justification
+            if not require_approval or not enforce_invariants or not enforce_clean_resources:
+                if caller_role not in ("admin", "operator") or not admin_override_reason or not admin_override_reason.strip():
+                    raise UnauthorizedOverrideError(
+                        "Desativar barreiras de seguranca de ativacao (require_approval, enforce_invariants ou enforce_clean_resources) "
+                        "requer papel administrativo ('admin' ou 'operator') e justificativa formal obrigatoria ('admin_override_reason')."
+                    )
+
             proposal = self.get_trajectory_proposal(proposal_id)
             if not proposal:
                 raise ValueError("Proposta nao encontrada")
@@ -1518,17 +1541,18 @@ class Store:
                     f"A proposta foi formulada sobre revisao {proposal.base_revision}, mas a ativa e {active_rev_num}"
                 )
 
-            # 3. Process Safety Fencing: verify no active worker runs are lingering
-            placeholders = ",".join("?" for _ in ACTIVE_RUN_STATES)
-            active_runs = self.db.execute(
+            # 3. Process Safety Fencing: verify no active worker runs OR identity_unknown runs are lingering
+            blocking_states = ACTIVE_RUN_STATES | UNCERTAIN_RUN_STATES
+            placeholders = ",".join("?" for _ in blocking_states)
+            lingering_runs = self.db.execute(
                 f"SELECT id, status, pid FROM runs WHERE task_id=? AND status IN ({placeholders})",
-                [task_id] + list(ACTIVE_RUN_STATES)
+                [task_id] + list(blocking_states)
             ).fetchall()
 
-            if active_runs:
-                running_ids = [f"{r['id']} ({r['status']})" for r in active_runs]
+            if lingering_runs:
+                running_ids = [f"{r['id']} ({r['status']})" for r in lingering_runs]
                 raise ActiveWorkerFencingError(
-                    f"Ativacao bloqueada por seguranca de processos: existem {len(active_runs)} worker(s) ativos "
+                    f"Ativacao bloqueada por seguranca de processos: existem {len(lingering_runs)} worker(s) ativos ou com identidade incerta "
                     f"[{', '.join(running_ids)}]. Encerre ou reconcilie os processos antes de ativar nova trajetoria."
                 )
 
@@ -1816,6 +1840,8 @@ class Store:
             target_artifact=target_artifact,
             created_at=stamp,
         )
+
+    register_invariant = create_invariant
 
     def get_invariants(self, task_id: str) -> List[InvariantDefinition]:
         """Fetch all invariants registered for a task."""

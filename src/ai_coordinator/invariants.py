@@ -68,6 +68,19 @@ def compute_sha256(path_or_bytes: Union[str, Path, bytes]) -> str:
     return hasher.hexdigest()
 
 
+def generate_verification_token(
+    task_id: str,
+    plan_revision: int,
+    invariant_id: str,
+    source: str,
+    exit_code: int = 0,
+    secret: str = "ai_coordinator_evidence_key",
+) -> str:
+    """Generate deterministic SHA-256 HMAC-like verification token for authentic evidence."""
+    payload = f"{task_id}:{plan_revision}:{invariant_id}:{source}:{exit_code}:{secret}"
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
 @dataclass(frozen=True)
 class InvariantDefinition:
     id: str
@@ -76,6 +89,7 @@ class InvariantDefinition:
     required: bool = True
     verifier_type: str = "trusted_test_runner"
     target_artifact: Optional[str] = None
+    require_authenticity_proof: bool = False
     created_at: str = field(default_factory=now)
 
     def to_dict(self) -> Dict[str, Any]:
@@ -90,6 +104,7 @@ class InvariantDefinition:
             required=bool(data.get("required", True)),
             verifier_type=data.get("verifier_type", "trusted_test_runner"),
             target_artifact=data.get("target_artifact"),
+            require_authenticity_proof=bool(data.get("require_authenticity_proof", False)),
             created_at=data.get("created_at", now()),
         )
 
@@ -101,6 +116,8 @@ class InvariantEvidence:
     exit_code: Optional[int] = None
     artifact_path: Optional[str] = None
     artifact_sha256: Optional[str] = None
+    verification_token: Optional[str] = None
+    proof_type: Optional[str] = None
     details: Optional[Dict[str, Any]] = None
 
     def to_dict(self) -> Dict[str, Any]:
@@ -114,6 +131,8 @@ class InvariantEvidence:
             exit_code=data.get("exit_code"),
             artifact_path=data.get("artifact_path"),
             artifact_sha256=data.get("artifact_sha256"),
+            verification_token=data.get("verification_token"),
+            proof_type=data.get("proof_type"),
             details=data.get("details"),
         )
 
@@ -191,11 +210,19 @@ class InvariantOracle:
     """Deterministic Invariant Oracle.
 
     Evaluates mandatory project invariants against trusted evidence,
-    pinning verification to exact task IDs, plan revisions, and artifact hashes.
+    pinning verification to exact task IDs, plan revisions, artifact hashes,
+    and verified execution provenance.
     """
 
-    def __init__(self, trusted_verifiers: Optional[Set[str]] = None) -> None:
+    def __init__(
+        self,
+        trusted_verifiers: Optional[Set[str]] = None,
+        run_lookup: Optional[Callable[[str, str], Optional[Dict[str, Any]]]] = None,
+        secret: str = "ai_coordinator_evidence_key",
+    ) -> None:
         self.trusted_verifiers = set(trusted_verifiers) if trusted_verifiers else set(DEFAULT_TRUSTED_VERIFIERS)
+        self.run_lookup = run_lookup
+        self.secret = secret
 
     def register_trusted_verifier(self, verifier_name: str) -> None:
         """Register a new trusted verifier identity."""
@@ -278,6 +305,86 @@ class InvariantOracle:
                 verified=False,
                 details=f"Evidencia originada de fonte nao confiavel / auto-declaracao textual: '{source}'",
             )
+
+        # 4.1 Authenticity verification: check verification token if supplied
+        token = ev_dict.get("verification_token")
+        if token is not None:
+            expected_token = generate_verification_token(
+                task_id=task_id,
+                plan_revision=plan_revision,
+                invariant_id=invariant.id,
+                source=source,
+                exit_code=int(ev_dict.get("exit_code", 0)),
+                secret=self.secret,
+            )
+            if str(token).strip() != expected_token:
+                return InvariantEvaluation(
+                    id=eval_id,
+                    task_id=task_id,
+                    plan_revision=plan_revision,
+                    invariant_id=invariant.id,
+                    status=InvariantStatus.UNKNOWN,
+                    evidence=ev_dict,
+                    verified=False,
+                    details="Falha de autenticidade: token criptografico de verificacao invalido ou violado",
+                )
+
+        # 4.2 Authenticity verification: check run_id against execution record if lookup available
+        run_id = ev_dict.get("run_id")
+        run_verified = False
+        if run_id is not None and self.run_lookup is not None:
+            run_info = self.run_lookup(task_id, str(run_id).strip())
+            if not run_info:
+                return InvariantEvaluation(
+                    id=eval_id,
+                    task_id=task_id,
+                    plan_revision=plan_revision,
+                    invariant_id=invariant.id,
+                    status=InvariantStatus.UNKNOWN,
+                    evidence=ev_dict,
+                    verified=False,
+                    details=f"Falha de autenticidade: run_id '{run_id}' nao existe no registro de execucoes da tarefa",
+                )
+            if run_info.get("status") not in ("complete", "COMPLETE"):
+                return InvariantEvaluation(
+                    id=eval_id,
+                    task_id=task_id,
+                    plan_revision=plan_revision,
+                    invariant_id=invariant.id,
+                    status=InvariantStatus.UNKNOWN,
+                    evidence=ev_dict,
+                    verified=False,
+                    details=f"Falha de autenticidade: worker '{run_id}' nao possui status concluido ('complete'), status atual: '{run_info.get('status')}'",
+                )
+            if ev_dict.get("exit_code") is not None and run_info.get("exit_code") is not None:
+                if int(ev_dict.get("exit_code")) != int(run_info.get("exit_code")):
+                    return InvariantEvaluation(
+                        id=eval_id,
+                        task_id=task_id,
+                        plan_revision=plan_revision,
+                        invariant_id=invariant.id,
+                        status=InvariantStatus.UNKNOWN,
+                        evidence=ev_dict,
+                        verified=False,
+                        details="Falha de autenticidade: exit_code da evidencia diverge do codigo de saida registrado no executor",
+                    )
+            run_verified = True
+
+        # 4.3 Mandatory authenticity proof if required by invariant definition
+        if getattr(invariant, "require_authenticity_proof", False):
+            has_valid_token = token is not None
+            has_valid_artifact = bool(ev_dict.get("artifact_path") or invariant.target_artifact)
+            if not (has_valid_token or run_verified or has_valid_artifact):
+                return InvariantEvaluation(
+                    id=eval_id,
+                    task_id=task_id,
+                    plan_revision=plan_revision,
+                    invariant_id=invariant.id,
+                    status=InvariantStatus.UNKNOWN,
+                    evidence=ev_dict,
+                    verified=False,
+                    details="Evidencia rejeitada: invariante exige comprovacao formal de autenticidade (token criptografico, registro de run_id ou integridade de artefato)",
+                )
 
         # 5. Trusted verifier evaluation
         exit_code = ev_dict.get("exit_code")

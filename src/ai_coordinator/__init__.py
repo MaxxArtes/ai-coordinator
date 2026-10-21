@@ -24,6 +24,7 @@ from .storage import (
     Store,
     RunState,
     ACTIVE_RUN_STATES,
+    UNCERTAIN_RUN_STATES,
     TERMINAL_RUN_STATES,
     VALID_STATUS_TRANSITIONS,
 )
@@ -48,6 +49,7 @@ from .dag import (
     StaleRevisionError,
     ActiveWorkerFencingError,
     ProposalNotApprovedError,
+    UnauthorizedOverrideError,
     PlanNode,
     PlanEdge,
     PlanRevision,
@@ -81,6 +83,7 @@ from .invariants import (
     RevisionOracleReport,
     InvariantOracle,
     compute_sha256,
+    generate_verification_token,
 )
 from .resource_ledger import (
     ResourceLedgerError,
@@ -144,6 +147,7 @@ __all__ = [
     "Store",
     "RunState",
     "ACTIVE_RUN_STATES",
+    "UNCERTAIN_RUN_STATES",
     "TERMINAL_RUN_STATES",
     "VALID_STATUS_TRANSITIONS",
     "FlightPlan",
@@ -164,6 +168,7 @@ __all__ = [
     "StaleRevisionError",
     "ActiveWorkerFencingError",
     "ProposalNotApprovedError",
+    "UnauthorizedOverrideError",
     "PlanNode",
     "PlanEdge",
     "PlanRevision",
@@ -193,6 +198,7 @@ __all__ = [
     "RevisionOracleReport",
     "InvariantOracle",
     "compute_sha256",
+    "generate_verification_token",
     "ResourceLedgerError",
     "ResourceConflictError",
     "AuthorizationRequiredError",

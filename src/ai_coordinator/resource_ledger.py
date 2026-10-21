@@ -9,6 +9,7 @@ import json
 import os
 from pathlib import Path
 import re
+import shutil
 import sqlite3
 from typing import Any, Dict, List, Optional, Set, Union
 import uuid
@@ -212,8 +213,9 @@ class ResourceEvent:
 class ResourceLedger:
     """Manages the two-phase lifecycle of resource mutations and compensations."""
 
-    def __init__(self, db: sqlite3.Connection) -> None:
+    def __init__(self, db: sqlite3.Connection, backup_dir: Optional[Union[str, Path]] = None) -> None:
         self.db = db
+        self.backup_dir = Path(backup_dir) if backup_dir else None
 
     def record_intent(
         self,
@@ -249,12 +251,23 @@ class ResourceLedger:
 
         # Compute pre_hash for files if modifying and pre_hash is omitted
         captured_pre_hash = pre_hash
+        if metadata is None:
+            metadata = {}
         if resource_type == ResourceType.FILE and action in (ResourceAction.MODIFY, ResourceAction.DELETE):
             if captured_pre_hash is None and os.path.isfile(canonical_id):
                 try:
                     captured_pre_hash = compute_sha256(canonical_id)
                 except Exception:
                     captured_pre_hash = None
+            if action == ResourceAction.MODIFY and os.path.isfile(canonical_id):
+                if "backup_path" not in metadata and "backup_content" not in metadata and self.backup_dir:
+                    try:
+                        self.backup_dir.mkdir(parents=True, exist_ok=True)
+                        b_file = self.backup_dir / f"bak_{task_id}_{idempotency_key}_{uuid.uuid4().hex[:8]}.bak"
+                        shutil.copy2(canonical_id, b_file)
+                        metadata["backup_path"] = str(b_file)
+                    except Exception:
+                        pass
 
         # External irreversible resources automatically require explicit authorization
         if resource_type == ResourceType.EXTERNAL and not compensable:
@@ -507,8 +520,36 @@ class ResourceLedger:
                     except Exception as exc:
                         raise ResourceLedgerError(f"Falha ao remover arquivo criado: {exc}")
             elif rec.action == ResourceAction.MODIFY:
-                # If backup exists in metadata or pre_hash is specified, verify or log restoration
-                pass
+                backup_path = rec.metadata.get("backup_path") if rec.metadata else None
+                backup_content = rec.metadata.get("backup_content") if rec.metadata else None
+                if backup_path and os.path.isfile(backup_path):
+                    try:
+                        shutil.copy2(backup_path, rec.canonical_id)
+                    except Exception as exc:
+                        raise ResourceLedgerError(f"Falha ao restaurar backup para '{rec.canonical_id}': {exc}")
+                elif backup_content is not None:
+                    try:
+                        p = Path(rec.canonical_id)
+                        p.parent.mkdir(parents=True, exist_ok=True)
+                        if isinstance(backup_content, bytes):
+                            p.write_bytes(backup_content)
+                        else:
+                            p.write_text(str(backup_content), encoding="utf-8")
+                    except Exception as exc:
+                        raise ResourceLedgerError(f"Falha ao restaurar conteudo de backup para '{rec.canonical_id}': {exc}")
+                else:
+                    raise ResourceLedgerError(
+                        f"Compensacao bloqueada para acao 'modify' no arquivo '{rec.canonical_id}': "
+                        "nenhum backup (backup_path ou backup_content) disponivel para restauracao fisica."
+                    )
+
+                if rec.pre_hash and os.path.isfile(rec.canonical_id):
+                    restored_hash = compute_sha256(rec.canonical_id)
+                    if restored_hash.lower() != rec.pre_hash.strip().lower():
+                        raise ResourceConflictError(
+                            f"Falha na restauracao do arquivo '{rec.canonical_id}': "
+                            f"hash apos restauracao '{restored_hash}' difere do hash original '{rec.pre_hash}'."
+                        )
 
         stamp = now()
         self.db.execute(
@@ -529,6 +570,10 @@ class ResourceLedger:
         return ResourceRecord.from_row(
             self.db.execute("SELECT * FROM resource_ledger WHERE id=?", (resource_id,)).fetchone()
         )
+
+    # Convenience aliases
+    compensate = apply_compensation_step
+    reconcile_uncertain = reconcile_resources
 
     def list_resources(
         self,
