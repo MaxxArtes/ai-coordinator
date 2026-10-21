@@ -76,14 +76,16 @@ def generate_verification_token(
     invariant_id: str,
     source: str,
     run_id: Optional[str] = None,
+    artifact_sha256: Optional[str] = None,
     exit_code: int = 0,
+    nonce: Optional[str] = None,
     secret: Optional[Union[str, bytes]] = None,
 ) -> str:
-    """Generate deterministic HMAC-SHA256 verification token bound to task, revision, invariant, source, run_id, and exit_code."""
+    """Generate deterministic HMAC-SHA256 verification token bound to task, revision, invariant, source, run_id, artifact hash, exit_code and nonce."""
     if secret is None:
         raise ValueError("Chave secreta obrigatoria para geracao de token de autenticidade (HMAC-SHA256)")
     key = secret.encode("utf-8") if isinstance(secret, str) else bytes(secret)
-    payload = f"{task_id}:{plan_revision}:{invariant_id}:{source}:{run_id or ''}:{exit_code}".encode("utf-8")
+    payload = f"{task_id}:{plan_revision}:{invariant_id}:{source}:{run_id or ''}:{artifact_sha256 or ''}:{exit_code}:{nonce or ''}".encode("utf-8")
     return hmac.new(key, payload, hashlib.sha256).hexdigest()
 
 
@@ -123,6 +125,7 @@ class InvariantEvidence:
     artifact_path: Optional[str] = None
     artifact_sha256: Optional[str] = None
     verification_token: Optional[str] = None
+    nonce: Optional[str] = None
     proof_type: Optional[str] = None
     details: Optional[Dict[str, Any]] = None
 
@@ -237,7 +240,9 @@ class InvariantOracle:
         invariant_id: str,
         source: str,
         run_id: Optional[str] = None,
+        artifact_sha256: Optional[str] = None,
         exit_code: int = 0,
+        nonce: Optional[str] = None,
     ) -> str:
         """Issue an authentic HMAC-SHA256 verification token using the supervisor's private key."""
         return generate_verification_token(
@@ -246,7 +251,9 @@ class InvariantOracle:
             invariant_id=invariant_id,
             source=source,
             run_id=run_id,
+            artifact_sha256=artifact_sha256,
             exit_code=exit_code,
+            nonce=nonce,
             secret=self.secret,
         )
 
@@ -342,7 +349,9 @@ class InvariantOracle:
                 invariant_id=invariant.id,
                 source=source,
                 run_id=ev_dict.get("run_id"),
+                artifact_sha256=ev_dict.get("artifact_sha256"),
                 exit_code=int(ev_dict.get("exit_code", 0)),
+                nonce=ev_dict.get("nonce"),
                 secret=self.secret,
             )
             if not hmac.compare_digest(str(token).strip(), expected_token):

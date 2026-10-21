@@ -53,6 +53,7 @@ from .invariants import (
     InvariantVerificationError,
     InvariantOracle,
     compute_sha256,
+    generate_verification_token,
 )
 from .resource_ledger import (
     ResourceRecord,
@@ -230,7 +231,7 @@ VALID_STATUS_TRANSITIONS: Dict[str, Set[str]] = {
 class Store:
     """Atomic SQLite state persistence with optimistic revision fencing and conservative reconciliation."""
 
-    def __init__(self, root: Union[str, Path]):
+    def __init__(self, root: Union[str, Path], supervisor_key: Optional[str] = None):
         self.root = Path(root)
         self.root.mkdir(parents=True, exist_ok=True)
         self.db = sqlite3.connect(self.root / "coordination.sqlite", timeout=20.0)
@@ -245,11 +246,16 @@ class Store:
         self.insight_engine = InsightEngine(self.db, self.experience_store)
         self.reconstructor = TrajectoryReconstructor(self)
         self.supervisor_secret = secrets.token_bytes(32)
+        self.supervisor_key = str(supervisor_key).strip() if supervisor_key else secrets.token_hex(32)
         self.admin_token = secrets.token_hex(32)
         self.oracle = InvariantOracle(run_lookup=self.get_run_for_task, secret=self.supervisor_secret)
 
-    def issue_admin_override_token(self, justification: str) -> str:
-        """Issue an authentic supervisor override token for audited administrative operations."""
+    def issue_admin_override_token(self, supervisor_key: str, justification: str) -> str:
+        """Issue an authentic supervisor override token for audited administrative operations.
+        Requires genuine supervisor authentication key.
+        """
+        if not supervisor_key or not hmac.compare_digest(str(supervisor_key).strip(), self.supervisor_key):
+            raise UnauthorizedOverrideError("Emissao de token administrativo negada: chave de supervisor ausente ou invalida")
         if not justification or not justification.strip():
             raise ValueError("Justificativa formal obrigatoria para emissao de token administrativo")
         return self.admin_token
@@ -261,7 +267,9 @@ class Store:
         invariant_id: str,
         source: str,
         run_id: Optional[str] = None,
+        artifact_sha256: Optional[str] = None,
         exit_code: int = 0,
+        nonce: Optional[str] = None,
     ) -> str:
         """Issue an authentic HMAC-SHA256 verification token signed by the supervisor secret."""
         return self.oracle.issue_evidence_token(
@@ -270,7 +278,9 @@ class Store:
             invariant_id=invariant_id,
             source=source,
             run_id=run_id,
+            artifact_sha256=artifact_sha256,
             exit_code=exit_code,
+            nonce=nonce,
         )
 
     def get_run_for_task(self, task_id: str, run_id: str) -> Optional[Dict[str, Any]]:
@@ -1610,11 +1620,14 @@ class Store:
             for r in runs_with_pids:
                 pid = r["pid"]
                 c_time = r["process_create_time"]
-                is_alive = False
                 try:
                     is_alive = safe_process_alive(pid, expected_create_time_ns=c_time)
-                except Exception:
-                    is_alive = False
+                except Exception as exc:
+                    raise ActiveWorkerFencingError(
+                        f"Ativacao bloqueada por falha na consulta de status do processo no SO: "
+                        f"o worker run '{r['id']}' (PID {pid}) nao pode ser verificado com seguranca ({exc}). "
+                        "Ativacao abortada preventivamente para evitar execucoes fantasmas (fail-closed)."
+                    )
                 if is_alive:
                     raise ActiveWorkerFencingError(
                         f"Ativacao bloqueada por presenca de processo ativo no SO: o worker run '{r['id']}' "
@@ -1637,7 +1650,7 @@ class Store:
             # 5. Invariant Oracle Verification Fencing (Scenario 12)
             if enforce_invariants:
                 req_invariants = self.db.execute(
-                    "SELECT id, description, verifier_type, target_artifact FROM invariants WHERE task_id=? AND required=1",
+                    "SELECT id, description, verifier_type, target_artifact, require_authenticity_proof FROM invariants WHERE task_id=? AND required=1",
                     (task_id,),
                 ).fetchall()
                 for inv in req_invariants:
@@ -1676,6 +1689,32 @@ class Store:
                                     f"Ativacao bloqueada: integridade do artefato '{target_artifact}' foi violada apos a avaliacao. "
                                     f"Hash esperado {expected_sha}, hash atual no disco {curr_sha}."
                                 )
+
+                    # Revalidate cryptographic provenance at activation time
+                    inv_requires_auth = bool(inv["require_authenticity_proof"]) if "require_authenticity_proof" in inv.keys() else False
+                    if inv_requires_auth or ev_dict.get("verification_token"):
+                        token = ev_dict.get("verification_token")
+                        if not token:
+                            raise InvariantVerificationError(
+                                f"Ativacao bloqueada por proveniencia de invariantes: o invariante obrigatorio '{inv_id}' "
+                                "exige comprovacao formal, mas a avaliacao ativa nao contem token criptografico HMAC do supervisor."
+                            )
+                        expected_token = generate_verification_token(
+                            task_id=task_id,
+                            plan_revision=active_rev_num,
+                            invariant_id=inv_id,
+                            source=ev_dict.get("source", inv["verifier_type"]),
+                            run_id=ev_dict.get("run_id"),
+                            artifact_sha256=ev_dict.get("artifact_sha256"),
+                            exit_code=int(ev_dict.get("exit_code", 0)),
+                            nonce=ev_dict.get("nonce"),
+                            secret=self.supervisor_secret,
+                        )
+                        if not hmac.compare_digest(str(token).strip(), expected_token):
+                            raise InvariantVerificationError(
+                                f"Ativacao bloqueada por adulteracao de avaliacao: o token HMAC da avaliacao do invariante '{inv_id}' "
+                                "nao coincide com a chave do supervisor. Avaliacao rejeitada no gate de ativacao."
+                            )
 
             # 6. Create the new immutable plan revision
             new_rev = self.create_plan_revision(
@@ -1955,6 +1994,37 @@ class Store:
 
     def record_invariant_evaluation(self, evaluation: InvariantEvaluation) -> InvariantEvaluation:
         """Persist an invariant evaluation result in SQLite."""
+        # Enforce provenance: prevent unauthorized direct insertion of verified=True without authentic token
+        inv_row = self.db.execute(
+            "SELECT require_authenticity_proof, verifier_type FROM invariants WHERE task_id=? AND id=?",
+            (evaluation.task_id, evaluation.invariant_id),
+        ).fetchone()
+        if inv_row:
+            req_auth = bool(inv_row["require_authenticity_proof"]) if "require_authenticity_proof" in inv_row.keys() else False
+            ev = evaluation.evidence or {}
+            tok = ev.get("verification_token")
+            if req_auth and evaluation.verified and not tok:
+                raise InvariantVerificationError(
+                    f"Tentativa de registrar avaliacao 'verified=True' para invariante '{evaluation.invariant_id}' "
+                    "que exige comprovacao formal (require_authenticity_proof), porem sem token HMAC emitido pelo supervisor."
+                )
+            if tok is not None and evaluation.verified:
+                expected_token = generate_verification_token(
+                    task_id=evaluation.task_id,
+                    plan_revision=evaluation.plan_revision,
+                    invariant_id=evaluation.invariant_id,
+                    source=ev.get("source", inv_row["verifier_type"]),
+                    run_id=ev.get("run_id"),
+                    artifact_sha256=ev.get("artifact_sha256"),
+                    exit_code=int(ev.get("exit_code", 0)),
+                    nonce=ev.get("nonce"),
+                    secret=self.supervisor_secret,
+                )
+                if not hmac.compare_digest(str(tok).strip(), expected_token):
+                    raise InvariantVerificationError(
+                        f"Tentativa de registrar avaliacao com token HMAC adulterado ou forjado para invariante '{evaluation.invariant_id}'"
+                    )
+
         ev_json = json.dumps(evaluation.evidence) if evaluation.evidence else None
         with self.transaction():
             self.db.execute(

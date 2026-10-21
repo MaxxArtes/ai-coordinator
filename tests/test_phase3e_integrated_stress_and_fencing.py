@@ -711,7 +711,10 @@ class Phase3E1IntegratedStressAndFencingTests(unittest.TestCase):
         self.assertIn("token administrativo de supervisor ausente ou invalido", str(ctx_forged.exception))
 
         # 7c: Valid admin token but without admin_override_reason -> UnauthorizedOverrideError
-        admin_tok = self.store.issue_admin_override_token(justification="Homologacao emergencial auditada")
+        admin_tok = self.store.issue_admin_override_token(
+            supervisor_key=self.store.supervisor_key,
+            justification="Homologacao emergencial auditada",
+        )
         with self.assertRaises(UnauthorizedOverrideError) as ctx_no_reason:
             self.store.activate_trajectory_proposal(
                 prop.id,
@@ -890,6 +893,219 @@ class Phase3E1IntegratedStressAndFencingTests(unittest.TestCase):
         matched = [i for i in invs if i.id == "inv_auth_persisted"]
         self.assertEqual(len(matched), 1)
         self.assertTrue(matched[0].require_authenticity_proof)
+
+    # -------------------------------------------------------------------------
+    # Scenario 12: Emissão Autenticada de Admin Token e Rejeição de Não Autorizados (3E.3)
+    # -------------------------------------------------------------------------
+    def test_phase3e3_admin_token_issuance_unauthorized_rejection(self):
+        """Validates that issue_admin_override_token() strictly requires supervisor_key:
+        a) Unauthenticated call without supervisor_key or with forged key -> UnauthorizedOverrideError
+        b) Call with authentic supervisor_key and justification -> returns admin_token.
+        """
+        # 12a: Unauthenticated worker / rogue agent attempts to issue admin override token
+        with self.assertRaises(UnauthorizedOverrideError) as ctx_no_key:
+            self.store.issue_admin_override_token(
+                supervisor_key="worker_fake_key_12345",
+                justification="Tentativa de auto-concessao",
+            )
+        self.assertIn("chave de supervisor ausente ou invalida", str(ctx_no_key.exception))
+
+        # 12b: Empty key rejected
+        with self.assertRaises(UnauthorizedOverrideError):
+            self.store.issue_admin_override_token(
+                supervisor_key="",
+                justification="Sem chave",
+            )
+
+        # 12c: Genuine supervisor passes valid supervisor_key -> succeeds
+        valid_tok = self.store.issue_admin_override_token(
+            supervisor_key=self.store.supervisor_key,
+            justification="Auditoria emergencial autorizada pelo supervisor",
+        )
+        self.assertEqual(valid_tok, self.store.admin_token)
+
+    # -------------------------------------------------------------------------
+    # Scenario 13: Verificação de Processos no SO com Falha Fail-Closed (3E.3)
+    # -------------------------------------------------------------------------
+    def test_phase3e3_process_query_os_error_fail_closed(self):
+        """Validates that if safe_process_alive() raises an OS exception (e.g.,
+        permission error or handle error), proposal activation strictly fails-closed
+        with ActiveWorkerFencingError, preventing phantom process bypass.
+        """
+        self.store.create_plan_revision(self.task_id, nodes=[{"node_id": "a", "title": "A"}], edges=[], summary="R1 Fail-Closed")
+        prop = self.store.propose_trajectory(
+            self.task_id,
+            base_revision=1,
+            proposed_nodes=[{"node_id": "a", "title": "A"}, {"node_id": "b", "title": "B"}],
+            proposed_edges=[{"from_node": "a", "to_node": "b"}],
+            reason="Adicionar B com teste de erro no SO",
+        )
+        self.store.resolve_trajectory_proposal(prop.id, "approved")
+
+        # Worker PID registered in task
+        run_id, _, _ = self.store.reserve(self.task_id, "code", "prompt", 5)
+        self.store.transition_run(run_id, to_status=RunState.STARTING, pid=9999, process_create_time=54321)
+        self.store.transition_run(run_id, to_status=RunState.INTERRUPTED, error="Tentativa de parada")
+
+        # Mock safe_process_alive raising OSError
+        with patch("ai_coordinator.storage.safe_process_alive", side_effect=OSError("Access denied during OS process query")):
+            with self.assertRaises(ActiveWorkerFencingError) as ctx_err:
+                self.store.activate_trajectory_proposal(prop.id)
+            self.assertIn("falha na consulta de status do processo no SO", str(ctx_err.exception))
+            self.assertIn("fail-closed", str(ctx_err.exception))
+
+    # -------------------------------------------------------------------------
+    # Scenario 14: Proveniência de Invariantes e Bloqueio de Inserções Não Autorizadas (3E.3)
+    # -------------------------------------------------------------------------
+    def test_phase3e3_record_invariant_provenance_enforcement(self):
+        """Validates that record_invariant_evaluation() rejects unauthentic evaluations:
+        a) Attempting to record verified=True on strict invariant without token -> InvariantVerificationError
+        b) Attempting to record verified=True with forged HMAC token -> InvariantVerificationError
+        c) Legitimate evaluation with supervisor-issued token -> succeeds.
+        """
+        self.store.create_invariant(
+            task_id=self.task_id,
+            description="Invariante de seguranca estrita",
+            invariant_id="inv_strict_provenance",
+            required=True,
+            verifier_type="trusted_test_runner",
+            require_authenticity_proof=True,
+        )
+
+        # 14a: Worker attempts to directly persist verified=True without token
+        unauth_eval = InvariantEvaluation(
+            id="eval-unauth-1",
+            task_id=self.task_id,
+            plan_revision=1,
+            invariant_id="inv_strict_provenance",
+            status=InvariantStatus.PASS,
+            evidence={"source": "trusted_test_runner", "exit_code": 0},
+            verified=True,
+            details="Tentativa de aprovacao auto-declarada",
+        )
+        with self.assertRaises(InvariantVerificationError) as ctx_no_tok:
+            self.store.record_invariant_evaluation(unauth_eval)
+        self.assertIn("sem token HMAC emitido pelo supervisor", str(ctx_no_tok.exception))
+
+        # 14b: Worker attempts to record with forged HMAC token
+        forged_eval = InvariantEvaluation(
+            id="eval-forged-1",
+            task_id=self.task_id,
+            plan_revision=1,
+            invariant_id="inv_strict_provenance",
+            status=InvariantStatus.PASS,
+            evidence={
+                "source": "trusted_test_runner",
+                "exit_code": 0,
+                "verification_token": "forged_hmac_12345",
+            },
+            verified=True,
+            details="Tentativa com token falso",
+        )
+        with self.assertRaises(InvariantVerificationError) as ctx_forged:
+            self.store.record_invariant_evaluation(forged_eval)
+        self.assertIn("token HMAC adulterado ou forjado", str(ctx_forged.exception))
+
+        # 14c: Authentic evaluation issued by supervisor succeeds
+        auth_token = self.store.issue_evidence_token(
+            task_id=self.task_id,
+            plan_revision=1,
+            invariant_id="inv_strict_provenance",
+            source="trusted_test_runner",
+            exit_code=0,
+        )
+        legit_eval = InvariantEvaluation(
+            id="eval-legit-1",
+            task_id=self.task_id,
+            plan_revision=1,
+            invariant_id="inv_strict_provenance",
+            status=InvariantStatus.PASS,
+            evidence={
+                "source": "trusted_test_runner",
+                "exit_code": 0,
+                "verification_token": auth_token,
+            },
+            verified=True,
+            details="Evidencia legitima assinada pelo supervisor",
+        )
+        recorded = self.store.record_invariant_evaluation(legit_eval)
+        self.assertTrue(recorded.verified)
+
+    # -------------------------------------------------------------------------
+    # Scenario 15: Vinculação de Hash do Artefato e Nonce no HMAC (3E.3)
+    # -------------------------------------------------------------------------
+    def test_phase3e3_hmac_artifact_hash_and_nonce_binding(self):
+        """Validates that verification token payload binds artifact_sha256 and nonce:
+        a) Token issued with specific artifact_sha256 and nonce matches when presented identically
+        b) Tampering artifact_sha256 or nonce invalidates token (UNKNOWN status)
+        c) Token cannot be replayed with different artifact or nonce.
+        """
+        oracle = InvariantOracle(run_lookup=self.store.get_run_for_task)
+        inv = InvariantDefinition(
+            id="inv_artifact_nonce",
+            task_id=self.task_id,
+            description="Vinculacao de artefato e nonce",
+            require_authenticity_proof=True,
+        )
+
+        real_run_id, _, _ = self.store.reserve(self.task_id, "code", "run prompt", 5)
+        self.store.transition_run(real_run_id, to_status=RunState.STARTING, pid=6666, process_create_time=888)
+        self.store.transition_run(real_run_id, to_status=RunState.RUNNING)
+        self.store.confirm_exit(real_run_id, exit_code=0)
+
+        art_hash = "abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890"
+        test_nonce = "nonce-eval-unique-9988"
+
+        # Issue token with artifact_sha256 and nonce
+        token = oracle.issue_evidence_token(
+            task_id=self.task_id,
+            plan_revision=1,
+            invariant_id="inv_artifact_nonce",
+            source="trusted_test_runner",
+            run_id=real_run_id,
+            artifact_sha256=art_hash,
+            exit_code=0,
+            nonce=test_nonce,
+        )
+
+        # 15a: Present matching evidence -> PASS
+        ev_ok = InvariantEvidence(
+            source="trusted_test_runner",
+            run_id=real_run_id,
+            artifact_sha256=art_hash,
+            exit_code=0,
+            nonce=test_nonce,
+            verification_token=token,
+        )
+        res_ok = oracle.evaluate(self.task_id, plan_revision=1, invariant=inv, evidence=ev_ok)
+        self.assertEqual(res_ok.status, InvariantStatus.PASS)
+        self.assertTrue(res_ok.verified)
+
+        # 15b: Tamper artifact hash -> UNKNOWN
+        ev_tampered_hash = InvariantEvidence(
+            source="trusted_test_runner",
+            run_id=real_run_id,
+            artifact_sha256="tampered_different_hash_00000000000000000000000000000000000000",
+            exit_code=0,
+            nonce=test_nonce,
+            verification_token=token,
+        )
+        res_tampered = oracle.evaluate(self.task_id, plan_revision=1, invariant=inv, evidence=ev_tampered_hash)
+        self.assertEqual(res_tampered.status, InvariantStatus.UNKNOWN)
+        self.assertFalse(res_tampered.verified)
+
+        # 15c: Tamper nonce -> UNKNOWN
+        ev_tampered_nonce = InvariantEvidence(
+            source="trusted_test_runner",
+            run_id=real_run_id,
+            artifact_sha256=art_hash,
+            exit_code=0,
+            nonce="replayed_nonce_different",
+            verification_token=token,
+        )
+        res_nonce_tampered = oracle.evaluate(self.task_id, plan_revision=1, invariant=inv, evidence=ev_tampered_nonce)
+        self.assertEqual(res_nonce_tampered.status, InvariantStatus.UNKNOWN)
+        self.assertFalse(res_nonce_tampered.verified)
 
 
 if __name__ == "__main__":
