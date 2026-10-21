@@ -17,6 +17,36 @@ import uuid
 now = lambda: dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
 
 
+def normalize_project_id(project_id: Optional[str]) -> str:
+    """Normalize a project identifier or path, resolving symlinks (e.g. /var vs /private/var on macOS)."""
+    if not project_id:
+        return ""
+    clean = str(project_id).strip()
+    if not clean:
+        return ""
+    try:
+        p = Path(clean)
+        if p.exists() or "/" in clean or "\\" in clean:
+            return str(p.resolve())
+    except (OSError, ValueError):
+        pass
+    return clean
+
+
+def project_id_candidates(project_id: Optional[str]) -> List[str]:
+    """Return all plausible representations of a project identifier (raw and resolved)."""
+    if not project_id:
+        return []
+    clean = str(project_id).strip()
+    if not clean:
+        return []
+    res = [clean]
+    norm = normalize_project_id(clean)
+    if norm and norm not in res:
+        res.append(norm)
+    return res
+
+
 class ExperienceCategory:
     ARCHITECTURE_DECISION = "architecture_decision"
     TOOL_FIX = "tool_fix"
@@ -79,6 +109,7 @@ class ExperienceRecord:
             raise ValueError("id da experiencia deve ser uma string nao vazia")
         if not self.project_id or not isinstance(self.project_id, str):
             raise ValueError("project_id deve ser uma string nao vazia")
+        self.project_id = normalize_project_id(self.project_id) or self.project_id.strip()
         if not self.category or self.category not in ExperienceCategory.ALL:
             raise ValueError(f"category '{self.category}' invalida. Opcoes: {ExperienceCategory.ALL}")
         if not self.problem_pattern or not isinstance(self.problem_pattern, str):
@@ -181,7 +212,7 @@ class ExperienceStore:
 
         rec = ExperienceRecord(
             id=rec_id,
-            project_id=str(project_id).strip(),
+            project_id=normalize_project_id(project_id) or str(project_id).strip(),
             task_id=str(task_id).strip() if task_id else None,
             category=category,
             problem_pattern=problem_pattern.strip(),
@@ -243,7 +274,9 @@ class ExperienceStore:
             if rec.visibility == ExperienceVisibility.PRIVATE_HUMAN:
                 return None
             if caller_authorized_projects is not None and rec.visibility != ExperienceVisibility.GLOBAL_AUTHORIZED:
-                if rec.project_id not in caller_authorized_projects:
+                expanded_auth = {c for ap in caller_authorized_projects for c in project_id_candidates(ap)}
+                rec_candidates = set(project_id_candidates(rec.project_id))
+                if not (rec_candidates & expanded_auth):
                     return None
         return rec
 
@@ -274,28 +307,34 @@ class ExperienceStore:
             clauses.append("visibility != ?")
             params.append(ExperienceVisibility.PRIVATE_HUMAN)
 
-        # 2. Scope filter with strict authorization bounding
+        # 2. Scope filter with strict authorization bounding and alias normalization
         if caller_role in ("worker", "agent") and caller_authorized_projects is not None:
-            if project_id and project_id not in caller_authorized_projects:
+            expanded_auth_set = {c for ap in caller_authorized_projects for c in project_id_candidates(ap)}
+            proj_candidates = project_id_candidates(project_id) if project_id else []
+
+            if project_id and not (set(proj_candidates) & expanded_auth_set):
                 clauses.append("visibility = ?")
                 params.append(ExperienceVisibility.GLOBAL_AUTHORIZED)
             else:
-                if caller_authorized_projects:
-                    placeholders = ",".join("?" for _ in caller_authorized_projects)
+                if expanded_auth_set:
+                    placeholders = ",".join("?" for _ in expanded_auth_set)
                     clauses.append(f"(project_id IN ({placeholders}) OR visibility = ?)")
-                    params.extend(caller_authorized_projects)
+                    params.extend(list(expanded_auth_set))
                     params.append(ExperienceVisibility.GLOBAL_AUTHORIZED)
                 else:
                     clauses.append("visibility = ?")
                     params.append(ExperienceVisibility.GLOBAL_AUTHORIZED)
         elif project_id:
-            clauses.append("(project_id = ? OR visibility = ?)")
-            params.append(project_id)
+            proj_candidates = project_id_candidates(project_id)
+            placeholders = ",".join("?" for _ in proj_candidates)
+            clauses.append(f"(project_id IN ({placeholders}) OR visibility = ?)")
+            params.extend(proj_candidates)
             params.append(ExperienceVisibility.GLOBAL_AUTHORIZED)
         elif caller_authorized_projects:
-            placeholders = ",".join("?" for _ in caller_authorized_projects)
+            expanded_auth_set = {c for ap in caller_authorized_projects for c in project_id_candidates(ap)}
+            placeholders = ",".join("?" for _ in expanded_auth_set)
             clauses.append(f"(project_id IN ({placeholders}) OR visibility = ?)")
-            params.extend(caller_authorized_projects)
+            params.extend(list(expanded_auth_set))
             params.append(ExperienceVisibility.GLOBAL_AUTHORIZED)
 
         # 3. Category & Outcome filters

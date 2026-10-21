@@ -16,7 +16,14 @@ from typing import Any, Dict, List, Optional, Set, Tuple, Union
 import uuid
 
 from .dag import PlanNode, PlanEdge, TrajectoryProposal, validate_dag
-from .experience import ExperienceCategory, ExperienceOutcome, ExperienceStore, ExperienceVisibility
+from .experience import (
+    ExperienceCategory,
+    ExperienceOutcome,
+    ExperienceStore,
+    ExperienceVisibility,
+    normalize_project_id,
+    project_id_candidates,
+)
 
 now = lambda: dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
 
@@ -89,6 +96,7 @@ class Insight:
             raise ValueError("id do insight deve ser uma string nao vazia")
         if not self.project_id or not isinstance(self.project_id, str):
             raise ValueError("project_id deve ser uma string nao vazia")
+        self.project_id = normalize_project_id(self.project_id) or self.project_id.strip()
         if self.type not in InsightType.ALL:
             raise ValueError(f"type '{self.type}' invalido. Opcoes: {InsightType.ALL}")
         if self.author not in ("human", "agent"):
@@ -204,6 +212,7 @@ class InsightEngine:
 
     def record_insight(self, insight: Insight) -> Insight:
         """Persist an insight into the incubator."""
+        insight.project_id = normalize_project_id(insight.project_id) or insight.project_id.strip()
         insight.validate()
         stamp = now()
         if not insight.created_at:
@@ -268,27 +277,34 @@ class InsightEngine:
             clauses.append("visibility != ?")
             params.append(ExperienceVisibility.PRIVATE_HUMAN)
 
+        # 2. Scope filter with strict authorization bounding and alias normalization
         if caller_role in ("worker", "agent") and caller_authorized_projects is not None:
-            if project_id and project_id not in caller_authorized_projects:
+            expanded_auth_set = {c for ap in caller_authorized_projects for c in project_id_candidates(ap)}
+            proj_candidates = project_id_candidates(project_id) if project_id else []
+
+            if project_id and not (set(proj_candidates) & expanded_auth_set):
                 clauses.append("visibility = ?")
                 params.append(ExperienceVisibility.GLOBAL_AUTHORIZED)
             else:
-                if caller_authorized_projects:
-                    placeholders = ",".join("?" for _ in caller_authorized_projects)
+                if expanded_auth_set:
+                    placeholders = ",".join("?" for _ in expanded_auth_set)
                     clauses.append(f"(project_id IN ({placeholders}) OR visibility = ?)")
-                    params.extend(caller_authorized_projects)
+                    params.extend(list(expanded_auth_set))
                     params.append(ExperienceVisibility.GLOBAL_AUTHORIZED)
                 else:
                     clauses.append("visibility = ?")
                     params.append(ExperienceVisibility.GLOBAL_AUTHORIZED)
         elif project_id:
-            clauses.append("(project_id = ? OR visibility = ?)")
-            params.append(project_id)
+            proj_candidates = project_id_candidates(project_id)
+            placeholders = ",".join("?" for _ in proj_candidates)
+            clauses.append(f"(project_id IN ({placeholders}) OR visibility = ?)")
+            params.extend(proj_candidates)
             params.append(ExperienceVisibility.GLOBAL_AUTHORIZED)
         elif caller_authorized_projects:
-            placeholders = ",".join("?" for _ in caller_authorized_projects)
+            expanded_auth_set = {c for ap in caller_authorized_projects for c in project_id_candidates(ap)}
+            placeholders = ",".join("?" for _ in expanded_auth_set)
             clauses.append(f"(project_id IN ({placeholders}) OR visibility = ?)")
-            params.extend(caller_authorized_projects)
+            params.extend(list(expanded_auth_set))
             params.append(ExperienceVisibility.GLOBAL_AUTHORIZED)
 
         if status:
@@ -353,8 +369,9 @@ class InsightEngine:
         if self.autonomy_level == AutonomyLevel.MANUAL:
             return []
 
+        norm_proj = normalize_project_id(project_id) or project_id.strip()
         incubating = self.list_incubator(
-            project_id=project_id,
+            project_id=norm_proj,
             status=InsightStatus.INCUBATING,
             caller_role=caller_role,
             caller_authorized_projects=caller_authorized_projects,
@@ -378,8 +395,9 @@ class InsightEngine:
         Cross-references incubating hypotheses against newly recorded successful experiences,
         changes, and solutions, returning only relevant connections with clear justifications.
         """
+        norm_proj = normalize_project_id(project_id) or project_id.strip()
         incubating = self.list_incubator(
-            project_id=project_id,
+            project_id=norm_proj,
             status=InsightStatus.INCUBATING,
             caller_role=caller_role,
             caller_authorized_projects=caller_authorized_projects,
@@ -389,7 +407,7 @@ class InsightEngine:
         for ins in incubating:
             check_since = since_timestamp or ins.created_at
             recent_exps = self.experience_store.find_experiences(
-                project_id=project_id,
+                project_id=norm_proj,
                 query_text=ins.content,
                 tags=ins.metadata.get("context_tags"),
                 outcome=ExperienceOutcome.SUCCESS,
@@ -442,8 +460,9 @@ class InsightEngine:
         
         Enriquece alternativas com experiencias anteriores registradas para o topico/tags.
         """
+        norm_proj = normalize_project_id(project_id) or project_id.strip()
         past_lessons = self.experience_store.summarize_relevant_lessons(
-            project_id=project_id,
+            project_id=norm_proj,
             problem_text=topic_or_goal,
             tags=context_tags,
             caller_role=caller_role,
@@ -513,7 +532,7 @@ class InsightEngine:
 
         insight = Insight(
             id=insight_id,
-            project_id=project_id,
+            project_id=norm_proj,
             task_id=task_id,
             type=InsightType.EXPLORATION,
             author=author,
@@ -550,14 +569,19 @@ class InsightEngine:
         - Nao presume que os dois problemas sao equivalentes.
         - Filtra estritamente registros privados antes da busca.
         """
+        src_proj = normalize_project_id(source_project_id) or source_project_id.strip()
+        tgt_proj = normalize_project_id(target_project_id) or target_project_id.strip()
         # Verify access authorization for both projects
         if caller_role in ("worker", "agent") and caller_authorized_projects is not None:
-            if source_project_id not in caller_authorized_projects or target_project_id not in caller_authorized_projects:
+            expanded_auth = {c for ap in caller_authorized_projects for c in project_id_candidates(ap)}
+            src_cands = set(project_id_candidates(src_proj))
+            tgt_cands = set(project_id_candidates(tgt_proj))
+            if not (src_cands & expanded_auth) or not (tgt_cands & expanded_auth):
                 return None
 
         # Look for successful patterns in the source project
         source_lessons = self.experience_store.find_experiences(
-            project_id=source_project_id,
+            project_id=src_proj,
             query_text=topic,
             outcome=ExperienceOutcome.SUCCESS,
             caller_role=caller_role,
@@ -571,8 +595,8 @@ class InsightEngine:
         insight_id = f"conn-{uuid.uuid4().hex[:10]}"
 
         content = (
-            f"Oportunidade de conexao cruzada entre projetos: uma solucao aplicada em '{source_project_id}' "
-            f"para '{primary.problem_pattern[:80]}' pode inspirar abordagem em '{target_project_id}' para '{topic[:80]}'."
+            f"Oportunidade de conexao cruzada entre projetos: uma solucao aplicada em '{src_proj}' "
+            f"para '{primary.problem_pattern[:80]}' pode inspirar abordagem em '{tgt_proj}' para '{topic[:80]}'."
         )
 
         alternatives = [
@@ -603,7 +627,7 @@ class InsightEngine:
 
         insight = Insight(
             id=insight_id,
-            project_id=target_project_id,
+            project_id=tgt_proj,
             task_id=None,
             type=InsightType.CROSS_PROJECT_CONNECTION,
             author=author,
@@ -612,7 +636,7 @@ class InsightEngine:
             status=InsightStatus.INCUBATING,
             content=content,
             alternatives=alternatives,
-            suggested_first_step=f"Avaliar aplicabilidade da solucao '{primary.id}' em '{target_project_id}' em contexto seguro.",
+            suggested_first_step=f"Avaliar aplicabilidade da solucao '{primary.id}' em '{tgt_proj}' em contexto seguro.",
             related_tasks=[],
             confidence=0.75,
             presentation=InsightPresentation.CONTEXTUAL,
@@ -634,10 +658,11 @@ class InsightEngine:
         caller_role: str = "agent",
     ) -> Insight:
         """Modalidade Reavaliar: Revisita decisoes anteriores diante de falhas ou novos dados."""
+        norm_proj = normalize_project_id(project_id) or project_id.strip()
         # Query past error patterns and remedies
         query = f"{current_issue} {observed_error or ''}"
         remedies = self.experience_store.find_experiences(
-            project_id=project_id,
+            project_id=norm_proj,
             query_text=query,
             category=ExperienceCategory.TOOL_FIX,
             outcome=ExperienceOutcome.SUCCESS,
@@ -683,7 +708,7 @@ class InsightEngine:
 
         insight = Insight(
             id=insight_id,
-            project_id=project_id,
+            project_id=norm_proj,
             task_id=task_id,
             type=InsightType.RE_EVALUATION,
             author="agent",

@@ -65,6 +65,8 @@ from .experience import (
     ExperienceOutcome,
     ExperienceVisibility,
     ExperienceAuthor,
+    normalize_project_id,
+    project_id_candidates,
 )
 from .insights import (
     Insight,
@@ -1052,7 +1054,7 @@ class Store:
             self.reconcile(task_id=task_id)
             task_data = self.task(task_id)
             contextual = self.insight_engine.get_contextual_insights(
-                project_id=task_data["project"],
+                project_id=normalize_project_id(task_data["project"]) or task_data["project"],
                 task_id=task_id,
                 caller_role="agent",
             )
@@ -1551,7 +1553,7 @@ class Store:
                 for inv in req_invariants:
                     inv_id = inv["id"]
                     eval_row = self.db.execute(
-                        "SELECT status, verified FROM invariant_evaluations WHERE task_id=? AND plan_revision=? AND invariant_id=? ORDER BY evaluated_at DESC LIMIT 1",
+                        "SELECT status, verified FROM invariant_evaluations WHERE task_id=? AND plan_revision=? AND invariant_id=? ORDER BY evaluated_at DESC, rowid DESC LIMIT 1",
                         (task_id, active_rev_num, inv_id),
                     ).fetchone()
                     if not eval_row:
@@ -1869,12 +1871,12 @@ class Store:
         task_id = validate_id(task_id)
         if plan_revision is not None:
             rows = self.db.execute(
-                "SELECT * FROM invariant_evaluations WHERE task_id=? AND plan_revision=? ORDER BY evaluated_at ASC",
+                "SELECT * FROM invariant_evaluations WHERE task_id=? AND plan_revision=? ORDER BY evaluated_at ASC, rowid ASC",
                 (task_id, plan_revision),
             ).fetchall()
         else:
             rows = self.db.execute(
-                "SELECT * FROM invariant_evaluations WHERE task_id=? ORDER BY evaluated_at ASC",
+                "SELECT * FROM invariant_evaluations WHERE task_id=? ORDER BY evaluated_at ASC, rowid ASC",
                 (task_id,),
             ).fetchall()
 

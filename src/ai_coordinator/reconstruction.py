@@ -304,7 +304,7 @@ class TrajectoryReconstructor:
             for inv in req_invariants:
                 inv_id = inv["id"]
                 eval_row = self.store.db.execute(
-                    "SELECT status, verified FROM invariant_evaluations WHERE task_id=? AND plan_revision=? AND invariant_id=? ORDER BY evaluated_at DESC LIMIT 1",
+                    "SELECT status, verified FROM invariant_evaluations WHERE task_id=? AND plan_revision=? AND invariant_id=? ORDER BY evaluated_at DESC, rowid DESC LIMIT 1",
                     (task_id, base_revision, inv_id),
                 ).fetchone()
                 if not eval_row or eval_row["status"] not in (InvariantStatus.PASS, InvariantStatus.NOT_APPLICABLE) or not eval_row["verified"]:

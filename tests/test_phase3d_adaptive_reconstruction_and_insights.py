@@ -20,9 +20,12 @@ from ai_coordinator import (
     ProposalNotApprovedError,
     InvariantDefinition,
     InvariantEvidence,
+    InvariantEvaluation,
     InvariantOracle,
     InvariantStatus,
     compute_sha256,
+    normalize_project_id,
+    project_id_candidates,
     ResourceLedger,
     ResourceRecord,
     ResourceState,
@@ -880,6 +883,182 @@ class Phase3DAdaptiveReconstructionAndInsightsTests(unittest.TestCase):
                 id="e-inv2", project_id="p", task_id=None, category=ExperienceCategory.TOOL_FIX,
                 problem_pattern="prob", solution_pattern="sol", confidence="ultra_high"
             ).validate()
+
+    # -------------------------------------------------------------------------
+    # Scenario 22: Invariant Oracle tie-breaking with rowid DESC on equal timestamps
+    # -------------------------------------------------------------------------
+    def test_invariant_oracle_tie_breaking_with_rowid_desc(self):
+        inv = self.store.create_invariant(
+            task_id=self.task_id,
+            description="Tie test",
+            required=True,
+            invariant_id="inv-tie",
+        )
+
+        fixed_time = "2026-10-21T12:00:00.000000Z"
+        # First evaluation: FAIL at fixed_time
+        eval_fail = InvariantEvaluation(
+            id="eval-fail-1",
+            task_id=self.task_id,
+            plan_revision=1,
+            invariant_id="inv-tie",
+            status=InvariantStatus.FAIL,
+            evaluated_at=fixed_time,
+            verified=True,
+            details="Initial failure",
+        )
+        self.store.record_invariant_evaluation(eval_fail)
+
+        # Second evaluation inserted later: PASS at the EXACT SAME timestamp
+        eval_pass = InvariantEvaluation(
+            id="eval-pass-2",
+            task_id=self.task_id,
+            plan_revision=1,
+            invariant_id="inv-tie",
+            status=InvariantStatus.PASS,
+            evaluated_at=fixed_time,
+            verified=True,
+            details="Remediated pass",
+        )
+        self.store.record_invariant_evaluation(eval_pass)
+
+        # 1. get_invariant_evaluations must order by evaluated_at ASC, rowid ASC
+        evals = self.store.get_invariant_evaluations(self.task_id, plan_revision=1)
+        self.assertEqual(len(evals), 2)
+        self.assertEqual(evals[0].id, "eval-fail-1")
+        self.assertEqual(evals[1].id, "eval-pass-2")
+
+        # 2. evaluate_revision iterates ASC and keeps the latest rowid: overall status is PASS
+        oracle = InvariantOracle()
+        report = oracle.evaluate_revision(self.task_id, 1, [inv], evals)
+        self.assertEqual(report.status, InvariantStatus.PASS)
+        self.assertTrue(report.all_satisfied)
+
+        # 3. Direct DB query with rowid DESC must select eval-pass-2
+        row = self.store.db.execute(
+            "SELECT id, status, verified FROM invariant_evaluations WHERE task_id=? AND plan_revision=? AND invariant_id=? ORDER BY evaluated_at DESC, rowid DESC LIMIT 1",
+            (self.task_id, 1, "inv-tie"),
+        ).fetchone()
+        self.assertIsNotNone(row)
+        self.assertEqual(row["id"], "eval-pass-2")
+        self.assertEqual(row["status"], InvariantStatus.PASS)
+
+    # -------------------------------------------------------------------------
+    # Scenario 23: Contextual insights and experience path alias normalization
+    # -------------------------------------------------------------------------
+    def test_contextual_insights_and_experience_path_alias_normalization(self):
+        engine = self.store.insight_engine
+        proj_canonical = str(self.proj_dir.resolve())
+        # Simulate an alias by using a relative path or trailing separator
+        proj_alias = str(self.proj_dir)
+
+        # Check normalization helpers
+        cands_canonical = project_id_candidates(proj_canonical)
+        cands_alias = project_id_candidates(proj_alias)
+        self.assertIn(proj_canonical, cands_canonical)
+        self.assertIn(proj_canonical, cands_alias)
+
+        # 1. Record an insight using the alias path
+        ins = engine.explore(
+            project_id=proj_alias,
+            topic_or_goal="Normalizacao de rotas multiplataforma",
+            task_id=self.task_id,
+            presentation=InsightPresentation.CONTEXTUAL,
+        )
+        # Must be normalized on record
+        self.assertEqual(ins.project_id, normalize_project_id(proj_alias))
+
+        # 2. Retrieve contextual insights using the canonical resolved path
+        engine.set_autonomy_level("contextual")
+        results = self.store.get_contextual_insights(proj_canonical, task_id=self.task_id)
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0].id, ins.id)
+
+        # 3. Store.resume() retrieves contextual insights even if task uses canonical and query uses alias
+        resume_res = self.store.resume(self.task_id)
+        self.assertIn("contextual_insights", resume_res)
+        self.assertEqual(len(resume_res["contextual_insights"]), 1)
+        self.assertEqual(resume_res["contextual_insights"][0]["id"], ins.id)
+
+        # 4. Cross-project connection with alias paths
+        target_dir = Path(self.tmp.name) / "target_proj"
+        target_dir.mkdir(parents=True, exist_ok=True)
+        target_canonical = str(target_dir.resolve())
+        target_alias = str(target_dir)
+
+        # Record a successful experience in source project
+        self.store.record_experience(
+            project_id=proj_alias,
+            problem_pattern="Normalizacao de caminhos em runners CI",
+            solution_pattern="Utilizar Path.resolve() com project_id_candidates",
+            outcome=ExperienceOutcome.SUCCESS,
+        )
+
+        # Agent authorized with alias paths must be accepted for connect
+        conn = engine.connect(
+            source_project_id=proj_alias,
+            target_project_id=target_alias,
+            topic="Normalizacao de caminhos em runners CI",
+            caller_role="agent",
+            caller_authorized_projects=[proj_canonical, target_canonical],
+        )
+        self.assertIsNotNone(conn)
+        self.assertEqual(conn.project_id, target_canonical)
+
+    # -------------------------------------------------------------------------
+    # Scenario 24: Privacy fence preservation under alias normalization
+    # -------------------------------------------------------------------------
+    def test_privacy_fence_preservation_under_alias_normalization(self):
+        engine = self.store.insight_engine
+        proj_canonical = str(self.proj_dir.resolve())
+        proj_alias = str(self.proj_dir)
+
+        # 1. Private human insight must NEVER be visible to agent even via alias
+        private_ins = Insight(
+            id="ins-priv-alias-1",
+            project_id=proj_alias,
+            task_id=self.task_id,
+            type=InsightType.HYPOTHESIS,
+            author="human",
+            origin="notion",
+            visibility=ExperienceVisibility.PRIVATE_HUMAN,
+            content="Anotacao privada confidencial do usuario",
+            presentation=InsightPresentation.CONTEXTUAL,
+        )
+        engine.record_insight(private_ins)
+
+        # Query by agent using canonical path
+        agent_results = engine.list_incubator(
+            project_id=proj_canonical,
+            caller_role="agent",
+            caller_authorized_projects=[proj_canonical],
+        )
+        for r in agent_results:
+            self.assertNotEqual(r.id, "ins-priv-alias-1")
+
+        # 2. Unauthorized agent cannot access project data even with alias variations
+        unauth_results = engine.list_incubator(
+            project_id=proj_alias,
+            caller_role="agent",
+            caller_authorized_projects=["unrelated-project-id"],
+        )
+        self.assertEqual(len(unauth_results), 0)
+
+        # 3. Private experience must NEVER be returned to agent
+        self.store.record_experience(
+            project_id=proj_alias,
+            problem_pattern="Segredo industrial do usuario",
+            solution_pattern="Guardar em cofre local",
+            author=ExperienceAuthor.HUMAN,
+            visibility=ExperienceVisibility.PRIVATE_HUMAN,
+        )
+        found = self.store.find_experiences(
+            project_id=proj_canonical,
+            query_text="Segredo industrial",
+            caller_role="agent",
+            caller_authorized_projects=[proj_canonical],
+        )
+        self.assertEqual(len(found), 0)
 
 
 if __name__ == "__main__":

@@ -103,6 +103,8 @@ from .experience import (
     ExperienceAuthor,
     ExperienceRecord,
     ExperienceStore,
+    normalize_project_id,
+    project_id_candidates,
 )
 from .insights import (
     InsightType,
@@ -209,6 +211,8 @@ __all__ = [
     "ExperienceAuthor",
     "ExperienceRecord",
     "ExperienceStore",
+    "normalize_project_id",
+    "project_id_candidates",
     "InsightType",
     "InsightStatus",
     "InsightPresentation",

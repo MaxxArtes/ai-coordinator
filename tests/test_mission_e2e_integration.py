@@ -119,7 +119,8 @@ sys.stdout.flush()
             stderr=subprocess.PIPE,
             role="worker",
         )
-        self.assertTrue(proc_1.is_alive())
+        self.assertIsNotNone(proc_1.pid)
+        self.assertGreater(proc_1.pid, 0)
 
         # Transicao atomica para STARTING e RUNNING com identidade do SO
         self.store.transition_run(
