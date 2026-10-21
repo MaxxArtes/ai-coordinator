@@ -260,14 +260,24 @@ class ResourceLedger:
                 except Exception:
                     captured_pre_hash = None
             if action == ResourceAction.MODIFY and os.path.isfile(canonical_id):
-                if "backup_path" not in metadata and "backup_content" not in metadata and self.backup_dir:
+                if "backup_path" not in metadata and "backup_content" not in metadata:
+                    if not self.backup_dir:
+                        raise ResourceLedgerError(
+                            f"Falha preventiva: backup_dir nao configurado no ResourceLedger para modificacao de '{canonical_id}'. "
+                            "Operacao abortada para garantir compensabilidade."
+                        )
                     try:
                         self.backup_dir.mkdir(parents=True, exist_ok=True)
                         b_file = self.backup_dir / f"bak_{task_id}_{idempotency_key}_{uuid.uuid4().hex[:8]}.bak"
                         shutil.copy2(canonical_id, b_file)
+                        if not os.path.isfile(b_file) or (captured_pre_hash and compute_sha256(b_file) != captured_pre_hash):
+                            raise ResourceLedgerError("Backup fisico criado divergiu do hash original do arquivo")
                         metadata["backup_path"] = str(b_file)
-                    except Exception:
-                        pass
+                    except Exception as exc:
+                        raise ResourceLedgerError(
+                            f"Falha preventiva ao criar backup fisico obrigatorio de '{canonical_id}': {exc}. "
+                            "Operacao abortada para garantir compensabilidade."
+                        )
 
         # External irreversible resources automatically require explicit authorization
         if resource_type == ResourceType.EXTERNAL and not compensable:

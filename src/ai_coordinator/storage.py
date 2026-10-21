@@ -4,10 +4,13 @@ from __future__ import annotations
 
 import contextlib
 import datetime as dt
+import hashlib
+import hmac
 import json
 import os
 from pathlib import Path
 import re
+import secrets
 import sqlite3
 import time
 from typing import Any, Dict, List, Optional, Set, Tuple, Union
@@ -241,7 +244,34 @@ class Store:
         self.experience_store = ExperienceStore(self.db)
         self.insight_engine = InsightEngine(self.db, self.experience_store)
         self.reconstructor = TrajectoryReconstructor(self)
-        self.oracle = InvariantOracle(run_lookup=self.get_run_for_task)
+        self.supervisor_secret = secrets.token_bytes(32)
+        self.admin_token = secrets.token_hex(32)
+        self.oracle = InvariantOracle(run_lookup=self.get_run_for_task, secret=self.supervisor_secret)
+
+    def issue_admin_override_token(self, justification: str) -> str:
+        """Issue an authentic supervisor override token for audited administrative operations."""
+        if not justification or not justification.strip():
+            raise ValueError("Justificativa formal obrigatoria para emissao de token administrativo")
+        return self.admin_token
+
+    def issue_evidence_token(
+        self,
+        task_id: str,
+        plan_revision: int,
+        invariant_id: str,
+        source: str,
+        run_id: Optional[str] = None,
+        exit_code: int = 0,
+    ) -> str:
+        """Issue an authentic HMAC-SHA256 verification token signed by the supervisor secret."""
+        return self.oracle.issue_evidence_token(
+            task_id=task_id,
+            plan_revision=plan_revision,
+            invariant_id=invariant_id,
+            source=source,
+            run_id=run_id,
+            exit_code=exit_code,
+        )
 
     def get_run_for_task(self, task_id: str, run_id: str) -> Optional[Dict[str, Any]]:
         """Lookup execution run record for a specific task."""
@@ -414,6 +444,7 @@ class Store:
             required INTEGER NOT NULL DEFAULT 1,
             verifier_type TEXT NOT NULL,
             target_artifact TEXT,
+            require_authenticity_proof INTEGER NOT NULL DEFAULT 0,
             created_at TEXT NOT NULL
           );
 
@@ -559,6 +590,15 @@ class Store:
                 except sqlite3.OperationalError as exc:
                     if "duplicate column" not in str(exc).lower():
                         raise
+        self.db.commit()
+
+        inv_columns = {r[1] for r in self.db.execute("PRAGMA table_info(invariants)")}
+        if "require_authenticity_proof" not in inv_columns:
+            try:
+                self.db.execute("ALTER TABLE invariants ADD COLUMN require_authenticity_proof INTEGER NOT NULL DEFAULT 0")
+            except sqlite3.OperationalError as exc:
+                if "duplicate column" not in str(exc).lower():
+                    raise
         self.db.commit()
 
     @contextlib.contextmanager
@@ -1503,15 +1543,20 @@ class Store:
         enforce_clean_resources: bool = True,
         caller_role: Optional[str] = None,
         admin_override_reason: Optional[str] = None,
+        admin_token: Optional[str] = None,
     ) -> PlanRevision:
         """Safely activate a trajectory proposal, enforcing approval, optimistic fencing, worker isolation, clean resources, and invariant verification."""
         with self.transaction():
-            # Administrative override check: disabling safety fencing requires explicit admin role and justification
+            # Administrative override check: disabling safety fencing requires authentic supervisor admin token
             if not require_approval or not enforce_invariants or not enforce_clean_resources:
-                if caller_role not in ("admin", "operator") or not admin_override_reason or not admin_override_reason.strip():
+                if not admin_token or not hmac.compare_digest(str(admin_token).strip(), self.admin_token):
                     raise UnauthorizedOverrideError(
-                        "Desativar barreiras de seguranca de ativacao (require_approval, enforce_invariants ou enforce_clean_resources) "
-                        "requer papel administrativo ('admin' ou 'operator') e justificativa formal obrigatoria ('admin_override_reason')."
+                        "Desativacao de barreiras de seguranca de ativacao rejeitada: token administrativo de supervisor ausente ou invalido. "
+                        "A autodeclaracao de 'caller_role' nao confere autoridade administrativa."
+                    )
+                if not admin_override_reason or not admin_override_reason.strip():
+                    raise UnauthorizedOverrideError(
+                        "Desativacao de barreiras de seguranca de ativacao rejeitada: justificativa formal obrigatoria ausente ('admin_override_reason')."
                     )
 
             proposal = self.get_trajectory_proposal(proposal_id)
@@ -1545,7 +1590,7 @@ class Store:
             blocking_states = ACTIVE_RUN_STATES | UNCERTAIN_RUN_STATES
             placeholders = ",".join("?" for _ in blocking_states)
             lingering_runs = self.db.execute(
-                f"SELECT id, status, pid FROM runs WHERE task_id=? AND status IN ({placeholders})",
+                f"SELECT id, status, pid, process_create_time FROM runs WHERE task_id=? AND status IN ({placeholders})",
                 [task_id] + list(blocking_states)
             ).fetchall()
 
@@ -1555,6 +1600,27 @@ class Store:
                     f"Ativacao bloqueada por seguranca de processos: existem {len(lingering_runs)} worker(s) ativos ou com identidade incerta "
                     f"[{', '.join(running_ids)}]. Encerre ou reconcilie os processos antes de ativar nova trajetoria."
                 )
+
+            # 3b. Operating System Process Neutralization Check:
+            # Verify that no worker processes with PIDs belonging to this task are still running in the OS
+            runs_with_pids = self.db.execute(
+                "SELECT id, status, pid, process_create_time FROM runs WHERE task_id=? AND pid IS NOT NULL AND pid > 0",
+                (task_id,)
+            ).fetchall()
+            for r in runs_with_pids:
+                pid = r["pid"]
+                c_time = r["process_create_time"]
+                is_alive = False
+                try:
+                    is_alive = safe_process_alive(pid, expected_create_time_ns=c_time)
+                except Exception:
+                    is_alive = False
+                if is_alive:
+                    raise ActiveWorkerFencingError(
+                        f"Ativacao bloqueada por presenca de processo ativo no SO: o worker run '{r['id']}' "
+                        f"(PID {pid}, status={r['status']}) ainda esta ativo no sistema operacional. "
+                        "Neutralize e encerre o processo fisicamente antes de ativar nova trajetoria."
+                    )
 
             # 4. Resource Ledger Cleanliness Fencing (Scenario 12)
             if enforce_clean_resources:
@@ -1571,13 +1637,13 @@ class Store:
             # 5. Invariant Oracle Verification Fencing (Scenario 12)
             if enforce_invariants:
                 req_invariants = self.db.execute(
-                    "SELECT id, description FROM invariants WHERE task_id=? AND required=1",
+                    "SELECT id, description, verifier_type, target_artifact FROM invariants WHERE task_id=? AND required=1",
                     (task_id,),
                 ).fetchall()
                 for inv in req_invariants:
                     inv_id = inv["id"]
                     eval_row = self.db.execute(
-                        "SELECT status, verified FROM invariant_evaluations WHERE task_id=? AND plan_revision=? AND invariant_id=? ORDER BY evaluated_at DESC, rowid DESC LIMIT 1",
+                        "SELECT status, verified, evidence FROM invariant_evaluations WHERE task_id=? AND plan_revision=? AND invariant_id=? ORDER BY evaluated_at DESC, rowid DESC LIMIT 1",
                         (task_id, active_rev_num, inv_id),
                     ).fetchone()
                     if not eval_row:
@@ -1590,6 +1656,26 @@ class Store:
                             f"Ativacao bloqueada por oraculo de invariantes: invariante obrigatorio '{inv_id}' "
                             f"possui status '{eval_row['status']}' (verificado={bool(eval_row['verified'])})."
                         )
+
+                    # Revalidate physical artifact integrity at activation time
+                    ev_json = eval_row["evidence"]
+                    ev_dict = json.loads(ev_json) if ev_json else {}
+                    target_artifact = ev_dict.get("artifact_path") or inv["target_artifact"]
+                    expected_sha = ev_dict.get("artifact_sha256")
+                    if target_artifact:
+                        p_art = Path(target_artifact)
+                        if not p_art.is_file():
+                            raise InvariantVerificationError(
+                                f"Ativacao bloqueada por integridade de artefatos: artefato verificado '{target_artifact}' "
+                                "nao existe mais no disco."
+                            )
+                        if expected_sha:
+                            curr_sha = compute_sha256(p_art)
+                            if curr_sha.lower() != expected_sha.strip().lower():
+                                raise InvariantVerificationError(
+                                    f"Ativacao bloqueada: integridade do artefato '{target_artifact}' foi violada apos a avaliacao. "
+                                    f"Hash esperado {expected_sha}, hash atual no disco {curr_sha}."
+                                )
 
             # 6. Create the new immutable plan revision
             new_rev = self.create_plan_revision(
@@ -1808,6 +1894,7 @@ class Store:
         required: bool = True,
         verifier_type: str = "trusted_test_runner",
         target_artifact: Optional[str] = None,
+        require_authenticity_proof: bool = False,
         invariant_id: Optional[str] = None,
     ) -> InvariantDefinition:
         """Register an invariant constraint for a task."""
@@ -1818,8 +1905,8 @@ class Store:
             self.db.execute(
                 """
                 INSERT OR REPLACE INTO invariants (
-                    id, task_id, description, required, verifier_type, target_artifact, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                    id, task_id, description, required, verifier_type, target_artifact, require_authenticity_proof, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     inv_id,
@@ -1828,6 +1915,7 @@ class Store:
                     1 if required else 0,
                     verifier_type,
                     target_artifact,
+                    1 if require_authenticity_proof else 0,
                     stamp,
                 ),
             )
@@ -1838,6 +1926,7 @@ class Store:
             required=required,
             verifier_type=verifier_type,
             target_artifact=target_artifact,
+            require_authenticity_proof=require_authenticity_proof,
             created_at=stamp,
         )
 
@@ -1858,6 +1947,7 @@ class Store:
                 required=bool(r["required"]),
                 verifier_type=r["verifier_type"],
                 target_artifact=r["target_artifact"],
+                require_authenticity_proof=bool(r["require_authenticity_proof"]) if "require_authenticity_proof" in r.keys() else False,
                 created_at=r["created_at"],
             )
             for r in rows

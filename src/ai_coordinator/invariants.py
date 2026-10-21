@@ -5,10 +5,12 @@ import dataclasses
 from dataclasses import dataclass, field
 import datetime as dt
 import hashlib
+import hmac
 import json
 import os
 from pathlib import Path
 import re
+import secrets
 from typing import Any, Callable, Dict, List, Optional, Set, Union
 import uuid
 
@@ -73,12 +75,16 @@ def generate_verification_token(
     plan_revision: int,
     invariant_id: str,
     source: str,
+    run_id: Optional[str] = None,
     exit_code: int = 0,
-    secret: str = "ai_coordinator_evidence_key",
+    secret: Optional[Union[str, bytes]] = None,
 ) -> str:
-    """Generate deterministic SHA-256 HMAC-like verification token for authentic evidence."""
-    payload = f"{task_id}:{plan_revision}:{invariant_id}:{source}:{exit_code}:{secret}"
-    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+    """Generate deterministic HMAC-SHA256 verification token bound to task, revision, invariant, source, run_id, and exit_code."""
+    if secret is None:
+        raise ValueError("Chave secreta obrigatoria para geracao de token de autenticidade (HMAC-SHA256)")
+    key = secret.encode("utf-8") if isinstance(secret, str) else bytes(secret)
+    payload = f"{task_id}:{plan_revision}:{invariant_id}:{source}:{run_id or ''}:{exit_code}".encode("utf-8")
+    return hmac.new(key, payload, hashlib.sha256).hexdigest()
 
 
 @dataclass(frozen=True)
@@ -218,11 +224,31 @@ class InvariantOracle:
         self,
         trusted_verifiers: Optional[Set[str]] = None,
         run_lookup: Optional[Callable[[str, str], Optional[Dict[str, Any]]]] = None,
-        secret: str = "ai_coordinator_evidence_key",
+        secret: Optional[Union[str, bytes]] = None,
     ) -> None:
         self.trusted_verifiers = set(trusted_verifiers) if trusted_verifiers else set(DEFAULT_TRUSTED_VERIFIERS)
         self.run_lookup = run_lookup
-        self.secret = secret
+        self.secret = secret if secret is not None else secrets.token_bytes(32)
+
+    def issue_evidence_token(
+        self,
+        task_id: str,
+        plan_revision: int,
+        invariant_id: str,
+        source: str,
+        run_id: Optional[str] = None,
+        exit_code: int = 0,
+    ) -> str:
+        """Issue an authentic HMAC-SHA256 verification token using the supervisor's private key."""
+        return generate_verification_token(
+            task_id=task_id,
+            plan_revision=plan_revision,
+            invariant_id=invariant_id,
+            source=source,
+            run_id=run_id,
+            exit_code=exit_code,
+            secret=self.secret,
+        )
 
     def register_trusted_verifier(self, verifier_name: str) -> None:
         """Register a new trusted verifier identity."""
@@ -308,16 +334,18 @@ class InvariantOracle:
 
         # 4.1 Authenticity verification: check verification token if supplied
         token = ev_dict.get("verification_token")
+        token_valid = False
         if token is not None:
             expected_token = generate_verification_token(
                 task_id=task_id,
                 plan_revision=plan_revision,
                 invariant_id=invariant.id,
                 source=source,
+                run_id=ev_dict.get("run_id"),
                 exit_code=int(ev_dict.get("exit_code", 0)),
                 secret=self.secret,
             )
-            if str(token).strip() != expected_token:
+            if not hmac.compare_digest(str(token).strip(), expected_token):
                 return InvariantEvaluation(
                     id=eval_id,
                     task_id=task_id,
@@ -326,8 +354,9 @@ class InvariantOracle:
                     status=InvariantStatus.UNKNOWN,
                     evidence=ev_dict,
                     verified=False,
-                    details="Falha de autenticidade: token criptografico de verificacao invalido ou violado",
+                    details="Falha de autenticidade: token criptografico HMAC-SHA256 invalido, forjado ou com parametros divergentes",
                 )
+            token_valid = True
 
         # 4.2 Authenticity verification: check run_id against execution record if lookup available
         run_id = ev_dict.get("run_id")
@@ -372,9 +401,13 @@ class InvariantOracle:
 
         # 4.3 Mandatory authenticity proof if required by invariant definition
         if getattr(invariant, "require_authenticity_proof", False):
-            has_valid_token = token is not None
-            has_valid_artifact = bool(ev_dict.get("artifact_path") or invariant.target_artifact)
-            if not (has_valid_token or run_verified or has_valid_artifact):
+            # Strict mode: requires BOTH valid HMAC token AND verified execution record in task!
+            if not (token_valid and run_verified):
+                missing_items = []
+                if not token_valid:
+                    missing_items.append("token HMAC-SHA256 valido do supervisor")
+                if not run_verified:
+                    missing_items.append("execucao comprovada no registro da tarefa (run_id concluido)")
                 return InvariantEvaluation(
                     id=eval_id,
                     task_id=task_id,
@@ -383,7 +416,7 @@ class InvariantOracle:
                     status=InvariantStatus.UNKNOWN,
                     evidence=ev_dict,
                     verified=False,
-                    details="Evidencia rejeitada: invariante exige comprovacao formal de autenticidade (token criptografico, registro de run_id ou integridade de artefato)",
+                    details=f"Evidencia rejeitada por falta de comprovacao formal vinculada: pendente {', '.join(missing_items)}",
                 )
 
         # 5. Trusted verifier evaluation

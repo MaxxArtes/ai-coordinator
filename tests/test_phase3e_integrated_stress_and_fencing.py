@@ -24,6 +24,7 @@ from ai_coordinator import (
     ActiveWorkerFencingError,
     ProposalNotApprovedError,
     UnauthorizedOverrideError,
+    InvariantVerificationError,
     PlanNode,
     PlanEdge,
     PlanRevision,
@@ -529,14 +530,15 @@ class Phase3E1IntegratedStressAndFencingTests(unittest.TestCase):
         self.assertEqual(rev3.revision, 3)
 
     # -------------------------------------------------------------------------
-    # Scenario 6: Autenticidade das Evidências e Bloqueio de Falsificação
+    # Scenario 6: Autenticidade das Evidências e Bloqueio de Falsificação (3E.2)
     # -------------------------------------------------------------------------
     def test_evidence_authenticity_and_forgery_prevention(self):
         """Validates that:
         a) Unauthenticated textual claim with source='trusted_test_runner' is rejected when authenticity proof required,
-        b) Forged verification token is rejected as UNKNOWN,
+        b) Forged verification token or forged secret key is rejected as UNKNOWN,
         c) Non-existent or failed run_id is rejected as UNKNOWN,
-        d) Authentic token and verified run record are accepted as PASS.
+        d) Token without verified run_id in strict mode is rejected as UNKNOWN,
+        e) Authentic token bound to task/revision/run_id + verified completed run are accepted as PASS.
         """
         oracle = InvariantOracle(run_lookup=self.store.get_run_for_task)
 
@@ -560,7 +562,7 @@ class Phase3E1IntegratedStressAndFencingTests(unittest.TestCase):
         )
         self.assertEqual(res_unverified.status, InvariantStatus.UNKNOWN)
         self.assertFalse(res_unverified.verified)
-        self.assertIn("exige comprovacao formal de autenticidade", res_unverified.details)
+        self.assertIn("Evidencia rejeitada por falta de comprovacao formal vinculada", res_unverified.details)
 
         # 6b: Forged verification token -> UNKNOWN
         forged_ev = InvariantEvidence(
@@ -576,30 +578,30 @@ class Phase3E1IntegratedStressAndFencingTests(unittest.TestCase):
         )
         self.assertEqual(res_forged.status, InvariantStatus.UNKNOWN)
         self.assertFalse(res_forged.verified)
-        self.assertIn("token criptografico de verificacao invalido", res_forged.details)
+        self.assertIn("token criptografico HMAC-SHA256 invalido", res_forged.details)
 
-        # 6c: Valid cryptographic verification token -> PASS
-        valid_token = generate_verification_token(
+        # 6c: Forged token calculated with an untrusted key (simulating rogue worker trying to forge HMAC) -> UNKNOWN
+        forged_key_token = generate_verification_token(
             task_id=self.task_id,
             plan_revision=1,
             invariant_id="strict_security",
             source="trusted_test_runner",
             exit_code=0,
-            secret=oracle.secret,
+            secret="untrusted_attacker_secret",
         )
-        authentic_token_ev = InvariantEvidence(
+        forged_key_ev = InvariantEvidence(
             source="trusted_test_runner",
             exit_code=0,
-            verification_token=valid_token,
+            verification_token=forged_key_token,
         )
-        res_token_pass = oracle.evaluate(
+        res_forged_key = oracle.evaluate(
             task_id=self.task_id,
             plan_revision=1,
             invariant=inv_strict,
-            evidence=authentic_token_ev,
+            evidence=forged_key_ev,
         )
-        self.assertEqual(res_token_pass.status, InvariantStatus.PASS)
-        self.assertTrue(res_token_pass.verified)
+        self.assertEqual(res_forged_key.status, InvariantStatus.UNKNOWN)
+        self.assertFalse(res_forged_key.verified)
 
         # 6d: Run linkage: claiming a non-existent run_id -> UNKNOWN
         fake_run_ev = InvariantEvidence(
@@ -616,16 +618,49 @@ class Phase3E1IntegratedStressAndFencingTests(unittest.TestCase):
         self.assertEqual(res_fake_run.status, InvariantStatus.UNKNOWN)
         self.assertIn("nao existe no registro de execucoes", res_fake_run.details)
 
-        # 6e: Run linkage: genuine completed run with matching exit_code 0 -> PASS
+        # 6e: Valid HMAC token but missing verified completed run in strict mode -> UNKNOWN
+        token_no_run = oracle.issue_evidence_token(
+            task_id=self.task_id,
+            plan_revision=1,
+            invariant_id="strict_security",
+            source="trusted_test_runner",
+            run_id=None,
+            exit_code=0,
+        )
+        ev_no_run = InvariantEvidence(
+            source="trusted_test_runner",
+            exit_code=0,
+            verification_token=token_no_run,
+        )
+        res_no_run = oracle.evaluate(
+            task_id=self.task_id,
+            plan_revision=1,
+            invariant=inv_strict,
+            evidence=ev_no_run,
+        )
+        self.assertEqual(res_no_run.status, InvariantStatus.UNKNOWN)
+        self.assertFalse(res_no_run.verified)
+        self.assertIn("execucao comprovada no registro da tarefa", res_no_run.details)
+
+        # 6f: Both authentic HMAC token bound to run_id AND verified completed run -> PASS
         real_run_id, _, _ = self.store.reserve(self.task_id, "code", "run prompt", 5)
         self.store.transition_run(real_run_id, to_status=RunState.STARTING, pid=5555, process_create_time=777)
         self.store.transition_run(real_run_id, to_status=RunState.RUNNING)
         self.store.confirm_exit(real_run_id, exit_code=0)
 
+        valid_token_with_run = oracle.issue_evidence_token(
+            task_id=self.task_id,
+            plan_revision=1,
+            invariant_id="strict_security",
+            source="trusted_test_runner",
+            run_id=real_run_id,
+            exit_code=0,
+        )
         real_run_ev = InvariantEvidence(
             source="trusted_test_runner",
             run_id=real_run_id,
             exit_code=0,
+            verification_token=valid_token_with_run,
         )
         res_real_run = oracle.evaluate(
             task_id=self.task_id,
@@ -637,12 +672,13 @@ class Phase3E1IntegratedStressAndFencingTests(unittest.TestCase):
         self.assertTrue(res_real_run.verified)
 
     # -------------------------------------------------------------------------
-    # Scenario 7: Proteção Administrativa de Barreiras de Ativação
+    # Scenario 7: Proteção Administrativa de Barreiras de Ativação (3E.2)
     # -------------------------------------------------------------------------
     def test_administrative_override_protection(self):
         """Validates that disabling safety barriers (require_approval=False,
         enforce_invariants=False, enforce_clean_resources=False) strictly requires
-        caller_role in ('admin', 'operator') and an admin_override_reason.
+        caller_role in ('admin', 'operator'), an admin_override_reason, AND a valid
+        admin_token generated by the supervisor.
         """
         self.store.create_plan_revision(self.task_id, nodes=[{"node_id": "a", "title": "A"}], edges=[], summary="Plano Admin")
         prop = self.store.propose_trajectory(
@@ -661,25 +697,199 @@ class Phase3E1IntegratedStressAndFencingTests(unittest.TestCase):
                 require_approval=False,
                 caller_role="worker",
             )
-        self.assertIn("requer papel administrativo", str(ctx_unauth.exception))
+        self.assertIn("token administrativo de supervisor ausente ou invalido", str(ctx_unauth.exception))
 
-        # 7b: Default call with require_approval=False without admin reason -> UnauthorizedOverrideError
-        with self.assertRaises(UnauthorizedOverrideError):
+        # 7b: Self-declared admin role without valid supervisor admin_token -> UnauthorizedOverrideError
+        with self.assertRaises(UnauthorizedOverrideError) as ctx_forged:
             self.store.activate_trajectory_proposal(
                 prop.id,
                 require_approval=False,
                 caller_role="admin",
+                admin_token="forged_attacker_token",
+                admin_override_reason="Ignorar barreiras",
+            )
+        self.assertIn("token administrativo de supervisor ausente ou invalido", str(ctx_forged.exception))
+
+        # 7c: Valid admin token but without admin_override_reason -> UnauthorizedOverrideError
+        admin_tok = self.store.issue_admin_override_token(justification="Homologacao emergencial auditada")
+        with self.assertRaises(UnauthorizedOverrideError) as ctx_no_reason:
+            self.store.activate_trajectory_proposal(
+                prop.id,
+                require_approval=False,
+                caller_role="admin",
+                admin_token=admin_tok,
                 admin_override_reason="",  # empty justification
             )
+        self.assertIn("justificativa formal obrigatoria ausente", str(ctx_no_reason.exception))
 
-        # 7c: Privileged admin with explicit justification -> SUCCEEDS
+        # 7d: Privileged admin with authentic token and explicit justification -> SUCCEEDS
         rev_admin = self.store.activate_trajectory_proposal(
             prop.id,
             require_approval=False,
             caller_role="admin",
+            admin_token=admin_tok,
             admin_override_reason="Homologacao emergencial auditada pelo comite de seguranca",
         )
         self.assertEqual(rev_admin.revision, 2)
+
+    # -------------------------------------------------------------------------
+    # Scenario 8: Revalidação Física de Artefatos no Momento da Ativação (3E.2)
+    # -------------------------------------------------------------------------
+    def test_phase3e2_artifact_tampering_and_missing_revalidation_at_activation(self):
+        """Validates that proposal activation recomputes physical SHA-256 hashes of
+        verified artifacts on disk:
+        a) If artifact is altered between evaluation and activation -> InvariantVerificationError
+        b) If artifact is deleted from disk -> InvariantVerificationError
+        c) If artifact matches verified SHA-256 -> activation succeeds.
+        """
+        artifact_path = self.proj_dir / "dist" / "bundle.js"
+        artifact_path.parent.mkdir(parents=True, exist_ok=True)
+        artifact_path.write_text("console.log('original valid build');", encoding="utf-8")
+        original_hash = compute_sha256(artifact_path)
+
+        # Register invariant requiring target artifact
+        self.store.create_invariant(
+            task_id=self.task_id,
+            description="Bundle de producao integro e gerado",
+            invariant_id="build_bundle",
+            required=True,
+            verifier_type="trusted_test_runner",
+            target_artifact=str(artifact_path),
+        )
+
+        # Propose and approve alternative route
+        self.store.create_plan_revision(self.task_id, nodes=[{"node_id": "a", "title": "A"}], edges=[], summary="R1 Base")
+        prop = self.store.propose_trajectory(
+            self.task_id,
+            base_revision=1,
+            proposed_nodes=[{"node_id": "a", "title": "A"}, {"node_id": "b", "title": "B"}],
+            proposed_edges=[{"from_node": "a", "to_node": "b"}],
+            reason="Adicionar B com artefato validado",
+        )
+        self.store.resolve_trajectory_proposal(prop.id, "approved")
+
+        # Record genuine passing invariant evaluation with artifact hash
+        pass_eval = InvariantEvaluation(
+            id="eval-bundle-1",
+            task_id=self.task_id,
+            plan_revision=1,
+            invariant_id="build_bundle",
+            status=InvariantStatus.PASS,
+            evidence={
+                "source": "trusted_test_runner",
+                "artifact_path": str(artifact_path),
+                "artifact_sha256": original_hash,
+                "exit_code": 0,
+            },
+            verified=True,
+            details="Bundle validado com sucesso",
+        )
+        self.store.record_invariant_evaluation(pass_eval)
+
+        # 8a: Tamper artifact on disk after evaluation
+        artifact_path.write_text("console.log('malicious injected payload');", encoding="utf-8")
+        with self.assertRaises(InvariantVerificationError) as ctx_tamper:
+            self.store.activate_trajectory_proposal(prop.id)
+        self.assertIn("integridade do artefato", str(ctx_tamper.exception))
+        self.assertIn("foi violada apos a avaliacao", str(ctx_tamper.exception))
+
+        # 8b: Delete artifact on disk
+        artifact_path.unlink()
+        with self.assertRaises(InvariantVerificationError) as ctx_missing:
+            self.store.activate_trajectory_proposal(prop.id)
+        self.assertIn("nao existe mais no disco", str(ctx_missing.exception))
+
+        # 8c: Restore artifact with original content -> activation succeeds
+        artifact_path.write_text("console.log('original valid build');", encoding="utf-8")
+        rev2 = self.store.activate_trajectory_proposal(prop.id)
+        self.assertEqual(rev2.revision, 2)
+
+    # -------------------------------------------------------------------------
+    # Scenario 9: Neutralização Física de Processos no SO Bloqueia Ativação (3E.2)
+    # -------------------------------------------------------------------------
+    def test_phase3e2_os_process_neutralization_blocks_activation(self):
+        """Validates that even if a worker run is marked INTERRUPTED in SQLite,
+        proposal activation queries the operating system via safe_process_alive()
+        and strictly blocks activation if the PID is still physically alive in the OS.
+        """
+        self.store.create_plan_revision(self.task_id, nodes=[{"node_id": "a", "title": "A"}], edges=[], summary="R1 Base")
+        prop = self.store.propose_trajectory(
+            self.task_id,
+            base_revision=1,
+            proposed_nodes=[{"node_id": "a", "title": "A"}, {"node_id": "b", "title": "B"}],
+            proposed_edges=[{"from_node": "a", "to_node": "b"}],
+            reason="Adicionar B",
+        )
+        self.store.resolve_trajectory_proposal(prop.id, "approved")
+
+        # Worker was interrupted in DB, but rogue subprocess is still alive in OS
+        run_id, _, _ = self.store.reserve(self.task_id, "code", "prompt", 5)
+        self.store.transition_run(run_id, to_status=RunState.STARTING, pid=8888, process_create_time=123456)
+        self.store.transition_run(run_id, to_status=RunState.INTERRUPTED, error="Tentativa de cancelamento")
+
+        # Mock safe_process_alive to return True for PID 8888
+        with patch("ai_coordinator.storage.safe_process_alive", return_value=True):
+            with self.assertRaises(ActiveWorkerFencingError) as ctx_os:
+                self.store.activate_trajectory_proposal(prop.id)
+            self.assertIn("PID 8888", str(ctx_os.exception))
+            self.assertIn("ainda esta ativo no sistema operacional", str(ctx_os.exception))
+
+        # When process is truly neutralized in OS (safe_process_alive returns False)
+        with patch("ai_coordinator.storage.safe_process_alive", return_value=False):
+            rev2 = self.store.activate_trajectory_proposal(prop.id)
+            self.assertEqual(rev2.revision, 2)
+
+    # -------------------------------------------------------------------------
+    # Scenario 10: Fail-Fast no Backup do Resource Ledger (3E.2)
+    # -------------------------------------------------------------------------
+    def test_phase3e2_resource_ledger_fail_fast_backup(self):
+        """Validates that ResourceLedger.record_intent() fails fast if physical backup
+        creation fails, preventing unbacked modifications.
+        """
+        target_f = self.proj_dir / "protected.cfg"
+        target_f.write_text("config_val=10", encoding="utf-8")
+
+        # Mock shutil.copy2 to raise an IOError during backup creation
+        with patch("shutil.copy2", side_effect=OSError("Disk write error on backup partition")):
+            with self.assertRaises(ResourceLedgerError) as ctx_bak_fail:
+                self.store.resource_ledger.record_intent(
+                    task_id=self.task_id,
+                    plan_revision=1,
+                    resource_type=ResourceType.FILE,
+                    raw_id=str(target_f),
+                    action=ResourceAction.MODIFY,
+                    idempotency_key="intent-fail-bak",
+                )
+            self.assertIn("Falha preventiva ao criar backup fisico", str(ctx_bak_fail.exception))
+
+        # Ledger must not contain a valid record for the failed intent
+        rows = self.store.db.execute(
+            "SELECT * FROM resource_ledger WHERE idempotency_key='intent-fail-bak'",
+        ).fetchall()
+        self.assertEqual(len(rows), 0)
+
+    # -------------------------------------------------------------------------
+    # Scenario 11: Persistência de Exigência de Autenticidade no Oracle (3E.2)
+    # -------------------------------------------------------------------------
+    def test_phase3e2_invariant_persistence_of_authenticity_requirement(self):
+        """Validates that require_authenticity_proof is persisted in SQLite invariants
+        table schema and properly retrieved.
+        """
+        inv_created = self.store.create_invariant(
+            task_id=self.task_id,
+            description="Exigencia de autenticidade persistida",
+            invariant_id="inv_auth_persisted",
+            required=True,
+            verifier_type="trusted_test_runner",
+            require_authenticity_proof=True,
+        )
+        self.assertTrue(inv_created.require_authenticity_proof)
+
+        # Retrieve via get_invariants
+        invs = self.store.get_invariants(self.task_id)
+        matched = [i for i in invs if i.id == "inv_auth_persisted"]
+        self.assertEqual(len(matched), 1)
+        self.assertTrue(matched[0].require_authenticity_proof)
 
 
 if __name__ == "__main__":
