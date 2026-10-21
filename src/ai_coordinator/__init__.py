@@ -96,6 +96,31 @@ from .resource_ledger import (
     ResourceLedger,
     canonicalize_resource_id,
 )
+from .experience import (
+    ExperienceCategory,
+    ExperienceOutcome,
+    ExperienceVisibility,
+    ExperienceAuthor,
+    ExperienceRecord,
+    ExperienceStore,
+)
+from .insights import (
+    InsightType,
+    InsightStatus,
+    InsightPresentation,
+    AutonomyLevel,
+    Insight,
+    InsightEngine,
+)
+from .reconstruction import (
+    ReconstructionError,
+    ReconnectionPointNotFoundError,
+    AlternativeRoutePreview,
+    calculate_reconnection_points,
+    calculate_upstream_prerequisites,
+    splice_alternative_route,
+    TrajectoryReconstructor,
+)
 
 __all__ = [
     "Coordinator",
@@ -178,5 +203,24 @@ __all__ = [
     "ResourceEvent",
     "ResourceLedger",
     "canonicalize_resource_id",
+    "ExperienceCategory",
+    "ExperienceOutcome",
+    "ExperienceVisibility",
+    "ExperienceAuthor",
+    "ExperienceRecord",
+    "ExperienceStore",
+    "InsightType",
+    "InsightStatus",
+    "InsightPresentation",
+    "AutonomyLevel",
+    "Insight",
+    "InsightEngine",
+    "ReconstructionError",
+    "ReconnectionPointNotFoundError",
+    "AlternativeRoutePreview",
+    "calculate_reconnection_points",
+    "calculate_upstream_prerequisites",
+    "splice_alternative_route",
+    "TrajectoryReconstructor",
 ]
 __version__ = "0.3.0"

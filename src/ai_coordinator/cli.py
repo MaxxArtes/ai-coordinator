@@ -593,6 +593,50 @@ def parser():
     ic = sub.add_parser("invariant-check"); ic.add_argument("--task", required=True); ic.add_argument("--revision", type=int)
     rl = sub.add_parser("resource-ledger"); rl.add_argument("--task", required=True); rl.add_argument("--revision", type=int); rl.add_argument("--status")
     rr = sub.add_parser("resource-reconcile"); rr.add_argument("--task", required=True)
+    exp = sub.add_parser("experience")
+    exp.add_argument("--project", default=".")
+    exp.add_argument("--record")
+    exp.add_argument("--problem")
+    exp.add_argument("--solution")
+    exp.add_argument("--category", choices=["architecture_decision", "tool_fix", "error_pattern", "solution_pattern", "user_preference"], default="solution_pattern")
+    exp.add_argument("--outcome", choices=["success", "failed", "neutral"], default="success")
+    exp.add_argument("--tag", action="append", default=[])
+    exp.add_argument("--confidence", choices=["high", "medium", "low"], default="medium")
+    exp.add_argument("--author", choices=["human", "agent"], default="agent")
+    exp.add_argument("--visibility", choices=["private_human", "project_shared", "global_authorized"], default="project_shared")
+    exp.add_argument("--find")
+    exp.add_argument("--caller-role", choices=["human", "agent", "worker"], default="agent")
+    exp.add_argument("--limit", type=int, default=10)
+
+    ins = sub.add_parser("insight")
+    ins.add_argument("--project", default=".")
+    ins.add_argument("--task")
+    ins.add_argument("--explore")
+    ins.add_argument("--connect")
+    ins.add_argument("--from-project")
+    ins.add_argument("--to-project")
+    ins.add_argument("--reevaluate")
+    ins.add_argument("--error")
+    ins.add_argument("--list", action="store_true")
+    ins.add_argument("--status", choices=["incubating", "promoted_to_proposal", "archived", "rejected"])
+    ins.add_argument("--presentation", choices=["now", "contextual", "review"])
+    ins.add_argument("--promote")
+    ins.add_argument("--route", default="A")
+    ins.add_argument("--base-revision", type=int)
+    ins.add_argument("--archive")
+    ins.add_argument("--caller-role", choices=["human", "agent", "worker"], default="human")
+
+    rec = sub.add_parser("route-reconstruct")
+    rec.add_argument("--task", required=True)
+    rec.add_argument("--revision", type=int)
+    rec.add_argument("--failed-node", required=True)
+    rec.add_argument("--replacement-nodes")
+    rec.add_argument("--replacement-edges")
+    rec.add_argument("--reconnection-node")
+    rec.add_argument("--preview", action="store_true")
+    rec.add_argument("--propose", action="store_true")
+    rec.add_argument("--reason", default="")
+
     sub.add_parser("routes")
     sc = sub.add_parser('scope'); sc.add_argument('--project', required=True); sc.add_argument('--init', action='store_true')
     ex = sub.add_parser('export'); ex.add_argument('--task', required=True); ex.add_argument('--to', required=True)
@@ -757,6 +801,150 @@ def main():
         elif args.command == "resource-reconcile":
             reconciled = store.reconcile_resources(args.task)
             emit([r.to_dict() for r in reconciled])
+        elif args.command == "experience":
+            proj = project_path(args.project) if getattr(args, "project", None) and args.project != "." else (project_path(".") if Path(".").is_dir() else args.project)
+            if getattr(args, "record", None):
+                record_data = read_json(args.record) if Path(args.record).is_file() else json.loads(args.record)
+                rec = store.record_experience(
+                    project_id=record_data.get("project_id", proj),
+                    problem_pattern=record_data["problem_pattern"],
+                    solution_pattern=record_data["solution_pattern"],
+                    category=record_data.get("category", args.category),
+                    outcome=record_data.get("outcome", args.outcome),
+                    context_tags=record_data.get("context_tags", args.tag),
+                    confidence=record_data.get("confidence", args.confidence),
+                    author=record_data.get("author", args.author),
+                    visibility=record_data.get("visibility", args.visibility),
+                    task_id=record_data.get("task_id"),
+                )
+                emit(rec.to_dict())
+            elif getattr(args, "problem", None) and getattr(args, "solution", None):
+                rec = store.record_experience(
+                    project_id=proj,
+                    problem_pattern=args.problem,
+                    solution_pattern=args.solution,
+                    category=args.category,
+                    outcome=args.outcome,
+                    context_tags=args.tag,
+                    confidence=args.confidence,
+                    author=args.author,
+                    visibility=args.visibility,
+                )
+                emit(rec.to_dict())
+            elif getattr(args, "find", None):
+                recs = store.find_experiences(
+                    project_id=proj,
+                    query_text=args.find,
+                    tags=args.tag if args.tag else None,
+                    category=args.category if args.category != "solution_pattern" else None,
+                    caller_role=args.caller_role,
+                    limit=args.limit,
+                )
+                emit([r.to_dict() for r in recs])
+            else:
+                recs = store.find_experiences(
+                    project_id=proj,
+                    caller_role=args.caller_role,
+                    limit=args.limit,
+                )
+                emit([r.to_dict() for r in recs])
+        elif args.command == "insight":
+            proj = project_path(args.project) if getattr(args, "project", None) and args.project != "." else (project_path(".") if Path(".").is_dir() else args.project)
+            if getattr(args, "explore", None):
+                ins = store.insight_engine.explore(
+                    project_id=proj,
+                    topic_or_goal=args.explore,
+                    task_id=getattr(args, "task", None),
+                    caller_role=args.caller_role,
+                )
+                emit(ins.to_dict())
+            elif getattr(args, "connect", None):
+                src_proj = project_path(args.from_project) if getattr(args, "from_project", None) else proj
+                tgt_proj = project_path(args.to_project) if getattr(args, "to_project", None) else proj
+                ins = store.insight_engine.connect(
+                    source_project_id=src_proj,
+                    target_project_id=tgt_proj,
+                    topic=args.connect,
+                    caller_role=args.caller_role,
+                )
+                emit(ins.to_dict() if ins else {"status": "no_connection_found"})
+            elif getattr(args, "reevaluate", None):
+                ins = store.insight_engine.reevaluate(
+                    task_id=args.task or "general",
+                    project_id=proj,
+                    current_issue=args.reevaluate,
+                    observed_error=getattr(args, "error", None),
+                    caller_role=args.caller_role,
+                )
+                emit(ins.to_dict())
+            elif getattr(args, "promote", None):
+                prop = store.insight_engine.promote_to_trajectory_proposal(
+                    store=store,
+                    insight_id=args.promote,
+                    task_id=args.task,
+                    base_revision=args.base_revision or 1,
+                    route_choice=args.route or "A",
+                    caller_role=args.caller_role,
+                )
+                emit(prop.to_dict())
+            elif getattr(args, "archive", None):
+                ins = store.update_insight_status(
+                    insight_id=args.archive,
+                    new_status="archived",
+                    caller_role=args.caller_role,
+                )
+                emit(ins.to_dict())
+            else:
+                insights = store.list_incubator(
+                    project_id=proj if getattr(args, "project", None) else None,
+                    status=args.status,
+                    presentation=args.presentation,
+                    caller_role=args.caller_role,
+                )
+                emit([i.to_dict() for i in insights])
+        elif args.command == "route-reconstruct":
+            active_rev = args.revision
+            if active_rev is None:
+                rev_row = store.get_plan_revision(args.task)
+                active_rev = rev_row.revision if rev_row else 1
+
+            nodes_data = []
+            if getattr(args, "replacement_nodes", None):
+                if Path(args.replacement_nodes).is_file():
+                    nodes_data = read_json(args.replacement_nodes)
+                else:
+                    nodes_data = json.loads(args.replacement_nodes)
+
+            edges_data = None
+            if getattr(args, "replacement_edges", None):
+                if Path(args.replacement_edges).is_file():
+                    edges_data = read_json(args.replacement_edges)
+                else:
+                    edges_data = json.loads(args.replacement_edges)
+
+            if getattr(args, "preview", False):
+                preview = store.preview_alternative_route(
+                    task_id=args.task,
+                    base_revision=active_rev,
+                    failed_node_id=args.failed_node,
+                    replacement_nodes=nodes_data,
+                    replacement_edges=edges_data,
+                    reconnection_node_id=getattr(args, "reconnection_node", None),
+                )
+                emit(preview.to_dict())
+            elif getattr(args, "propose", False):
+                prop = store.propose_alternative_route(
+                    task_id=args.task,
+                    base_revision=active_rev,
+                    failed_node_id=args.failed_node,
+                    replacement_nodes=nodes_data,
+                    reason=args.reason or "Proposta de rota alternativa via CLI",
+                    replacement_edges=edges_data,
+                    reconnection_node_id=getattr(args, "reconnection_node", None),
+                )
+                emit(prop.to_dict())
+            else:
+                emit({"error": "Especifique --preview ou --propose para route-reconstruct"})
         return 0
     finally:
         store.db.close()

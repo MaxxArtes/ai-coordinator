@@ -58,6 +58,29 @@ from .resource_ledger import (
     ResourceLedger,
     UnresolvedResourceError,
 )
+from .experience import (
+    ExperienceRecord,
+    ExperienceStore,
+    ExperienceCategory,
+    ExperienceOutcome,
+    ExperienceVisibility,
+    ExperienceAuthor,
+)
+from .insights import (
+    Insight,
+    InsightEngine,
+    InsightType,
+    InsightStatus,
+    InsightPresentation,
+    AutonomyLevel,
+)
+from .reconstruction import (
+    TrajectoryReconstructor,
+    AlternativeRoutePreview,
+    calculate_reconnection_points,
+    calculate_upstream_prerequisites,
+    splice_alternative_route,
+)
 
 now = lambda: dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
 
@@ -206,6 +229,9 @@ class Store:
         self._init_schema()
         self.mission_control = MissionControl(self)
         self.resource_ledger = ResourceLedger(self.db)
+        self.experience_store = ExperienceStore(self.db)
+        self.insight_engine = InsightEngine(self.db, self.experience_store)
+        self.reconstructor = TrajectoryReconstructor(self)
 
     def _init_schema(self) -> None:
         self.db.executescript("""
@@ -437,6 +463,49 @@ class Store:
           CREATE INDEX IF NOT EXISTS idx_resource_ledger_task_rev ON resource_ledger(task_id, plan_revision);
           CREATE INDEX IF NOT EXISTS idx_resource_ledger_status ON resource_ledger(task_id, status);
           CREATE INDEX IF NOT EXISTS idx_resource_events_res ON resource_ledger_events(resource_id);
+
+          CREATE TABLE IF NOT EXISTS experience_records (
+            id TEXT PRIMARY KEY,
+            project_id TEXT NOT NULL,
+            task_id TEXT,
+            category TEXT NOT NULL,
+            problem_pattern TEXT NOT NULL,
+            solution_pattern TEXT NOT NULL,
+            outcome TEXT NOT NULL,
+            context_tags TEXT NOT NULL DEFAULT '[]',
+            confidence TEXT NOT NULL DEFAULT 'medium',
+            author TEXT NOT NULL DEFAULT 'agent',
+            visibility TEXT NOT NULL DEFAULT 'project_shared',
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            metadata TEXT DEFAULT '{}'
+          );
+
+          CREATE TABLE IF NOT EXISTS insights (
+            id TEXT PRIMARY KEY,
+            project_id TEXT NOT NULL,
+            task_id TEXT,
+            type TEXT NOT NULL,
+            author TEXT NOT NULL,
+            origin TEXT NOT NULL,
+            visibility TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'incubating',
+            content TEXT NOT NULL,
+            alternatives TEXT NOT NULL DEFAULT '[]',
+            suggested_first_step TEXT,
+            related_tasks TEXT NOT NULL DEFAULT '[]',
+            confidence REAL,
+            presentation TEXT NOT NULL DEFAULT 'contextual',
+            provenance TEXT NOT NULL DEFAULT '{}',
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            metadata TEXT DEFAULT '{}'
+          );
+
+          CREATE INDEX IF NOT EXISTS idx_experience_project ON experience_records(project_id, category);
+          CREATE INDEX IF NOT EXISTS idx_experience_visibility ON experience_records(visibility);
+          CREATE INDEX IF NOT EXISTS idx_insights_project ON insights(project_id, status);
+          CREATE INDEX IF NOT EXISTS idx_insights_visibility ON insights(visibility);
         """)
 
         # Dynamic migrations for any existing columns
@@ -1903,3 +1972,159 @@ class Store:
     def get_resource_events(self, resource_id: str) -> List[ResourceEvent]:
         """Retrieve audit event ledger for a specific resource."""
         return self.resource_ledger.get_events(resource_id=resource_id)
+
+    # -------------------------------------------------------------------------
+    # Experience and Continuous Learning Methods
+    # -------------------------------------------------------------------------
+    def record_experience(
+        self,
+        project_id: str,
+        problem_pattern: str,
+        solution_pattern: str,
+        category: str = ExperienceCategory.SOLUTION_PATTERN,
+        outcome: str = ExperienceOutcome.SUCCESS,
+        task_id: Optional[str] = None,
+        context_tags: Optional[List[str]] = None,
+        confidence: str = "medium",
+        author: str = ExperienceAuthor.AGENT,
+        visibility: str = ExperienceVisibility.PROJECT_SHARED,
+        metadata: Optional[Dict[str, Any]] = None,
+        record_id: Optional[str] = None,
+    ) -> ExperienceRecord:
+        """Record an auditable experience / lesson learned."""
+        return self.experience_store.record_experience(
+            project_id=project_id,
+            problem_pattern=problem_pattern,
+            solution_pattern=solution_pattern,
+            category=category,
+            outcome=outcome,
+            task_id=task_id,
+            context_tags=context_tags,
+            confidence=confidence,
+            author=author,
+            visibility=visibility,
+            metadata=metadata,
+            record_id=record_id,
+        )
+
+    def get_experience(self, record_id: str, caller_role: str = "agent") -> Optional[ExperienceRecord]:
+        """Fetch experience record with privacy gating."""
+        return self.experience_store.get_experience(record_id, caller_role=caller_role)
+
+    def find_experiences(
+        self,
+        project_id: Optional[str] = None,
+        query_text: Optional[str] = None,
+        tags: Optional[List[str]] = None,
+        category: Optional[str] = None,
+        outcome: Optional[str] = None,
+        author_filter: Optional[str] = None,
+        caller_role: str = "agent",
+        caller_authorized_projects: Optional[List[str]] = None,
+        limit: int = 10,
+    ) -> List[ExperienceRecord]:
+        """Deterministic experience search with privacy gating and token ranking."""
+        return self.experience_store.find_experiences(
+            project_id=project_id,
+            query_text=query_text,
+            tags=tags,
+            category=category,
+            outcome=outcome,
+            author_filter=author_filter,
+            caller_role=caller_role,
+            caller_authorized_projects=caller_authorized_projects,
+            limit=limit,
+        )
+
+    # -------------------------------------------------------------------------
+    # Insight Engine and Incubator Methods
+    # -------------------------------------------------------------------------
+    def record_insight(self, insight: Insight) -> Insight:
+        """Persist an insight into the incubator."""
+        return self.insight_engine.record_insight(insight)
+
+    def get_insight(self, insight_id: str, caller_role: str = "agent") -> Optional[Insight]:
+        """Fetch insight by ID with privacy gating."""
+        return self.insight_engine.get_insight(insight_id, caller_role=caller_role)
+
+    def list_incubator(
+        self,
+        project_id: Optional[str] = None,
+        status: Optional[str] = InsightStatus.INCUBATING,
+        presentation: Optional[str] = None,
+        caller_role: str = "agent",
+        caller_authorized_projects: Optional[List[str]] = None,
+        limit: int = 50,
+    ) -> List[Insight]:
+        """List incubating insights respecting privacy and project authorization."""
+        return self.insight_engine.list_incubator(
+            project_id=project_id,
+            status=status,
+            presentation=presentation,
+            caller_role=caller_role,
+            caller_authorized_projects=caller_authorized_projects,
+            limit=limit,
+        )
+
+    def update_insight_status(
+        self,
+        insight_id: str,
+        new_status: str,
+        reason: Optional[str] = None,
+        caller_role: str = "human",
+    ) -> Insight:
+        """Update incubation status of an insight."""
+        return self.insight_engine.update_insight_status(
+            insight_id=insight_id,
+            new_status=new_status,
+            reason=reason,
+            caller_role=caller_role,
+        )
+
+    # -------------------------------------------------------------------------
+    # Alternative Route Reconstruction Methods
+    # -------------------------------------------------------------------------
+    def preview_alternative_route(
+        self,
+        task_id: str,
+        base_revision: int,
+        failed_node_id: str,
+        replacement_nodes: List[Union[PlanNode, Dict[str, Any]]],
+        replacement_edges: Optional[List[Union[PlanEdge, Dict[str, Any]]]] = None,
+        reconnection_node_id: Optional[str] = None,
+    ) -> AlternativeRoutePreview:
+        """Dry-run preview of an alternative route without database mutation."""
+        return self.reconstructor.preview_alternative_route(
+            task_id=task_id,
+            base_revision=base_revision,
+            failed_node_id=failed_node_id,
+            replacement_nodes=replacement_nodes,
+            replacement_edges=replacement_edges,
+            reconnection_node_id=reconnection_node_id,
+        )
+
+    def propose_alternative_route(
+        self,
+        task_id: str,
+        base_revision: int,
+        failed_node_id: str,
+        replacement_nodes: List[Union[PlanNode, Dict[str, Any]]],
+        reason: str,
+        replacement_edges: Optional[List[Union[PlanEdge, Dict[str, Any]]]] = None,
+        reconnection_node_id: Optional[str] = None,
+        diff_summary: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> TrajectoryProposal:
+        """Formulate and record an unactivated alternative trajectory proposal."""
+        return self.reconstructor.propose_alternative_route(
+            task_id=task_id,
+            base_revision=base_revision,
+            failed_node_id=failed_node_id,
+            replacement_nodes=replacement_nodes,
+            reason=reason,
+            replacement_edges=replacement_edges,
+            reconnection_node_id=reconnection_node_id,
+            diff_summary=diff_summary,
+            metadata=metadata,
+        )
+
