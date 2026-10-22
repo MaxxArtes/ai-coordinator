@@ -344,6 +344,76 @@ class UnifiedKnowledgeCoreTests(unittest.TestCase):
                 },
             )
 
+        # 7. Caller injection of custom oracle is rejected at API level
+        custom_oracle = InvariantOracle(secret="custom_secret_key_1234567890123456")
+        with self.assertRaises(TypeError):
+            self.core.verify_with_oracle(
+                self.supervisor, rec["id"], expected_revision=1,
+                oracle_token="token",
+                verification_evidence={"task_id": "task-test-01"},
+                oracle=custom_oracle,
+            )
+
+        # 8. Core without configured oracle fails closed
+        unconfigured_core = UnifiedKnowledgeCore(self.db, oracle=None)
+        with self.assertRaises(KnowledgeAccessDenied):
+            unconfigured_core.verify_with_oracle(
+                self.supervisor, rec["id"], expected_revision=1,
+                oracle_token="token",
+                verification_evidence={"task_id": "task-test-01"},
+            )
+
+        # 9. Replay attack: legitimate token from Entry A cannot be reused on Entry B
+        rec_b = self._decision("Decisao B para teste de replay")
+        valid_token_a = self.oracle.issue_evidence_token(
+            task_id="task-test-01",
+            plan_revision=1,
+            invariant_id=rec["id"],
+            source="trusted_test_runner",
+            exit_code=0,
+        )
+        # Attempt to verify Entry B with Entry A's token
+        with self.assertRaises(UntrustedEvidenceError):
+            self.core.verify_with_oracle(
+                self.supervisor, rec_b["id"], expected_revision=1,
+                oracle_token=valid_token_a,
+                verification_evidence={
+                    "task_id": "task-test-01",
+                    "plan_revision": 1,
+                    "source": "trusted_test_runner",
+                    "exit_code": 0,
+                },
+            )
+        # Attempt to claim invariant_id from Entry A while certifying Entry B
+        with self.assertRaises(UntrustedEvidenceError):
+            self.core.verify_with_oracle(
+                self.supervisor, rec_b["id"], expected_revision=1,
+                oracle_token=valid_token_a,
+                verification_evidence={
+                    "task_id": "task-test-01",
+                    "invariant_id": rec["id"],
+                    "plan_revision": 1,
+                    "source": "trusted_test_runner",
+                    "exit_code": 0,
+                },
+            )
+
+        # 10. Task mismatch: task_id in evidence must match authoritative task_id on entry
+        task_rec = self.core.capture(
+            self.alice, "project-a", KnowledgeKind.OBSERVATION, "Nota com task",
+            task_id="authoritative-task-1", visibility=KnowledgeVisibility.PROJECT_SHARED,
+        )
+        with self.assertRaises(UntrustedEvidenceError):
+            self.core.verify_with_oracle(
+                self.supervisor, task_rec["id"], expected_revision=1,
+                oracle_token="any-token",
+                verification_evidence={
+                    "task_id": "divergent-task-2",
+                    "plan_revision": 1,
+                    "source": "trusted_test_runner",
+                },
+            )
+
     def test_18_supervisor_verify_with_oracle_success(self):
         task_id = "task-integration-99"
         run_id = "run-101"
@@ -508,6 +578,69 @@ class UnifiedKnowledgeCoreTests(unittest.TestCase):
         oracle_verified = self.core.find(self.alice, project_id="project-a", evidence_levels=[KnowledgeEvidenceLevel.ORACLE_VERIFIED])
         self.assertEqual(len(oracle_verified), 1)
         self.assertEqual(oracle_verified[0]["evidence_level"], KnowledgeEvidenceLevel.ORACLE_VERIFIED)
+
+    def test_21_find_operational_precedents_strict_isolation(self):
+        # 1. Thought: speculative_draft, unverified -> EXCLUDED
+        self.core.capture(self.alice, "project-a", KnowledgeKind.THOUGHT, "Rascunho de arquitetura")
+
+        # 2. Captured decision (not accepted): decision_record, captured -> EXCLUDED
+        self._decision("Decisao apenas capturada")
+
+        # 3. Proposed decision: decision_record, proposed -> EXCLUDED
+        dec_proposed = self._decision("Decisao proposta")
+        self.core.transition(self.alice, dec_proposed["id"], expected_revision=1,
+                             new_state=KnowledgeState.PROPOSED, reason="Em analise")
+
+        # 4. Accepted decision: decision_record, accepted, human_reviewed -> INCLUDED
+        dec_accepted = self._decision("Decisao final aprovada")
+        self._accept(dec_accepted)
+
+        # 5. Unverified observation: observation, unverified -> EXCLUDED
+        self.core.capture(self.alice, "project-a", KnowledgeKind.OBSERVATION, "Ensaio pontual sem checagem",
+                          visibility=KnowledgeVisibility.PROJECT_SHARED)
+
+        # 6. Oracle verified observation: validated_finding, oracle_verified -> INCLUDED
+        task_id = "task-op-21"
+        run_id = "run-op-21"
+        self.runs[(task_id, run_id)] = {"status": "complete", "exit_code": 0}
+        obs_verified = self.core.capture(
+            self.alice, "project-a", KnowledgeKind.OBSERVATION, "Invariante comprovado por teste",
+            task_id=task_id, visibility=KnowledgeVisibility.PROJECT_SHARED,
+        )
+        token = self.oracle.issue_evidence_token(
+            task_id=task_id,
+            plan_revision=1,
+            invariant_id=obs_verified["id"],
+            source="trusted_test_runner",
+            run_id=run_id,
+            exit_code=0,
+        )
+        self.core.verify_with_oracle(
+            self.supervisor, obs_verified["id"], expected_revision=1,
+            oracle_token=token,
+            verification_evidence={
+                "task_id": task_id,
+                "run_id": run_id,
+                "plan_revision": 1,
+                "source": "trusted_test_runner",
+                "exit_code": 0,
+            },
+        )
+
+        # Query operational precedents: MUST ONLY return entries 4 and 6!
+        precedents = self.core.find_operational_precedents(self.alice, project_id="project-a")
+        self.assertEqual(len(precedents), 2)
+        returned_ids = {p["id"] for p in precedents}
+        self.assertIn(dec_accepted["id"], returned_ids)
+        self.assertIn(obs_verified["id"], returned_ids)
+
+        for p in precedents:
+            # Must either be an accepted decision or a verified finding/observation
+            is_accepted_decision = (p["state"] == KnowledgeState.ACCEPTED and p["nature"] == KnowledgeNature.DECISION_RECORD)
+            is_verified_finding = (p["evidence_level"] in (KnowledgeEvidenceLevel.ORACLE_VERIFIED, KnowledgeEvidenceLevel.HUMAN_REVIEWED)
+                                   and p["nature"] in (KnowledgeNature.VALIDATED_FINDING, KnowledgeNature.OBSERVATION))
+            self.assertTrue(is_accepted_decision or is_verified_finding)
+            self.assertNotEqual(p["nature"], KnowledgeNature.SPECULATIVE_DRAFT)
 
 
 if __name__ == "__main__":

@@ -490,21 +490,20 @@ class UnifiedKnowledgeCore:
         expected_revision: int,
         oracle_token: str,
         verification_evidence: Mapping[str, Any],
-        oracle: Optional[InvariantOracle] = None,
         nature: str = KnowledgeNature.VALIDATED_FINDING,
         reason: str = "Verificacao formal concluida pelo Oraculo",
     ) -> Dict[str, Any]:
-        """Certify an entry as oracle_verified using InvariantOracle evaluation.
+        """Certify an entry as oracle_verified using the store's configured InvariantOracle.
 
         Strictly restricted to supervisor principal and requires authentic cryptographic proof
-        bound to task, revision, and actual execution.
+        bound to task, revision, and actual execution. Caller injection of an arbitrary oracle
+        is forbidden.
         """
         if principal.role != "supervisor":
             raise KnowledgeAccessDenied("Apenas o supervisor/oraculo pode certificar oracle_verified")
 
-        active_oracle = oracle or self.oracle
-        if active_oracle is None:
-            raise KnowledgeAccessDenied("Certificacao negada: Oraculo de invariantes indisponivel")
+        if self.oracle is None:
+            raise KnowledgeAccessDenied("Certificacao negada: Oraculo de invariantes nao configurado nesta instancia")
 
         if not isinstance(oracle_token, str) or not oracle_token.strip():
             raise ValueError("oracle_token obrigatorio para certificacao pelo Oraculo")
@@ -521,12 +520,22 @@ class UnifiedKnowledgeCore:
             if row["revision"] != expected_revision:
                 raise KnowledgeConflict("Revisao obsoleta; releia a entrada")
 
-            task_id = str(verification_evidence.get("task_id") or row.get("task_id") or "").strip()
+            # Replay protection: invariant_id MUST strictly match the entry_id being certified
+            claimed_invariant_id = str(verification_evidence.get("invariant_id") or entry_id).strip()
+            if claimed_invariant_id != entry_id:
+                raise UntrustedEvidenceError(f"Prova rejeitada: invariant_id '{claimed_invariant_id}' diverge do entry_id certificado '{entry_id}'")
+            invariant_id = entry_id
+
+            # Task binding: task_id MUST match the authoritative task linked to this entry
+            entry_task_id = str(row.get("task_id") or "").strip()
+            ev_task_id = str(verification_evidence.get("task_id") or "").strip()
+            if entry_task_id and ev_task_id and entry_task_id != ev_task_id:
+                raise UntrustedEvidenceError(f"Prova rejeitada: task_id '{ev_task_id}' diverge da tarefa autoritativa do registro '{entry_task_id}'")
+            task_id = entry_task_id or ev_task_id
             if not task_id:
                 raise ValueError("Evidencia do Oraculo exige vinculo com task_id")
 
             plan_revision = int(verification_evidence.get("plan_revision", 1))
-            invariant_id = str(verification_evidence.get("invariant_id") or entry_id).strip()
             source = str(verification_evidence.get("source", "trusted_test_runner")).strip()
             run_id = verification_evidence.get("run_id")
             artifact_sha256 = verification_evidence.get("artifact_sha256")
@@ -551,7 +560,7 @@ class UnifiedKnowledgeCore:
                 details=dict(verification_evidence),
             )
 
-            evaluation = active_oracle.evaluate(
+            evaluation = self.oracle.evaluate(
                 task_id=task_id,
                 plan_revision=plan_revision,
                 invariant=inv_def,
@@ -674,6 +683,66 @@ class UnifiedKnowledgeCore:
             rec["relevance_score"] = len(overlap) / max(len(needle), 1)
             if rec["state"] == KnowledgeState.SUPERSEDED:
                 rec["relevance_score"] *= 0.25
+            results.append(rec)
+        results.sort(key=lambda r: (-r["relevance_score"], r["created_at"], r["id"]))
+        return results[:limit]
+
+    def find_operational_precedents(
+        self,
+        principal: KnowledgePrincipal,
+        *,
+        query: str = "",
+        project_id: Optional[str] = None,
+        context: Optional[Mapping[str, Any]] = None,
+        limit: int = 20,
+    ) -> List[Dict[str, Any]]:
+        """Retrieve strictly reliable operational precedents for execution context.
+
+        Fencing guarantees:
+        - Only returns ACCEPTED decisions (nature=DECISION_RECORD, state=ACCEPTED).
+        - Only returns findings/observations with evidence_level in (ORACLE_VERIFIED, HUMAN_REVIEWED).
+        - Strictly excludes all speculative_draft, proposed/captured/rejected decisions,
+          and unverified observations.
+        """
+        if not isinstance(limit, int) or not 1 <= limit <= 100:
+            raise ValueError("limit deve estar entre 1 e 100")
+        clause, params = self._can_read_sql(principal)
+        clauses = [clause]
+        if project_id is not None:
+            clauses.append("project_id = ?")
+            params.append(project_id)
+
+        # Operational fence: accepted decisions OR verified findings/observations
+        op_fence = (
+            "((state = ? AND nature = ?) OR "
+            "(nature IN (?, ?) AND evidence_level IN (?, ?)))"
+        )
+        clauses.append(op_fence)
+        params.extend((
+            KnowledgeState.ACCEPTED,
+            KnowledgeNature.DECISION_RECORD,
+            KnowledgeNature.VALIDATED_FINDING,
+            KnowledgeNature.OBSERVATION,
+            KnowledgeEvidenceLevel.ORACLE_VERIFIED,
+            KnowledgeEvidenceLevel.HUMAN_REVIEWED,
+        ))
+
+        sql = "SELECT * FROM knowledge_entries WHERE " + " AND ".join(clauses) + " ORDER BY created_at DESC, id LIMIT 1000"
+        rows = self.db.execute(sql, params).fetchall()
+        needle = set(re.findall(r"\w+", query.casefold(), flags=re.UNICODE))
+        context = context or {}
+        results: List[Dict[str, Any]] = []
+        for raw in rows:
+            rec = self._decode(raw)
+            saved_ctx = rec["context"]
+            if any(k in saved_ctx and saved_ctx[k] != v for k, v in context.items()):
+                continue
+            haystack = set(re.findall(r"\w+", (rec["content"] + " " + " ".join(rec["tags"])).casefold(), flags=re.UNICODE))
+            overlap = needle & haystack
+            if needle and not overlap:
+                continue
+            rec["context_match"] = "confirmed" if context and all(k in saved_ctx for k in context) else "unconfirmed"
+            rec["relevance_score"] = len(overlap) / max(len(needle), 1)
             results.append(rec)
         results.sort(key=lambda r: (-r["relevance_score"], r["created_at"], r["id"]))
         return results[:limit]
