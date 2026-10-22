@@ -82,6 +82,7 @@ from .insights import (
     InsightPresentation,
     AutonomyLevel,
 )
+from .knowledge import UnifiedKnowledgeCore
 from .reconstruction import (
     TrajectoryReconstructor,
     AlternativeRoutePreview,
@@ -243,6 +244,7 @@ class Store:
         self.mission_control = MissionControl(self)
         self.resource_ledger = ResourceLedger(self.db, backup_dir=self.root / "backups")
         self.experience_store = ExperienceStore(self.db)
+        self.knowledge_core = UnifiedKnowledgeCore(self.db)
         self.insight_engine = InsightEngine(self.db, self.experience_store)
         self.reconstructor = TrajectoryReconstructor(self)
         self.supervisor_secret = secrets.token_bytes(32)
