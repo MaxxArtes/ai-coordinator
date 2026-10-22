@@ -175,9 +175,10 @@ class LearningFromPitaiATests(unittest.TestCase):
         )
         with self.assertRaises(KnowledgeAccessDenied):
             self.core.import_legacy_experience(self.worker, record)
-        created = self.core.import_legacy_experience(self.owner, record)
-        self.assertIsNone(self.store.knowledge_core.get(self.worker, created["id"]))
-        self.assertIsNotNone(self.store.knowledge_core.get(self.owner, created["id"]))
+        # Legacy author='human' has no stable author_id. Fail closed rather
+        # than allowing any authorized project member to claim the private note.
+        with self.assertRaises(KnowledgeAccessDenied):
+            self.core.import_legacy_experience(self.owner, record)
 
     def test_12_out_of_scope_import_rejected(self):
         record = ExperienceRecord(
