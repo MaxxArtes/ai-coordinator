@@ -140,8 +140,28 @@ from .reconstruction import (
     splice_alternative_route,
     TrajectoryReconstructor,
 )
+from .human_workspace import (
+    HumanWorkspace,
+    HumanPrincipal,
+    HumanInboxState,
+    HumanInboxReadState,
+    HumanInboxItemKind,
+    HumanWorkspaceError,
+    HumanWorkspaceAccessDenied,
+    HumanWorkspaceConflict,
+    HumanWorkspaceNotFoundError,
+)
 
 __all__ = [
+    "HumanWorkspace",
+    "HumanPrincipal",
+    "HumanInboxState",
+    "HumanInboxReadState",
+    "HumanInboxItemKind",
+    "HumanWorkspaceError",
+    "HumanWorkspaceAccessDenied",
+    "HumanWorkspaceConflict",
+    "HumanWorkspaceNotFoundError",
     "KnowledgeLearning",
     "KnowledgeAccessDenied",
     "KnowledgeConflict",

@@ -84,6 +84,17 @@ from .insights import (
 )
 from .knowledge import UnifiedKnowledgeCore
 from .knowledge_learning import KnowledgeLearning
+from .human_workspace import (
+    HumanWorkspace,
+    HumanPrincipal,
+    HumanInboxState,
+    HumanInboxReadState,
+    HumanInboxItemKind,
+    HumanWorkspaceError,
+    HumanWorkspaceAccessDenied,
+    HumanWorkspaceConflict,
+    HumanWorkspaceNotFoundError,
+)
 from .reconstruction import (
     TrajectoryReconstructor,
     AlternativeRoutePreview,
@@ -251,6 +262,7 @@ class Store:
         self.oracle = InvariantOracle(run_lookup=self.get_run_for_task, secret=self.supervisor_secret)
         self.knowledge_core = UnifiedKnowledgeCore(self.db, oracle=self.oracle)
         self.knowledge_learning = KnowledgeLearning(self.knowledge_core)
+        self.human_workspace = HumanWorkspace(self.db, supervisor_secret=self.supervisor_secret)
         self.insight_engine = InsightEngine(self.db, self.experience_store)
         self.reconstructor = TrajectoryReconstructor(self)
 
@@ -286,6 +298,15 @@ class Store:
             exit_code=exit_code,
             nonce=nonce,
         )
+
+    def issue_human_session_token(self, owner_id: str) -> str:
+        """Issue an authentic HMAC session token binding the human owner identity."""
+        return self.human_workspace.issue_session_token(owner_id)
+
+    def create_human_principal(self, owner_id: str, session_token: Optional[str] = None) -> HumanPrincipal:
+        """Create an authenticated HumanPrincipal for human workspace operations."""
+        token = session_token or self.issue_human_session_token(owner_id)
+        return HumanPrincipal(owner_id=owner_id, role="human", session_token=token)
 
     def get_run_for_task(self, task_id: str, run_id: str) -> Optional[Dict[str, Any]]:
         """Lookup execution run record for a specific task."""
