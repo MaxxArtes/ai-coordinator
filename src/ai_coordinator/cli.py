@@ -566,8 +566,24 @@ def export_context(store, config, ident, destination):
     path.write_text(scrub(text), encoding='utf-8')
     return {'task': ident, 'file': str(path.resolve()), 'characters': len(text)}
 
+def _get_version() -> str:
+    try:
+        from importlib.metadata import version as package_version
+        return package_version("ai-coordinator")
+    except Exception:
+        try:
+            from . import __version__
+            return __version__
+        except Exception:
+            return "0.4.0"
+
 def parser():
-    p = argparse.ArgumentParser(description=__doc__)
+    p = argparse.ArgumentParser(prog="ai-coordinator", description=__doc__)
+    p.add_argument(
+        "--version",
+        action="version",
+        version=f"%(prog)s {_get_version()}",
+    )
     p.add_argument("--root", default=str(default_data_dir()))
     sub = p.add_subparsers(dest="command", required=True)
     n = sub.add_parser("new"); n.add_argument("--project", required=True); n.add_argument("--goal", required=True); n.add_argument("--ai-memory-workstream-id"); n.add_argument("--flight-plan")
