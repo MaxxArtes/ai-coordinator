@@ -262,7 +262,11 @@ class Store:
         self.oracle = InvariantOracle(run_lookup=self.get_run_for_task, secret=self.supervisor_secret)
         self.knowledge_core = UnifiedKnowledgeCore(self.db, oracle=self.oracle)
         self.knowledge_learning = KnowledgeLearning(self.knowledge_core)
-        self.human_workspace = HumanWorkspace(self.db, supervisor_secret=self.supervisor_secret)
+        self.human_workspace = HumanWorkspace(
+            self.db,
+            supervisor_secret=self.supervisor_secret,
+            supervisor_key=self.supervisor_key,
+        )
         self.insight_engine = InsightEngine(self.db, self.experience_store)
         self.reconstructor = TrajectoryReconstructor(self)
 
@@ -299,14 +303,24 @@ class Store:
             nonce=nonce,
         )
 
-    def issue_human_session_token(self, owner_id: str) -> str:
-        """Issue an authentic HMAC session token binding the human owner identity."""
-        return self.human_workspace.issue_session_token(owner_id)
+    def issue_human_session_token(self, owner_id: str, supervisor_key: str) -> str:
+        """Issue an authentic HMAC session token binding the human owner identity.
+        Requires genuine supervisor authentication key.
+        """
+        return self.human_workspace.issue_session_token(owner_id, supervisor_key=supervisor_key)
 
-    def create_human_principal(self, owner_id: str, session_token: Optional[str] = None) -> HumanPrincipal:
+    def create_human_principal(
+        self,
+        owner_id: str,
+        supervisor_key: Optional[str] = None,
+        session_token: Optional[str] = None,
+    ) -> HumanPrincipal:
         """Create an authenticated HumanPrincipal for human workspace operations."""
-        token = session_token or self.issue_human_session_token(owner_id)
-        return HumanPrincipal(owner_id=owner_id, role="human", session_token=token)
+        if session_token is None:
+            if not supervisor_key:
+                raise HumanWorkspaceAccessDenied("Chave de supervisor obrigatoria para emissao de nova sessao humana")
+            session_token = self.issue_human_session_token(owner_id, supervisor_key=supervisor_key)
+        return HumanPrincipal(owner_id=owner_id, role="human", session_token=session_token)
 
     def get_run_for_task(self, task_id: str, run_id: str) -> Optional[Dict[str, Any]]:
         """Lookup execution run record for a specific task."""

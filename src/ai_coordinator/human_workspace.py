@@ -100,9 +100,15 @@ class HumanPrincipal:
 class HumanWorkspace:
     """Private Human Inbox and cognitive workspace manager backed by SQLite WAL."""
 
-    def __init__(self, db: sqlite3.Connection, supervisor_secret: Optional[bytes] = None):
+    def __init__(
+        self,
+        db: sqlite3.Connection,
+        supervisor_secret: Optional[bytes] = None,
+        supervisor_key: Optional[str] = None,
+    ):
         self.db = db
         self.supervisor_secret = supervisor_secret or secrets.token_bytes(32)
+        self.supervisor_key = str(supervisor_key).strip() if supervisor_key else None
         self._init_schema()
 
     def _init_schema(self) -> None:
@@ -182,15 +188,23 @@ class HumanWorkspace:
         finally:
             cursor.close()
 
-    def issue_session_token(self, owner_id: str) -> str:
-        """Issue an authentic HMAC session token binding the owner identity."""
+    def issue_session_token(self, owner_id: str, supervisor_key: str) -> str:
+        """Issue an authentic HMAC session token binding the owner identity.
+        Requires genuine supervisor authentication key.
+        """
+        if os.environ.get("AI_COORDINATOR_ROLE") == "worker":
+            raise HumanWorkspaceAccessDenied("Workers subordinados estao proibidos de solicitar tokens de sessao")
+        if not supervisor_key or not self.supervisor_key or not hmac.compare_digest(str(supervisor_key).strip(), self.supervisor_key):
+            raise HumanWorkspaceAccessDenied("Emissao de token negada: chave de supervisor ausente ou invalida")
         if not owner_id or not isinstance(owner_id, str):
             raise ValueError("owner_id obrigatorio")
         cleaned = owner_id.strip()
+        if not re.fullmatch(r"[a-zA-Z0-9_.-]{1,64}", cleaned):
+            raise ValueError("owner_id invalido")
         digest = hmac.new(self.supervisor_secret, f"human_session:{cleaned}".encode("utf-8"), hashlib.sha256).hexdigest()
         return f"hsess_{cleaned}_{digest}"
 
-    def verify_principal(self, principal: HumanPrincipal, require_session_token: bool = False) -> None:
+    def verify_principal(self, principal: HumanPrincipal, require_session_token: bool = True) -> None:
         """Enforce strict caller authorization, worker lockout, and cryptographic token validity."""
         if not isinstance(principal, HumanPrincipal):
             raise HumanWorkspaceAccessDenied("Principal invalido para operacao do Human Workspace")
@@ -208,7 +222,7 @@ class HumanWorkspace:
 
         if require_session_token or principal.session_token is not None:
             if not principal.session_token:
-                raise HumanWorkspaceAccessDenied("Token de sessao obrigatorio para esta operacao")
+                raise HumanWorkspaceAccessDenied("Token de sessao autenticado e obrigatorio para operacoes do Human Workspace")
             expected_prefix = f"hsess_{principal.owner_id}_"
             if not principal.session_token.startswith(expected_prefix):
                 raise HumanWorkspaceAccessDenied("Token de sessao invalido: proprietario divergente")
