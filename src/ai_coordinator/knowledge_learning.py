@@ -16,7 +16,9 @@ from .experience import ExperienceCategory, ExperienceRecord, ExperienceVisibili
 from .knowledge import (
     KnowledgeAccessDenied,
     KnowledgeConflict,
+    KnowledgeEvidenceLevel,
     KnowledgeKind,
+    KnowledgeNature,
     KnowledgePrincipal,
     KnowledgeVisibility,
     UnifiedKnowledgeCore,
@@ -124,6 +126,8 @@ class KnowledgeLearning:
         return self.core.capture(
             principal, project_id, KnowledgeKind.HYPOTHESIS, protocol["hypothesis"],
             visibility=visibility, task_id=task_id, context=context_data,
+            nature=KnowledgeNature.SPECULATIVE_DRAFT,
+            evidence_level=KnowledgeEvidenceLevel.UNVERIFIED,
             source_kind="experiment", source_id=source_id, tags=tags,
             evidence={"protocol_sha256": _canonical_hash(protocol)},
         )
@@ -263,6 +267,8 @@ class KnowledgeLearning:
                     "reviewed_by": r["reviewed_by"],
                     "review_reason": r["review_reason"],
                     "proof_level": "human_reviewed_not_oracle_verified",
+                    "evidence_level": KnowledgeEvidenceLevel.HUMAN_REVIEWED,
+                    "nature": entry.get("nature", KnowledgeNature.SPECULATIVE_DRAFT),
                 })
         results.sort(key=lambda r: (-r["relevance_score"], r["knowledge_id"]))
         return results[:limit]
@@ -309,10 +315,17 @@ class KnowledgeLearning:
             ExperienceCategory.SOLUTION_PATTERN: KnowledgeKind.SOLUTION_PATTERN,
             ExperienceCategory.USER_PREFERENCE: KnowledgeKind.USER_PREFERENCE,
         }[record.category]
+        nature = (
+            KnowledgeNature.DECISION_RECORD
+            if record.category in (ExperienceCategory.ARCHITECTURE_DECISION, ExperienceCategory.USER_PREFERENCE)
+            else KnowledgeNature.OBSERVATION
+        )
         return self.core.capture(
             principal, record.project_id, kind,
             f"Problema: {record.problem_pattern}\nAbordagem: {record.solution_pattern}",
             task_id=record.task_id, visibility=record.visibility,
+            nature=nature,
+            evidence_level=KnowledgeEvidenceLevel.UNVERIFIED,
             source_kind="experience_store", source_id=record.id,
             tags=record.context_tags,
             context={

@@ -72,6 +72,32 @@ class KnowledgeState:
     }
 
 
+class KnowledgeNature:
+    """Epistemological nature of knowledge statements."""
+    SPECULATIVE_DRAFT = "speculative_draft"
+    OBSERVATION = "observation"
+    VALIDATED_FINDING = "validated_finding"
+    DECISION_RECORD = "decision_record"
+    ALL = frozenset((
+        SPECULATIVE_DRAFT,
+        OBSERVATION,
+        VALIDATED_FINDING,
+        DECISION_RECORD,
+    ))
+
+
+class KnowledgeEvidenceLevel:
+    """Degree of empirical or physical verification supporting a statement."""
+    UNVERIFIED = "unverified"
+    HUMAN_REVIEWED = "human_reviewed"
+    ORACLE_VERIFIED = "oracle_verified"
+    ALL = frozenset((
+        UNVERIFIED,
+        HUMAN_REVIEWED,
+        ORACLE_VERIFIED,
+    ))
+
+
 class KnowledgeVisibility:
     PRIVATE_HUMAN = "private_human"
     PROJECT_SHARED = "project_shared"
@@ -113,7 +139,7 @@ class UnifiedKnowledgeCore:
 
     def _init_schema(self) -> None:
         in_tx = self.db.in_transaction
-        statements = (
+        table_statements = (
             """CREATE TABLE IF NOT EXISTS knowledge_entries (
                 id TEXT PRIMARY KEY,
                 project_id TEXT NOT NULL,
@@ -124,6 +150,8 @@ class UnifiedKnowledgeCore:
                 author_role TEXT NOT NULL,
                 visibility TEXT NOT NULL,
                 state TEXT NOT NULL,
+                nature TEXT NOT NULL DEFAULT 'speculative_draft',
+                evidence_level TEXT NOT NULL DEFAULT 'unverified',
                 revision INTEGER NOT NULL DEFAULT 1,
                 source_kind TEXT NOT NULL,
                 source_id TEXT,
@@ -158,15 +186,28 @@ class UnifiedKnowledgeCore:
                 FOREIGN KEY (source_id) REFERENCES knowledge_entries(id),
                 FOREIGN KEY (target_id) REFERENCES knowledge_entries(id)
             )""",
+        )
+        for stmt in table_statements:
+            self.db.execute(stmt)
+
+        columns = {row[1] for row in self.db.execute("PRAGMA table_info(knowledge_entries)").fetchall()}
+        if "nature" not in columns:
+            self.db.execute("ALTER TABLE knowledge_entries ADD COLUMN nature TEXT NOT NULL DEFAULT 'speculative_draft'")
+        if "evidence_level" not in columns:
+            self.db.execute("ALTER TABLE knowledge_entries ADD COLUMN evidence_level TEXT NOT NULL DEFAULT 'unverified'")
+
+        aux_statements = (
             "CREATE INDEX IF NOT EXISTS idx_knowledge_scope ON knowledge_entries(project_id, visibility, state)",
+            "CREATE INDEX IF NOT EXISTS idx_knowledge_nature_evidence ON knowledge_entries(project_id, nature, evidence_level)",
             "CREATE INDEX IF NOT EXISTS idx_knowledge_events ON knowledge_events(entry_id, entry_revision)",
             """CREATE TRIGGER IF NOT EXISTS knowledge_events_no_update
                BEFORE UPDATE ON knowledge_events BEGIN SELECT RAISE(ABORT, 'knowledge events append-only'); END""",
             """CREATE TRIGGER IF NOT EXISTS knowledge_events_no_delete
                BEFORE DELETE ON knowledge_events BEGIN SELECT RAISE(ABORT, 'knowledge events append-only'); END""",
         )
-        for stmt in statements:
+        for stmt in aux_statements:
             self.db.execute(stmt)
+
         if not in_tx:
             self.db.commit()
 
@@ -263,6 +304,8 @@ class UnifiedKnowledgeCore:
         *,
         task_id: Optional[str] = None,
         visibility: str = KnowledgeVisibility.PRIVATE_HUMAN,
+        nature: Optional[str] = None,
+        evidence_level: Optional[str] = None,
         source_kind: str = "manual",
         source_id: Optional[str] = None,
         tags: Sequence[str] = (),
@@ -276,6 +319,27 @@ class UnifiedKnowledgeCore:
             raise ValueError("Tipo de conhecimento invalido")
         if visibility not in KnowledgeVisibility.ALL or not self._can_write(principal, project_id, visibility):
             raise KnowledgeAccessDenied("Principal sem autorizacao para gravar neste escopo")
+
+        if nature is None:
+            if kind in (KnowledgeKind.DECISION, KnowledgeKind.ARCHITECTURE_DECISION, KnowledgeKind.USER_PREFERENCE):
+                nature = KnowledgeNature.DECISION_RECORD
+            elif kind == KnowledgeKind.OBSERVATION:
+                nature = KnowledgeNature.OBSERVATION
+            else:
+                nature = KnowledgeNature.SPECULATIVE_DRAFT
+        elif nature not in KnowledgeNature.ALL:
+            raise ValueError("Natureza epistemologica invalida")
+
+        if evidence_level is None:
+            evidence_level = KnowledgeEvidenceLevel.UNVERIFIED
+        elif evidence_level not in KnowledgeEvidenceLevel.ALL:
+            raise ValueError("Grau de evidencia invalido")
+
+        if evidence_level == KnowledgeEvidenceLevel.ORACLE_VERIFIED and principal.role != "supervisor":
+            raise KnowledgeAccessDenied("Apenas o supervisor/oraculo pode emitir ou validar comprovacoes oracle_verified")
+        if nature == KnowledgeNature.VALIDATED_FINDING and principal.role != "supervisor":
+            raise KnowledgeAccessDenied("Apenas o supervisor/oraculo pode certificar validated_finding")
+
         clean_tags = sorted({self._validate_text(t, "tag", 80).casefold() for t in tags})
         if len(clean_tags) > self.MAX_TAGS:
             raise ValueError("Quantidade excessiva de tags")
@@ -286,13 +350,13 @@ class UnifiedKnowledgeCore:
                 self.db.execute(
                     """INSERT INTO knowledge_entries (
                         id, project_id, task_id, kind, content, author_id, author_role,
-                        visibility, state, revision, source_kind, source_id,
+                        visibility, state, nature, evidence_level, revision, source_kind, source_id,
                         tags_json, context_json, evidence_json, created_at, updated_at
-                    ) VALUES (?,?,?,?,?,?,?,?,?,1,?,?,?,?,?,?,?)""",
+                    ) VALUES (?,?,?,?,?,?,?,?,?,?,?,1,?,?,?,?,?,?,?)""",
                     (
                         entry_id, project_id, task_id, kind, content.strip(),
                         principal.principal_id, principal.role, visibility,
-                        KnowledgeState.CAPTURED, source_kind, source_id,
+                        KnowledgeState.CAPTURED, nature, evidence_level, source_kind, source_id,
                         json.dumps(clean_tags), self._json_object(context, "context"),
                         self._json_object(evidence, "evidence"), stamp, stamp,
                     ),
@@ -324,6 +388,8 @@ class UnifiedKnowledgeCore:
         new_state: str,
         reason: str,
         replacement_id: Optional[str] = None,
+        new_nature: Optional[str] = None,
+        new_evidence_level: Optional[str] = None,
     ) -> Dict[str, Any]:
         reason = self._validate_text(reason, "reason", 2000)
         with self._transaction():
@@ -353,15 +419,107 @@ class UnifiedKnowledgeCore:
                     raise KnowledgeTransitionError("Substituicao requer outra decisao aceita no mesmo projeto")
             elif replacement_id is not None:
                 raise KnowledgeTransitionError("replacement_id so e permitido em superseded")
+
+            target_nature = row.get("nature", KnowledgeNature.SPECULATIVE_DRAFT)
+            target_evidence = row.get("evidence_level", KnowledgeEvidenceLevel.UNVERIFIED)
+
+            if new_nature is not None:
+                if new_nature not in KnowledgeNature.ALL:
+                    raise ValueError("Natureza epistemologica invalida")
+                if new_nature == KnowledgeNature.VALIDATED_FINDING and principal.role != "supervisor":
+                    raise KnowledgeAccessDenied("Apenas o supervisor/oraculo pode certificar validated_finding")
+                target_nature = new_nature
+            elif new_state == KnowledgeState.ACCEPTED and target_nature == KnowledgeNature.SPECULATIVE_DRAFT:
+                if row["kind"] in (KnowledgeKind.DECISION, KnowledgeKind.ARCHITECTURE_DECISION, KnowledgeKind.USER_PREFERENCE):
+                    target_nature = KnowledgeNature.DECISION_RECORD
+
+            if new_evidence_level is not None:
+                if new_evidence_level not in KnowledgeEvidenceLevel.ALL:
+                    raise ValueError("Grau de evidencia invalido")
+                if new_evidence_level == KnowledgeEvidenceLevel.ORACLE_VERIFIED and principal.role != "supervisor":
+                    raise KnowledgeAccessDenied("Apenas o supervisor/oraculo pode emitir ou validar comprovacoes oracle_verified")
+                target_evidence = new_evidence_level
+            elif new_state == KnowledgeState.ACCEPTED and target_evidence == KnowledgeEvidenceLevel.UNVERIFIED and principal.role == "human":
+                target_evidence = KnowledgeEvidenceLevel.HUMAN_REVIEWED
+
             cur = self.db.execute(
                 """UPDATE knowledge_entries
-                   SET state = ?, revision = revision + 1, updated_at = ?, superseded_by = ?
+                   SET state = ?, nature = ?, evidence_level = ?, revision = revision + 1,
+                       updated_at = ?, superseded_by = ?
                    WHERE id = ? AND revision = ? AND state = ?""",
-                (new_state, _now(), replacement_id, entry_id, expected_revision, row["state"]),
+                (new_state, target_nature, target_evidence, _now(), replacement_id, entry_id, expected_revision, row["state"]),
             )
             if cur.rowcount != 1:
                 raise KnowledgeConflict("Conflito concorrente de revisao")
             self._event(entry_id, expected_revision + 1, "transition", principal.principal_id, row["state"], new_state, reason)
+        result = self.get(principal, entry_id)
+        assert result is not None
+        return result
+
+    def verify_with_oracle(
+        self,
+        principal: KnowledgePrincipal,
+        entry_id: str,
+        *,
+        expected_revision: int,
+        oracle_token: str,
+        verification_evidence: Mapping[str, Any],
+        nature: str = KnowledgeNature.VALIDATED_FINDING,
+        reason: str = "Verificacao formal concluida pelo Oraculo",
+    ) -> Dict[str, Any]:
+        """Certify an entry as oracle_verified; strictly restricted to a supervisor principal.
+
+        Requires an authentic oracle_token and verification_evidence mapping.
+        """
+        if principal.role != "supervisor":
+            raise KnowledgeAccessDenied("Apenas o supervisor/oraculo pode certificar oracle_verified")
+        if not isinstance(oracle_token, str) or len(oracle_token.strip()) < 16:
+            raise ValueError("oracle_token invalido ou insuficiente")
+        if not isinstance(verification_evidence, Mapping) or not verification_evidence:
+            raise ValueError("verification_evidence obrigatorio para certificacao pelo Oraculo")
+        if nature not in (KnowledgeNature.VALIDATED_FINDING, KnowledgeNature.DECISION_RECORD, KnowledgeNature.OBSERVATION):
+            raise ValueError("Natureza epistemologica incompativel com verificacao do Oraculo")
+        reason = self._validate_text(reason, "reason", 2000)
+
+        with self._transaction():
+            row = self.get(principal, entry_id)
+            if row is None:
+                raise KnowledgeAccessDenied("Registro ausente ou fora do escopo")
+            if row["revision"] != expected_revision:
+                raise KnowledgeConflict("Revisao obsoleta; releia a entrada")
+
+            current_evidence = dict(row["evidence"])
+            current_evidence["oracle_verification"] = {
+                "token": oracle_token.strip(),
+                "evidence": dict(verification_evidence),
+                "verified_at": _now(),
+                "verified_by": principal.principal_id,
+            }
+            cur = self.db.execute(
+                """UPDATE knowledge_entries
+                   SET nature = ?, evidence_level = ?, evidence_json = ?,
+                       revision = revision + 1, updated_at = ?
+                   WHERE id = ? AND revision = ?""",
+                (
+                    nature,
+                    KnowledgeEvidenceLevel.ORACLE_VERIFIED,
+                    self._json_object(current_evidence, "evidence"),
+                    _now(),
+                    entry_id,
+                    expected_revision,
+                ),
+            )
+            if cur.rowcount != 1:
+                raise KnowledgeConflict("Conflito concorrente de revisao")
+            self._event(
+                entry_id,
+                expected_revision + 1,
+                "oracle_verify",
+                principal.principal_id,
+                row["state"],
+                row["state"],
+                reason,
+            )
         result = self.get(principal, entry_id)
         assert result is not None
         return result
@@ -374,6 +532,8 @@ class UnifiedKnowledgeCore:
         project_id: Optional[str] = None,
         kinds: Sequence[str] = (),
         states: Sequence[str] = (),
+        natures: Sequence[str] = (),
+        evidence_levels: Sequence[str] = (),
         context: Optional[Mapping[str, Any]] = None,
         limit: int = 20,
     ) -> List[Dict[str, Any]]:
@@ -389,6 +549,10 @@ class UnifiedKnowledgeCore:
             raise ValueError("kind invalido")
         if any(s not in KnowledgeState.TRANSITIONS for s in states):
             raise ValueError("state invalido")
+        if any(n not in KnowledgeNature.ALL for n in natures):
+            raise ValueError("nature invalida")
+        if any(e not in KnowledgeEvidenceLevel.ALL for e in evidence_levels):
+            raise ValueError("evidence_level invalido")
         clause, params = self._can_read_sql(principal)
         clauses = [clause]
         if project_id is not None:
@@ -400,6 +564,12 @@ class UnifiedKnowledgeCore:
         if states:
             clauses.append("state IN (" + ",".join("?" for _ in states) + ")")
             params.extend(states)
+        if natures:
+            clauses.append("nature IN (" + ",".join("?" for _ in natures) + ")")
+            params.extend(natures)
+        if evidence_levels:
+            clauses.append("evidence_level IN (" + ",".join("?" for _ in evidence_levels) + ")")
+            params.extend(evidence_levels)
         sql = "SELECT * FROM knowledge_entries WHERE " + " AND ".join(clauses) + " ORDER BY created_at DESC, id LIMIT 1000"
         rows = self.db.execute(sql, params).fetchall()
         needle = set(re.findall(r"\w+", query.casefold(), flags=re.UNICODE))

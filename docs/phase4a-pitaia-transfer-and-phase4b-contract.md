@@ -15,25 +15,25 @@ Fontes que motivaram o desenho:
   rejeição falsa e sucesso composto;
 - `pitanga-app/.../MemoriaUsuario.kt`: personalização local removível pelo usuário.
 
-## Implementado em 4A.1 / 4A.2
+## Implementado em 4A.1 / 4A.2 / 4A.3
 
-`Store.knowledge_learning` implementa `KnowledgeLearning`:
-- `propose_experiment`: hipótese e critério de falsificação são armazenados
-  **antes** do resultado em `knowledge_entries`, com SHA-256 canônico do protocolo.
-- `record_observation`: anexa observações **relatadas**. Uma referência de CI,
-  log ou hash fornecida pelo autor **não prova autenticidade** nem validação do teste.
-- `review_observation`: humano autorizado pode aceitar ou rejeitar a observação
-  com motivo; apenas uma revisão por observação, com transações serializadas.
-- `reviewed_precedents`: disponibiliza resultados aceitos pelo humano dentro do
-  escopo autorizado, incluindo resultados **negativos**. Etiqueta explícita
-  `human_reviewed_not_oracle_verified`.
-- `import_legacy_experience`: importar explicitamente experiências
-  compartilhadas de `experience.py`, por ID único
-  `(project_id, source_kind, source_id)`, sem apagar a origem nem assumir
-  aprovação. Importação de notas `private_human` legadas está **bloqueada**
-  até existir um mapeamento de autoria autenticado.
-- A tabela `knowledge_experiment_events` é append-only por triggers;
-  a política de acesso é derivada do `knowledge_entries` autoritativo.
+`Store.knowledge_core` e `Store.knowledge_learning` implementam o núcleo de conhecimento:
+- **Três dimensões independentes**:
+  - `state` (Ciclo de vida): `captured`, `proposed`, `accepted`, `rejected`, `superseded`, `archived`.
+  - `nature` (Natureza epistemológica): `speculative_draft`, `observation`, `validated_finding`, `decision_record`. Distingue decisões normativas de projeto de descobertas factuais universais.
+  - `evidence_level` (Grau de evidência): `unverified`, `human_reviewed`, `oracle_verified`.
+- **Proteção do Oráculo**:
+  - `oracle_verified` e `validated_finding` só podem ser atribuídos por `principal.role == "supervisor"` através de `verify_with_oracle` com token autenticado e evidências auditáveis.
+  - Workers e humanos não conseguem forjar `oracle_verified` via JSON ou transições diretas.
+- **Protocolo de experimentos falsificáveis**:
+  - `propose_experiment`: hipótese e critério de falsificação são armazenados **antes** do resultado em `knowledge_entries`, com SHA-256 canônico do protocolo e `evidence_level="unverified"`.
+- **Observações e precedentes negativos**:
+  - `record_observation`: registra observações relatadas sem promoção automática.
+  - `review_observation`: revisão humana serializada; resultados negativos (`outcome="failed"`) são preservados como precedentes fundamentais para evitar repetir erros passados.
+- **Migração retrocompatível do legado**:
+  - Esquema SQLite com migração automática via `_init_schema` adicionando `nature` e `evidence_level` caso ausentes.
+  - `import_legacy_experience`: importa dados históricos de `experience.py` com `evidence_level="unverified"` e bloqueia notas privadas legadas sem autor único autenticado (*fail-closed*).
+- A tabela `knowledge_experiment_events` é append-only por triggers; a política de acesso é derivada do `knowledge_entries` autoritativo.
 
 **Não implementado:** verificação do hash do artefato de terceiros pelo Oracle,
 assinatura de evidências de execução, sincronização automática dos registros legados,
@@ -90,23 +90,27 @@ Um processo de migração em lote exigirá:
 4. Trocar a API legada por adaptador read-through apenas com testes comparativos.
 5. Descomissionar a tabela antiga somente com plano de reversão aprovado.
 
-## Contrato proposto para 4B — Human Workspace (ainda NÃO implementado)
+## Contrato proposto para 4B — Human Workspace (a implementar na Fase 4B)
 
-- **Inbox**: `capture_text(owner_id, content, source, captured_at)`, sem projeto
-  obrigatório. Internamente usar um escopo privado de inbox associado à identidade
-  humana (nunca uma string global compartilhada), antes da triagem.
+- **Tabela dedicada `human_inbox`**:
+  - `id TEXT PRIMARY KEY`, `owner_id TEXT NOT NULL`, `project_id TEXT NULLABLE`,
+    `content TEXT NOT NULL`, `status TEXT NOT NULL DEFAULT 'unread'`,
+    `captured_at TEXT NOT NULL`, `updated_at TEXT NOT NULL`.
+  - Isola anotações pessoais da tabela `knowledge_entries` (que possui `project_id TEXT NOT NULL`),
+    permitindo captura sem atrito sem exigir projetos globais genéricos ou gambiarras de esquema.
+  - O `owner_id` deve ser autenticado por broker/supervisor confiável; workers subordinados não podem
+    forjar identidades humanas.
 - **Triagem**: `review_item(entry_id, expected_revision, classification, project_id?)`.
-  Escolha humana, controle otimista de revisão, nenhuma conversão automática em DAG.
+  Escolha humana, controle otimista de revisão, nenhuma conversão automática em nós da DAG.
 - **Checkpoint cognitivo**: `save_focus_checkpoint(project_id, intention, last_decision,
-  open_questions, next_step)`. Notas humanas privadas por padrão, revisão e histórico.
-- **Retomar**: `resume_human_project(project_id)` sintetiza apenas itens autorizados:
-  decisões vigentes, questões abertas, experimentos revisados, eventos do Oracle e do
-  Resource Ledger; prioriza evidência recente e marca lacunas.
-- **Controle**: toggle explícito para aprender novas preferências e comando de
-  exclusão/exportação, com política de retenção, minimização de dados e separação
-  entre conhecimento pessoal e compartilhado.
-- **Adaptadores**: CLI/Notion são interfaces e não autoridades. Um adaptador nunca
-  autentica a si mesmo por preencher `KnowledgePrincipal`; identidade vem do broker.
+  open_questions, next_step)`. Preserva o foco mental antes de interrupções ou trocas de contexto.
+- **Retomar**: `resume_human_project(project_id)` sintetiza itens autorizados: decisões vigentes,
+  questões em aberto, experimentos revisados, eventos do Oracle e do Resource Ledger.
+- **Insight Engine híbrido e econômico**:
+  - Proatividade por eventos contextuais locais (retomada, término de missão, bloqueio) com detecção determinística no SQLite sem consumo contínuo de tokens.
+  - Ideação e reflexão profunda com modelos externos apenas sob demanda ou autorização explícita com orçamento e cotas.
+  - Três regras inegociáveis: repetição de hipótese por múltiplos modelos não é validação; semântica entre projetos não quebra privacidade; autonomia determinística total mesmo offline.
+- **Adaptadores**: CLI e visualizadores externos (ex: Notion na 4F) são interfaces secundárias de leitura e ingestão, sem autoridade operacional sobre a fonte única da verdade (SQLite).
 
 ## Avaliação antes da 4C/4D
 

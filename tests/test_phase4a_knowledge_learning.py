@@ -215,6 +215,30 @@ class LearningFromPitaiATests(unittest.TestCase):
         )
         self.assertEqual(res[0]["context_match"], "unconfirmed")
 
+    def test_15_legacy_imported_has_unverified_evidence_level_and_negative_experiment_retained(self):
+        legacy = self.store.experience_store.record_experience(
+            project_id="alpha", problem_pattern="Deadlock",
+            solution_pattern="WAL mode",
+        )
+        imported = self.core.import_legacy_experience(self.owner, legacy)
+        self.assertEqual(imported["evidence_level"], "unverified")
+        self.assertEqual(imported["nature"], "observation")
+
+        e = self._experiment()
+        obs = self.core.record_observation(
+            self.worker, e["id"], outcome="failed",
+            summary="Falhou com timeout de 30s", evidence_refs=("ci/run-99",),
+        )
+        self.core.review_observation(
+            self.owner, e["id"], observation_id=obs,
+            decision="accepted", reason="Confirmado que essa abordagem falha",
+        )
+        precedents = self.core.reviewed_precedents(self.worker, query="sincronizacao")
+        self.assertEqual(len(precedents), 1)
+        self.assertEqual(precedents[0]["outcome"], "failed")
+        self.assertEqual(precedents[0]["proof_level"], "human_reviewed_not_oracle_verified")
+        self.assertEqual(precedents[0]["evidence_level"], "human_reviewed")
+
 
 if __name__ == "__main__":
     unittest.main()

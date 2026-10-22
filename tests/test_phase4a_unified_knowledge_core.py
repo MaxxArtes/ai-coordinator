@@ -9,7 +9,9 @@ import unittest
 from ai_coordinator.knowledge import (
     KnowledgeAccessDenied,
     KnowledgeConflict,
+    KnowledgeEvidenceLevel,
     KnowledgeKind,
+    KnowledgeNature,
     KnowledgePrincipal,
     KnowledgeState,
     KnowledgeTransitionError,
@@ -28,6 +30,7 @@ class UnifiedKnowledgeCoreTests(unittest.TestCase):
         self.bob = KnowledgePrincipal("bob", "human", frozenset(("project-a",)))
         self.agent_a = KnowledgePrincipal("agent-a", "agent", frozenset(("project-a",)))
         self.agent_b = KnowledgePrincipal("agent-b", "agent", frozenset(("project-b",)))
+        self.supervisor = KnowledgePrincipal("supervisor", "supervisor", frozenset(("project-a", "project-b")), True, True)
         self.unscoped = KnowledgePrincipal("no-project", "agent")
 
     def tearDown(self):
@@ -193,6 +196,159 @@ class UnifiedKnowledgeCoreTests(unittest.TestCase):
                 self.assertEqual(store.knowledge_core.get(human, record["id"])["content"], "Captura local")
             finally:
                 store.db.close()
+
+    def test_16_three_independent_dimensions(self):
+        # 1. Thought captured defaults to speculative_draft and unverified
+        thought = self.core.capture(self.alice, "project-a", KnowledgeKind.THOUGHT, "Ideia preliminar")
+        self.assertEqual(thought["state"], KnowledgeState.CAPTURED)
+        self.assertEqual(thought["nature"], KnowledgeNature.SPECULATIVE_DRAFT)
+        self.assertEqual(thought["evidence_level"], KnowledgeEvidenceLevel.UNVERIFIED)
+
+        # 2. Decision captured defaults to decision_record and unverified
+        decision = self._decision("Adotar PostgreSQL no servico de relatorios")
+        self.assertEqual(decision["state"], KnowledgeState.CAPTURED)
+        self.assertEqual(decision["nature"], KnowledgeNature.DECISION_RECORD)
+        self.assertEqual(decision["evidence_level"], KnowledgeEvidenceLevel.UNVERIFIED)
+
+        # 3. Accepted by human: state is accepted, nature is decision_record, evidence is human_reviewed (NEVER oracle_verified)
+        accepted = self._accept(decision)
+        self.assertEqual(accepted["state"], KnowledgeState.ACCEPTED)
+        self.assertEqual(accepted["nature"], KnowledgeNature.DECISION_RECORD)
+        self.assertEqual(accepted["evidence_level"], KnowledgeEvidenceLevel.HUMAN_REVIEWED)
+        self.assertNotEqual(accepted["evidence_level"], KnowledgeEvidenceLevel.ORACLE_VERIFIED)
+
+    def test_17_worker_and_human_cannot_forge_oracle_verified(self):
+        # Agent cannot capture as oracle_verified or validated_finding
+        with self.assertRaises(KnowledgeAccessDenied):
+            self.core.capture(
+                self.agent_a, "project-a", KnowledgeKind.OBSERVATION, "Teste passou",
+                evidence_level=KnowledgeEvidenceLevel.ORACLE_VERIFIED,
+                visibility=KnowledgeVisibility.PROJECT_SHARED,
+            )
+        with self.assertRaises(KnowledgeAccessDenied):
+            self.core.capture(
+                self.agent_a, "project-a", KnowledgeKind.OBSERVATION, "Fato provado",
+                nature=KnowledgeNature.VALIDATED_FINDING,
+                visibility=KnowledgeVisibility.PROJECT_SHARED,
+            )
+
+        # Human cannot capture as oracle_verified directly
+        with self.assertRaises(KnowledgeAccessDenied):
+            self.core.capture(
+                self.alice, "project-a", KnowledgeKind.OBSERVATION, "Teste manual",
+                evidence_level=KnowledgeEvidenceLevel.ORACLE_VERIFIED,
+            )
+
+        # Human cannot transition directly to oracle_verified
+        rec = self._decision("Mudar cache")
+        with self.assertRaises(KnowledgeAccessDenied):
+            self.core.transition(
+                self.alice, rec["id"], expected_revision=1,
+                new_state=KnowledgeState.PROPOSED, reason="Tentativa invalida",
+                new_evidence_level=KnowledgeEvidenceLevel.ORACLE_VERIFIED,
+            )
+
+        # Neither worker nor human can call verify_with_oracle
+        with self.assertRaises(KnowledgeAccessDenied):
+            self.core.verify_with_oracle(
+                self.agent_a, rec["id"], expected_revision=1,
+                oracle_token="token-com-mais-de-16-caracteres",
+                verification_evidence={"run": 1},
+            )
+        with self.assertRaises(KnowledgeAccessDenied):
+            self.core.verify_with_oracle(
+                self.alice, rec["id"], expected_revision=1,
+                oracle_token="token-com-mais-de-16-caracteres",
+                verification_evidence={"run": 1},
+            )
+
+    def test_18_supervisor_verify_with_oracle_success(self):
+        rec = self.core.capture(
+            self.alice, "project-a", KnowledgeKind.OBSERVATION,
+            "Sincronizacao de processos com teste concorrente",
+            visibility=KnowledgeVisibility.PROJECT_SHARED,
+        )
+        verified = self.core.verify_with_oracle(
+            self.supervisor, rec["id"], expected_revision=1,
+            oracle_token="oracle-token-sha256-abc1234567890",
+            verification_evidence={"command": "pytest -k concurrency", "exit_code": 0, "hash": "a" * 64},
+            nature=KnowledgeNature.VALIDATED_FINDING,
+            reason="Oraculo confirmou execucao com sucesso",
+        )
+        self.assertEqual(verified["evidence_level"], KnowledgeEvidenceLevel.ORACLE_VERIFIED)
+        self.assertEqual(verified["nature"], KnowledgeNature.VALIDATED_FINDING)
+        self.assertIn("oracle_verification", verified["evidence"])
+        self.assertEqual(verified["evidence"]["oracle_verification"]["token"], "oracle-token-sha256-abc1234567890")
+        self.assertEqual(verified["evidence"]["oracle_verification"]["verified_by"], "supervisor")
+
+        events = self.core.events(self.supervisor, rec["id"])
+        self.assertEqual(events[-1]["event_type"], "oracle_verify")
+
+    def test_19_retrocompatible_schema_migration(self):
+        # Simulate legacy database created without nature and evidence_level
+        conn = sqlite3.connect(":memory:")
+        conn.row_factory = sqlite3.Row
+        conn.execute(
+            """CREATE TABLE knowledge_entries (
+                id TEXT PRIMARY KEY,
+                project_id TEXT NOT NULL,
+                task_id TEXT,
+                kind TEXT NOT NULL,
+                content TEXT NOT NULL,
+                author_id TEXT NOT NULL,
+                author_role TEXT NOT NULL,
+                visibility TEXT NOT NULL,
+                state TEXT NOT NULL,
+                revision INTEGER NOT NULL DEFAULT 1,
+                source_kind TEXT NOT NULL,
+                source_id TEXT,
+                tags_json TEXT NOT NULL,
+                context_json TEXT NOT NULL,
+                evidence_json TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                superseded_by TEXT
+            )"""
+        )
+        conn.execute(
+            """INSERT INTO knowledge_entries (
+                id, project_id, task_id, kind, content, author_id, author_role,
+                visibility, state, revision, source_kind, source_id,
+                tags_json, context_json, evidence_json, created_at, updated_at
+            ) VALUES ('legacy-1', 'project-a', NULL, 'thought', 'Nota antiga', 'alice', 'human',
+                      'private_human', 'captured', 1, 'manual', NULL, '[]', '{}', '{}',
+                      '2026-10-01T00:00:00Z', '2026-10-01T00:00:00Z')"""
+        )
+        conn.commit()
+
+        # Instantiate core; should migrate schema and add missing columns
+        core = UnifiedKnowledgeCore(conn)
+        row = core.get(self.alice, "legacy-1")
+        self.assertIsNotNone(row)
+        self.assertEqual(row["nature"], KnowledgeNature.SPECULATIVE_DRAFT)
+        self.assertEqual(row["evidence_level"], KnowledgeEvidenceLevel.UNVERIFIED)
+        conn.close()
+
+    def test_20_find_filters_by_nature_and_evidence_level(self):
+        self.core.capture(self.alice, "project-a", KnowledgeKind.THOUGHT, "Rascunho A",
+                          visibility=KnowledgeVisibility.PROJECT_SHARED)
+        dec = self._decision("Decisao B")
+        self._accept(dec)
+        obs = self.core.capture(self.alice, "project-a", KnowledgeKind.OBSERVATION, "Evidencia C",
+                                visibility=KnowledgeVisibility.PROJECT_SHARED)
+        self.core.verify_with_oracle(
+            self.supervisor, obs["id"], expected_revision=1,
+            oracle_token="oracle-token-sha256-xyz9876543210",
+            verification_evidence={"verified": True},
+        )
+
+        decisions = self.core.find(self.alice, project_id="project-a", natures=[KnowledgeNature.DECISION_RECORD])
+        self.assertEqual(len(decisions), 1)
+        self.assertEqual(decisions[0]["nature"], KnowledgeNature.DECISION_RECORD)
+
+        oracle_verified = self.core.find(self.alice, project_id="project-a", evidence_levels=[KnowledgeEvidenceLevel.ORACLE_VERIFIED])
+        self.assertEqual(len(oracle_verified), 1)
+        self.assertEqual(oracle_verified[0]["evidence_level"], KnowledgeEvidenceLevel.ORACLE_VERIFIED)
 
 
 if __name__ == "__main__":
