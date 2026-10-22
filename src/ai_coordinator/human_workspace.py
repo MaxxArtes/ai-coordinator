@@ -18,10 +18,11 @@ import hashlib
 import hmac
 import json
 import os
+from pathlib import Path
 import re
 import secrets
 import sqlite3
-from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple, Union
 
 
 def _now() -> str:
@@ -127,9 +128,18 @@ class HumanWorkspace:
                     read_state TEXT NOT NULL DEFAULT 'unread',
                     revision INTEGER NOT NULL DEFAULT 1,
                     created_at TEXT NOT NULL,
-                    updated_at TEXT NOT NULL
+                    updated_at TEXT NOT NULL,
+                    converted_task_id TEXT
                 )"""
             )
+            existing_cols = {r[1] for r in self.db.execute("PRAGMA table_info(human_inbox)").fetchall()}
+            if "converted_task_id" not in existing_cols:
+                try:
+                    self.db.execute("ALTER TABLE human_inbox ADD COLUMN converted_task_id TEXT")
+                except sqlite3.OperationalError as exc:
+                    if "duplicate column" not in str(exc).lower():
+                        raise
+
             self.db.execute(
                 """CREATE INDEX IF NOT EXISTS idx_human_inbox_owner
                    ON human_inbox(owner_id, state, created_at DESC)"""
@@ -137,6 +147,11 @@ class HumanWorkspace:
             self.db.execute(
                 """CREATE INDEX IF NOT EXISTS idx_human_inbox_owner_proj
                    ON human_inbox(owner_id, project_id)"""
+            )
+            self.db.execute(
+                """CREATE UNIQUE INDEX IF NOT EXISTS idx_human_inbox_converted_task
+                   ON human_inbox(converted_task_id)
+                   WHERE converted_task_id IS NOT NULL"""
             )
 
             self.db.execute(
@@ -178,15 +193,29 @@ class HumanWorkspace:
     @contextlib.contextmanager
     def _transaction(self):
         cursor = self.db.cursor()
-        cursor.execute("BEGIN IMMEDIATE")
-        try:
-            yield cursor
-            self.db.commit()
-        except Exception:
-            self.db.rollback()
-            raise
-        finally:
-            cursor.close()
+        is_nested = self.db.in_transaction
+        if is_nested:
+            sp_name = f"sp_{secrets.token_hex(8)}"
+            cursor.execute(f"SAVEPOINT {sp_name}")
+            try:
+                yield cursor
+                cursor.execute(f"RELEASE SAVEPOINT {sp_name}")
+            except Exception:
+                cursor.execute(f"ROLLBACK TO SAVEPOINT {sp_name}")
+                cursor.execute(f"RELEASE SAVEPOINT {sp_name}")
+                raise
+            finally:
+                cursor.close()
+        else:
+            cursor.execute("BEGIN IMMEDIATE")
+            try:
+                yield cursor
+                self.db.commit()
+            except Exception:
+                self.db.rollback()
+                raise
+            finally:
+                cursor.close()
 
     def issue_session_token(self, owner_id: str, supervisor_key: str) -> str:
         """Issue an authentic HMAC session token binding the owner identity.
@@ -249,6 +278,7 @@ class HumanWorkspace:
             "revision": row["revision"],
             "created_at": row["created_at"],
             "updated_at": row["updated_at"],
+            "converted_task_id": row["converted_task_id"] if "converted_task_id" in row.keys() else None,
         }
 
     def _record_event(
@@ -638,3 +668,99 @@ class HumanWorkspace:
             }
             for r in rows
         ]
+
+    def convert_to_task(
+        self,
+        principal: HumanPrincipal,
+        item_id: str,
+        *,
+        store: Any,
+        project: Optional[Union[str, Path]] = None,
+        goal: Optional[str] = None,
+        expected_revision: Optional[int] = None,
+        status: str = "backlog",
+        flight_plan: Optional[Union[Dict[str, Any], Any]] = None,
+        ai_memory_workstream_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Convert a private human inbox item into a backlog task atomically and idempotently.
+
+        Enforces HumanPrincipal authentication, privacy fencing, optimistic revision checking,
+        and append-only audit event recording.
+        """
+        self.verify_principal(principal)
+
+        if not isinstance(item_id, str) or not item_id.strip():
+            raise ValueError("item_id obrigatorio para conversao em tarefa")
+
+        with self._transaction():
+            current = self.get(principal, item_id)
+            if current is None:
+                raise HumanWorkspaceNotFoundError("Item nao encontrado no inbox do proprietario")
+
+            if current["state"] == HumanInboxState.DISCARDED:
+                raise HumanWorkspaceError("Item descartado nao pode ser convertido em tarefa")
+
+            # Strict idempotency check: item already converted
+            if current["state"] == HumanInboxState.CONVERTED and current.get("converted_task_id"):
+                if expected_revision is not None and expected_revision not in (current["revision"], current["revision"] - 1):
+                    raise HumanWorkspaceConflict("Revisao concorrente detectada; releia o item")
+                existing_task = store.task(current["converted_task_id"])
+                return {"task": existing_task, "inbox_item": current, "created": False}
+
+            # Optimistic revision fencing for items not yet converted
+            if expected_revision is not None and current["revision"] != expected_revision:
+                raise HumanWorkspaceConflict("Revisao concorrente detectada; releia o item")
+
+            target_proj = project or current.get("project_id")
+            if not target_proj:
+                raise ValueError("Diretorio do projeto obrigatorio para conversao em tarefa")
+
+            task_goal = (goal.strip() if isinstance(goal, str) and goal.strip() else current["content"]).strip()
+            workstream = ai_memory_workstream_id or current.get("context", {}).get("ai_memory_workstream_id")
+
+            # Create task in Store in backlog status (not active)
+            task = store.new(
+                project=target_proj,
+                goal=task_goal,
+                ai_memory_workstream_id=workstream,
+                flight_plan=flight_plan,
+                status=status,
+            )
+            task_id = task["id"]
+
+            stamp = _now()
+            cur = self.db.execute(
+                """UPDATE human_inbox
+                   SET state = ?, converted_task_id = ?, revision = revision + 1, updated_at = ?
+                   WHERE id = ? AND owner_id = ? AND revision = ?""",
+                (
+                    HumanInboxState.CONVERTED,
+                    task_id,
+                    stamp,
+                    item_id,
+                    principal.owner_id,
+                    current["revision"],
+                ),
+            )
+            if cur.rowcount != 1:
+                raise HumanWorkspaceConflict("Falha ao atualizar estado por conflito concorrente")
+
+            self._record_event(
+                inbox_id=item_id,
+                revision=current["revision"] + 1,
+                action="convert_to_task",
+                actor_id=principal.owner_id,
+                old_state=current["state"],
+                new_state=HumanInboxState.CONVERTED,
+                old_read_state=current["read_state"],
+                new_read_state=current["read_state"],
+                details={
+                    "task_id": task_id,
+                    "project": str(target_proj),
+                    "status": status,
+                },
+            )
+
+        updated_item = self.get(principal, item_id)
+        assert updated_item is not None
+        return {"task": task, "inbox_item": updated_item, "created": True}

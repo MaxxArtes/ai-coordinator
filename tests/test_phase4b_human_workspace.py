@@ -412,6 +412,9 @@ class HumanWorkspaceSecurity4B1STests(unittest.TestCase):
         with self.assertRaises(HumanWorkspaceAccessDenied):
             self.ws.events(impostor_alice, alice_item["id"])
 
+        with self.assertRaises(HumanWorkspaceAccessDenied):
+            self.ws.convert_to_task(impostor_alice, alice_item["id"], store=self.store, project=self.root)
+
     def test_s06_forged_hmac_token_across_all_inbox_operations(self):
         alice_item = self.ws.capture(self.alice, "Item autentico para teste de token forjado")
         forged_alice = HumanPrincipal("alice", role="human", session_token=f"hsess_alice_{'0'*64}")
@@ -437,6 +440,259 @@ class HumanWorkspaceSecurity4B1STests(unittest.TestCase):
 
         with self.assertRaises(HumanWorkspaceAccessDenied):
             self.ws.events(forged_alice, alice_item["id"])
+
+        with self.assertRaises(HumanWorkspaceAccessDenied):
+            self.ws.convert_to_task(forged_alice, alice_item["id"], store=self.store, project=self.root)
+
+
+class HumanWorkspaceConversion4B2Tests(unittest.TestCase):
+    def setUp(self):
+        self.temp_dir = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+        self.root = self.temp_dir.name
+        self.store = Store(self.root)
+        self.ws = self.store.human_workspace
+
+        self.alice = self.store.create_human_principal("alice", supervisor_key=self.store.supervisor_key)
+        self.bob = self.store.create_human_principal("bob", supervisor_key=self.store.supervisor_key)
+
+    def tearDown(self):
+        try:
+            self.store.db.close()
+        except Exception:
+            pass
+        try:
+            self.temp_dir.cleanup()
+        except Exception:
+            pass
+
+    def test_01_successful_conversion_to_backlog_task(self):
+        item = self.ws.capture(
+            self.alice,
+            "Implementar telemetria de performance no worker",
+            item_kind=HumanInboxItemKind.TODO,
+            project_id=self.root,
+            tags=["telemetria", "performance"],
+        )
+        self.assertEqual(item["state"], HumanInboxState.CAPTURED)
+        self.assertEqual(item["revision"], 1)
+        self.assertIsNone(item["converted_task_id"])
+
+        result = self.store.convert_inbox_item_to_task(
+            self.alice,
+            item["id"],
+            expected_revision=1,
+        )
+
+        self.assertTrue(result["created"])
+        task = result["task"]
+        inbox_item = result["inbox_item"]
+
+        # Verify task attributes
+        self.assertTrue(task["id"])
+        self.assertEqual(task["status"], "backlog")
+        self.assertEqual(task["goal"], "Implementar telemetria de performance no worker")
+        self.assertEqual(task["project"], self.root)
+
+        # Backlog tasks must NOT appear in Store.context(project) as active tasks
+        active_contexts = self.store.context(self.root)
+        self.assertEqual(len(active_contexts), 0)
+
+        # Verify inbox item updated state
+        self.assertEqual(inbox_item["state"], HumanInboxState.CONVERTED)
+        self.assertEqual(inbox_item["converted_task_id"], task["id"])
+        self.assertEqual(inbox_item["revision"], 2)
+
+        # Verify audit events
+        events = self.ws.events(self.alice, item["id"])
+        self.assertEqual(len(events), 2)  # capture + convert_to_task
+        conv_event = events[1]
+        self.assertEqual(conv_event["action"], "convert_to_task")
+        self.assertEqual(conv_event["actor_id"], "alice")
+        self.assertEqual(conv_event["old_state"], HumanInboxState.CAPTURED)
+        self.assertEqual(conv_event["new_state"], HumanInboxState.CONVERTED)
+        self.assertEqual(conv_event["details"]["task_id"], task["id"])
+        self.assertEqual(conv_event["details"]["status"], "backlog")
+
+    def test_02_conversion_custom_goal_and_project_override(self):
+        item = self.ws.capture(
+            self.alice,
+            "Ideia preliminar sem projeto associado",
+            item_kind=HumanInboxItemKind.IDEA,
+        )
+        self.assertIsNone(item["project_id"])
+
+        result = self.store.convert_inbox_item_to_task(
+            self.alice,
+            item["id"],
+            project=self.root,
+            goal="Refinamento formal: arquitetura de fallback",
+            expected_revision=1,
+        )
+
+        self.assertTrue(result["created"])
+        self.assertEqual(result["task"]["goal"], "Refinamento formal: arquitetura de fallback")
+        self.assertEqual(result["task"]["project"], self.root)
+        self.assertEqual(result["inbox_item"]["state"], HumanInboxState.CONVERTED)
+
+    def test_03_strict_idempotency_second_conversion_returns_existing(self):
+        item = self.ws.capture(
+            self.alice,
+            "Tarefa de infraestrutura idempotente",
+            project_id=self.root,
+        )
+
+        # First conversion
+        res1 = self.store.convert_inbox_item_to_task(self.alice, item["id"], expected_revision=1)
+        self.assertTrue(res1["created"])
+        task_id = res1["task"]["id"]
+
+        # Retry with revision before conversion (network retry pattern)
+        res2 = self.store.convert_inbox_item_to_task(self.alice, item["id"], expected_revision=1)
+        self.assertFalse(res2["created"])
+        self.assertEqual(res2["task"]["id"], task_id)
+
+        # Retry with current revision
+        res3 = self.store.convert_inbox_item_to_task(self.alice, item["id"], expected_revision=2)
+        self.assertFalse(res3["created"])
+        self.assertEqual(res3["task"]["id"], task_id)
+
+        # Call without expected_revision
+        res4 = self.store.convert_inbox_item_to_task(self.alice, item["id"])
+        self.assertFalse(res4["created"])
+        self.assertEqual(res4["task"]["id"], task_id)
+
+        # Ensure no duplicate tasks were created in SQLite
+        task_count = self.store.db.execute("SELECT count(*) FROM tasks").fetchone()[0]
+        self.assertEqual(task_count, 1)
+
+        # Ensure no duplicate events were logged
+        events = self.ws.events(self.alice, item["id"])
+        conv_events = [e for e in events if e["action"] == "convert_to_task"]
+        self.assertEqual(len(conv_events), 1)
+
+    def test_04_optimistic_concurrency_conflict(self):
+        item = self.ws.capture(self.alice, "Item concorrente", project_id=self.root)
+
+        with self.assertRaises(HumanWorkspaceConflict):
+            self.store.convert_inbox_item_to_task(self.alice, item["id"], expected_revision=99)
+
+        # Item must remain untouched in captured state
+        fresh = self.ws.get(self.alice, item["id"])
+        self.assertEqual(fresh["state"], HumanInboxState.CAPTURED)
+        self.assertEqual(fresh["revision"], 1)
+        self.assertIsNone(fresh["converted_task_id"])
+
+        task_count = self.store.db.execute("SELECT count(*) FROM tasks").fetchone()[0]
+        self.assertEqual(task_count, 0)
+
+    def test_05_atomic_rollback_on_failure(self):
+        item = self.ws.capture(self.alice, "Item com rollback atomico", project_id=self.root)
+
+        # Monkeypatch _record_event to raise an exception after task creation
+        original_record_event = self.ws._record_event
+
+        def faulty_record_event(*args, **kwargs):
+            if kwargs.get("action") == "convert_to_task":
+                raise RuntimeError("Falha simulada no registro de auditoria")
+            return original_record_event(*args, **kwargs)
+
+        self.ws._record_event = faulty_record_event
+        try:
+            with self.assertRaises(RuntimeError):
+                self.store.convert_inbox_item_to_task(self.alice, item["id"], expected_revision=1)
+        finally:
+            self.ws._record_event = original_record_event
+
+        # Verify full rollback: task was NOT committed
+        task_count = self.store.db.execute("SELECT count(*) FROM tasks").fetchone()[0]
+        self.assertEqual(task_count, 0)
+
+        # Verify inbox item remains untouched
+        fresh = self.ws.get(self.alice, item["id"])
+        self.assertEqual(fresh["state"], HumanInboxState.CAPTURED)
+        self.assertEqual(fresh["revision"], 1)
+        self.assertIsNone(fresh["converted_task_id"])
+
+        # Audit events must only contain the capture event
+        events = self.ws.events(self.alice, item["id"])
+        self.assertEqual(len(events), 1)
+
+    def test_06_privacy_isolation_bob_cannot_convert_alice_item(self):
+        item = self.ws.capture(self.alice, "Item privado da Alice", project_id=self.root)
+
+        with self.assertRaises(HumanWorkspaceAccessDenied):
+            self.store.convert_inbox_item_to_task(self.bob, item["id"], expected_revision=1)
+
+        fresh = self.ws.get(self.alice, item["id"])
+        self.assertEqual(fresh["state"], HumanInboxState.CAPTURED)
+        self.assertIsNone(fresh["converted_task_id"])
+
+    def test_07_worker_lockout_cannot_convert(self):
+        item = self.ws.capture(self.alice, "Item com bloqueio de worker", project_id=self.root)
+
+        # 1. Environment-based worker lockout
+        with patch.dict(os.environ, {"AI_COORDINATOR_ROLE": "worker"}):
+            with self.assertRaises(HumanWorkspaceAccessDenied):
+                self.store.convert_inbox_item_to_task(self.alice, item["id"], expected_revision=1)
+
+        # 2. Role-based worker lockout
+        worker_principal = HumanPrincipal("alice", role="worker", session_token=self.alice.session_token)
+        with self.assertRaises(HumanWorkspaceAccessDenied):
+            self.store.convert_inbox_item_to_task(worker_principal, item["id"], expected_revision=1)
+
+    def test_08_discarded_item_conversion_rejected(self):
+        item = self.ws.capture(self.alice, "Item a ser descartado", project_id=self.root)
+        self.ws.transition_state(
+            self.alice,
+            item["id"],
+            new_state=HumanInboxState.DISCARDED,
+            expected_revision=1,
+        )
+
+        with self.assertRaises(HumanWorkspaceError) as ctx:
+            self.store.convert_inbox_item_to_task(self.alice, item["id"], expected_revision=2)
+        self.assertIn("descartado nao pode ser convertido", str(ctx.exception).lower())
+
+    def test_09_reentrant_nested_transaction_with_savepoint(self):
+        item = self.ws.capture(self.alice, "Item transacional aninhado", project_id=self.root)
+
+        # Call within an outer store.transaction()
+        with self.store.transaction():
+            res = self.store.convert_inbox_item_to_task(self.alice, item["id"], expected_revision=1)
+            self.assertTrue(res["created"])
+
+        # Verified committed after outer transaction closes
+        fresh = self.ws.get(self.alice, item["id"])
+        self.assertEqual(fresh["state"], HumanInboxState.CONVERTED)
+        self.assertEqual(self.store.task(res["task"]["id"])["status"], "backlog")
+
+        # Now test that rollback of outer transaction rolls back the nested conversion
+        item2 = self.ws.capture(self.alice, "Item que sofrera rollback externo", project_id=self.root)
+        try:
+            with self.store.transaction():
+                self.store.convert_inbox_item_to_task(self.alice, item2["id"], expected_revision=1)
+                raise ValueError("Rollback forcado da transacao externa")
+        except ValueError:
+            pass
+
+        fresh2 = self.ws.get(self.alice, item2["id"])
+        self.assertEqual(fresh2["state"], HumanInboxState.CAPTURED)
+        self.assertIsNone(fresh2["converted_task_id"])
+
+    def test_10_unique_partial_index_prevents_duplicate_converted_task_id(self):
+        item1 = self.ws.capture(self.alice, "Item um", project_id=self.root)
+        item2 = self.ws.capture(self.alice, "Item dois", project_id=self.root)
+
+        # Convert item1
+        res1 = self.store.convert_inbox_item_to_task(self.alice, item1["id"], expected_revision=1)
+        task_id = res1["task"]["id"]
+
+        # Attempt to directly point item2 to the same task_id via SQL should violate UNIQUE constraint
+        with self.assertRaises(sqlite3.IntegrityError):
+            self.store.db.execute(
+                "UPDATE human_inbox SET converted_task_id = ? WHERE id = ?",
+                (task_id, item2["id"]),
+            )
 
 
 if __name__ == "__main__":

@@ -322,6 +322,31 @@ class Store:
             session_token = self.issue_human_session_token(owner_id, supervisor_key=supervisor_key)
         return HumanPrincipal(owner_id=owner_id, role="human", session_token=session_token)
 
+    def convert_inbox_item_to_task(
+        self,
+        principal: HumanPrincipal,
+        item_id: str,
+        *,
+        project: Optional[Union[str, Path]] = None,
+        goal: Optional[str] = None,
+        expected_revision: Optional[int] = None,
+        status: str = "backlog",
+        flight_plan: Optional[Union[Dict[str, Any], FlightPlan]] = None,
+        ai_memory_workstream_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Convert a private human inbox item into a backlog task atomically and idempotently."""
+        return self.human_workspace.convert_to_task(
+            principal=principal,
+            item_id=item_id,
+            store=self,
+            project=project,
+            goal=goal,
+            expected_revision=expected_revision,
+            status=status,
+            flight_plan=flight_plan,
+            ai_memory_workstream_id=ai_memory_workstream_id,
+        )
+
     def get_run_for_task(self, task_id: str, run_id: str) -> Optional[Dict[str, Any]]:
         """Lookup execution run record for a specific task."""
         row = self.db.execute("SELECT * FROM runs WHERE id=? AND task_id=?", (run_id, task_id)).fetchone()
@@ -709,7 +734,8 @@ class Store:
         project: Union[str, Path],
         goal: str,
         ai_memory_workstream_id: Optional[str] = None,
-        flight_plan: Optional[Union[Dict[str, Any], FlightPlan]] = None
+        flight_plan: Optional[Union[Dict[str, Any], FlightPlan]] = None,
+        status: str = "active",
     ) -> Dict[str, Any]:
         if not goal.strip() or len(goal) > 1500:
             raise ValueError("Objetivo deve ter 1 a 1500 caracteres")
@@ -730,7 +756,7 @@ class Store:
         with self.transaction():
             self.db.execute(
                 "INSERT INTO tasks (id,project,goal,status,revision,snapshot,created,updated,ai_memory_workstream_id,step_count,uncheckpointed_steps,drift_status) VALUES (?,?,?,?,?,?,?,?,?,0,0,'nominal')",
-                (ident, project_path(project), scrub(goal), "active", 1,
+                (ident, project_path(project), scrub(goal), status, 1,
                  json.dumps(snapshot), stamp, stamp, linked_workstream),
             )
             if flight_plan:
