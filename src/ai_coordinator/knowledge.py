@@ -15,6 +15,14 @@ import sqlite3
 import uuid
 from typing import Any, Dict, Iterator, List, Mapping, Optional, Sequence, Tuple
 
+from .invariants import (
+    InvariantDefinition,
+    InvariantEvidence,
+    InvariantOracle,
+    InvariantStatus,
+    UntrustedEvidenceError,
+)
+
 
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
@@ -133,8 +141,9 @@ class UnifiedKnowledgeCore:
     MAX_CONTENT = 10000
     MAX_TAGS = 30
 
-    def __init__(self, connection: sqlite3.Connection):
+    def __init__(self, connection: sqlite3.Connection, oracle: Optional[InvariantOracle] = None):
         self.db = connection
+        self.oracle = oracle
         self._init_schema()
 
     def _init_schema(self) -> None:
@@ -193,6 +202,18 @@ class UnifiedKnowledgeCore:
         columns = {row[1] for row in self.db.execute("PRAGMA table_info(knowledge_entries)").fetchall()}
         if "nature" not in columns:
             self.db.execute("ALTER TABLE knowledge_entries ADD COLUMN nature TEXT NOT NULL DEFAULT 'speculative_draft'")
+            self.db.execute(
+                """UPDATE knowledge_entries
+                   SET nature = ?
+                   WHERE kind IN ('decision', 'architecture_decision', 'user_preference')""",
+                (KnowledgeNature.DECISION_RECORD,),
+            )
+            self.db.execute(
+                """UPDATE knowledge_entries
+                   SET nature = ?
+                   WHERE kind IN ('observation', 'lesson', 'solution_pattern', 'error_pattern')""",
+                (KnowledgeNature.OBSERVATION,),
+            )
         if "evidence_level" not in columns:
             self.db.execute("ALTER TABLE knowledge_entries ADD COLUMN evidence_level TEXT NOT NULL DEFAULT 'unverified'")
 
@@ -323,22 +344,25 @@ class UnifiedKnowledgeCore:
         if nature is None:
             if kind in (KnowledgeKind.DECISION, KnowledgeKind.ARCHITECTURE_DECISION, KnowledgeKind.USER_PREFERENCE):
                 nature = KnowledgeNature.DECISION_RECORD
-            elif kind == KnowledgeKind.OBSERVATION:
+            elif kind in (KnowledgeKind.OBSERVATION, KnowledgeKind.LESSON, KnowledgeKind.SOLUTION_PATTERN, KnowledgeKind.ERROR_PATTERN):
                 nature = KnowledgeNature.OBSERVATION
             else:
                 nature = KnowledgeNature.SPECULATIVE_DRAFT
         elif nature not in KnowledgeNature.ALL:
             raise ValueError("Natureza epistemologica invalida")
 
+        if nature == KnowledgeNature.VALIDATED_FINDING:
+            raise KnowledgeAccessDenied("Novos registros nao podem ser capturados diretamente como validated_finding; a certificacao exige avaliacao pelo Oraculo")
+
         if evidence_level is None:
             evidence_level = KnowledgeEvidenceLevel.UNVERIFIED
         elif evidence_level not in KnowledgeEvidenceLevel.ALL:
             raise ValueError("Grau de evidencia invalido")
 
-        if evidence_level == KnowledgeEvidenceLevel.ORACLE_VERIFIED and principal.role != "supervisor":
-            raise KnowledgeAccessDenied("Apenas o supervisor/oraculo pode emitir ou validar comprovacoes oracle_verified")
-        if nature == KnowledgeNature.VALIDATED_FINDING and principal.role != "supervisor":
-            raise KnowledgeAccessDenied("Apenas o supervisor/oraculo pode certificar validated_finding")
+        if evidence_level == KnowledgeEvidenceLevel.ORACLE_VERIFIED:
+            raise KnowledgeAccessDenied("Novos registros nao podem ser capturados diretamente como oracle_verified; use verify_with_oracle")
+        if evidence_level == KnowledgeEvidenceLevel.HUMAN_REVIEWED:
+            raise KnowledgeAccessDenied("Novos registros devem ser capturados como unverified; human_reviewed exige evento de revisao humana formal")
 
         clean_tags = sorted({self._validate_text(t, "tag", 80).casefold() for t in tags})
         if len(clean_tags) > self.MAX_TAGS:
@@ -426,8 +450,8 @@ class UnifiedKnowledgeCore:
             if new_nature is not None:
                 if new_nature not in KnowledgeNature.ALL:
                     raise ValueError("Natureza epistemologica invalida")
-                if new_nature == KnowledgeNature.VALIDATED_FINDING and principal.role != "supervisor":
-                    raise KnowledgeAccessDenied("Apenas o supervisor/oraculo pode certificar validated_finding")
+                if new_nature == KnowledgeNature.VALIDATED_FINDING:
+                    raise KnowledgeAccessDenied("validated_finding so pode ser atribuido via certificacao pelo Oraculo")
                 target_nature = new_nature
             elif new_state == KnowledgeState.ACCEPTED and target_nature == KnowledgeNature.SPECULATIVE_DRAFT:
                 if row["kind"] in (KnowledgeKind.DECISION, KnowledgeKind.ARCHITECTURE_DECISION, KnowledgeKind.USER_PREFERENCE):
@@ -436,8 +460,10 @@ class UnifiedKnowledgeCore:
             if new_evidence_level is not None:
                 if new_evidence_level not in KnowledgeEvidenceLevel.ALL:
                     raise ValueError("Grau de evidencia invalido")
-                if new_evidence_level == KnowledgeEvidenceLevel.ORACLE_VERIFIED and principal.role != "supervisor":
-                    raise KnowledgeAccessDenied("Apenas o supervisor/oraculo pode emitir ou validar comprovacoes oracle_verified")
+                if new_evidence_level == KnowledgeEvidenceLevel.ORACLE_VERIFIED:
+                    raise KnowledgeAccessDenied("oracle_verified so pode ser atribuido via certificacao pelo Oraculo")
+                if new_evidence_level == KnowledgeEvidenceLevel.HUMAN_REVIEWED and principal.role != "human":
+                    raise KnowledgeAccessDenied("Apenas humanos autenticados podem atribuir human_reviewed")
                 target_evidence = new_evidence_level
             elif new_state == KnowledgeState.ACCEPTED and target_evidence == KnowledgeEvidenceLevel.UNVERIFIED and principal.role == "human":
                 target_evidence = KnowledgeEvidenceLevel.HUMAN_REVIEWED
@@ -464,17 +490,24 @@ class UnifiedKnowledgeCore:
         expected_revision: int,
         oracle_token: str,
         verification_evidence: Mapping[str, Any],
+        oracle: Optional[InvariantOracle] = None,
         nature: str = KnowledgeNature.VALIDATED_FINDING,
         reason: str = "Verificacao formal concluida pelo Oraculo",
     ) -> Dict[str, Any]:
-        """Certify an entry as oracle_verified; strictly restricted to a supervisor principal.
+        """Certify an entry as oracle_verified using InvariantOracle evaluation.
 
-        Requires an authentic oracle_token and verification_evidence mapping.
+        Strictly restricted to supervisor principal and requires authentic cryptographic proof
+        bound to task, revision, and actual execution.
         """
         if principal.role != "supervisor":
             raise KnowledgeAccessDenied("Apenas o supervisor/oraculo pode certificar oracle_verified")
-        if not isinstance(oracle_token, str) or len(oracle_token.strip()) < 16:
-            raise ValueError("oracle_token invalido ou insuficiente")
+
+        active_oracle = oracle or self.oracle
+        if active_oracle is None:
+            raise KnowledgeAccessDenied("Certificacao negada: Oraculo de invariantes indisponivel")
+
+        if not isinstance(oracle_token, str) or not oracle_token.strip():
+            raise ValueError("oracle_token obrigatorio para certificacao pelo Oraculo")
         if not isinstance(verification_evidence, Mapping) or not verification_evidence:
             raise ValueError("verification_evidence obrigatorio para certificacao pelo Oraculo")
         if nature not in (KnowledgeNature.VALIDATED_FINDING, KnowledgeNature.DECISION_RECORD, KnowledgeNature.OBSERVATION):
@@ -488,10 +521,58 @@ class UnifiedKnowledgeCore:
             if row["revision"] != expected_revision:
                 raise KnowledgeConflict("Revisao obsoleta; releia a entrada")
 
+            task_id = str(verification_evidence.get("task_id") or row.get("task_id") or "").strip()
+            if not task_id:
+                raise ValueError("Evidencia do Oraculo exige vinculo com task_id")
+
+            plan_revision = int(verification_evidence.get("plan_revision", 1))
+            invariant_id = str(verification_evidence.get("invariant_id") or entry_id).strip()
+            source = str(verification_evidence.get("source", "trusted_test_runner")).strip()
+            run_id = verification_evidence.get("run_id")
+            artifact_sha256 = verification_evidence.get("artifact_sha256")
+            exit_code = int(verification_evidence.get("exit_code", 0))
+            nonce = verification_evidence.get("nonce")
+
+            inv_def = InvariantDefinition(
+                id=invariant_id,
+                task_id=task_id,
+                description=f"Validacao de conhecimento {entry_id}",
+                required=True,
+                verifier_type=source,
+                require_authenticity_proof=True,
+            )
+            ev = InvariantEvidence(
+                source=source,
+                run_id=str(run_id).strip() if run_id else None,
+                exit_code=exit_code,
+                artifact_sha256=str(artifact_sha256).strip() if artifact_sha256 else None,
+                verification_token=str(oracle_token).strip(),
+                nonce=str(nonce).strip() if nonce else None,
+                details=dict(verification_evidence),
+            )
+
+            evaluation = active_oracle.evaluate(
+                task_id=task_id,
+                plan_revision=plan_revision,
+                invariant=inv_def,
+                evidence=ev,
+                evidence_plan_revision=plan_revision,
+            )
+            if not evaluation.verified or evaluation.status != InvariantStatus.PASS:
+                raise UntrustedEvidenceError(f"Certificacao rejeitada pelo Oraculo: {evaluation.details}")
+
             current_evidence = dict(row["evidence"])
             current_evidence["oracle_verification"] = {
                 "token": oracle_token.strip(),
-                "evidence": dict(verification_evidence),
+                "task_id": task_id,
+                "plan_revision": plan_revision,
+                "invariant_id": invariant_id,
+                "source": source,
+                "run_id": run_id,
+                "artifact_sha256": artifact_sha256,
+                "exit_code": exit_code,
+                "evaluation_id": evaluation.id,
+                "evaluation_details": evaluation.details,
                 "verified_at": _now(),
                 "verified_by": principal.principal_id,
             }
@@ -535,6 +616,7 @@ class UnifiedKnowledgeCore:
         natures: Sequence[str] = (),
         evidence_levels: Sequence[str] = (),
         context: Optional[Mapping[str, Any]] = None,
+        include_speculative: bool = False,
         limit: int = 20,
     ) -> List[Dict[str, Any]]:
         """Filter access in SQL before lexical scoring and context compatibility.
@@ -542,6 +624,7 @@ class UnifiedKnowledgeCore:
         Context mismatches are excluded, not treated as reusable precedents.
         Missing context does not imply compatibility; returned records are marked
         'context_unconfirmed' when not all caller constraints were covered.
+        Speculative drafts are excluded by default from operational retrieval.
         """
         if not isinstance(limit, int) or not 1 <= limit <= 100:
             raise ValueError("limit deve estar entre 1 e 100")
@@ -567,6 +650,9 @@ class UnifiedKnowledgeCore:
         if natures:
             clauses.append("nature IN (" + ",".join("?" for _ in natures) + ")")
             params.extend(natures)
+        elif not include_speculative:
+            clauses.append("nature != ?")
+            params.append(KnowledgeNature.SPECULATIVE_DRAFT)
         if evidence_levels:
             clauses.append("evidence_level IN (" + ",".join("?" for _ in evidence_levels) + ")")
             params.extend(evidence_levels)

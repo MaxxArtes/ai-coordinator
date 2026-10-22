@@ -238,7 +238,7 @@ class KnowledgeLearning:
         """
         candidate_entries = self.core.find(
             principal, query=query, kinds=(KnowledgeKind.HYPOTHESIS,),
-            context=context, limit=100,
+            include_speculative=True, context=context, limit=100,
         )
         results: List[Dict[str, Any]] = []
         for entry in candidate_entries:

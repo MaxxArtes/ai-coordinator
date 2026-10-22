@@ -6,6 +6,7 @@ import sqlite3
 import tempfile
 import unittest
 
+from ai_coordinator.invariants import InvariantOracle, UntrustedEvidenceError
 from ai_coordinator.knowledge import (
     KnowledgeAccessDenied,
     KnowledgeConflict,
@@ -25,7 +26,15 @@ class UnifiedKnowledgeCoreTests(unittest.TestCase):
     def setUp(self):
         self.db = sqlite3.connect(":memory:")
         self.db.row_factory = sqlite3.Row
-        self.core = UnifiedKnowledgeCore(self.db)
+        self.runs = {
+            ("task-integration-99", "run-101"): {"status": "complete", "exit_code": 0},
+            ("task-find-20", "run-202"): {"status": "complete", "exit_code": 0},
+        }
+        self.oracle = InvariantOracle(
+            run_lookup=lambda task, run: self.runs.get((task, run)),
+            secret="supervisor_test_secret_32_bytes_long!",
+        )
+        self.core = UnifiedKnowledgeCore(self.db, oracle=self.oracle)
         self.alice = KnowledgePrincipal("alice", "human", frozenset(("project-a", "project-b")), True, True)
         self.bob = KnowledgePrincipal("bob", "human", frozenset(("project-a",)))
         self.agent_a = KnowledgePrincipal("agent-a", "agent", frozenset(("project-a",)))
@@ -159,7 +168,7 @@ class UnifiedKnowledgeCoreTests(unittest.TestCase):
         with self.assertRaises(KnowledgeConflict):
             self.core.capture(self.alice, "project-a", KnowledgeKind.THOUGHT, "Outra ideia",
                               source_kind="notion", source_id="page-123")
-        self.assertEqual(len(self.core.find(self.alice)), 1)
+        self.assertEqual(len(self.core.find(self.alice, include_speculative=True)), 1)
 
     def test_12_links_do_not_disclose_private_target(self):
         private = self.core.capture(self.alice, "project-a", KnowledgeKind.THOUGHT, "Nota reservada")
@@ -218,7 +227,7 @@ class UnifiedKnowledgeCoreTests(unittest.TestCase):
         self.assertNotEqual(accepted["evidence_level"], KnowledgeEvidenceLevel.ORACLE_VERIFIED)
 
     def test_17_worker_and_human_cannot_forge_oracle_verified(self):
-        # Agent cannot capture as oracle_verified or validated_finding
+        # 1. Capture cannot directly declare oracle_verified, validated_finding or human_reviewed
         with self.assertRaises(KnowledgeAccessDenied):
             self.core.capture(
                 self.agent_a, "project-a", KnowledgeKind.OBSERVATION, "Teste passou",
@@ -231,6 +240,12 @@ class UnifiedKnowledgeCoreTests(unittest.TestCase):
                 nature=KnowledgeNature.VALIDATED_FINDING,
                 visibility=KnowledgeVisibility.PROJECT_SHARED,
             )
+        with self.assertRaises(KnowledgeAccessDenied):
+            self.core.capture(
+                self.agent_a, "project-a", KnowledgeKind.OBSERVATION, "Auto declaracao",
+                evidence_level=KnowledgeEvidenceLevel.HUMAN_REVIEWED,
+                visibility=KnowledgeVisibility.PROJECT_SHARED,
+            )
 
         # Human cannot capture as oracle_verified directly
         with self.assertRaises(KnowledgeAccessDenied):
@@ -239,7 +254,15 @@ class UnifiedKnowledgeCoreTests(unittest.TestCase):
                 evidence_level=KnowledgeEvidenceLevel.ORACLE_VERIFIED,
             )
 
-        # Human cannot transition directly to oracle_verified
+        # Supervisor cannot bypass capture either: all entries start unverified
+        with self.assertRaises(KnowledgeAccessDenied):
+            self.core.capture(
+                self.supervisor, "project-a", KnowledgeKind.OBSERVATION, "Direto supervisor",
+                evidence_level=KnowledgeEvidenceLevel.ORACLE_VERIFIED,
+                visibility=KnowledgeVisibility.PROJECT_SHARED,
+            )
+
+        # 2. Transition cannot directly set oracle_verified or validated_finding
         rec = self._decision("Mudar cache")
         with self.assertRaises(KnowledgeAccessDenied):
             self.core.transition(
@@ -247,39 +270,121 @@ class UnifiedKnowledgeCoreTests(unittest.TestCase):
                 new_state=KnowledgeState.PROPOSED, reason="Tentativa invalida",
                 new_evidence_level=KnowledgeEvidenceLevel.ORACLE_VERIFIED,
             )
+        with self.assertRaises(KnowledgeAccessDenied):
+            self.core.transition(
+                self.alice, rec["id"], expected_revision=1,
+                new_state=KnowledgeState.PROPOSED, reason="Tentativa invalida",
+                new_nature=KnowledgeNature.VALIDATED_FINDING,
+            )
 
-        # Neither worker nor human can call verify_with_oracle
+        # Agent cannot transition to human_reviewed
+        with self.assertRaises(KnowledgeAccessDenied):
+            self.core.transition(
+                self.agent_a, rec["id"], expected_revision=1,
+                new_state=KnowledgeState.PROPOSED, reason="Tentativa agente",
+                new_evidence_level=KnowledgeEvidenceLevel.HUMAN_REVIEWED,
+            )
+
+        # 3. Neither worker nor human can call verify_with_oracle
         with self.assertRaises(KnowledgeAccessDenied):
             self.core.verify_with_oracle(
                 self.agent_a, rec["id"], expected_revision=1,
                 oracle_token="token-com-mais-de-16-caracteres",
-                verification_evidence={"run": 1},
+                verification_evidence={"task_id": "task-test-01"},
             )
         with self.assertRaises(KnowledgeAccessDenied):
             self.core.verify_with_oracle(
                 self.alice, rec["id"], expected_revision=1,
                 oracle_token="token-com-mais-de-16-caracteres",
-                verification_evidence={"run": 1},
+                verification_evidence={"task_id": "task-test-01"},
+            )
+
+        # 4. Supervisor calling verify_with_oracle with arbitrary forged token is rejected by InvariantOracle
+        with self.assertRaises(UntrustedEvidenceError):
+            self.core.verify_with_oracle(
+                self.supervisor, rec["id"], expected_revision=1,
+                oracle_token="arbitrary_token_12345678",
+                verification_evidence={
+                    "task_id": "task-test-01",
+                    "plan_revision": 1,
+                    "source": "trusted_test_runner",
+                },
+            )
+
+        # 5. Token generated with untrusted key is rejected
+        from ai_coordinator.invariants import generate_verification_token
+        rogue_token = generate_verification_token(
+            task_id="task-test-01",
+            plan_revision=1,
+            invariant_id=rec["id"],
+            source="trusted_test_runner",
+            secret="rogue_untrusted_secret_key",
+        )
+        with self.assertRaises(UntrustedEvidenceError):
+            self.core.verify_with_oracle(
+                self.supervisor, rec["id"], expected_revision=1,
+                oracle_token=rogue_token,
+                verification_evidence={
+                    "task_id": "task-test-01",
+                    "plan_revision": 1,
+                    "source": "trusted_test_runner",
+                },
+            )
+
+        # 6. Non-existent run_id is rejected by InvariantOracle
+        with self.assertRaises(UntrustedEvidenceError):
+            self.core.verify_with_oracle(
+                self.supervisor, rec["id"], expected_revision=1,
+                oracle_token="fake_token_1234567890",
+                verification_evidence={
+                    "task_id": "task-test-01",
+                    "run_id": "fake-run-999",
+                    "plan_revision": 1,
+                    "source": "trusted_test_runner",
+                },
             )
 
     def test_18_supervisor_verify_with_oracle_success(self):
+        task_id = "task-integration-99"
+        run_id = "run-101"
         rec = self.core.capture(
             self.alice, "project-a", KnowledgeKind.OBSERVATION,
             "Sincronizacao de processos com teste concorrente",
+            task_id=task_id,
             visibility=KnowledgeVisibility.PROJECT_SHARED,
         )
+        # Generate authentic HMAC-SHA256 token signed with the supervisor oracle secret
+        valid_token = self.oracle.issue_evidence_token(
+            task_id=task_id,
+            plan_revision=1,
+            invariant_id=rec["id"],
+            source="trusted_test_runner",
+            run_id=run_id,
+            exit_code=0,
+        )
+        evidence = {
+            "task_id": task_id,
+            "run_id": run_id,
+            "plan_revision": 1,
+            "invariant_id": rec["id"],
+            "source": "trusted_test_runner",
+            "exit_code": 0,
+            "command": "pytest -k concurrency",
+        }
         verified = self.core.verify_with_oracle(
             self.supervisor, rec["id"], expected_revision=1,
-            oracle_token="oracle-token-sha256-abc1234567890",
-            verification_evidence={"command": "pytest -k concurrency", "exit_code": 0, "hash": "a" * 64},
+            oracle_token=valid_token,
+            verification_evidence=evidence,
             nature=KnowledgeNature.VALIDATED_FINDING,
             reason="Oraculo confirmou execucao com sucesso",
         )
         self.assertEqual(verified["evidence_level"], KnowledgeEvidenceLevel.ORACLE_VERIFIED)
         self.assertEqual(verified["nature"], KnowledgeNature.VALIDATED_FINDING)
         self.assertIn("oracle_verification", verified["evidence"])
-        self.assertEqual(verified["evidence"]["oracle_verification"]["token"], "oracle-token-sha256-abc1234567890")
+        self.assertEqual(verified["evidence"]["oracle_verification"]["token"], valid_token)
         self.assertEqual(verified["evidence"]["oracle_verification"]["verified_by"], "supervisor")
+        self.assertEqual(verified["evidence"]["oracle_verification"]["task_id"], task_id)
+        self.assertEqual(verified["evidence"]["oracle_verification"]["run_id"], run_id)
 
         events = self.core.events(self.supervisor, rec["id"])
         self.assertEqual(events[-1]["event_type"], "oracle_verify")
@@ -311,36 +416,90 @@ class UnifiedKnowledgeCoreTests(unittest.TestCase):
             )"""
         )
         conn.execute(
-            """INSERT INTO knowledge_entries (
-                id, project_id, task_id, kind, content, author_id, author_role,
-                visibility, state, revision, source_kind, source_id,
-                tags_json, context_json, evidence_json, created_at, updated_at
-            ) VALUES ('legacy-1', 'project-a', NULL, 'thought', 'Nota antiga', 'alice', 'human',
-                      'private_human', 'captured', 1, 'manual', NULL, '[]', '{}', '{}',
-                      '2026-10-01T00:00:00Z', '2026-10-01T00:00:00Z')"""
+            """INSERT INTO knowledge_entries VALUES
+                ('legacy-thought', 'project-a', NULL, 'thought', 'Ideia antiga', 'alice', 'human',
+                 'private_human', 'captured', 1, 'manual', NULL, '[]', '{}', '{}',
+                 '2026-10-01T00:00:00Z', '2026-10-01T00:00:00Z', NULL),
+                ('legacy-decision', 'project-a', NULL, 'decision', 'Decisao antiga', 'alice', 'human',
+                 'project_shared', 'accepted', 1, 'manual', NULL, '[]', '{}', '{}',
+                 '2026-10-01T00:00:00Z', '2026-10-01T00:00:00Z', NULL),
+                ('legacy-obs', 'project-a', NULL, 'observation', 'Observacao antiga', 'alice', 'human',
+                 'project_shared', 'captured', 1, 'manual', NULL, '[]', '{}', '{}',
+                 '2026-10-01T00:00:00Z', '2026-10-01T00:00:00Z', NULL)"""
         )
         conn.commit()
 
-        # Instantiate core; should migrate schema and add missing columns
+        # Instantiate core; should migrate schema and add missing columns with retrocompatible classification
         core = UnifiedKnowledgeCore(conn)
-        row = core.get(self.alice, "legacy-1")
-        self.assertIsNotNone(row)
-        self.assertEqual(row["nature"], KnowledgeNature.SPECULATIVE_DRAFT)
-        self.assertEqual(row["evidence_level"], KnowledgeEvidenceLevel.UNVERIFIED)
+
+        thought_row = core.get(self.alice, "legacy-thought")
+        self.assertIsNotNone(thought_row)
+        self.assertEqual(thought_row["nature"], KnowledgeNature.SPECULATIVE_DRAFT)
+        self.assertEqual(thought_row["evidence_level"], KnowledgeEvidenceLevel.UNVERIFIED)
+
+        decision_row = core.get(self.alice, "legacy-decision")
+        self.assertIsNotNone(decision_row)
+        self.assertEqual(decision_row["nature"], KnowledgeNature.DECISION_RECORD)
+        self.assertEqual(decision_row["evidence_level"], KnowledgeEvidenceLevel.UNVERIFIED)
+
+        obs_row = core.get(self.alice, "legacy-obs")
+        self.assertIsNotNone(obs_row)
+        self.assertEqual(obs_row["nature"], KnowledgeNature.OBSERVATION)
+        self.assertEqual(obs_row["evidence_level"], KnowledgeEvidenceLevel.UNVERIFIED)
+
         conn.close()
 
     def test_20_find_filters_by_nature_and_evidence_level(self):
+        # 1. Thought: nature is speculative_draft
         self.core.capture(self.alice, "project-a", KnowledgeKind.THOUGHT, "Rascunho A",
                           visibility=KnowledgeVisibility.PROJECT_SHARED)
+
+        # 2. Decision: nature is decision_record
         dec = self._decision("Decisao B")
         self._accept(dec)
+
+        # 3. Observation: verified by oracle -> nature is validated_finding, evidence is oracle_verified
+        task_id = "task-find-20"
+        run_id = "run-202"
         obs = self.core.capture(self.alice, "project-a", KnowledgeKind.OBSERVATION, "Evidencia C",
-                                visibility=KnowledgeVisibility.PROJECT_SHARED)
+                                task_id=task_id, visibility=KnowledgeVisibility.PROJECT_SHARED)
+        token = self.oracle.issue_evidence_token(
+            task_id=task_id,
+            plan_revision=1,
+            invariant_id=obs["id"],
+            source="trusted_test_runner",
+            run_id=run_id,
+            exit_code=0,
+        )
         self.core.verify_with_oracle(
             self.supervisor, obs["id"], expected_revision=1,
-            oracle_token="oracle-token-sha256-xyz9876543210",
-            verification_evidence={"verified": True},
+            oracle_token=token,
+            verification_evidence={
+                "task_id": task_id,
+                "run_id": run_id,
+                "plan_revision": 1,
+                "invariant_id": obs["id"],
+                "source": "trusted_test_runner",
+                "exit_code": 0,
+            },
         )
+
+        # Default find() excludes speculative_draft from operational context!
+        operational = self.core.find(self.alice, project_id="project-a")
+        self.assertEqual(len(operational), 2)
+        operational_natures = {r["nature"] for r in operational}
+        self.assertNotIn(KnowledgeNature.SPECULATIVE_DRAFT, operational_natures)
+        self.assertIn(KnowledgeNature.DECISION_RECORD, operational_natures)
+        self.assertIn(KnowledgeNature.VALIDATED_FINDING, operational_natures)
+
+        # Explicit include_speculative=True returns all 3 entries
+        all_entries = self.core.find(self.alice, project_id="project-a", include_speculative=True)
+        self.assertEqual(len(all_entries), 3)
+
+        # Explicit natures filter
+        drafts = self.core.find(self.alice, project_id="project-a", natures=[KnowledgeNature.SPECULATIVE_DRAFT])
+        self.assertEqual(len(drafts), 1)
+        self.assertEqual(drafts[0]["nature"], KnowledgeNature.SPECULATIVE_DRAFT)
 
         decisions = self.core.find(self.alice, project_id="project-a", natures=[KnowledgeNature.DECISION_RECORD])
         self.assertEqual(len(decisions), 1)
