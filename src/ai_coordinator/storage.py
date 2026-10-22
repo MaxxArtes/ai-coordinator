@@ -335,6 +335,8 @@ class Store:
         ai_memory_workstream_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Convert a private human inbox item into a backlog task atomically and idempotently."""
+        if status != "backlog":
+            raise ValueError("Tarefas convertidas a partir do Human Inbox devem obrigatoriamente possuir status 'backlog'")
         return self.human_workspace.convert_to_task(
             principal=principal,
             item_id=item_id,
@@ -729,6 +731,22 @@ class Store:
     def mirror(self, value: Dict[str, Any]) -> None:
         atomic_json(self.root / "tasks" / value["id"] / "state.json", value)
 
+    def cleanup_orphaned_task_mirrors(self) -> List[str]:
+        """Scan tasks directory on disk and remove mirror directories that do not exist in SQLite."""
+        tasks_dir = self.root / "tasks"
+        if not tasks_dir.is_dir():
+            return []
+        import shutil
+        cleaned = []
+        for entry in list(tasks_dir.iterdir()):
+            if entry.is_dir():
+                task_id = entry.name
+                row = self.db.execute("SELECT 1 FROM tasks WHERE id = ?", (task_id,)).fetchone()
+                if not row:
+                    shutil.rmtree(entry, ignore_errors=True)
+                    cleaned.append(task_id)
+        return cleaned
+
     def new(
         self,
         project: Union[str, Path],
@@ -736,6 +754,7 @@ class Store:
         ai_memory_workstream_id: Optional[str] = None,
         flight_plan: Optional[Union[Dict[str, Any], FlightPlan]] = None,
         status: str = "active",
+        mirror: bool = True,
     ) -> Dict[str, Any]:
         if not goal.strip() or len(goal) > 1500:
             raise ValueError("Objetivo deve ter 1 a 1500 caracteres")
@@ -770,6 +789,8 @@ class Store:
                     flight_plan.task_id = ident
                     self.mission_control.set_flight_plan(flight_plan)
             created_task = self.task(ident)
+        # Mirror is executed ONLY after the transaction is successfully committed!
+        if mirror and not self.db.in_transaction:
             self.mirror(created_task)
         return created_task
 
@@ -805,6 +826,7 @@ class Store:
             )
             self.mission_control.on_checkpoint_recorded(ident)
             updated_task = self.task(ident)
+        if not self.db.in_transaction:
             self.mirror(updated_task)
         return updated_task
 
@@ -1029,6 +1051,7 @@ class Store:
 
     def reconcile(self, task_id: Optional[str] = None, silence_threshold_seconds: float = 60.0) -> List[Dict[str, Any]]:
         """Conservative recovery and reconciliation for active runs without fabricating terminal outcomes."""
+        self.cleanup_orphaned_task_mirrors()
         reconciled = []
         with self.transaction():
             query = "SELECT * FROM runs WHERE status IN (?, ?, ?, ?, ?, ?, ?)"

@@ -490,6 +490,10 @@ class HumanWorkspace:
         self.verify_principal(principal)
         if new_state not in HumanInboxState.ALL:
             raise ValueError(f"new_state invalido: '{new_state}'")
+        if new_state == HumanInboxState.CONVERTED:
+            raise ValueError(
+                "Transicao direta para 'converted' proibida; utilize convert_to_task() para conversao com tarefa vinculada"
+            )
 
         with self._transaction():
             current = self.get(principal, item_id)
@@ -692,6 +696,9 @@ class HumanWorkspace:
         if not isinstance(item_id, str) or not item_id.strip():
             raise ValueError("item_id obrigatorio para conversao em tarefa")
 
+        if status != "backlog":
+            raise ValueError("Tarefas convertidas a partir do Human Inbox devem obrigatoriamente possuir status 'backlog'")
+
         with self._transaction():
             current = self.get(principal, item_id)
             if current is None:
@@ -718,13 +725,14 @@ class HumanWorkspace:
             task_goal = (goal.strip() if isinstance(goal, str) and goal.strip() else current["content"]).strip()
             workstream = ai_memory_workstream_id or current.get("context", {}).get("ai_memory_workstream_id")
 
-            # Create task in Store in backlog status (not active)
+            # Create task in Store in backlog status (not active) without immediate disk mirror
             task = store.new(
                 project=target_proj,
                 goal=task_goal,
                 ai_memory_workstream_id=workstream,
                 flight_plan=flight_plan,
                 status=status,
+                mirror=False,
             )
             task_id = task["id"]
 
@@ -760,6 +768,9 @@ class HumanWorkspace:
                     "status": status,
                 },
             )
+
+        # Safely mirror task to disk ONLY AFTER the SQLite transaction has committed
+        store.mirror(task)
 
         updated_item = self.get(principal, item_id)
         assert updated_item is not None

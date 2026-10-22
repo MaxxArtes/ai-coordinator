@@ -1,5 +1,6 @@
 """Tests for Phase 4B.1 - Human Workspace (Human Inbox, Privacy, Lifecycle, Audit Log, and Worker Isolation)."""
 
+import concurrent.futures
 import os
 from pathlib import Path
 import sqlite3
@@ -187,24 +188,32 @@ class HumanWorkspaceInboxTests(unittest.TestCase):
         # 2. Concurrency conflict on stale revision
         with self.assertRaises(HumanWorkspaceConflict):
             self.ws.transition_state(
-                self.alice, item["id"], new_state=HumanInboxState.CONVERTED, expected_revision=1
+                self.alice, item["id"], new_state=HumanInboxState.DISCARDED, expected_revision=1
             )
 
-        # 3. triaged -> converted (valid)
-        converted = self.ws.transition_state(
-            self.alice, item["id"], new_state=HumanInboxState.CONVERTED, expected_revision=2,
-            reason="Convertido para tarefa de backlog",
+        # 3. Direct transition to converted is strictly forbidden (must use convert_to_task)
+        with self.assertRaises(ValueError) as ctx_conv:
+            self.ws.transition_state(
+                self.alice, item["id"], new_state=HumanInboxState.CONVERTED, expected_revision=2
+            )
+        self.assertIn("utilize convert_to_task()", str(ctx_conv.exception).lower())
+
+        # 4. Use convert_to_task to legally convert the item to a backlog task
+        conv_res = self.store.convert_inbox_item_to_task(
+            self.alice, item["id"], project=self.root, expected_revision=2
         )
+        converted = conv_res["inbox_item"]
         self.assertEqual(converted["state"], HumanInboxState.CONVERTED)
         self.assertEqual(converted["revision"], 3)
+        self.assertIsNotNone(converted["converted_task_id"])
 
-        # 4. converted -> captured is illegal!
+        # 5. converted -> captured is illegal!
         with self.assertRaises(ValueError):
             self.ws.transition_state(
                 self.alice, item["id"], new_state=HumanInboxState.CAPTURED, expected_revision=3
             )
 
-        # 5. converted -> discarded (valid)
+        # 6. converted -> discarded (valid)
         discarded = self.ws.transition_state(
             self.alice, item["id"], new_state=HumanInboxState.DISCARDED, expected_revision=3,
             reason="Descartado apos analise",
@@ -212,7 +221,7 @@ class HumanWorkspaceInboxTests(unittest.TestCase):
         self.assertEqual(discarded["state"], HumanInboxState.DISCARDED)
         self.assertEqual(discarded["revision"], 4)
 
-        # 6. discarded -> captured (re-opening is valid)
+        # 7. discarded -> captured (re-opening is valid)
         reopened = self.ws.transition_state(
             self.alice, item["id"], new_state=HumanInboxState.CAPTURED, expected_revision=4,
             reason="Restaurado para captura ativa",
@@ -608,6 +617,11 @@ class HumanWorkspaceConversion4B2Tests(unittest.TestCase):
         task_count = self.store.db.execute("SELECT count(*) FROM tasks").fetchone()[0]
         self.assertEqual(task_count, 0)
 
+        # Verify filesystem integrity: zero orphaned task directories exist on disk
+        tasks_dir = Path(self.root) / "tasks"
+        task_dirs = list(tasks_dir.iterdir()) if tasks_dir.is_dir() else []
+        self.assertEqual(len(task_dirs), 0, "No orphaned task directory should exist on disk after rollback")
+
         # Verify inbox item remains untouched
         fresh = self.ws.get(self.alice, item["id"])
         self.assertEqual(fresh["state"], HumanInboxState.CAPTURED)
@@ -694,6 +708,78 @@ class HumanWorkspaceConversion4B2Tests(unittest.TestCase):
                 "UPDATE human_inbox SET converted_task_id = ? WHERE id = ?",
                 (task_id, item2["id"]),
             )
+
+    def test_11_rejection_of_non_backlog_status(self):
+        item = self.ws.capture(self.alice, "Item com status restrito", project_id=self.root)
+
+        with self.assertRaises(ValueError) as ctx_active:
+            self.store.convert_inbox_item_to_task(self.alice, item["id"], status="active")
+        self.assertIn("backlog", str(ctx_active.exception).lower())
+
+        with self.assertRaises(ValueError) as ctx_complete:
+            self.store.convert_inbox_item_to_task(self.alice, item["id"], status="completed")
+        self.assertIn("backlog", str(ctx_complete.exception).lower())
+
+    def test_12_concurrent_conversion_from_distinct_connections(self):
+        # Capture item using test fixture store
+        item = self.ws.capture(self.alice, "Anotacao concorrente multithread", project_id=self.root)
+
+        results = []
+        errors = []
+
+        # Each thread creates its own independent Store connection to SQLite WAL
+        def worker_convert():
+            worker_store = Store(self.root)
+            try:
+                principal = worker_store.create_human_principal("alice", supervisor_key=worker_store.supervisor_key)
+                res = worker_store.convert_inbox_item_to_task(principal, item["id"], expected_revision=1)
+                results.append(res)
+            except Exception as e:
+                errors.append(e)
+            finally:
+                worker_store.db.close()
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+            f1 = executor.submit(worker_convert)
+            f2 = executor.submit(worker_convert)
+            f1.result()
+            f2.result()
+
+        # Both threads must complete without unhandled database errors
+        self.assertEqual(len(errors), 0, f"Unexpected errors during concurrent conversion: {errors}")
+        self.assertEqual(len(results), 2)
+
+        # Both threads returned the exact same task_id
+        task_ids = {r["task"]["id"] for r in results}
+        self.assertEqual(len(task_ids), 1)
+
+        # Exactly one thread created it; the other handled it idempotently
+        created_flags = [r["created"] for r in results]
+        self.assertIn(True, created_flags)
+        self.assertIn(False, created_flags)
+
+        # SQLite database contains exactly 1 task
+        task_count = self.store.db.execute("SELECT count(*) FROM tasks").fetchone()[0]
+        self.assertEqual(task_count, 1)
+
+        # human_inbox must have exactly 1 event of type convert_to_task
+        events = self.ws.events(self.alice, item["id"])
+        conv_events = [e for e in events if e["action"] == "convert_to_task"]
+        self.assertEqual(len(conv_events), 1)
+
+    def test_13_orphan_task_mirror_reconciliation(self):
+        # Inject an orphaned task folder into the filesystem
+        tasks_dir = Path(self.root) / "tasks"
+        orphan_dir = tasks_dir / "orphan_fake_task_9999"
+        orphan_dir.mkdir(parents=True, exist_ok=True)
+        (orphan_dir / "state.json").write_text("{}", encoding="utf-8")
+
+        self.assertTrue(orphan_dir.is_dir())
+
+        # Reconciliation must detect and remove the orphan
+        cleaned = self.store.cleanup_orphaned_task_mirrors()
+        self.assertIn("orphan_fake_task_9999", cleaned)
+        self.assertFalse(orphan_dir.exists())
 
 
 if __name__ == "__main__":
