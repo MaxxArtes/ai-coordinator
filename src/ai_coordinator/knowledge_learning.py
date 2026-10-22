@@ -280,10 +280,13 @@ class KnowledgeLearning:
         principal and a trustworthy mapping of the original human author.
         """
         record.validate()
-        if record.visibility == ExperienceVisibility.PRIVATE_HUMAN and (
-            principal.role != "human" or record.author != "human"
-        ):
-            raise KnowledgeAccessDenied("Importacao privada exige identidade humana mapeada")
+        if record.visibility == ExperienceVisibility.PRIVATE_HUMAN:
+            # Legacy records contain only author='human', never a unique author ID.
+            # A project-authorized human is NOT necessarily the original author.
+            # Deny until an authenticated identity mapping is available.
+            raise KnowledgeAccessDenied(
+                "Importacao privada indisponivel: origem nao possui identidade humana verificavel"
+            )
         if record.project_id not in principal.authorized_projects:
             raise KnowledgeAccessDenied("Importacao fora dos projetos autorizados")
         digest = _canonical_hash(record.to_dict())
