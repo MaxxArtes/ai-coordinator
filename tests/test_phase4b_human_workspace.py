@@ -22,7 +22,7 @@ from ai_coordinator.human_workspace import (
 
 class HumanWorkspaceInboxTests(unittest.TestCase):
     def setUp(self):
-        self.temp_dir = tempfile.TemporaryDirectory()
+        self.temp_dir = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
         self.root = self.temp_dir.name
         self.store = Store(self.root)
         self.ws = self.store.human_workspace
@@ -31,8 +31,14 @@ class HumanWorkspaceInboxTests(unittest.TestCase):
         self.bob = self.store.create_human_principal("bob")
 
     def tearDown(self):
-        self.store.db.close()
-        self.temp_dir.cleanup()
+        try:
+            self.store.db.close()
+        except Exception:
+            pass
+        try:
+            self.temp_dir.cleanup()
+        except Exception:
+            pass
 
     # --- 1. Schema and Idempotent Migrations ---
     def test_01_schema_idempotency_and_table_existence(self):
@@ -254,15 +260,18 @@ class HumanWorkspaceInboxTests(unittest.TestCase):
         with self.assertRaises(HumanWorkspaceAccessDenied):
             self.ws.events(self.bob, item["id"])
 
+        first_event_id = events[0]["id"]
         # Direct SQL UPDATE attempt on human_inbox_events MUST BE ABORTED by trigger
         with self.assertRaises(sqlite3.DatabaseError) as ctx_update:
-            self.store.db.execute("UPDATE human_inbox_events SET action='tampered' WHERE id=1")
+            self.store.db.execute("UPDATE human_inbox_events SET action='tampered' WHERE id=?", (first_event_id,))
         self.assertIn("append-only", str(ctx_update.exception))
+        self.store.db.rollback()
 
         # Direct SQL DELETE attempt on human_inbox_events MUST BE ABORTED by trigger
         with self.assertRaises(sqlite3.DatabaseError) as ctx_delete:
-            self.store.db.execute("DELETE FROM human_inbox_events WHERE id=1")
+            self.store.db.execute("DELETE FROM human_inbox_events WHERE id=?", (first_event_id,))
         self.assertIn("append-only", str(ctx_delete.exception))
+        self.store.db.rollback()
 
     # --- 7. Security: Worker Lockout and Cryptographic Session Verification ---
     def test_10_worker_lockout_by_role_and_environment(self):

@@ -258,7 +258,7 @@ class CliVersionTests(unittest.TestCase):
             capture_output=True,
             text=True,
         )
-        self.assertEqual(res.returncode, 0)
+        self.assertEqual(res.returncode, 0, f"Falha na execucao do CLI. Stderr: {res.stderr}")
         expected = f"ai-coordinator {_get_version()}"
         self.assertEqual(res.stdout.strip(), expected)
 
