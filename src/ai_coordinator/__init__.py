@@ -109,6 +109,7 @@ from .experience import (
     normalize_project_id,
     project_id_candidates,
 )
+from .knowledge_learning import KnowledgeLearning
 from .knowledge import (
     KnowledgeAccessDenied,
     KnowledgeConflict,
@@ -139,6 +140,7 @@ from .reconstruction import (
 )
 
 __all__ = [
+    "KnowledgeLearning",
     "KnowledgeAccessDenied",
     "KnowledgeConflict",
     "KnowledgeError",
