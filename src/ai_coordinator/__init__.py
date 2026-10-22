@@ -109,6 +109,20 @@ from .experience import (
     normalize_project_id,
     project_id_candidates,
 )
+from .knowledge_learning import KnowledgeLearning
+from .knowledge import (
+    KnowledgeAccessDenied,
+    KnowledgeConflict,
+    KnowledgeError,
+    KnowledgeEvidenceLevel,
+    KnowledgeKind,
+    KnowledgeNature,
+    KnowledgePrincipal,
+    KnowledgeState,
+    KnowledgeTransitionError,
+    KnowledgeVisibility,
+    UnifiedKnowledgeCore,
+)
 from .insights import (
     InsightType,
     InsightStatus,
@@ -128,6 +142,18 @@ from .reconstruction import (
 )
 
 __all__ = [
+    "KnowledgeLearning",
+    "KnowledgeAccessDenied",
+    "KnowledgeConflict",
+    "KnowledgeError",
+    "KnowledgeEvidenceLevel",
+    "KnowledgeKind",
+    "KnowledgeNature",
+    "KnowledgePrincipal",
+    "KnowledgeState",
+    "KnowledgeTransitionError",
+    "KnowledgeVisibility",
+    "UnifiedKnowledgeCore",
     "Coordinator",
     "open_coordinator",
     "ProcessIdentity",

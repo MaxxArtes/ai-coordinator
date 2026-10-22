@@ -82,6 +82,8 @@ from .insights import (
     InsightPresentation,
     AutonomyLevel,
 )
+from .knowledge import UnifiedKnowledgeCore
+from .knowledge_learning import KnowledgeLearning
 from .reconstruction import (
     TrajectoryReconstructor,
     AlternativeRoutePreview,
@@ -243,12 +245,14 @@ class Store:
         self.mission_control = MissionControl(self)
         self.resource_ledger = ResourceLedger(self.db, backup_dir=self.root / "backups")
         self.experience_store = ExperienceStore(self.db)
-        self.insight_engine = InsightEngine(self.db, self.experience_store)
-        self.reconstructor = TrajectoryReconstructor(self)
         self.supervisor_secret = secrets.token_bytes(32)
         self.supervisor_key = str(supervisor_key).strip() if supervisor_key else secrets.token_hex(32)
         self.admin_token = secrets.token_hex(32)
         self.oracle = InvariantOracle(run_lookup=self.get_run_for_task, secret=self.supervisor_secret)
+        self.knowledge_core = UnifiedKnowledgeCore(self.db, oracle=self.oracle)
+        self.knowledge_learning = KnowledgeLearning(self.knowledge_core)
+        self.insight_engine = InsightEngine(self.db, self.experience_store)
+        self.reconstructor = TrajectoryReconstructor(self)
 
     def issue_admin_override_token(self, supervisor_key: str, justification: str) -> str:
         """Issue an authentic supervisor override token for audited administrative operations.
