@@ -497,7 +497,8 @@ class UnifiedKnowledgeCore:
 
         Strictly restricted to supervisor principal and requires authentic cryptographic proof
         bound to task, revision, and actual execution. Caller injection of an arbitrary oracle
-        is forbidden.
+        is forbidden. Cryptographic proofs are strictly bound to entry_id and task_id to prevent
+        cross-entry transfer; does not claim an absolute single-use nonce registry.
         """
         if principal.role != "supervisor":
             raise KnowledgeAccessDenied("Apenas o supervisor/oraculo pode certificar oracle_verified")
@@ -520,7 +521,7 @@ class UnifiedKnowledgeCore:
             if row["revision"] != expected_revision:
                 raise KnowledgeConflict("Revisao obsoleta; releia a entrada")
 
-            # Replay protection: invariant_id MUST strictly match the entry_id being certified
+            # Cross-entry transfer protection: invariant_id MUST strictly match the entry_id being certified
             claimed_invariant_id = str(verification_evidence.get("invariant_id") or entry_id).strip()
             if claimed_invariant_id != entry_id:
                 raise UntrustedEvidenceError(f"Prova rejeitada: invariant_id '{claimed_invariant_id}' diverge do entry_id certificado '{entry_id}'")
@@ -700,9 +701,12 @@ class UnifiedKnowledgeCore:
 
         Fencing guarantees:
         - Only returns ACCEPTED decisions (nature=DECISION_RECORD, state=ACCEPTED).
-        - Only returns findings/observations with evidence_level in (ORACLE_VERIFIED, HUMAN_REVIEWED).
+        - Only returns findings/observations with evidence_level in (ORACLE_VERIFIED, HUMAN_REVIEWED)
+          and state NOT IN (REJECTED, ARCHIVED, SUPERSEDED).
         - Strictly excludes all speculative_draft, proposed/captured/rejected decisions,
           and unverified observations.
+        - When contextual constraints are provided, strictly requires confirmed compatibility
+          (context_match == 'confirmed'), discarding unconfirmed entries.
         """
         if not isinstance(limit, int) or not 1 <= limit <= 100:
             raise ValueError("limit deve estar entre 1 e 100")
@@ -713,12 +717,17 @@ class UnifiedKnowledgeCore:
             params.append(project_id)
 
         # Operational fence: accepted decisions OR verified findings/observations
+        # Excludes rejected, archived, or superseded records across all natures.
         op_fence = (
+            "state NOT IN (?, ?, ?) AND "
             "((state = ? AND nature = ?) OR "
             "(nature IN (?, ?) AND evidence_level IN (?, ?)))"
         )
         clauses.append(op_fence)
         params.extend((
+            KnowledgeState.REJECTED,
+            KnowledgeState.ARCHIVED,
+            KnowledgeState.SUPERSEDED,
             KnowledgeState.ACCEPTED,
             KnowledgeNature.DECISION_RECORD,
             KnowledgeNature.VALIDATED_FINDING,
@@ -742,6 +751,8 @@ class UnifiedKnowledgeCore:
             if needle and not overlap:
                 continue
             rec["context_match"] = "confirmed" if context and all(k in saved_ctx for k in context) else "unconfirmed"
+            if context and rec["context_match"] != "confirmed":
+                continue
             rec["relevance_score"] = len(overlap) / max(len(needle), 1)
             results.append(rec)
         results.sort(key=lambda r: (-r["relevance_score"], r["created_at"], r["id"]))

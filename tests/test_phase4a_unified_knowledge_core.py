@@ -45,11 +45,12 @@ class UnifiedKnowledgeCoreTests(unittest.TestCase):
     def tearDown(self):
         self.db.close()
 
-    def _decision(self, name="Usar SQLite WAL", visibility=KnowledgeVisibility.PROJECT_SHARED):
+    def _decision(self, name="Usar SQLite WAL", visibility=KnowledgeVisibility.PROJECT_SHARED, context=None):
+        ctx = {"engine": "sqlite", "runtime": "python"} if context is None else context
         return self.core.capture(
             self.alice, "project-a", KnowledgeKind.ARCHITECTURE_DECISION,
             name, visibility=visibility, tags=("architecture", "sqlite"),
-            context={"engine": "sqlite", "runtime": "python"},
+            context=ctx,
             source_kind="human",
         )
 
@@ -363,7 +364,7 @@ class UnifiedKnowledgeCoreTests(unittest.TestCase):
                 verification_evidence={"task_id": "task-test-01"},
             )
 
-        # 9. Replay attack: legitimate token from Entry A cannot be reused on Entry B
+        # 9. Cross-entry token transfer: legitimate token from Entry A cannot be reused on Entry B (cryptographic binding to entry_id and task_id)
         rec_b = self._decision("Decisao B para teste de replay")
         valid_token_a = self.oracle.issue_evidence_token(
             task_id="task-test-01",
@@ -641,6 +642,115 @@ class UnifiedKnowledgeCoreTests(unittest.TestCase):
                                    and p["nature"] in (KnowledgeNature.VALIDATED_FINDING, KnowledgeNature.OBSERVATION))
             self.assertTrue(is_accepted_decision or is_verified_finding)
             self.assertNotEqual(p["nature"], KnowledgeNature.SPECULATIVE_DRAFT)
+
+    def test_22_find_operational_precedents_context_strictness_and_invalidation(self):
+        # 1. Verified observation that gets subsequently rejected -> MUST BE EXCLUDED
+        task_id = "task-op-22"
+        run_id = "run-op-22"
+        self.runs[(task_id, run_id)] = {"status": "complete", "exit_code": 0}
+        obs_flawed = self.core.capture(
+            self.alice, "project-a", KnowledgeKind.OBSERVATION, "Medicao preliminar com falha posterior",
+            task_id=task_id, visibility=KnowledgeVisibility.PROJECT_SHARED,
+        )
+        token = self.oracle.issue_evidence_token(
+            task_id=task_id,
+            plan_revision=1,
+            invariant_id=obs_flawed["id"],
+            source="trusted_test_runner",
+            run_id=run_id,
+            exit_code=0,
+        )
+        self.core.verify_with_oracle(
+            self.supervisor, obs_flawed["id"], expected_revision=1,
+            oracle_token=token,
+            verification_evidence={
+                "task_id": task_id,
+                "run_id": run_id,
+                "plan_revision": 1,
+                "source": "trusted_test_runner",
+                "exit_code": 0,
+            },
+        )
+        # Transition to rejected
+        self.core.transition(
+            self.alice, obs_flawed["id"], expected_revision=2,
+            new_state=KnowledgeState.REJECTED, reason="Falha reproduzida e refutada",
+        )
+
+        # 2. Verified observation that gets archived -> MUST BE EXCLUDED
+        obs_archived = self.core.capture(
+            self.alice, "project-a", KnowledgeKind.OBSERVATION, "Medicao antiga arquivada",
+            task_id=task_id, visibility=KnowledgeVisibility.PROJECT_SHARED,
+        )
+        token2 = self.oracle.issue_evidence_token(
+            task_id=task_id,
+            plan_revision=1,
+            invariant_id=obs_archived["id"],
+            source="trusted_test_runner",
+            run_id=run_id,
+            exit_code=0,
+        )
+        self.core.verify_with_oracle(
+            self.supervisor, obs_archived["id"], expected_revision=1,
+            oracle_token=token2,
+            verification_evidence={
+                "task_id": task_id,
+                "run_id": run_id,
+                "plan_revision": 1,
+                "source": "trusted_test_runner",
+                "exit_code": 0,
+            },
+        )
+        self.core.transition(
+            self.alice, obs_archived["id"], expected_revision=2,
+            new_state=KnowledgeState.ARCHIVED, reason="Arquivo historico",
+        )
+
+        # Precedents query without context: neither rejected nor archived observation should appear
+        precedents = self.core.find_operational_precedents(self.alice, project_id="project-a")
+        ret_ids = {p["id"] for p in precedents}
+        self.assertNotIn(obs_flawed["id"], ret_ids)
+        self.assertNotIn(obs_archived["id"], ret_ids)
+
+        # 3. Context strictness test
+        # Entry with full matching context
+        dec_full_ctx = self._decision(
+            "Regra estrita para Windows x64",
+            context={"os": "windows", "arch": "x64"},
+        )
+        self._accept(dec_full_ctx)
+
+        # Entry with partial context (missing 'arch')
+        dec_partial_ctx = self._decision(
+            "Regra generica para Windows",
+            context={"os": "windows"},
+        )
+        self._accept(dec_partial_ctx)
+
+        # Entry with conflicting context
+        dec_conflict_ctx = self._decision(
+            "Regra para Linux x64",
+            context={"os": "linux", "arch": "x64"},
+        )
+        self._accept(dec_conflict_ctx)
+
+        # Query operational precedents requiring both 'os' and 'arch'
+        strict_results = self.core.find_operational_precedents(
+            self.alice,
+            project_id="project-a",
+            context={"os": "windows", "arch": "x64"},
+        )
+        strict_ids = {r["id"] for r in strict_results}
+
+        # ONLY dec_full_ctx should match (context_match == 'confirmed')
+        self.assertIn(dec_full_ctx["id"], strict_ids)
+        # dec_partial_ctx is 'unconfirmed' -> MUST BE EXCLUDED from operational precedents
+        self.assertNotIn(dec_partial_ctx["id"], strict_ids)
+        # dec_conflict_ctx is mismatch -> MUST BE EXCLUDED
+        self.assertNotIn(dec_conflict_ctx["id"], strict_ids)
+
+        for r in strict_results:
+            self.assertEqual(r["context_match"], "confirmed")
 
 
 if __name__ == "__main__":
