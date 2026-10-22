@@ -1,6 +1,7 @@
 """Tests for Phase 4B.1 - Human Workspace (Human Inbox, Privacy, Lifecycle, Audit Log, and Worker Isolation)."""
 
 import os
+from pathlib import Path
 import sqlite3
 import tempfile
 import unittest
@@ -23,7 +24,7 @@ from ai_coordinator.human_workspace import (
 class HumanWorkspaceInboxTests(unittest.TestCase):
     def setUp(self):
         self.temp_dir = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
-        self.root = self.temp_dir.name
+        self.root = str(Path(self.temp_dir.name).resolve())
         self.store = Store(self.root)
         self.ws = self.store.human_workspace
 
@@ -448,7 +449,7 @@ class HumanWorkspaceSecurity4B1STests(unittest.TestCase):
 class HumanWorkspaceConversion4B2Tests(unittest.TestCase):
     def setUp(self):
         self.temp_dir = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
-        self.root = self.temp_dir.name
+        self.root = str(Path(self.temp_dir.name).resolve())
         self.store = Store(self.root)
         self.ws = self.store.human_workspace
 
