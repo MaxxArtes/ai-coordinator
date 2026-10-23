@@ -588,6 +588,9 @@ def parser():
     )
     p.add_argument("--root", default=str(default_data_dir()))
     p.add_argument("--supervisor-key", help="Supervisor authentication key")
+    p.add_argument("--supervisor-key-file", help="Path to supervisor key file")
+    p.add_argument("--session-token", help="Human session token")
+    p.add_argument("--session-token-file", help="Path to human session token file")
     sub = p.add_subparsers(dest="command", required=True)
     n = sub.add_parser("new"); n.add_argument("--project", required=True); n.add_argument("--goal", required=True); n.add_argument("--ai-memory-workstream-id"); n.add_argument("--flight-plan")
     c = sub.add_parser("context"); c.add_argument("--project", required=True)
@@ -676,8 +679,11 @@ def parser():
     foc_res = foc_sub.add_parser("resume", help="Generate local deterministic briefing to resume work")
     foc_res.add_argument("--project", required=True, help="Project directory")
     foc_res.add_argument("--task", help="Optional specific task ID")
-    foc_res.add_argument("--owner", default="default_human", help="Human owner ID")
-    foc_res.add_argument("--supervisor-key", help="Optional supervisor authentication key")
+    foc_res.add_argument("--owner", default=argparse.SUPPRESS, help="Human owner ID (defaults to current OS user)")
+    foc_res.add_argument("--supervisor-key", default=argparse.SUPPRESS, help="Optional supervisor authentication key")
+    foc_res.add_argument("--supervisor-key-file", default=argparse.SUPPRESS, help="Path to supervisor key file")
+    foc_res.add_argument("--session-token", default=argparse.SUPPRESS, help="Human session token")
+    foc_res.add_argument("--session-token-file", default=argparse.SUPPRESS, help="Path to human session token file")
 
     foc_save = foc_sub.add_parser("save", help="Record an immutable cognitive focus checkpoint")
     foc_save.add_argument("--project", required=True, help="Project directory")
@@ -689,14 +695,20 @@ def parser():
     foc_save.add_argument("--blockers", nargs="*", default=[], help="Blockers or impediments")
     foc_save.add_argument("--open-questions", nargs="*", default=[], help="Unresolved open questions")
     foc_save.add_argument("--expected-revision", type=int, help="Optimistic revision fencing")
-    foc_save.add_argument("--owner", default="default_human", help="Human owner ID")
-    foc_save.add_argument("--supervisor-key", help="Optional supervisor authentication key")
+    foc_save.add_argument("--owner", default=argparse.SUPPRESS, help="Human owner ID (defaults to current OS user)")
+    foc_save.add_argument("--supervisor-key", default=argparse.SUPPRESS, help="Optional supervisor authentication key")
+    foc_save.add_argument("--supervisor-key-file", default=argparse.SUPPRESS, help="Path to supervisor key file")
+    foc_save.add_argument("--session-token", default=argparse.SUPPRESS, help="Human session token")
+    foc_save.add_argument("--session-token-file", default=argparse.SUPPRESS, help="Path to human session token file")
 
     foc_show = foc_sub.add_parser("show", help="Show latest focus checkpoint")
     foc_show.add_argument("--project", required=True, help="Project directory")
     foc_show.add_argument("--task", help="Optional associated task ID")
-    foc_show.add_argument("--owner", default="default_human", help="Human owner ID")
-    foc_show.add_argument("--supervisor-key", help="Optional supervisor authentication key")
+    foc_show.add_argument("--owner", default=argparse.SUPPRESS, help="Human owner ID (defaults to current OS user)")
+    foc_show.add_argument("--supervisor-key", default=argparse.SUPPRESS, help="Optional supervisor authentication key")
+    foc_show.add_argument("--supervisor-key-file", default=argparse.SUPPRESS, help="Path to supervisor key file")
+    foc_show.add_argument("--session-token", default=argparse.SUPPRESS, help="Human session token")
+    foc_show.add_argument("--session-token-file", default=argparse.SUPPRESS, help="Path to human session token file")
     return p
 
 def main():
@@ -1019,9 +1031,22 @@ def main():
             else:
                 emit({"error": "Especifique --preview ou --propose para route-reconstruct"})
         elif args.command == "focus":
-            owner = getattr(args, "owner", "default_human")
-            key_to_use = getattr(args, "supervisor_key", None) or sup_key or store.supervisor_key
-            principal = store.create_human_principal(owner_id=owner, supervisor_key=key_to_use)
+            sup_key_file = getattr(args, "supervisor_key_file", None) or os.environ.get("AI_COORDINATOR_SUPERVISOR_FILE")
+            sup_key_val = getattr(args, "supervisor_key", None) or sup_key or os.environ.get("AI_COORDINATOR_SUPERVISOR_KEY")
+            if not sup_key_val and sup_key_file and Path(sup_key_file).is_file():
+                sup_key_val = Path(sup_key_file).read_text(encoding="utf-8").strip()
+
+            sess_token_file = getattr(args, "session_token_file", None) or os.environ.get("AI_COORDINATOR_SESSION_FILE")
+            sess_token = getattr(args, "session_token", None) or os.environ.get("AI_COORDINATOR_SESSION_TOKEN")
+            if not sess_token and sess_token_file and Path(sess_token_file).is_file():
+                sess_token = Path(sess_token_file).read_text(encoding="utf-8").strip()
+
+            requested_owner = getattr(args, "owner", None)
+            principal = store.resolve_cli_principal(
+                owner=requested_owner,
+                session_token=sess_token,
+                supervisor_key=sup_key_val,
+            )
             if args.focus_command == "resume":
                 emit(store.resume_human_project(principal, project=args.project, task_id=getattr(args, "task", None)))
             elif args.focus_command == "save":

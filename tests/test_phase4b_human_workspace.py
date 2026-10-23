@@ -1184,5 +1184,209 @@ class HumanFocusCheckpointTests(unittest.TestCase):
         self.assertIn("Workers subordinados estao", out_worker["error"])
 
 
+
+class Phase4B3SecurityHardeningTests(unittest.TestCase):
+    """Hardened security tests for Phase 4B.3-S:
+    - CLI Authentication & Session Protection (P0)
+    - Cross-project task isolation and link validation
+    - Accurate unbounded Inbox SQL aggregations
+    - Tamper-proofing of persisted supervisor credentials
+    """
+
+    def setUp(self):
+        self.temp_dir = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+        self.root = str(Path(self.temp_dir.name).resolve() / "store_data")
+        self.proj_a = str(Path(self.temp_dir.name).resolve() / "project_alpha")
+        self.proj_b = str(Path(self.temp_dir.name).resolve() / "project_beta")
+        Path(self.proj_a).mkdir(parents=True, exist_ok=True)
+        Path(self.proj_b).mkdir(parents=True, exist_ok=True)
+
+        self.supervisor_key = "genuine_supervisor_master_key_4b3s"
+        self.store = Store(self.root, supervisor_key=self.supervisor_key)
+        self.ws = self.store.human_workspace
+
+        self.alice = self.store.create_human_principal("alice", supervisor_key=self.supervisor_key)
+        self.bob = self.store.create_human_principal("bob", supervisor_key=self.supervisor_key)
+
+    def tearDown(self):
+        try:
+            self.store.db.close()
+        except Exception:
+            pass
+        try:
+            self.temp_dir.cleanup()
+        except Exception:
+            pass
+
+    # --- 1. Cross-Project Task Isolation in resume_human_project ---
+    def test_01_resume_human_project_rejects_cross_project_task(self):
+        # Create a task in Project Beta
+        task_b = self.store.new(project=self.proj_b, goal="Tarefa exclusiva do Projeto Beta")
+
+        # Attempt to resume Project Alpha requesting task from Project Beta -> must be denied
+        with self.assertRaises(HumanWorkspaceAccessDenied) as ctx:
+            self.store.resume_human_project(self.alice, project=self.proj_a, task_id=task_b["id"])
+        self.assertIn("pertence ao projeto", str(ctx.exception).lower())
+
+        # Non-existent task ID in Project Alpha -> NotFound
+        with self.assertRaises(HumanWorkspaceNotFoundError):
+            self.store.resume_human_project(self.alice, project=self.proj_a, task_id="non_existent_tid_123")
+
+    # --- 2. Cross-Project Task Linking in save_focus_checkpoint ---
+    def test_02_save_focus_checkpoint_rejects_cross_project_task_and_nonexistent(self):
+        # Create a task in Project Beta
+        task_b = self.store.new(project=self.proj_b, goal="Tarefa exclusiva do Projeto Beta")
+
+        # Attempt to bind Project Beta's task to Project Alpha's focus checkpoint -> denied
+        with self.assertRaises(HumanWorkspaceAccessDenied) as ctx:
+            self.store.save_focus_checkpoint(
+                self.alice,
+                project=self.proj_a,
+                intent="Tentativa de vincular tarefa de outro projeto",
+                task_id=task_b["id"],
+            )
+        self.assertIn("incompativel", str(ctx.exception).lower())
+
+        # Non-existent task ID -> NotFound
+        with self.assertRaises(HumanWorkspaceNotFoundError):
+            self.store.save_focus_checkpoint(
+                self.alice,
+                project=self.proj_a,
+                intent="Tentativa com tarefa inexistente",
+                task_id="ghost_task_999",
+            )
+
+        # Legitimate task in Project Alpha binds successfully
+        task_a = self.store.new(project=self.proj_a, goal="Tarefa valida do Projeto Alpha")
+        cp = self.store.save_focus_checkpoint(
+            self.alice,
+            project=self.proj_a,
+            intent="Foco vinculado legitimamente",
+            task_id=task_a["id"],
+        )
+        self.assertEqual(cp["task_id"], task_a["id"])
+
+    # --- 3. Accurate Unbounded Inbox Aggregations (> 50 items) ---
+    def test_03_resume_human_project_counts_inbox_beyond_list_limit(self):
+        # Capture 65 items (exceeding the standard list_inbox limit of 50)
+        # 40 will be marked as read, 25 remain unread
+        for i in range(65):
+            item = self.ws.capture(
+                self.alice,
+                f"Item de inbox numero {i}",
+                project_id=self.proj_a,
+            )
+            if i < 40:
+                self.ws.mark_read_state(
+                    self.alice,
+                    item["id"],
+                    read_state=HumanInboxReadState.READ,
+                    expected_revision=item["revision"],
+                )
+
+        briefing = self.store.resume_human_project(self.alice, project=self.proj_a)
+        summary = briefing["inbox_summary"]
+
+        self.assertEqual(summary["pending_captured_count"], 65)
+        self.assertEqual(summary["unread_count"], 25)
+        self.assertIn("[INBOX HUMANO PENDENTE]: 65 notas (25 nao lidas)", briefing["briefing_text"])
+
+    # --- 4. CLI Privilege Separation and Impersonation Defense (P0) ---
+    def test_04_cli_blocks_arbitrary_owner_impersonation_without_credentials(self):
+        python_exe = sys.executable
+        cli_module = "ai_coordinator.cli"
+        env = {**os.environ, "PYTHONPATH": str(Path(__file__).resolve().parent.parent / "src")}
+
+        # Caller attempts to select owner 'arbitrary_target_user' without providing supervisor key or session token
+        cmd = [
+            python_exe, "-m", cli_module,
+            "--root", self.root,
+            "focus", "resume",
+            "--project", self.proj_a,
+            "--owner", "arbitrary_target_user",
+        ]
+        res = subprocess.run(cmd, capture_output=True, text=True, env=env)
+        self.assertEqual(res.returncode, 2)
+        out = json.loads(res.stdout)
+        self.assertIn("error", out)
+        self.assertIn("requer credencial de supervisor autenticada", out["error"])
+
+    def test_05_cli_blocks_counterfeit_supervisor_key(self):
+        python_exe = sys.executable
+        cli_module = "ai_coordinator.cli"
+        env = {**os.environ, "PYTHONPATH": str(Path(__file__).resolve().parent.parent / "src")}
+
+        # Caller provides forged/wrong supervisor key
+        cmd = [
+            python_exe, "-m", cli_module,
+            "--root", self.root,
+            "--supervisor-key", "forged_wrong_key_12345",
+            "focus", "resume",
+            "--project", self.proj_a,
+            "--owner", "alice",
+        ]
+        res = subprocess.run(cmd, capture_output=True, text=True, env=env)
+        self.assertEqual(res.returncode, 2)
+        out = json.loads(res.stdout)
+        self.assertIn("error", out)
+        self.assertIn("chave de supervisor invalida", out["error"])
+
+    def test_06_cli_credential_passing_via_files_and_env_vars(self):
+        python_exe = sys.executable
+        cli_module = "ai_coordinator.cli"
+        env = {**os.environ, "PYTHONPATH": str(Path(__file__).resolve().parent.parent / "src")}
+
+        # 1. Using --supervisor-key-file
+        key_file_path = Path(self.temp_dir.name) / "secret.key"
+        key_file_path.write_text(self.supervisor_key, encoding="utf-8")
+
+        cmd_file = [
+            python_exe, "-m", cli_module,
+            "--root", self.root,
+            "--supervisor-key-file", str(key_file_path),
+            "focus", "save",
+            "--project", self.proj_a,
+            "--intent", "Focus gravado via key file",
+            "--owner", "alice",
+        ]
+        res_file = subprocess.run(cmd_file, capture_output=True, text=True, env=env)
+        self.assertEqual(res_file.returncode, 0, f"Failed: {res_file.stderr}")
+        out_file = json.loads(res_file.stdout)
+        self.assertEqual(out_file["intent"], "Focus gravado via key file")
+
+        # 2. Using --session-token-file
+        alice_token = self.store.issue_human_session_token("alice", supervisor_key=self.supervisor_key)
+        token_file_path = Path(self.temp_dir.name) / "session.token"
+        token_file_path.write_text(alice_token, encoding="utf-8")
+
+        cmd_token = [
+            python_exe, "-m", cli_module,
+            "--root", self.root,
+            "--session-token-file", str(token_file_path),
+            "focus", "show",
+            "--project", self.proj_a,
+            "--owner", "alice",
+        ]
+        res_token = subprocess.run(cmd_token, capture_output=True, text=True, env=env)
+        self.assertEqual(res_token.returncode, 0, f"Failed: {res_token.stderr}")
+        out_token = json.loads(res_token.stdout)
+        self.assertEqual(out_token["intent"], "Focus gravado via key file")
+
+    # --- 5. Persisted Credentials Tamper Protection ---
+    def test_07_persisted_supervisor_key_tamper_protection(self):
+        # A new Store instance opened pointing to same root with a fake supervisor_key
+        # must preserve the canonical disk key and reject the fake key
+        tampered_store = Store(self.root, supervisor_key="unauthorized_tampered_key")
+        try:
+            self.assertEqual(tampered_store.supervisor_key, self.supervisor_key)
+            self.assertFalse(tampered_store._supervisor_key_matched)
+
+            # Operations requiring supervisor authentication with the tampered key must fail
+            with self.assertRaises(HumanWorkspaceAccessDenied):
+                tampered_store.issue_human_session_token("alice", supervisor_key="unauthorized_tampered_key")
+        finally:
+            tampered_store.db.close()
+
+
 if __name__ == "__main__":
     unittest.main()

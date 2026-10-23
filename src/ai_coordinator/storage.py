@@ -257,8 +257,35 @@ class Store:
         self.mission_control = MissionControl(self)
         self.resource_ledger = ResourceLedger(self.db, backup_dir=self.root / "backups")
         self.experience_store = ExperienceStore(self.db)
-        self.supervisor_secret = secrets.token_bytes(32)
-        self.supervisor_key = str(supervisor_key).strip() if supervisor_key else secrets.token_hex(32)
+
+        # Persistent security credentials and supervisor authentication
+        auth_dir = self.root / "auth"
+        auth_dir.mkdir(parents=True, exist_ok=True)
+        secret_file = auth_dir / "supervisor.secret"
+        key_file = auth_dir / "supervisor.key"
+
+        if secret_file.is_file() and key_file.is_file():
+            self.supervisor_secret = secret_file.read_bytes()
+            canonical_key = key_file.read_text(encoding="utf-8").strip()
+            self.supervisor_key = canonical_key
+            self._supervisor_key_matched = (
+                hmac.compare_digest(str(supervisor_key).strip(), canonical_key)
+                if supervisor_key
+                else False
+            )
+        else:
+            self.supervisor_secret = secrets.token_bytes(32)
+            self.supervisor_key = str(supervisor_key).strip() if supervisor_key else secrets.token_hex(32)
+            self._supervisor_key_matched = True
+            secret_file.write_bytes(self.supervisor_secret)
+            key_file.write_text(self.supervisor_key, encoding="utf-8")
+            if os.name != "nt":
+                try:
+                    os.chmod(secret_file, 0o600)
+                    os.chmod(key_file, 0o600)
+                except Exception:
+                    pass
+
         self.admin_token = secrets.token_hex(32)
         self.oracle = InvariantOracle(run_lookup=self.get_run_for_task, secret=self.supervisor_secret)
         self.knowledge_core = UnifiedKnowledgeCore(self.db, oracle=self.oracle)
@@ -442,6 +469,59 @@ class Store:
         return self.human_workspace.resume_human_project(
             principal, project=project, store=self, task_id=task_id
         )
+
+    def resolve_cli_principal(
+        self,
+        owner: Optional[str] = None,
+        session_token: Optional[str] = None,
+        supervisor_key: Optional[str] = None,
+    ) -> HumanPrincipal:
+        """Resolve and authenticate a HumanPrincipal for CLI operations with strict privilege separation.
+        Prevents arbitrary owner impersonation, ephemeral key fabrication, and worker bypass.
+        """
+        if os.environ.get("AI_COORDINATOR_ROLE") == "worker":
+            raise HumanWorkspaceAccessDenied("Workers subordinados estao estritamente proibidos de acessar o Human Workspace")
+
+        effective_os_user = "default_human"
+        try:
+            import getpass
+            raw_user = getpass.getuser()
+            cleaned_user = re.sub(r"[^a-zA-Z0-9_.-]", "_", str(raw_user)).strip()
+            if cleaned_user:
+                effective_os_user = cleaned_user
+        except Exception:
+            pass
+
+        target_owner = (str(owner).strip() if owner else effective_os_user)
+
+        # 1. Prioritize explicit session token if provided
+        if session_token:
+            clean_token = str(session_token).strip()
+            expected_prefix = f"hsess_{target_owner}_"
+            if not clean_token.startswith(expected_prefix):
+                raise HumanWorkspaceAccessDenied("Token de sessao invalido: proprietario informado diverge do token apresentado")
+            principal = HumanPrincipal(owner_id=target_owner, role="human", session_token=clean_token)
+            self.human_workspace.verify_principal(principal, require_session_token=True)
+            return principal
+
+        # 2. Check supervisor key authentication
+        if supervisor_key:
+            clean_key = str(supervisor_key).strip()
+            if not hmac.compare_digest(clean_key, self.supervisor_key):
+                raise HumanWorkspaceAccessDenied("Autenticacao negada: chave de supervisor invalida")
+            issued_token = self.human_workspace.issue_session_token(target_owner, supervisor_key=clean_key)
+            return HumanPrincipal(owner_id=target_owner, role="human", session_token=issued_token)
+
+        # 3. No supervisor key and no session token:
+        # Caller wants to act as another owner without supervisor credentials -> REJECT
+        if owner and owner != effective_os_user:
+            raise HumanWorkspaceAccessDenied(
+                f"Acesso negado: a selecao de outro proprietario ('{owner}') requer credencial de supervisor autenticada"
+            )
+
+        # 4. Local OS user acting as themselves backed by local protected file permissions
+        issued_token = self.human_workspace.issue_session_token(effective_os_user, supervisor_key=self.supervisor_key)
+        return HumanPrincipal(owner_id=effective_os_user, role="human", session_token=issued_token)
 
     def get_run_for_task(self, task_id: str, run_id: str) -> Optional[Dict[str, Any]]:
         """Lookup execution run record for a specific task."""

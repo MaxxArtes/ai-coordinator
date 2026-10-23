@@ -881,6 +881,15 @@ class HumanWorkspace:
 
         clean_proj = str(Path(project).resolve())
         clean_task_id = str(task_id).strip() if task_id else None
+        if clean_task_id:
+            row_task = self.db.execute("SELECT id, project FROM tasks WHERE id = ?", (clean_task_id,)).fetchone()
+            if not row_task:
+                raise HumanWorkspaceNotFoundError(f"Tarefa '{clean_task_id}' nao encontrada para vinculacao ao checkpoint")
+            task_proj = str(Path(row_task["project"]).resolve())
+            if os.path.normcase(task_proj) != os.path.normcase(clean_proj):
+                raise HumanWorkspaceAccessDenied(
+                    f"Acesso negado: a tarefa '{clean_task_id}' pertence ao projeto '{task_proj}', incompativel com '{clean_proj}'"
+                )
 
         clean_decisions = [_scrub(str(d).strip()) for d in decisions if str(d).strip()]
         clean_priorities = [_scrub(str(p).strip()) for p in priorities if str(p).strip()]
@@ -1029,10 +1038,18 @@ class HumanWorkspace:
             try:
                 target_task = store.task(task_id)
             except Exception:
-                target_task = None
+                raise HumanWorkspaceNotFoundError(f"Tarefa '{task_id}' nao encontrada para briefing de continuidade")
+            task_proj = str(Path(target_task.get("project", "")).resolve())
+            if os.path.normcase(task_proj) != os.path.normcase(clean_proj):
+                raise HumanWorkspaceAccessDenied(
+                    f"Acesso negado: a tarefa '{task_id}' pertence ao projeto '{task_proj}', e nao ao projeto '{clean_proj}'"
+                )
         elif latest_focus and latest_focus.get("task_id"):
             try:
-                target_task = store.task(latest_focus["task_id"])
+                candidate_task = store.task(latest_focus["task_id"])
+                candidate_proj = str(Path(candidate_task.get("project", "")).resolve())
+                if os.path.normcase(candidate_proj) == os.path.normcase(clean_proj):
+                    target_task = candidate_task
             except Exception:
                 target_task = None
 
@@ -1044,9 +1061,16 @@ class HumanWorkspace:
             except Exception:
                 target_task = None
 
-        # Fetch inbox items for summary
-        inbox_items = self.list_inbox(principal, project_id=clean_proj, state=HumanInboxState.CAPTURED)
-        unread_count = len([i for i in inbox_items if i["read_state"] == HumanInboxReadState.UNREAD])
+        # Fetch inbox items summary using direct SQL aggregation (no 50-item list truncation)
+        row_inbox = self.db.execute(
+            """SELECT COUNT(*) AS total_pending,
+                      SUM(CASE WHEN read_state = 'unread' THEN 1 ELSE 0 END) AS unread_pending
+               FROM human_inbox
+               WHERE owner_id = ? AND project_id = ? AND state = ?""",
+            (principal.owner_id, clean_proj, HumanInboxState.CAPTURED),
+        ).fetchone()
+        pending_count = int(row_inbox["total_pending"]) if row_inbox and row_inbox["total_pending"] is not None else 0
+        unread_count = int(row_inbox["unread_pending"]) if row_inbox and row_inbox["unread_pending"] is not None else 0
 
         task_state = None
         if target_task:
@@ -1097,7 +1121,7 @@ class HumanWorkspace:
             if task_state["decisions"]:
                 continuity_lines.append(f"Decisoes da Tarefa: {', '.join(task_state['decisions'])}")
 
-        continuity_lines.append(f"\n[INBOX HUMANO PENDENTE]: {len(inbox_items)} notas ({unread_count} nao lidas)")
+        continuity_lines.append(f"\n[INBOX HUMANO PENDENTE]: {pending_count} notas ({unread_count} nao lidas)")
 
         return {
             "project": clean_proj,
@@ -1107,7 +1131,7 @@ class HumanWorkspace:
             "human_focus": latest_focus,
             "task_state": task_state,
             "inbox_summary": {
-                "pending_captured_count": len(inbox_items),
+                "pending_captured_count": pending_count,
                 "unread_count": unread_count,
             },
             "briefing_text": "\n".join(continuity_lines),
