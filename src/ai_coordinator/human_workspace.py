@@ -190,30 +190,89 @@ class HumanWorkspace:
                    END;"""
             )
 
+            # Phase 4B.3: Cognitive Focus Checkpoints
+            self.db.execute(
+                """CREATE TABLE IF NOT EXISTS human_focus_checkpoints (
+                    id TEXT PRIMARY KEY,
+                    owner_id TEXT NOT NULL,
+                    project_id TEXT NOT NULL,
+                    task_id TEXT,
+                    intent TEXT NOT NULL,
+                    decisions_json TEXT NOT NULL DEFAULT '[]',
+                    priorities_json TEXT NOT NULL DEFAULT '[]',
+                    blockers_json TEXT NOT NULL DEFAULT '[]',
+                    open_questions_json TEXT NOT NULL DEFAULT '[]',
+                    next_action TEXT NOT NULL DEFAULT '',
+                    context_json TEXT NOT NULL DEFAULT '{}',
+                    revision INTEGER NOT NULL DEFAULT 1,
+                    created_at TEXT NOT NULL
+                )"""
+            )
+            self.db.execute(
+                """CREATE INDEX IF NOT EXISTS idx_human_focus_owner_proj
+                   ON human_focus_checkpoints(owner_id, project_id, created_at DESC)"""
+            )
+            self.db.execute(
+                """CREATE INDEX IF NOT EXISTS idx_human_focus_owner_task
+                   ON human_focus_checkpoints(owner_id, task_id, created_at DESC)"""
+            )
+            self.db.execute(
+                """CREATE TRIGGER IF NOT EXISTS trg_prevent_update_human_focus_checkpoints
+                   BEFORE UPDATE ON human_focus_checkpoints
+                   BEGIN
+                       SELECT RAISE(ABORT, 'human_focus_checkpoints e estritamente append-only; atualizacao proibida');
+                   END;"""
+            )
+            self.db.execute(
+                """CREATE TRIGGER IF NOT EXISTS trg_prevent_delete_human_focus_checkpoints
+                   BEFORE DELETE ON human_focus_checkpoints
+                   BEGIN
+                       SELECT RAISE(ABORT, 'human_focus_checkpoints e estritamente append-only; exclusao proibida');
+                   END;"""
+            )
+
     @contextlib.contextmanager
-    def _transaction(self):
+    def _transaction(self, store: Optional[Any] = None):
         cursor = self.db.cursor()
         is_nested = self.db.in_transaction
         if is_nested:
             sp_name = f"sp_{secrets.token_hex(8)}"
+            if store is not None and hasattr(store, "enter_savepoint_scope"):
+                store.enter_savepoint_scope()
             cursor.execute(f"SAVEPOINT {sp_name}")
             try:
                 yield cursor
                 cursor.execute(f"RELEASE SAVEPOINT {sp_name}")
+                if store is not None and hasattr(store, "release_savepoint_scope"):
+                    store.release_savepoint_scope()
             except Exception:
                 cursor.execute(f"ROLLBACK TO SAVEPOINT {sp_name}")
                 cursor.execute(f"RELEASE SAVEPOINT {sp_name}")
+                if store is not None and hasattr(store, "rollback_savepoint_scope"):
+                    store.rollback_savepoint_scope()
                 raise
             finally:
                 cursor.close()
         else:
+            if store is not None and hasattr(store, "_post_commit_scopes"):
+                store._post_commit_scopes = [[]]
             cursor.execute("BEGIN IMMEDIATE")
             try:
                 yield cursor
                 self.db.commit()
             except Exception:
                 self.db.rollback()
+                if store is not None and hasattr(store, "_post_commit_scopes"):
+                    store._post_commit_scopes.clear()
                 raise
+            else:
+                if store is not None and hasattr(store, "_post_commit_scopes"):
+                    actions = []
+                    for s in store._post_commit_scopes:
+                        actions.extend(s)
+                    store._post_commit_scopes.clear()
+                    for act in actions:
+                        act()
             finally:
                 cursor.close()
 
@@ -699,7 +758,7 @@ class HumanWorkspace:
         if status != "backlog":
             raise ValueError("Tarefas convertidas a partir do Human Inbox devem obrigatoriamente possuir status 'backlog'")
 
-        with self._transaction():
+        with self._transaction(store=store):
             current = self.get(principal, item_id)
             if current is None:
                 raise HumanWorkspaceNotFoundError("Item nao encontrado no inbox do proprietario")
@@ -775,3 +834,281 @@ class HumanWorkspace:
         updated_item = self.get(principal, item_id)
         assert updated_item is not None
         return {"task": task, "inbox_item": updated_item, "created": True}
+
+    def _decode_focus_row(self, row: sqlite3.Row) -> Dict[str, Any]:
+        return {
+            "id": row["id"],
+            "owner_id": row["owner_id"],
+            "project_id": row["project_id"],
+            "task_id": row["task_id"],
+            "intent": row["intent"],
+            "decisions": json.loads(row["decisions_json"]),
+            "priorities": json.loads(row["priorities_json"]),
+            "blockers": json.loads(row["blockers_json"]),
+            "open_questions": json.loads(row["open_questions_json"]),
+            "next_action": row["next_action"],
+            "context": json.loads(row["context_json"]),
+            "revision": row["revision"],
+            "created_at": row["created_at"],
+        }
+
+    def save_focus_checkpoint(
+        self,
+        principal: HumanPrincipal,
+        project: Union[str, Path],
+        intent: str,
+        *,
+        task_id: Optional[str] = None,
+        decisions: Sequence[str] = (),
+        priorities: Sequence[str] = (),
+        blockers: Sequence[str] = (),
+        open_questions: Sequence[str] = (),
+        next_action: str = "",
+        context: Optional[Mapping[str, Any]] = None,
+        expected_revision: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        """Record an immutable, append-only cognitive focus checkpoint for the human owner."""
+        self.verify_principal(principal)
+
+        if not isinstance(intent, str) or not intent.strip():
+            raise ValueError("Intencao (intent) obrigatoria para checkpoint cognitivo")
+        if len(intent) > 5000:
+            raise ValueError("Intencao excede limite de 5000 caracteres")
+
+        clean_next_action = str(next_action or "").strip()
+        if len(clean_next_action) > 1500:
+            raise ValueError("Proxima acao (next_action) excede limite de 1500 caracteres")
+
+        clean_proj = str(Path(project).resolve())
+        clean_task_id = str(task_id).strip() if task_id else None
+
+        clean_decisions = [_scrub(str(d).strip()) for d in decisions if str(d).strip()]
+        clean_priorities = [_scrub(str(p).strip()) for p in priorities if str(p).strip()]
+        clean_blockers = [_scrub(str(b).strip()) for b in blockers if str(b).strip()]
+        clean_questions = [_scrub(str(q).strip()) for q in open_questions if str(q).strip()]
+
+        chk_id = f"fchk_{secrets.token_hex(8)}"
+        stamp = _now()
+
+        with self._transaction():
+            # Query highest revision for this owner and project
+            row = self.db.execute(
+                """SELECT revision FROM human_focus_checkpoints
+                   WHERE owner_id = ? AND project_id = ?
+                   ORDER BY revision DESC LIMIT 1""",
+                (principal.owner_id, clean_proj),
+            ).fetchone()
+            current_rev = row["revision"] if row else 0
+
+            if expected_revision is not None and current_rev != expected_revision:
+                raise HumanWorkspaceConflict(
+                    f"Revisao de foco concorrente detectada: esperada {expected_revision}, atual {current_rev}"
+                )
+
+            next_rev = current_rev + 1
+
+            self.db.execute(
+                """INSERT INTO human_focus_checkpoints
+                   (id, owner_id, project_id, task_id, intent, decisions_json, priorities_json,
+                    blockers_json, open_questions_json, next_action, context_json, revision, created_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    chk_id,
+                    principal.owner_id,
+                    clean_proj,
+                    clean_task_id,
+                    _scrub(intent.strip()),
+                    json.dumps(clean_decisions, ensure_ascii=False),
+                    json.dumps(clean_priorities, ensure_ascii=False),
+                    json.dumps(clean_blockers, ensure_ascii=False),
+                    json.dumps(clean_questions, ensure_ascii=False),
+                    _scrub(clean_next_action),
+                    json.dumps(dict(context or {}), ensure_ascii=False),
+                    next_rev,
+                    stamp,
+                ),
+            )
+
+            # Record event in audit log
+            self._record_event(
+                inbox_id=chk_id,
+                revision=next_rev,
+                action="save_focus_checkpoint",
+                actor_id=principal.owner_id,
+                details={
+                    "checkpoint_id": chk_id,
+                    "project_id": clean_proj,
+                    "task_id": clean_task_id,
+                    "revision": next_rev,
+                },
+            )
+
+        saved = self.db.execute(
+            "SELECT * FROM human_focus_checkpoints WHERE id = ?", (chk_id,)
+        ).fetchone()
+        assert saved is not None
+        return self._decode_focus_row(saved)
+
+    def get_latest_focus_checkpoint(
+        self,
+        principal: HumanPrincipal,
+        project: Union[str, Path],
+        task_id: Optional[str] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """Retrieve the latest authorized cognitive focus checkpoint for the human owner."""
+        self.verify_principal(principal)
+        clean_proj = str(Path(project).resolve())
+
+        if task_id:
+            row = self.db.execute(
+                """SELECT * FROM human_focus_checkpoints
+                   WHERE owner_id = ? AND project_id = ? AND task_id = ?
+                   ORDER BY revision DESC LIMIT 1""",
+                (principal.owner_id, clean_proj, str(task_id).strip()),
+            ).fetchone()
+        else:
+            row = self.db.execute(
+                """SELECT * FROM human_focus_checkpoints
+                   WHERE owner_id = ? AND project_id = ?
+                   ORDER BY revision DESC LIMIT 1""",
+                (principal.owner_id, clean_proj),
+            ).fetchone()
+
+        if not row:
+            return None
+        # Strict privacy check
+        if row["owner_id"] != principal.owner_id:
+            raise HumanWorkspaceAccessDenied("Acesso negado: o checkpoint pertence a outro proprietario")
+        return self._decode_focus_row(row)
+
+    def list_focus_checkpoints(
+        self,
+        principal: HumanPrincipal,
+        project: Union[str, Path],
+        task_id: Optional[str] = None,
+        limit: int = 10,
+    ) -> List[Dict[str, Any]]:
+        """List historical focus checkpoints for owner and project in descending revision order."""
+        self.verify_principal(principal)
+        if not isinstance(limit, int) or not 1 <= limit <= 100:
+            raise ValueError("limit deve estar entre 1 e 100")
+        clean_proj = str(Path(project).resolve())
+
+        if task_id:
+            rows = self.db.execute(
+                """SELECT * FROM human_focus_checkpoints
+                   WHERE owner_id = ? AND project_id = ? AND task_id = ?
+                   ORDER BY revision DESC LIMIT ?""",
+                (principal.owner_id, clean_proj, str(task_id).strip(), limit),
+            ).fetchall()
+        else:
+            rows = self.db.execute(
+                """SELECT * FROM human_focus_checkpoints
+                   WHERE owner_id = ? AND project_id = ?
+                   ORDER BY revision DESC LIMIT ?""",
+                (principal.owner_id, clean_proj, limit),
+            ).fetchall()
+
+        return [self._decode_focus_row(r) for r in rows]
+
+    def resume_human_project(
+        self,
+        principal: HumanPrincipal,
+        project: Union[str, Path],
+        store: Any,
+        task_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Compose a deterministic local continuity briefing combining human focus and verifiable task state."""
+        self.verify_principal(principal)
+        clean_proj = str(Path(project).resolve())
+
+        latest_focus = self.get_latest_focus_checkpoint(principal, clean_proj, task_id=task_id)
+
+        target_task = None
+        if task_id:
+            try:
+                target_task = store.task(task_id)
+            except Exception:
+                target_task = None
+        elif latest_focus and latest_focus.get("task_id"):
+            try:
+                target_task = store.task(latest_focus["task_id"])
+            except Exception:
+                target_task = None
+
+        if not target_task:
+            try:
+                active_contexts = store.context(clean_proj)
+                if active_contexts:
+                    target_task = store.task(active_contexts[0]["id"])
+            except Exception:
+                target_task = None
+
+        # Fetch inbox items for summary
+        inbox_items = self.list_inbox(principal, project_id=clean_proj, state=HumanInboxState.CAPTURED)
+        unread_count = len([i for i in inbox_items if i["read_state"] == HumanInboxReadState.UNREAD])
+
+        task_state = None
+        if target_task:
+            snapshot = target_task.get("snapshot", {})
+            task_state = {
+                "id": target_task["id"],
+                "status": target_task.get("status", "unknown"),
+                "goal": target_task.get("goal", ""),
+                "revision": target_task.get("revision", 1),
+                "decisions": snapshot.get("decisions", []),
+                "changed_files": snapshot.get("changed_files", []),
+                "checks": snapshot.get("checks", []),
+                "pending": snapshot.get("pending", []),
+                "next_step": snapshot.get("next_step", ""),
+                "step_count": target_task.get("step_count", 0),
+                "drift_status": target_task.get("drift_status", "nominal"),
+            }
+
+        continuity_lines = [
+            f"=== BRIEFING DE CONTINUIDADE (PROJETO: {clean_proj}) ===",
+            f"Proprietario: {principal.owner_id}",
+            f"Modo: Offline (Zero chamadas externas de IA)",
+        ]
+        if latest_focus:
+            continuity_lines.append(f"\n[FOCO COGNITIVO HUMANO - Rev {latest_focus['revision']}]")
+            continuity_lines.append(f"Intencao: {latest_focus['intent']}")
+            if latest_focus["next_action"]:
+                continuity_lines.append(f"Proxima Acao Definida: {latest_focus['next_action']}")
+            if latest_focus["priorities"]:
+                continuity_lines.append(f"Prioridades: {', '.join(latest_focus['priorities'])}")
+            if latest_focus["blockers"]:
+                continuity_lines.append(f"Bloqueios: {', '.join(latest_focus['blockers'])}")
+            if latest_focus["open_questions"]:
+                continuity_lines.append(f"Questoes Abertas: {', '.join(latest_focus['open_questions'])}")
+            if latest_focus["decisions"]:
+                continuity_lines.append(f"Decisoes Humanas: {', '.join(latest_focus['decisions'])}")
+        else:
+            continuity_lines.append("\n[FOCO COGNITIVO HUMANO]: Nenhum foco registrado formalmente.")
+
+        if task_state:
+            continuity_lines.append(f"\n[ESTADO OPERACIONAL DA TAREFA: {task_state['id']}]")
+            continuity_lines.append(f"Status: {task_state['status']} (Rev {task_state['revision']})")
+            continuity_lines.append(f"Objetivo: {task_state['goal']}")
+            if task_state["next_step"]:
+                continuity_lines.append(f"Proximo Passo Operacional: {task_state['next_step']}")
+            if task_state["pending"]:
+                continuity_lines.append(f"Pendencias: {', '.join(task_state['pending'])}")
+            if task_state["decisions"]:
+                continuity_lines.append(f"Decisoes da Tarefa: {', '.join(task_state['decisions'])}")
+
+        continuity_lines.append(f"\n[INBOX HUMANO PENDENTE]: {len(inbox_items)} notas ({unread_count} nao lidas)")
+
+        return {
+            "project": clean_proj,
+            "owner_id": principal.owner_id,
+            "generated_at": _now(),
+            "offline_mode": True,
+            "human_focus": latest_focus,
+            "task_state": task_state,
+            "inbox_summary": {
+                "pending_captured_count": len(inbox_items),
+                "unread_count": unread_count,
+            },
+            "briefing_text": "\n".join(continuity_lines),
+        }

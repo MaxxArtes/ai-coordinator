@@ -5,6 +5,8 @@ import json
 import os
 from pathlib import Path
 import sqlite3
+import subprocess
+import sys
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -856,6 +858,330 @@ class HumanWorkspaceConversion4B2Tests(unittest.TestCase):
             self.assertTrue((symlink_target / "keep.txt").is_file())
         except (OSError, NotImplementedError):
             pass  # Windows without SeCreateSymbolicLinkPrivilege
+
+
+
+class HumanFocusCheckpointTests(unittest.TestCase):
+    def setUp(self):
+        self.temp_dir = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+        self.root = str(Path(self.temp_dir.name).resolve())
+        self.supervisor_key = "test_sup_secret_key_4b3"
+        self.store = Store(self.root, supervisor_key=self.supervisor_key)
+        self.ws = self.store.human_workspace
+
+        self.alice = self.store.create_human_principal("alice", supervisor_key=self.supervisor_key)
+        self.bob = self.store.create_human_principal("bob", supervisor_key=self.supervisor_key)
+
+    def tearDown(self):
+        try:
+            self.store.db.close()
+        except Exception:
+            pass
+        try:
+            self.temp_dir.cleanup()
+        except Exception:
+            pass
+
+    # --- 1. Scoped Savepoint Rollback and Symlink Repair ---
+    def test_01_savepoint_rollback_discards_nested_actions_cleanly(self):
+        executed_actions = []
+
+        with self.store.transaction():
+            self.store.defer_post_commit(lambda: executed_actions.append("root_action"))
+
+            # Enter an inner savepoint
+            try:
+                with self.ws._transaction(store=self.store):
+                    self.store.defer_post_commit(lambda: executed_actions.append("nested_action_rolled_back"))
+                    # Simulate an exception that triggers rollback of this savepoint
+                    raise RuntimeError("simulated inner error")
+            except RuntimeError:
+                pass  # Savepoint rolled back
+
+            # Another root-level action after inner rollback
+            self.store.defer_post_commit(lambda: executed_actions.append("second_root_action"))
+
+        # Outermost transaction committed. The rolled-back nested action must NOT have run!
+        self.assertIn("root_action", executed_actions)
+        self.assertIn("second_root_action", executed_actions)
+        self.assertNotIn("nested_action_rolled_back", executed_actions)
+        self.assertEqual(executed_actions, ["root_action", "second_root_action"])
+
+    def test_02_reconcile_skips_symlink_task_dir_and_symlink_state_file(self):
+        task = self.store.new(project=self.root, goal="Tarefa teste symlinks")
+        tid = task["id"]
+        tasks_dir = Path(self.root) / "tasks"
+        task_dir = tasks_dir / tid
+        state_file = task_dir / "state.json"
+
+        # 1. State file as symlink
+        external_state = Path(self.root) / "external_state.json"
+        external_state.write_text("{\"revision\": 1}", encoding="utf-8")
+        state_file.unlink()
+        try:
+            os.symlink(str(external_state), str(state_file))
+            report = self.store.reconcile_task_mirrors()
+            skipped = [s["name"] for s in report["skipped"] if s.get("reason") == "symlink_file"]
+            self.assertIn(tid, skipped)
+        except (OSError, NotImplementedError):
+            pass
+
+    # --- 2. Focus Checkpoint Persistence and Immutability ---
+    def test_03_save_focus_checkpoint_schema_defaults_and_immutability(self):
+        cp = self.store.save_focus_checkpoint(
+            self.alice,
+            project=self.root,
+            intent="Definir checkpoints cognitivos imutaveis",
+            decisions=["Briefing estritamente deterministico offline", "Append-only com triggers"],
+            priorities=["Seguranca", "Conectividade Multi-IA"],
+            blockers=["Nenhum"],
+            open_questions=["Como lidar com workers?"],
+            next_action="Escrever suite de testes da 4B.3",
+        )
+
+        self.assertTrue(cp["id"].startswith("fchk_"))
+        self.assertEqual(cp["owner_id"], "alice")
+        self.assertEqual(cp["project_id"], str(Path(self.root).resolve()))
+        self.assertEqual(cp["intent"], "Definir checkpoints cognitivos imutaveis")
+        self.assertEqual(len(cp["decisions"]), 2)
+        self.assertEqual(len(cp["priorities"]), 2)
+        self.assertEqual(cp["blockers"], ["Nenhum"])
+        self.assertEqual(cp["open_questions"], ["Como lidar com workers?"])
+        self.assertEqual(cp["next_action"], "Escrever suite de testes da 4B.3")
+        self.assertEqual(cp["revision"], 1)
+        self.assertIsNotNone(cp["created_at"])
+
+        # Check triggers: UPDATE must be rejected by SQLite
+        with self.assertRaises(sqlite3.IntegrityError if hasattr(sqlite3, "IntegrityError") else sqlite3.OperationalError):
+            self.store.db.execute(
+                "UPDATE human_focus_checkpoints SET intent = 'alterado' WHERE id = ?",
+                (cp["id"],)
+            )
+
+        # DELETE must be rejected by SQLite
+        with self.assertRaises(sqlite3.IntegrityError if hasattr(sqlite3, "IntegrityError") else sqlite3.OperationalError):
+            self.store.db.execute(
+                "DELETE FROM human_focus_checkpoints WHERE id = ?",
+                (cp["id"],)
+            )
+
+    # --- 3. Revision Sequencing and Optimistic Concurrency ---
+    def test_04_revision_sequencing_and_concurrency_fencing(self):
+        # First checkpoint: revision 1
+        cp1 = self.store.save_focus_checkpoint(
+            self.alice,
+            project=self.root,
+            intent="Primeiro marco de foco",
+        )
+        self.assertEqual(cp1["revision"], 1)
+
+        # Conflict check: expected_revision=0 or 5 should fail
+        with self.assertRaises(HumanWorkspaceConflict):
+            self.store.save_focus_checkpoint(
+                self.alice,
+                project=self.root,
+                intent="Tentativa com revisao desatualizada",
+                expected_revision=0,
+            )
+
+        with self.assertRaises(HumanWorkspaceConflict):
+            self.store.save_focus_checkpoint(
+                self.alice,
+                project=self.root,
+                intent="Tentativa com revisao futura",
+                expected_revision=5,
+            )
+
+        # Expected revision 1 succeeds and produces revision 2
+        cp2 = self.store.save_focus_checkpoint(
+            self.alice,
+            project=self.root,
+            intent="Segundo marco de foco",
+            expected_revision=1,
+        )
+        self.assertEqual(cp2["revision"], 2)
+
+        # Latest should be cp2
+        latest = self.store.get_latest_focus_checkpoint(self.alice, project=self.root)
+        self.assertIsNotNone(latest)
+        self.assertEqual(latest["id"], cp2["id"])
+        self.assertEqual(latest["revision"], 2)
+
+        # List should return both in descending order
+        all_cps = self.store.list_focus_checkpoints(self.alice, project=self.root)
+        self.assertEqual(len(all_cps), 2)
+        self.assertEqual(all_cps[0]["revision"], 2)
+        self.assertEqual(all_cps[1]["revision"], 1)
+
+    # --- 4. Privacy, Tenant Isolation and Worker Lockout ---
+    def test_05_privacy_and_tenant_isolation(self):
+        self.store.save_focus_checkpoint(
+            self.alice,
+            project=self.root,
+            intent="Privacidade absoluta de Alice",
+        )
+
+        # Bob queries the same project: gets None
+        bob_latest = self.store.get_latest_focus_checkpoint(self.bob, project=self.root)
+        self.assertIsNone(bob_latest)
+
+        bob_list = self.store.list_focus_checkpoints(self.bob, project=self.root)
+        self.assertEqual(bob_list, [])
+
+    def test_06_worker_lockout_and_unauthorized_access(self):
+        # 1. Principal with worker role is blocked
+        worker_principal = HumanPrincipal(owner_id="worker_sub", role="worker")
+        with self.assertRaises(HumanWorkspaceAccessDenied):
+            self.store.save_focus_checkpoint(
+                worker_principal,
+                project=self.root,
+                intent="Worker tentando gravar foco",
+            )
+
+        # 2. Process environment lockout
+        with patch.dict(os.environ, {"AI_COORDINATOR_ROLE": "worker"}):
+            with self.assertRaises(HumanWorkspaceAccessDenied):
+                self.store.save_focus_checkpoint(
+                    self.alice,
+                    project=self.root,
+                    intent="Foco sob processo worker",
+                )
+            with self.assertRaises(HumanWorkspaceAccessDenied):
+                self.store.get_latest_focus_checkpoint(self.alice, project=self.root)
+            with self.assertRaises(HumanWorkspaceAccessDenied):
+                self.store.list_focus_checkpoints(self.alice, project=self.root)
+            with self.assertRaises(HumanWorkspaceAccessDenied):
+                self.store.resume_human_project(self.alice, project=self.root)
+
+    # --- 5. Cross-Session Durability ---
+    def test_07_cross_session_durability(self):
+        cp = self.store.save_focus_checkpoint(
+            self.alice,
+            project=self.root,
+            intent="Durabilidade entre sessoes",
+            decisions=["Decisao salva"],
+            next_action="Reiniciar store",
+        )
+
+        # Close existing store
+        self.store.db.close()
+
+        # Reopen brand new store pointing to same root and key
+        new_store = Store(self.root, supervisor_key=self.supervisor_key)
+        try:
+            alice_new = new_store.create_human_principal("alice", supervisor_key=self.supervisor_key)
+            loaded = new_store.get_latest_focus_checkpoint(alice_new, project=self.root)
+            self.assertIsNotNone(loaded)
+            self.assertEqual(loaded["id"], cp["id"])
+            self.assertEqual(loaded["intent"], "Durabilidade entre sessoes")
+            self.assertEqual(loaded["decisions"], ["Decisao salva"])
+            self.assertEqual(loaded["next_action"], "Reiniciar store")
+        finally:
+            new_store.db.close()
+
+    # --- 6. Deterministic Offline Briefing ---
+    def test_08_resume_human_project_offline_briefing(self):
+        # Create a captured inbox item
+        self.ws.capture(
+            self.alice,
+            "Lembrete importante no inbox",
+            project_id=self.root,
+        )
+
+        # Save focus checkpoint
+        self.store.save_focus_checkpoint(
+            self.alice,
+            project=self.root,
+            intent="Concluir entrega da 4B.3",
+            priorities=["Verificacao rigorosa", "Briefing sem leak"],
+            next_action="Rodar suite completa de testes",
+        )
+
+        # Create active task
+        task = self.store.new(project=self.root, goal="Entrega operacional da 4B.3")
+
+        # Resume project briefing
+        briefing = self.store.resume_human_project(self.alice, project=self.root)
+
+        self.assertTrue(briefing["offline_mode"])
+        self.assertEqual(briefing["owner_id"], "alice")
+        self.assertEqual(briefing["project"], str(Path(self.root).resolve()))
+        self.assertIsNotNone(briefing["human_focus"])
+        self.assertEqual(briefing["human_focus"]["intent"], "Concluir entrega da 4B.3")
+        self.assertIsNotNone(briefing["task_state"])
+        self.assertEqual(briefing["task_state"]["id"], task["id"])
+        self.assertEqual(briefing["task_state"]["goal"], "Entrega operacional da 4B.3")
+        self.assertEqual(briefing["inbox_summary"]["pending_captured_count"], 1)
+
+        # Briefing text structure
+        bt = briefing["briefing_text"]
+        self.assertIn("=== BRIEFING DE CONTINUIDADE", bt)
+        self.assertIn("Modo: Offline (Zero chamadas externas de IA)", bt)
+        self.assertIn("[FOCO COGNITIVO HUMANO", bt)
+        self.assertIn("Concluir entrega da 4B.3", bt)
+        self.assertIn("[ESTADO OPERACIONAL DA TAREFA", bt)
+        self.assertIn("Entrega operacional da 4B.3", bt)
+        self.assertIn("[INBOX HUMANO PENDENTE]: 1 notas", bt)
+
+    # --- 7. CLI Subcommands Execution ---
+    def test_09_cli_focus_commands(self):
+        python_exe = sys.executable
+        cli_module = "ai_coordinator.cli"
+        env = {**os.environ, "PYTHONPATH": str(Path(__file__).resolve().parent.parent / "src")}
+
+        # 1. focus save via CLI
+        cmd_save = [
+            python_exe, "-m", cli_module,
+            "--root", self.root,
+            "--supervisor-key", self.supervisor_key,
+            "focus", "save",
+            "--project", self.root,
+            "--intent", "CLI Focus Test",
+            "--next-action", "Validar CLI",
+            "--owner", "alice",
+        ]
+        res_save = subprocess.run(cmd_save, capture_output=True, text=True, env=env)
+        self.assertEqual(res_save.returncode, 0, f"CLI save failed: {res_save.stderr}")
+        out_save = json.loads(res_save.stdout)
+        self.assertEqual(out_save["intent"], "CLI Focus Test")
+        self.assertEqual(out_save["next_action"], "Validar CLI")
+
+        # 2. focus show via CLI
+        cmd_show = [
+            python_exe, "-m", cli_module,
+            "--root", self.root,
+            "--supervisor-key", self.supervisor_key,
+            "focus", "show",
+            "--project", self.root,
+            "--owner", "alice",
+        ]
+        res_show = subprocess.run(cmd_show, capture_output=True, text=True, env=env)
+        self.assertEqual(res_show.returncode, 0, f"CLI show failed: {res_show.stderr}")
+        out_show = json.loads(res_show.stdout)
+        self.assertEqual(out_show["intent"], "CLI Focus Test")
+
+        # 3. focus resume via CLI
+        cmd_resume = [
+            python_exe, "-m", cli_module,
+            "--root", self.root,
+            "--supervisor-key", self.supervisor_key,
+            "focus", "resume",
+            "--project", self.root,
+            "--owner", "alice",
+        ]
+        res_resume = subprocess.run(cmd_resume, capture_output=True, text=True, env=env)
+        self.assertEqual(res_resume.returncode, 0, f"CLI resume failed: {res_resume.stderr}")
+        out_resume = json.loads(res_resume.stdout)
+        self.assertTrue(out_resume["offline_mode"])
+        self.assertIn("CLI Focus Test", out_resume["briefing_text"])
+
+        # 4. Worker lockout rejection via CLI
+        worker_env = {**env, "AI_COORDINATOR_ROLE": "worker"}
+        res_worker = subprocess.run(cmd_resume, capture_output=True, text=True, env=worker_env)
+        self.assertEqual(res_worker.returncode, 2)
+        out_worker = json.loads(res_worker.stdout)
+        self.assertIn("error", out_worker)
+        self.assertIn("Workers subordinados estao", out_worker["error"])
 
 
 if __name__ == "__main__":

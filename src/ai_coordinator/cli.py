@@ -102,6 +102,8 @@ from .storage import (
     ACTIVE_RUN_STATES,
     TERMINAL_RUN_STATES,
     VALID_STATUS_TRANSITIONS,
+    HumanPrincipal,
+    HumanWorkspaceError,
 )
 
 def launcher(config, client):
@@ -585,6 +587,7 @@ def parser():
         version=f"%(prog)s {_get_version()}",
     )
     p.add_argument("--root", default=str(default_data_dir()))
+    p.add_argument("--supervisor-key", help="Supervisor authentication key")
     sub = p.add_subparsers(dest="command", required=True)
     n = sub.add_parser("new"); n.add_argument("--project", required=True); n.add_argument("--goal", required=True); n.add_argument("--ai-memory-workstream-id"); n.add_argument("--flight-plan")
     c = sub.add_parser("context"); c.add_argument("--project", required=True)
@@ -666,6 +669,34 @@ def parser():
     ev.add_argument("--case", action="append", default=[])
     er = sub.add_parser("benchmark-report", help="Summarize a manually scored benchmark JSON file")
     er.add_argument("--input", required=True); er.add_argument("--output")
+
+    foc = sub.add_parser("focus", help="Cognitive checkpointing and multi-AI continuity briefing")
+    foc_sub = foc.add_subparsers(dest="focus_command", required=True)
+
+    foc_res = foc_sub.add_parser("resume", help="Generate local deterministic briefing to resume work")
+    foc_res.add_argument("--project", required=True, help="Project directory")
+    foc_res.add_argument("--task", help="Optional specific task ID")
+    foc_res.add_argument("--owner", default="default_human", help="Human owner ID")
+    foc_res.add_argument("--supervisor-key", help="Optional supervisor authentication key")
+
+    foc_save = foc_sub.add_parser("save", help="Record an immutable cognitive focus checkpoint")
+    foc_save.add_argument("--project", required=True, help="Project directory")
+    foc_save.add_argument("--intent", required=True, help="Human intent or focus goal")
+    foc_save.add_argument("--task", help="Optional associated task ID")
+    foc_save.add_argument("--next-action", default="", help="Immediate next action")
+    foc_save.add_argument("--decisions", nargs="*", default=[], help="Explicit decisions made")
+    foc_save.add_argument("--priorities", nargs="*", default=[], help="Active priorities")
+    foc_save.add_argument("--blockers", nargs="*", default=[], help="Blockers or impediments")
+    foc_save.add_argument("--open-questions", nargs="*", default=[], help="Unresolved open questions")
+    foc_save.add_argument("--expected-revision", type=int, help="Optimistic revision fencing")
+    foc_save.add_argument("--owner", default="default_human", help="Human owner ID")
+    foc_save.add_argument("--supervisor-key", help="Optional supervisor authentication key")
+
+    foc_show = foc_sub.add_parser("show", help="Show latest focus checkpoint")
+    foc_show.add_argument("--project", required=True, help="Project directory")
+    foc_show.add_argument("--task", help="Optional associated task ID")
+    foc_show.add_argument("--owner", default="default_human", help="Human owner ID")
+    foc_show.add_argument("--supervisor-key", help="Optional supervisor authentication key")
     return p
 
 def main():
@@ -679,7 +710,8 @@ def main():
         emit(config["routes"]); return 0
     if args.command == 'scope':
         emit(scope(args.project, args.init)); return 0
-    store = Store(root)
+    sup_key = getattr(args, "supervisor_key", None) or os.environ.get("AI_COORDINATOR_SUPERVISOR_KEY")
+    store = Store(root, supervisor_key=sup_key)
     try:
         if args.command == 'plan':
             emit(runtime.route_plan(store,config,args.category,args.refresh))
@@ -986,6 +1018,33 @@ def main():
                 emit(prop.to_dict())
             else:
                 emit({"error": "Especifique --preview ou --propose para route-reconstruct"})
+        elif args.command == "focus":
+            owner = getattr(args, "owner", "default_human")
+            key_to_use = getattr(args, "supervisor_key", None) or sup_key or store.supervisor_key
+            principal = store.create_human_principal(owner_id=owner, supervisor_key=key_to_use)
+            if args.focus_command == "resume":
+                emit(store.resume_human_project(principal, project=args.project, task_id=getattr(args, "task", None)))
+            elif args.focus_command == "save":
+                res = store.save_focus_checkpoint(
+                    principal,
+                    project=args.project,
+                    intent=args.intent,
+                    task_id=getattr(args, "task", None),
+                    decisions=args.decisions or [],
+                    priorities=args.priorities or [],
+                    blockers=args.blockers or [],
+                    open_questions=args.open_questions or [],
+                    next_action=args.next_action or "",
+                    expected_revision=getattr(args, "expected_revision", None),
+                )
+                emit(res)
+            elif args.focus_command == "show":
+                res = store.get_latest_focus_checkpoint(
+                    principal,
+                    project=args.project,
+                    task_id=getattr(args, "task", None),
+                )
+                emit(res or {"status": "not_found", "message": "Nenhum checkpoint de foco encontrado"})
         return 0
     finally:
         store.db.close()
@@ -993,5 +1052,5 @@ def main():
 if __name__ == "__main__":
     try:
         sys.exit(main())
-    except (ValueError, OSError, sqlite3.Error, KeyError) as exc:
+    except (ValueError, OSError, sqlite3.Error, KeyError, HumanWorkspaceError) as exc:
         emit({"error": scrub(str(exc))}); sys.exit(2)

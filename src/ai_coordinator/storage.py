@@ -14,7 +14,7 @@ import secrets
 import shutil
 import sqlite3
 import time
-from typing import Any, Callable, Dict, List, Optional, Set, Tuple, Union
+from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Set, Tuple, Union
 import uuid
 
 from .process import safe_process_alive, ProcessSupervisor
@@ -270,7 +270,24 @@ class Store:
         )
         self.insight_engine = InsightEngine(self.db, self.experience_store)
         self.reconstructor = TrajectoryReconstructor(self)
-        self._post_commit_actions: List[Callable[[], Any]] = []
+        self._post_commit_scopes: List[List[Callable[[], Any]]] = []
+
+    def enter_savepoint_scope(self) -> None:
+        """Create a new scope level for post-commit actions inside an inner savepoint."""
+        if not self._post_commit_scopes:
+            self._post_commit_scopes = [[]]
+        self._post_commit_scopes.append([])
+
+    def release_savepoint_scope(self) -> None:
+        """Merge inner savepoint actions into outer scope upon successful savepoint release."""
+        if len(self._post_commit_scopes) > 1:
+            popped = self._post_commit_scopes.pop()
+            self._post_commit_scopes[-1].extend(popped)
+
+    def rollback_savepoint_scope(self) -> None:
+        """Discard inner savepoint actions when the savepoint rolls back."""
+        if len(self._post_commit_scopes) > 1:
+            self._post_commit_scopes.pop()
 
     def defer_post_commit(self, action: Callable[[], Any]) -> None:
         """Register an action to be executed only after the outermost transaction commits.
@@ -279,7 +296,9 @@ class Store:
         if not self.db.in_transaction:
             action()
         else:
-            self._post_commit_actions.append(action)
+            if not self._post_commit_scopes:
+                self._post_commit_scopes = [[]]
+            self._post_commit_scopes[-1].append(action)
 
     def issue_admin_override_token(self, supervisor_key: str, justification: str) -> str:
         """Issue an authentic supervisor override token for audited administrative operations.
@@ -358,6 +377,70 @@ class Store:
             status=status,
             flight_plan=flight_plan,
             ai_memory_workstream_id=ai_memory_workstream_id,
+        )
+
+    def save_focus_checkpoint(
+        self,
+        principal: HumanPrincipal,
+        project: Union[str, Path],
+        intent: str,
+        *,
+        task_id: Optional[str] = None,
+        decisions: Sequence[str] = (),
+        priorities: Sequence[str] = (),
+        blockers: Sequence[str] = (),
+        open_questions: Sequence[str] = (),
+        next_action: str = "",
+        context: Optional[Mapping[str, Any]] = None,
+        expected_revision: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        """Record an immutable, append-only cognitive focus checkpoint for the human owner."""
+        return self.human_workspace.save_focus_checkpoint(
+            principal,
+            project=project,
+            intent=intent,
+            task_id=task_id,
+            decisions=decisions,
+            priorities=priorities,
+            blockers=blockers,
+            open_questions=open_questions,
+            next_action=next_action,
+            context=context,
+            expected_revision=expected_revision,
+        )
+
+    def get_latest_focus_checkpoint(
+        self,
+        principal: HumanPrincipal,
+        project: Union[str, Path],
+        task_id: Optional[str] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """Retrieve the latest authorized cognitive focus checkpoint for the human owner."""
+        return self.human_workspace.get_latest_focus_checkpoint(
+            principal, project=project, task_id=task_id
+        )
+
+    def list_focus_checkpoints(
+        self,
+        principal: HumanPrincipal,
+        project: Union[str, Path],
+        task_id: Optional[str] = None,
+        limit: int = 10,
+    ) -> List[Dict[str, Any]]:
+        """List historical focus checkpoints for owner and project in descending revision order."""
+        return self.human_workspace.list_focus_checkpoints(
+            principal, project=project, task_id=task_id, limit=limit
+        )
+
+    def resume_human_project(
+        self,
+        principal: HumanPrincipal,
+        project: Union[str, Path],
+        task_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Compose a deterministic local continuity briefing combining human focus and verifiable task state."""
+        return self.human_workspace.resume_human_project(
+            principal, project=project, store=self, task_id=task_id
         )
 
     def get_run_for_task(self, task_id: str, run_id: str) -> Optional[Dict[str, Any]]:
@@ -695,17 +778,20 @@ class Store:
         if not is_outer:
             yield
         else:
+            self._post_commit_scopes = [[]]
             self.db.execute("BEGIN IMMEDIATE")
             try:
                 yield
                 self.db.commit()
             except BaseException:
                 self.db.rollback()
-                self._post_commit_actions.clear()
+                self._post_commit_scopes.clear()
                 raise
             else:
-                actions = list(self._post_commit_actions)
-                self._post_commit_actions.clear()
+                actions = []
+                for s in self._post_commit_scopes:
+                    actions.extend(s)
+                self._post_commit_scopes.clear()
                 for act in actions:
                     act()
 
@@ -793,7 +879,15 @@ class Store:
         for r in rows:
             tid = r["id"]
             expected_rev = r["revision"]
-            state_file = tasks_dir / tid / "state.json"
+            target_task_dir = tasks_dir / tid
+            # Symlink protection on target directory
+            if target_task_dir.is_symlink():
+                report["skipped"].append({"name": tid, "reason": "symlink_path"})
+                continue
+            state_file = target_task_dir / "state.json"
+            if state_file.is_symlink():
+                report["skipped"].append({"name": tid, "reason": "symlink_file"})
+                continue
             needs_repair = False
             if not state_file.is_file():
                 needs_repair = True
