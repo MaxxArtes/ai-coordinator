@@ -24,6 +24,7 @@ if os.name == "nt":
     import ctypes.wintypes as wintypes
 
     kernel32 = ctypes.windll.kernel32
+    ntdll = ctypes.windll.ntdll
 
     # Access Rights
     PROCESS_TERMINATE = 0x0001
@@ -32,9 +33,19 @@ if os.name == "nt":
     PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
     SYNCHRONIZE = 0x00100000
 
+    # Process Creation Flags
+    CREATE_SUSPENDED = 0x00000004
+
     # Job Object Constants
     JobObjectExtendedLimitInformation = 9
-    JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x2000
+    JOB_OBJECT_LIMIT_WORKINGSET = 0x00000001
+    JOB_OBJECT_LIMIT_PROCESS_TIME = 0x00000002
+    JOB_OBJECT_LIMIT_JOB_TIME = 0x00000004
+    JOB_OBJECT_LIMIT_ACTIVE_PROCESS = 0x00000008
+    JOB_OBJECT_LIMIT_PROCESS_MEMORY = 0x00000100
+    JOB_OBJECT_LIMIT_JOB_MEMORY = 0x00000200
+    JOB_OBJECT_LIMIT_DIE_ON_UNHANDLED_EXCEPTION = 0x00000400
+    JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x00002000
 
     # Wait Constants
     WAIT_OBJECT_0 = 0x00000000
@@ -149,10 +160,54 @@ if os.name == "nt":
     kernel32.Process32Next.argtypes = [wintypes.HANDLE, ctypes.POINTER(PROCESSENTRY32)]
     kernel32.Process32Next.restype = wintypes.BOOL
 
+    ntdll.NtResumeProcess.argtypes = [wintypes.HANDLE]
+    ntdll.NtResumeProcess.restype = wintypes.DWORD
+
 
 # ---------------------------------------------------------------------------
-# Data Models
+# Data Models & Environment Policies
 # ---------------------------------------------------------------------------
+
+SENSITIVE_COORDINATOR_VARS = frozenset({
+    "ai_coordinator_supervisor_key",
+    "ai_coordinator_supervisor_secret",
+    "ai_coordinator_auth_token",
+    "ai_memory_api_token",
+    "ai_memory_auth_token",
+    "human_workspace_supervisor_key",
+    "human_workspace_secret",
+})
+
+SAFE_BASE_WORKER_ENV_NAMES = frozenset({
+    "path", "home", "user", "logname", "shell", "tmp", "temp", "tmpdir",
+    "lang", "lc_all", "term", "colorterm", "xdg_config_home", "xdg_data_home",
+    "xdg_cache_home", "xdg_runtime_dir", "userprofile", "homedrive", "homepath",
+    "appdata", "localappdata", "programdata", "systemroot", "windir", "comspec",
+    "pathext", "os", "processor_architecture", "number_of_processors",
+})
+
+
+def _build_default_sanitized_env() -> dict[str, str]:
+    """Construct a clean baseline host environment with only standard OS variables."""
+    return {
+        k: v for k, v in os.environ.items()
+        if k.lower() in SAFE_BASE_WORKER_ENV_NAMES
+    }
+
+
+@dataclass(frozen=True)
+class ResourceLimits:
+    """Resource constraints enforced on a supervised worker process and its descendants."""
+    max_memory_bytes: Optional[int] = None
+    max_cpu_time_seconds: Optional[float] = None
+    max_processes: Optional[int] = None
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "max_memory_bytes": self.max_memory_bytes,
+            "max_cpu_time_seconds": self.max_cpu_time_seconds,
+            "max_processes": self.max_processes,
+        }
 
 @dataclass(frozen=True)
 class ProcessIdentity:
@@ -248,32 +303,53 @@ class WindowsProcessController:
             kernel32.CloseHandle(h)
 
     @staticmethod
-    def create_job_object(kill_on_close: bool = True) -> Optional[int]:
-        """Create a Win32 Job Object with optional KILL_ON_JOB_CLOSE."""
+    def create_job_object(
+        kill_on_close: bool = True,
+        resource_limits: Optional[ResourceLimits] = None,
+    ) -> Optional[int]:
+        """Create a Win32 Job Object with optional KILL_ON_JOB_CLOSE and resource limits."""
         if os.name != "nt":
             return None
         h_job = kernel32.CreateJobObjectW(None, None)
         if not h_job:
             return None
+
+        info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION()
+        limit_flags = 0
+
         if kill_on_close:
-            info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION()
-            info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
-            ok = kernel32.SetInformationJobObject(
-                h_job,
-                JobObjectExtendedLimitInformation,
-                ctypes.byref(info),
-                ctypes.sizeof(info),
-            )
-            if not ok:
-                kernel32.CloseHandle(h_job)
-                return None
+            limit_flags |= JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+
+        if resource_limits:
+            if resource_limits.max_memory_bytes and resource_limits.max_memory_bytes > 0:
+                limit_flags |= JOB_OBJECT_LIMIT_JOB_MEMORY
+                info.JobMemoryLimit = resource_limits.max_memory_bytes
+            if resource_limits.max_processes and resource_limits.max_processes > 0:
+                limit_flags |= JOB_OBJECT_LIMIT_ACTIVE_PROCESS
+                info.BasicLimitInformation.ActiveProcessLimit = resource_limits.max_processes
+            if resource_limits.max_cpu_time_seconds and resource_limits.max_cpu_time_seconds > 0:
+                limit_flags |= JOB_OBJECT_LIMIT_JOB_TIME
+                info.BasicLimitInformation.PerJobUserTimeLimit = int(resource_limits.max_cpu_time_seconds * 10_000_000)
+
+        info.BasicLimitInformation.LimitFlags = limit_flags
+        ok = kernel32.SetInformationJobObject(
+            h_job,
+            JobObjectExtendedLimitInformation,
+            ctypes.byref(info),
+            ctypes.sizeof(info),
+        )
+        if not ok:
+            kernel32.CloseHandle(h_job)
+            return None
         return int(h_job)
 
     @staticmethod
-    def assign_to_job(job_handle: int, pid: int) -> bool:
-        """Assign a process to a Job Object."""
+    def assign_to_job(job_handle: int, pid: int, proc_handle: Optional[int] = None) -> bool:
+        """Assign a process to a Job Object. Accepts optional existing process handle."""
         if os.name != "nt" or not job_handle or pid <= 0:
             return False
+        if proc_handle:
+            return bool(kernel32.AssignProcessToJobObject(job_handle, proc_handle))
         h_proc = kernel32.OpenProcess(PROCESS_SET_QUOTA | PROCESS_TERMINATE, False, pid)
         if not h_proc:
             return False
@@ -281,6 +357,14 @@ class WindowsProcessController:
             return bool(kernel32.AssignProcessToJobObject(job_handle, h_proc))
         finally:
             kernel32.CloseHandle(h_proc)
+
+    @staticmethod
+    def resume_process(proc_handle: Optional[int]) -> bool:
+        """Resume a process created with CREATE_SUSPENDED in Windows NT."""
+        if os.name != "nt" or not proc_handle:
+            return False
+        res = ntdll.NtResumeProcess(proc_handle)
+        return res == 0
 
     @staticmethod
     def terminate_job(job_handle: int, exit_code: int = 1) -> bool:
@@ -921,9 +1005,15 @@ class SupervisedProcess:
             return res
 
     def close(self) -> None:
-        """Clean up Win32 handles."""
+        """Clean up Win32 handles and process pipes."""
         if not self._closed:
             self._closed = True
+            for pipe in (self.proc.stdin, self.proc.stdout, self.proc.stderr):
+                if pipe and not getattr(pipe, "closed", True):
+                    try:
+                        pipe.close()
+                    except Exception:
+                        pass
             if os.name == "nt" and self.job_handle:
                 WindowsProcessController.close_handle(self.job_handle)
                 self.job_handle = None
@@ -962,22 +1052,77 @@ class ProcessSupervisor:
         stderr: Optional[Any] = None,
         role: str = "worker",
         use_job_object: bool = True,
+        allowed_roots: Optional[Sequence[Union[str, Path]]] = None,
+        resource_limits: Optional[ResourceLimits] = None,
         text: bool = True,
         encoding: str = "utf-8",
         errors: str = "replace",
     ) -> SupervisedProcess:
-        """Spawn a supervised process with fail-closed Job Object on Windows or session on POSIX."""
+        """Spawn a supervised process with fail-closed Job Object on Windows or session on POSIX.
+        Enforces pre-execution containment, environment sanitization, and authorized directory boundaries.
+        """
+        # 1. Directory Canonicalization & Boundary Validation
+        canon_cwd: Optional[str] = None
+        if cwd:
+            resolved_cwd = Path(cwd).resolve()
+            if not resolved_cwd.is_dir():
+                raise ValueError(f"Diretorio de trabalho nao existe: {resolved_cwd}")
+            if allowed_roots:
+                authorized = False
+                for r in allowed_roots:
+                    canon_root = Path(r).resolve()
+                    try:
+                        resolved_cwd.relative_to(canon_root)
+                        authorized = True
+                        break
+                    except ValueError:
+                        continue
+                if not authorized:
+                    from .human_workspace import HumanWorkspaceAccessDenied
+                    raise HumanWorkspaceAccessDenied(
+                        f"Acesso negado: diretorio de trabalho '{resolved_cwd}' fora das raizes autorizadas"
+                    )
+            canon_cwd = str(resolved_cwd)
+
+        # 2. Strict Environment Sanitization: Coordinator secrets NEVER reach workers
+        worker_env: dict[str, str]
+        if role == "worker":
+            if env is None:
+                worker_env = _build_default_sanitized_env()
+            else:
+                worker_env = dict(env)
+            # Remove any sensitive coordinator or supervisor credentials
+            for k in list(worker_env.keys()):
+                kl = k.lower()
+                if (
+                    kl in SENSITIVE_COORDINATOR_VARS
+                    or kl.startswith("ai_coordinator_supervisor_")
+                    or "supervisor_secret" in kl
+                    or "supervisor_key" in kl
+                ):
+                    del worker_env[k]
+            worker_env["AI_COORDINATOR_ROLE"] = "worker"
+        else:
+            worker_env = dict(env) if env is not None else dict(os.environ)
+
         job_handle: Optional[int] = None
         creation_flags = 0
 
         if os.name == "nt":
             creation_flags |= subprocess.CREATE_NO_WINDOW
             if use_job_object and role == "worker":
-                job_handle = WindowsProcessController.create_job_object(kill_on_close=True)
+                # Create Job Object BEFORE spawning the process (fail closed if OS rejects)
+                job_handle = WindowsProcessController.create_job_object(
+                    kill_on_close=True, resource_limits=resource_limits
+                )
+                if not job_handle:
+                    raise RuntimeError("Falha na ativacao da sandbox: impossivel criar Job Object no sistema operacional")
+                # Spawn process suspended to eliminate the race window before assignment
+                creation_flags |= CREATE_SUSPENDED
 
         kwargs: dict[str, Any] = {
-            "cwd": str(cwd) if cwd else None,
-            "env": env,
+            "cwd": canon_cwd,
+            "env": worker_env,
             "stdin": stdin,
             "stdout": stdout,
             "stderr": stderr,
@@ -993,15 +1138,26 @@ class ProcessSupervisor:
                 kwargs["start_new_session"] = True
 
         proc = subprocess.Popen(cmd, **kwargs)
-        identity = cls.capture_identity(proc.pid)
 
         if os.name == "nt" and job_handle:
-            # Assign process to Job Object
-            assigned = WindowsProcessController.assign_to_job(job_handle, proc.pid)
-            if not assigned and proc.poll() is None:
-                # Could not assign and process still runs -> fail closed for safety
-                kernel32.CloseHandle(job_handle)
-                proc.kill()
-                raise RuntimeError(f"Falha ao vincular processo {proc.pid} ao Job Object")
+            proc_handle = getattr(proc, "_handle", None)
+            assigned = WindowsProcessController.assign_to_job(job_handle, proc.pid, proc_handle=proc_handle)
+            if not assigned:
+                # Fail-closed: terminate suspended process immediately without ever running a single instruction
+                if proc_handle:
+                    kernel32.TerminateProcess(proc_handle, 1)
+                else:
+                    proc.kill()
+                WindowsProcessController.close_handle(job_handle)
+                raise RuntimeError(f"Falha na ativacao da sandbox: falha ao vincular processo {proc.pid} ao Job Object")
 
+            # Process is safely contained in the Job Object; now resume execution
+            resumed = WindowsProcessController.resume_process(proc_handle)
+            if not resumed:
+                if proc_handle:
+                    kernel32.TerminateProcess(proc_handle, 1)
+                WindowsProcessController.close_handle(job_handle)
+                raise RuntimeError(f"Falha ao resumir processo {proc.pid} apos vinculacao a sandbox")
+
+        identity = cls.capture_identity(proc.pid)
         return SupervisedProcess(proc=proc, identity=identity, job_handle=job_handle, role=role)

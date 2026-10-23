@@ -62,6 +62,19 @@ def worker_environment(config, candidate, task_id):
         allowed = set(policy["base_allowlist"])
         allowed.update(policy["allow_by_client"].get(candidate["client"], []))
         env = {key: value for key, value in os.environ.items() if key.casefold() in allowed}
+
+    # Strict sensitive credential stripping: coordinator secrets must NEVER reach a worker
+    from .process import SENSITIVE_COORDINATOR_VARS
+    for k in list(env.keys()):
+        kl = k.lower()
+        if (
+            kl in SENSITIVE_COORDINATOR_VARS
+            or kl.startswith("ai_coordinator_supervisor_")
+            or "supervisor_secret" in kl
+            or "supervisor_key" in kl
+        ):
+            del env[k]
+
     env.update(
         AI_COORDINATOR_ROLE="worker",
         AI_COORDINATOR_TASK_ID=task_id,
