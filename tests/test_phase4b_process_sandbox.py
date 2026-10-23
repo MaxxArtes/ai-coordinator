@@ -17,6 +17,7 @@ from ai_coordinator.process import (
     PosixProcessController,
     ResourceLimits,
     SENSITIVE_COORDINATOR_VARS,
+    safe_process_alive,
 )
 from ai_coordinator.human_workspace import HumanWorkspaceAccessDenied
 from ai_coordinator.runtime import worker_environment, worker_environment_policy
@@ -134,16 +135,13 @@ class ProcessSandboxContainmentTests(unittest.TestCase):
         # Allow OS kernel to reap descendant process tree
         deadline = time.monotonic() + 3.0
         while time.monotonic() < deadline:
-            is_alive = (
-                WindowsProcessController.is_running(grandchild_pid)
-                if os.name == "nt"
-                else PosixProcessController.is_running(grandchild_pid)
-            )
+            is_alive = safe_process_alive(grandchild_pid)
             if not is_alive:
                 break
             time.sleep(0.05)
 
         # Confirm grandchild is dead
+        self.assertFalse(safe_process_alive(grandchild_pid))
         if os.name == "nt":
             self.assertFalse(WindowsProcessController.is_running(grandchild_pid))
         else:

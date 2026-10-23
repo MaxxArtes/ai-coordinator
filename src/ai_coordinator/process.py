@@ -526,6 +526,53 @@ class WindowsProcessController:
 class PosixProcessController:
     """Handles Linux/Unix process verification, pidfd, and process groups."""
 
+    @classmethod
+    def is_running(cls, pid: int, expected_create_time_ns: Optional[int] = None) -> bool:
+        """Check if a POSIX process is currently running and matches creation time."""
+        if pid <= 0 or os.name == "nt":
+            return False
+        try:
+            os.kill(pid, 0)
+        except (ProcessLookupError, ValueError):
+            return False
+        except PermissionError:
+            # Process exists but owned by someone else
+            if expected_create_time_ns is not None:
+                cur_time = cls.get_creation_time(pid)
+                return cur_time == expected_create_time_ns
+            return True
+
+        # Non-destructive zombie/defunct check on Linux (/proc) and macOS/BSD (ps)
+        stat_file = Path(f"/proc/{pid}/stat")
+        if stat_file.exists():
+            try:
+                content = stat_file.read_text(encoding="ascii", errors="replace")
+                rparen = content.rfind(")")
+                if rparen != -1:
+                    state = content[rparen + 1:].split()[0]
+                    if state in ("Z", "X", "x"):  # Zombie or dead
+                        return False
+            except Exception:
+                pass
+        else:
+            # Fallback for macOS and non-Linux POSIX using non-destructive `ps`
+            try:
+                out = subprocess.check_output(
+                    ["ps", "-p", str(pid), "-o", "state="],
+                    text=True,
+                    stderr=subprocess.DEVNULL,
+                ).strip()
+                if out and out.startswith("Z"):
+                    return False
+            except Exception:
+                pass
+
+        if expected_create_time_ns is not None:
+            cur_time = cls.get_creation_time(pid)
+            if cur_time is not None and cur_time != expected_create_time_ns:
+                return False
+        return True
+
     @staticmethod
     def get_creation_time(pid: int) -> Optional[int]:
         """Read starttime from /proc/{pid}/stat on Linux, or ps on macOS/Unix."""
@@ -755,47 +802,7 @@ def safe_process_alive(pid: int, expected_create_time_ns: Optional[int] = None) 
     if os.name == "nt":
         return WindowsProcessController.is_running(pid, expected_create_time_ns=expected_create_time_ns)
     else:
-        try:
-            os.kill(pid, 0)
-        except (ProcessLookupError, ValueError):
-            return False
-        except PermissionError:
-            # Process exists but owned by someone else
-            if expected_create_time_ns is not None:
-                cur_time = PosixProcessController.get_creation_time(pid)
-                return cur_time == expected_create_time_ns
-            return True
-
-        # Non-destructive zombie/defunct check on Linux (/proc) and macOS/BSD (ps)
-        stat_file = Path(f"/proc/{pid}/stat")
-        if stat_file.exists():
-            try:
-                content = stat_file.read_text(encoding="ascii", errors="replace")
-                rparen = content.rfind(")")
-                if rparen != -1:
-                    state = content[rparen + 1:].split()[0]
-                    if state in ("Z", "X", "x"):  # Zombie or dead
-                        return False
-            except Exception:
-                pass
-        else:
-            # Fallback for macOS and non-Linux POSIX using non-destructive `ps`
-            try:
-                out = subprocess.check_output(
-                    ["ps", "-p", str(pid), "-o", "state="],
-                    text=True,
-                    stderr=subprocess.DEVNULL,
-                ).strip()
-                if out and out.startswith("Z"):
-                    return False
-            except Exception:
-                pass
-
-        if expected_create_time_ns is not None:
-            cur_time = PosixProcessController.get_creation_time(pid)
-            if cur_time is not None and cur_time != expected_create_time_ns:
-                return False
-        return True
+        return PosixProcessController.is_running(pid, expected_create_time_ns=expected_create_time_ns)
 
 
 def safe_terminate_tree(
