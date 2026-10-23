@@ -4,6 +4,7 @@ import json
 import os
 from pathlib import Path
 import subprocess
+import sqlite3
 import sys
 import tempfile
 import unittest
@@ -75,7 +76,7 @@ class AIMemoryIntegrationAndHardeningTests(unittest.TestCase):
     # 4B.4.1 — AIMemoryAdapter Authorization & UUID Validation
     # -------------------------------------------------------------------------
     def test_03_ai_memory_adapter_worker_lockout(self):
-        adapter = AIMemoryAdapter(mock_provider=lambda p, w, q: [])
+        adapter = AIMemoryAdapter(human_workspace=self.ws, mock_provider=lambda p, w, q: [])
         worker_principal = HumanPrincipal(owner_id="worker_agent", role="worker")
 
         # 1. Blocked via principal role
@@ -88,14 +89,14 @@ class AIMemoryIntegrationAndHardeningTests(unittest.TestCase):
                 adapter.fetch_context(self.alice, project=self.proj_a, workstream_id=self.workstream_id)
 
     def test_04_ai_memory_adapter_uuid_validation(self):
-        adapter = AIMemoryAdapter(mock_provider=lambda p, w, q: [])
+        adapter = AIMemoryAdapter(human_workspace=self.ws, mock_provider=lambda p, w, q: [])
         with self.assertRaises(ValueError) as ctx:
             adapter.fetch_context(self.alice, project=self.proj_a, workstream_id="invalid-not-a-uuid")
         self.assertIn("uuid valido", str(ctx.exception).lower())
 
     def test_05_ai_memory_adapter_offline_graceful_fallback(self):
         # Empty adapter without mock or endpoint -> returns offline status without error
-        adapter = AIMemoryAdapter()
+        adapter = AIMemoryAdapter(human_workspace=self.ws)
         self.assertFalse(adapter.is_available())
 
         res = adapter.fetch_context(self.alice, project=self.proj_a, workstream_id=self.workstream_id)
@@ -139,7 +140,7 @@ class AIMemoryIntegrationAndHardeningTests(unittest.TestCase):
                 },
             ]
 
-        adapter = AIMemoryAdapter(mock_provider=mock_memories)
+        adapter = AIMemoryAdapter(human_workspace=self.ws, mock_provider=mock_memories)
         res = adapter.fetch_context(self.alice, project=self.proj_a, workstream_id=self.workstream_id)
 
         self.assertEqual(res["status"], "success")
@@ -161,7 +162,7 @@ class AIMemoryIntegrationAndHardeningTests(unittest.TestCase):
                 for i in range(12)
             ]
 
-        adapter = AIMemoryAdapter(mock_provider=mock_large_memories)
+        adapter = AIMemoryAdapter(human_workspace=self.ws, mock_provider=mock_large_memories)
         # Limit max 4 memories and max 500 characters
         res = adapter.fetch_context(
             self.alice,
@@ -406,15 +407,16 @@ class AIMemoryIntegrationAndHardeningTests(unittest.TestCase):
         conn = sqlite3.connect(fake_db)
         cur = conn.cursor()
         cur.execute("CREATE TABLE projects (id TEXT, name TEXT, repo_path TEXT)")
-        cur.execute("CREATE TABLE pages (id TEXT, workspace_id TEXT, project_id TEXT, path TEXT, title TEXT, body TEXT, created_at INTEGER, is_latest INTEGER)")
+        cur.execute("CREATE TABLE pages (id TEXT, workspace_id TEXT, project_id TEXT, path TEXT, title TEXT, body TEXT, created_at INTEGER, frontmatter_json TEXT, is_latest INTEGER)")
 
         cur.execute(
             "INSERT INTO projects VALUES (?, ?, ?)",
             ("proj_1", Path(self.proj_a).name, self.proj_a),
         )
+        fm_json = json.dumps({"workstream_id": self.workstream_id})
         cur.execute(
-            "INSERT INTO pages VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-            ("p1", "ws_1", "proj_1", "guidelines.md", "Regras do Projeto", "Usar testes antes de comitar", 1792600000, 1),
+            "INSERT INTO pages VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            ("p1", "ws_1", "proj_1", "guidelines.md", "Regras do Projeto", "Usar testes antes de comitar", 1792600000, fm_json, 1),
         )
         conn.commit()
         conn.close()
@@ -427,6 +429,8 @@ class AIMemoryIntegrationAndHardeningTests(unittest.TestCase):
         self.assertEqual(len(res["memories"]), 1)
         self.assertIn("Regras do Projeto", res["memories"][0]["content"])
         self.assertEqual(res["memories"][0]["metadata"]["source"], "ai-memory-sqlite")
+        self.assertEqual(res["memories"][0]["project_id"], self.proj_a)
+        self.assertEqual(res["memories"][0]["workstream_id"], self.workstream_id)
 
     def test_16_adapter_real_cli_and_http_resilience(self):
         # Non-existent CLI executable gracefully fails to empty without crashing
@@ -438,15 +442,138 @@ class AIMemoryIntegrationAndHardeningTests(unittest.TestCase):
         res_offline = bad_cli_adapter.fetch_context(self.alice, project=self.proj_a, workstream_id=self.workstream_id)
         self.assertEqual(res_offline["status"], "unavailable")
 
-        # Inaccessible HTTP endpoint gracefully handled
+        # Inaccessible HTTP endpoint gracefully handled as error status
         http_adapter = AIMemoryAdapter(
             human_workspace=self.ws,
             endpoint="http://127.0.0.1:59999",  # unbindable dummy port
         )
         self.assertTrue(http_adapter.is_available())
         res_http = http_adapter.fetch_context(self.alice, project=self.proj_a, workstream_id=self.workstream_id)
-        self.assertEqual(res_http["status"], "success")
+        self.assertEqual(res_http["status"], "error")
         self.assertEqual(res_http["memories"], [])
+        self.assertIn("error_detail", res_http)
+
+    # -------------------------------------------------------------------------
+    # 4B.5.0 — Strict Scope Provenance, Mandatory Auth & Status Differentiation
+    # -------------------------------------------------------------------------
+    def test_17_adapter_sqlite_rejects_homonymous_projects_with_different_paths(self):
+        # Two projects with the exact same folder name ('backend'), but different paths
+        fake_db = Path(self.temp_dir.name) / "mock_homonyms.sqlite"
+        conn = sqlite3.connect(fake_db)
+        cur = conn.cursor()
+        cur.execute("CREATE TABLE projects (id TEXT, name TEXT, repo_path TEXT)")
+        cur.execute("CREATE TABLE pages (id TEXT, workspace_id TEXT, project_id TEXT, path TEXT, title TEXT, body TEXT, created_at INTEGER, frontmatter_json TEXT, is_latest INTEGER)")
+
+        proj_path_1 = str(Path(self.temp_dir.name) / "env_alpha" / "backend")
+        proj_path_2 = str(Path(self.temp_dir.name) / "env_beta" / "backend")
+        Path(proj_path_1).mkdir(parents=True, exist_ok=True)
+        Path(proj_path_2).mkdir(parents=True, exist_ok=True)
+
+        cur.execute("INSERT INTO projects VALUES (?, ?, ?)", ("p1", "backend", proj_path_1))
+        cur.execute("INSERT INTO projects VALUES (?, ?, ?)", ("p2", "backend", proj_path_2))
+
+        cur.execute("INSERT INTO pages VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    ("page_alpha", "w1", "p1", "doc.md", "Alpha Title", "Alpha Body", 1792600000, "{}", 1))
+        cur.execute("INSERT INTO pages VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    ("page_beta", "w2", "p2", "doc.md", "Beta Secret", "Beta Secret Body", 1792600000, "{}", 1))
+        conn.commit()
+        conn.close()
+
+        adapter = AIMemoryAdapter(human_workspace=self.ws, db_path=fake_db)
+        # Querying for Alpha must NOT leak Beta's memories despite sharing folder name 'backend'
+        res = adapter.fetch_context(self.alice, project=proj_path_1, workstream_id=None)
+        self.assertEqual(res["status"], "success")
+        self.assertEqual(len(res["memories"]), 1)
+        self.assertEqual(res["memories"][0]["id"], "page_page_alpha")
+        self.assertIn("Alpha Body", res["memories"][0]["content"])
+        self.assertNotIn("Beta Secret", res["formatted_text"])
+
+    def test_18_adapter_sqlite_rejects_pages_without_verified_workstream(self):
+        fake_db = Path(self.temp_dir.name) / "mock_workstreams.sqlite"
+        conn = sqlite3.connect(fake_db)
+        cur = conn.cursor()
+        cur.execute("CREATE TABLE projects (id TEXT, name TEXT, repo_path TEXT)")
+        cur.execute("CREATE TABLE pages (id TEXT, workspace_id TEXT, project_id TEXT, path TEXT, title TEXT, body TEXT, created_at INTEGER, frontmatter_json TEXT, is_latest INTEGER)")
+
+        cur.execute("INSERT INTO projects VALUES (?, ?, ?)", ("proj_ws", "proj_ws", self.proj_a))
+        # Page with unverified / empty frontmatter
+        cur.execute("INSERT INTO pages VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    ("p_orphan_ws", "w1", "proj_ws", "notes.md", "Notes", "Content without workstream", 1792600000, "{}", 1))
+        # Page with completely different workstream
+        other_ws = json.dumps({"workstream_id": "22222222-2222-2222-2222-222222222222"})
+        cur.execute("INSERT INTO pages VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    ("p_other_ws", "w1", "proj_ws", "notes2.md", "Notes 2", "Other WS Content", 1792600000, other_ws, 1))
+        conn.commit()
+        conn.close()
+
+        adapter = AIMemoryAdapter(human_workspace=self.ws, db_path=fake_db)
+        # Query requesting clean_workstream=self.workstream_id must reject orphan and wrong workstream pages
+        res = adapter.fetch_context(self.alice, project=self.proj_a, workstream_id=self.workstream_id)
+        self.assertEqual(res["status"], "empty")
+        self.assertEqual(len(res["memories"]), 0)
+
+    def test_19_adapter_denies_access_when_no_verifier_configured(self):
+        # Instantiating adapter without human_workspace and without verifier must strictly fail closed
+        standalone_adapter = AIMemoryAdapter(mock_provider=lambda p, w, q: [])
+        with self.assertRaises(HumanWorkspaceAccessDenied) as ctx:
+            standalone_adapter.fetch_context(self.alice, project=self.proj_a, workstream_id=self.workstream_id)
+        self.assertIn("verificador de autenticacao mandatorio nao configurado", str(ctx.exception).lower())
+
+    def test_20_adapter_semantic_status_differentiation(self):
+        # 1. Success: valid memories returned
+        mock_ok = lambda p, w, q: [{"id": "m1", "project_id": self.proj_a, "workstream_id": self.workstream_id, "content": "Ok"}]
+        adapter_ok = AIMemoryAdapter(human_workspace=self.ws, mock_provider=mock_ok)
+        res_ok = adapter_ok.fetch_context(self.alice, project=self.proj_a, workstream_id=self.workstream_id)
+        self.assertEqual(res_ok["status"], "success")
+        self.assertEqual(len(res_ok["memories"]), 1)
+
+        # 2. Empty: search succeeded cleanly, but 0 memories
+        mock_empty = lambda p, w, q: []
+        adapter_empty = AIMemoryAdapter(human_workspace=self.ws, mock_provider=mock_empty)
+        res_empty = adapter_empty.fetch_context(self.alice, project=self.proj_a, workstream_id=self.workstream_id)
+        self.assertEqual(res_empty["status"], "empty")
+        self.assertEqual(len(res_empty["memories"]), 0)
+
+        # 3. Unavailable: provider not available/offline
+        adapter_unavail = AIMemoryAdapter(human_workspace=self.ws)
+        res_unavail = adapter_unavail.fetch_context(self.alice, project=self.proj_a, workstream_id=self.workstream_id)
+        self.assertEqual(res_unavail["status"], "unavailable")
+
+        # 4. Error: operational error in backend
+        def mock_broken(p, w, q):
+            raise RuntimeError("Database disk I/O error simulated")
+        adapter_err = AIMemoryAdapter(human_workspace=self.ws, mock_provider=mock_broken)
+        res_err = adapter_err.fetch_context(self.alice, project=self.proj_a, workstream_id=self.workstream_id)
+        self.assertEqual(res_err["status"], "error")
+        self.assertIn("Database disk I/O error", res_err["error_detail"])
+
+        # 5. Unauthorized: tampered token triggers HumanWorkspaceAccessDenied
+        tampered_alice = HumanPrincipal(owner_id="alice", role="human", session_token="hsess_alice_badtoken999")
+        with self.assertRaises(HumanWorkspaceAccessDenied):
+            adapter_ok.fetch_context(tampered_alice, project=self.proj_a, workstream_id=self.workstream_id)
+
+    def test_21_adapter_preserves_source_provenance_strictly(self):
+        # Provenance must be faithfully copied from source without adapter synthesising scope
+        def mock_provenance(p, w, q):
+            return [
+                {
+                    "id": "mem_audit_scope",
+                    "project_id": self.proj_a,
+                    "workstream_id": self.workstream_id,
+                    "content": "Evidencia de auditoria com escopo autentico",
+                    "created_at": "2026-10-23T14:00:00Z",
+                    "relevance_score": 0.99,
+                    "tags": ["security", "audit"],
+                }
+            ]
+        adapter = AIMemoryAdapter(human_workspace=self.ws, mock_provider=mock_provenance)
+        res = adapter.fetch_context(self.alice, project=self.proj_a, workstream_id=self.workstream_id)
+        self.assertEqual(res["status"], "success")
+        mem = res["memories"][0]
+        self.assertEqual(mem["project_id"], self.proj_a)
+        self.assertEqual(mem["workstream_id"], self.workstream_id)
+        self.assertEqual(mem["tags"], ["security", "audit"])
+        self.assertTrue(mem["untrusted_data"])
 
 
 if __name__ == "__main__":
