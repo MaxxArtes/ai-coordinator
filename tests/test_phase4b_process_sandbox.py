@@ -132,7 +132,16 @@ class ProcessSandboxContainmentTests(unittest.TestCase):
         self.assertTrue(res.success)
 
         # Allow OS kernel to reap descendant process tree
-        time.sleep(0.3)
+        deadline = time.monotonic() + 3.0
+        while time.monotonic() < deadline:
+            is_alive = (
+                WindowsProcessController.is_running(grandchild_pid)
+                if os.name == "nt"
+                else PosixProcessController.is_running(grandchild_pid)
+            )
+            if not is_alive:
+                break
+            time.sleep(0.05)
 
         # Confirm grandchild is dead
         if os.name == "nt":

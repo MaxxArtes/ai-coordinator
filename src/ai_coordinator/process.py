@@ -1086,11 +1086,10 @@ class ProcessSupervisor:
 
         # 2. Strict Environment Sanitization: Coordinator secrets NEVER reach workers
         worker_env: dict[str, str]
+        base_source = env if env is not None else os.environ
+        worker_env = dict(base_source)
+
         if role == "worker":
-            if env is None:
-                worker_env = _build_default_sanitized_env()
-            else:
-                worker_env = dict(env)
             # Remove any sensitive coordinator or supervisor credentials
             for k in list(worker_env.keys()):
                 kl = k.lower()
