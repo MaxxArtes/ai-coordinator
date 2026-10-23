@@ -769,8 +769,8 @@ class HumanWorkspace:
                 },
             )
 
-        # Safely mirror task to disk ONLY AFTER the SQLite transaction has committed
-        store.mirror(task)
+        # Safely mirror task to disk ONLY AFTER the outermost transaction has committed
+        store.defer_post_commit(lambda: store.mirror(task))
 
         updated_item = self.get(principal, item_id)
         assert updated_item is not None

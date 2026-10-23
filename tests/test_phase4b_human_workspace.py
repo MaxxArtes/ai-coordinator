@@ -1,6 +1,7 @@
 """Tests for Phase 4B.1 - Human Workspace (Human Inbox, Privacy, Lifecycle, Audit Log, and Worker Isolation)."""
 
 import concurrent.futures
+import json
 import os
 from pathlib import Path
 import sqlite3
@@ -694,6 +695,14 @@ class HumanWorkspaceConversion4B2Tests(unittest.TestCase):
         self.assertEqual(fresh2["state"], HumanInboxState.CAPTURED)
         self.assertIsNone(fresh2["converted_task_id"])
 
+        # Outer rollback check: verify that NO state.json or mirror folder was left on disk after outer rollback
+        tasks_on_disk = [
+            d.name
+            for d in (Path(self.root) / "tasks").iterdir()
+            if d.is_dir() and not d.name.startswith(".")
+        ]
+        self.assertEqual(tasks_on_disk, [res["task"]["id"]])
+
     def test_10_unique_partial_index_prevents_duplicate_converted_task_id(self):
         item1 = self.ws.capture(self.alice, "Item um", project_id=self.root)
         item2 = self.ws.capture(self.alice, "Item dois", project_id=self.root)
@@ -768,18 +777,85 @@ class HumanWorkspaceConversion4B2Tests(unittest.TestCase):
         self.assertEqual(len(conv_events), 1)
 
     def test_13_orphan_task_mirror_reconciliation(self):
-        # Inject an orphaned task folder into the filesystem
+        # Inject an orphaned task folder with artifacts into the filesystem
         tasks_dir = Path(self.root) / "tasks"
         orphan_dir = tasks_dir / "orphan_fake_task_9999"
         orphan_dir.mkdir(parents=True, exist_ok=True)
-        (orphan_dir / "state.json").write_text("{}", encoding="utf-8")
+        (orphan_dir / "state.json").write_text("{\"corrupted\": true}", encoding="utf-8")
+        (orphan_dir / "execution.log").write_text("critical execution logs to preserve", encoding="utf-8")
 
         self.assertTrue(orphan_dir.is_dir())
 
-        # Reconciliation must detect and remove the orphan
+        # Reconciliation must move the orphan to quarantine, NOT delete it
         cleaned = self.store.cleanup_orphaned_task_mirrors()
         self.assertIn("orphan_fake_task_9999", cleaned)
         self.assertFalse(orphan_dir.exists())
+
+        # Verify evidence preservation in quarantine
+        quarantine_tasks = Path(self.root) / "quarantine" / "tasks"
+        self.assertTrue(quarantine_tasks.is_dir())
+        quarantined_dirs = [d for d in quarantine_tasks.iterdir() if d.name.startswith("orphan_fake_task_9999")]
+        self.assertEqual(len(quarantined_dirs), 1)
+        target_qdir = quarantined_dirs[0]
+        self.assertTrue((target_qdir / "execution.log").exists())
+        self.assertEqual((target_qdir / "execution.log").read_text(encoding="utf-8"), "critical execution logs to preserve")
+
+    def test_14_reconcile_repairs_missing_or_stale_task_mirrors(self):
+        # Create a legitimate task
+        task = self.store.new(project=self.root, goal="Tarefa a ser testada para reparo de espelhamento")
+        task_id = task["id"]
+        state_file = Path(self.root) / "tasks" / task_id / "state.json"
+        self.assertTrue(state_file.is_file())
+
+        # 1. Simulate accidental loss of state.json
+        state_file.unlink()
+        self.assertFalse(state_file.exists())
+
+        # Reconcile should repair missing mirror
+        report = self.store.reconcile_task_mirrors()
+        self.assertIn(task_id, report["repaired"])
+        self.assertTrue(state_file.is_file())
+
+        # 2. Simulate stale / corrupted mirror on disk
+        state_file.write_text("{\"revision\": 9999, \"invalid\": true}", encoding="utf-8")
+        report2 = self.store.reconcile_task_mirrors()
+        self.assertIn(task_id, report2["repaired"])
+        disk_data = json.loads(state_file.read_text(encoding="utf-8"))
+        self.assertEqual(disk_data["revision"], 1)
+        self.assertEqual(disk_data["goal"], "Tarefa a ser testada para reparo de espelhamento")
+
+    def test_15_reconcile_symlink_safety_and_invalid_folder_names(self):
+        tasks_dir = Path(self.root) / "tasks"
+        tasks_dir.mkdir(parents=True, exist_ok=True)
+
+        # 1. Non-matching directory names must be ignored (not quarantined)
+        ignored_dir = tasks_dir / ".hidden_service_dir"
+        ignored_dir.mkdir(parents=True, exist_ok=True)
+        short_dir = tasks_dir / "short"
+        short_dir.mkdir(parents=True, exist_ok=True)
+
+        report = self.store.reconcile_task_mirrors()
+        skipped_names = [s["name"] for s in report["skipped"]]
+        self.assertIn(".hidden_service_dir", skipped_names)
+        self.assertIn("short", skipped_names)
+        self.assertTrue(ignored_dir.is_dir())
+        self.assertTrue(short_dir.is_dir())
+
+        # 2. Symlink protection: if symlink can be created, ensure it is safely skipped
+        symlink_target = Path(self.root) / "external_target"
+        symlink_target.mkdir(parents=True, exist_ok=True)
+        (symlink_target / "keep.txt").write_text("safe", encoding="utf-8")
+        symlink_path = tasks_dir / "symlink_fake_12345"
+        try:
+            os.symlink(str(symlink_target), str(symlink_path), target_is_directory=True)
+            report_sym = self.store.reconcile_task_mirrors()
+            sym_skipped = [s["name"] for s in report_sym["skipped"] if s.get("reason") == "symlink"]
+            self.assertIn("symlink_fake_12345", sym_skipped)
+            # Target must remain completely intact
+            self.assertTrue(symlink_target.is_dir())
+            self.assertTrue((symlink_target / "keep.txt").is_file())
+        except (OSError, NotImplementedError):
+            pass  # Windows without SeCreateSymbolicLinkPrivilege
 
 
 if __name__ == "__main__":

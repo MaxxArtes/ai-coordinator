@@ -11,9 +11,10 @@ import os
 from pathlib import Path
 import re
 import secrets
+import shutil
 import sqlite3
 import time
-from typing import Any, Dict, List, Optional, Set, Tuple, Union
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple, Union
 import uuid
 
 from .process import safe_process_alive, ProcessSupervisor
@@ -269,6 +270,16 @@ class Store:
         )
         self.insight_engine = InsightEngine(self.db, self.experience_store)
         self.reconstructor = TrajectoryReconstructor(self)
+        self._post_commit_actions: List[Callable[[], Any]] = []
+
+    def defer_post_commit(self, action: Callable[[], Any]) -> None:
+        """Register an action to be executed only after the outermost transaction commits.
+        If no transaction is currently open, executes immediately.
+        """
+        if not self.db.in_transaction:
+            action()
+        else:
+            self._post_commit_actions.append(action)
 
     def issue_admin_override_token(self, supervisor_key: str, justification: str) -> str:
         """Issue an authentic supervisor override token for audited administrative operations.
@@ -680,7 +691,8 @@ class Store:
     @contextlib.contextmanager
     def transaction(self):
         """Context manager executing BEGIN IMMEDIATE for atomic, isolated writes (re-entrant)."""
-        if self.db.in_transaction:
+        is_outer = not self.db.in_transaction
+        if not is_outer:
             yield
         else:
             self.db.execute("BEGIN IMMEDIATE")
@@ -689,7 +701,13 @@ class Store:
                 self.db.commit()
             except BaseException:
                 self.db.rollback()
+                self._post_commit_actions.clear()
                 raise
+            else:
+                actions = list(self._post_commit_actions)
+                self._post_commit_actions.clear()
+                for act in actions:
+                    act()
 
     def _record_event(
         self,
@@ -731,21 +749,76 @@ class Store:
     def mirror(self, value: Dict[str, Any]) -> None:
         atomic_json(self.root / "tasks" / value["id"] / "state.json", value)
 
-    def cleanup_orphaned_task_mirrors(self) -> List[str]:
-        """Scan tasks directory on disk and remove mirror directories that do not exist in SQLite."""
+    def reconcile_task_mirrors(self) -> Dict[str, Any]:
+        """Reconcile disk mirrors with SQLite: quarantine unverified folders, ignore symlinks/system dirs,
+        and repair missing or stale mirrors for existing tasks.
+        """
         tasks_dir = self.root / "tasks"
-        if not tasks_dir.is_dir():
-            return []
-        import shutil
-        cleaned = []
-        for entry in list(tasks_dir.iterdir()):
-            if entry.is_dir():
-                task_id = entry.name
-                row = self.db.execute("SELECT 1 FROM tasks WHERE id = ?", (task_id,)).fetchone()
+        quarantine_dir = self.root / "quarantine" / "tasks"
+        report: Dict[str, List[Any]] = {
+            "quarantined": [],
+            "repaired": [],
+            "skipped": [],
+        }
+
+        # 1. Inspect existing directories in tasks/
+        if tasks_dir.is_dir():
+            for entry in list(tasks_dir.iterdir()):
+                # Symlink protection: never follow or remove targets of symlinks
+                if entry.is_symlink():
+                    report["skipped"].append({"name": entry.name, "reason": "symlink"})
+                    continue
+
+                if not entry.is_dir():
+                    continue
+
+                name = entry.name
+                # Ignore non-task directories and hidden directories (.quarantine, .git, etc.)
+                if name.startswith(".") or not re.fullmatch(r"[a-z0-9_-]{8,64}", name):
+                    report["skipped"].append({"name": name, "reason": "invalid_id_format"})
+                    continue
+
+                # Check if this task exists in SQLite
+                row = self.db.execute("SELECT 1 FROM tasks WHERE id = ?", (name,)).fetchone()
                 if not row:
-                    shutil.rmtree(entry, ignore_errors=True)
-                    cleaned.append(task_id)
-        return cleaned
+                    # Orphaned folder: move safely to quarantine preserving all files/logs/evidence
+                    quarantine_dir.mkdir(parents=True, exist_ok=True)
+                    stamp = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+                    dest = quarantine_dir / f"{name}_{stamp}"
+                    shutil.move(str(entry), str(dest))
+                    report["quarantined"].append(name)
+
+        # 2. Repair missing or desynchronized mirrors for valid tasks in SQLite
+        rows = self.db.execute("SELECT id, revision FROM tasks").fetchall()
+        for r in rows:
+            tid = r["id"]
+            expected_rev = r["revision"]
+            state_file = tasks_dir / tid / "state.json"
+            needs_repair = False
+            if not state_file.is_file():
+                needs_repair = True
+            else:
+                try:
+                    disk_data = json.loads(state_file.read_text(encoding="utf-8"))
+                    if disk_data.get("revision") != expected_rev:
+                        needs_repair = True
+                except Exception:
+                    needs_repair = True
+
+            if needs_repair:
+                try:
+                    task_data = self.task(tid)
+                    self.mirror(task_data)
+                    report["repaired"].append(tid)
+                except Exception:
+                    pass
+
+        return report
+
+    def cleanup_orphaned_task_mirrors(self) -> List[str]:
+        """Backward-compatible helper: invokes reconcile_task_mirrors and returns quarantined IDs."""
+        result = self.reconcile_task_mirrors()
+        return result["quarantined"]
 
     def new(
         self,
@@ -789,9 +862,9 @@ class Store:
                     flight_plan.task_id = ident
                     self.mission_control.set_flight_plan(flight_plan)
             created_task = self.task(ident)
-        # Mirror is executed ONLY after the transaction is successfully committed!
-        if mirror and not self.db.in_transaction:
-            self.mirror(created_task)
+        # Mirror is executed ONLY after the outermost transaction has committed!
+        if mirror:
+            self.defer_post_commit(lambda: self.mirror(created_task))
         return created_task
 
     def context(self, project: Union[str, Path]) -> List[Dict[str, Any]]:
@@ -826,8 +899,7 @@ class Store:
             )
             self.mission_control.on_checkpoint_recorded(ident)
             updated_task = self.task(ident)
-        if not self.db.in_transaction:
-            self.mirror(updated_task)
+        self.defer_post_commit(lambda: self.mirror(updated_task))
         return updated_task
 
     def runs(self, ident: str) -> List[Dict[str, Any]]:
@@ -1051,7 +1123,7 @@ class Store:
 
     def reconcile(self, task_id: Optional[str] = None, silence_threshold_seconds: float = 60.0) -> List[Dict[str, Any]]:
         """Conservative recovery and reconciliation for active runs without fabricating terminal outcomes."""
-        self.cleanup_orphaned_task_mirrors()
+        self.reconcile_task_mirrors()
         reconciled = []
         with self.transaction():
             query = "SELECT * FROM runs WHERE status IN (?, ?, ?, ?, ?, ?, ?)"
