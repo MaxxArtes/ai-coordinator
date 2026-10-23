@@ -1026,8 +1026,10 @@ class HumanWorkspace:
         project: Union[str, Path],
         store: Any,
         task_id: Optional[str] = None,
+        ai_memory_adapter: Optional[Any] = None,
     ) -> Dict[str, Any]:
-        """Compose a deterministic local continuity briefing combining human focus and verifiable task state."""
+        """Compose a deterministic local continuity briefing combining human focus, verifiable task state,
+        ai-memory context, and authorized knowledge precedents."""
         self.verify_principal(principal)
         clean_proj = str(Path(project).resolve())
 
@@ -1080,6 +1082,7 @@ class HumanWorkspace:
                 "status": target_task.get("status", "unknown"),
                 "goal": target_task.get("goal", ""),
                 "revision": target_task.get("revision", 1),
+                "ai_memory_workstream_id": target_task.get("ai_memory_workstream_id"),
                 "decisions": snapshot.get("decisions", []),
                 "changed_files": snapshot.get("changed_files", []),
                 "checks": snapshot.get("checks", []),
@@ -1088,6 +1091,53 @@ class HumanWorkspace:
                 "step_count": target_task.get("step_count", 0),
                 "drift_status": target_task.get("drift_status", "nominal"),
             }
+
+        # Fetch contextual memories via ai-memory adapter if available and linked to task/project
+        mem_info = {"status": "unavailable", "memories": []}
+        workstream = target_task.get("ai_memory_workstream_id") if target_task else None
+        if not workstream and latest_focus and isinstance(latest_focus.get("context"), dict):
+            workstream = latest_focus["context"].get("ai_memory_workstream_id")
+
+        if ai_memory_adapter is not None and hasattr(ai_memory_adapter, "fetch_context"):
+            try:
+                mem_info = ai_memory_adapter.fetch_context(
+                    principal,
+                    project=clean_proj,
+                    workstream_id=workstream,
+                )
+            except Exception:
+                mem_info = {
+                    "status": "error",
+                    "memories": [],
+                    "formatted_text": "(Erro ao consultar ai-memory; fallback offline mantido)",
+                }
+
+        # Fetch authorized precedents from KnowledgeCore
+        precedents: List[Dict[str, Any]] = []
+        if hasattr(store, "knowledge_core") and store.knowledge_core is not None:
+            try:
+                from .knowledge import KnowledgePrincipal
+                kp = KnowledgePrincipal(
+                    principal_id=principal.owner_id,
+                    role="human",
+                    authorized_projects=frozenset([clean_proj]),
+                )
+                raw_entries = store.knowledge_core.find(
+                    principal=kp,
+                    project_id=clean_proj,
+                    include_speculative=True,
+                    limit=5,
+                )
+                for entry in raw_entries:
+                    precedents.append({
+                        "id": entry.get("id"),
+                        "kind": entry.get("kind"),
+                        "content": entry.get("content"),
+                        "evidence_level": entry.get("evidence_level", "unverified"),
+                        "nature": entry.get("nature", "speculative_draft"),
+                    })
+            except Exception:
+                precedents = []
 
         continuity_lines = [
             f"=== BRIEFING DE CONTINUIDADE (PROJETO: {clean_proj}) ===",
@@ -1114,12 +1164,24 @@ class HumanWorkspace:
             continuity_lines.append(f"\n[ESTADO OPERACIONAL DA TAREFA: {task_state['id']}]")
             continuity_lines.append(f"Status: {task_state['status']} (Rev {task_state['revision']})")
             continuity_lines.append(f"Objetivo: {task_state['goal']}")
+            if task_state.get("ai_memory_workstream_id"):
+                continuity_lines.append(f"Workstream ai-memory: {task_state['ai_memory_workstream_id']}")
             if task_state["next_step"]:
                 continuity_lines.append(f"Proximo Passo Operacional: {task_state['next_step']}")
             if task_state["pending"]:
                 continuity_lines.append(f"Pendencias: {', '.join(task_state['pending'])}")
             if task_state["decisions"]:
                 continuity_lines.append(f"Decisoes da Tarefa: {', '.join(task_state['decisions'])}")
+
+        if mem_info.get("memories"):
+            continuity_lines.append(f"\n{mem_info.get('formatted_text', '')}")
+
+        if precedents:
+            continuity_lines.append(f"\n[PRECEDENTES AUTORIZADOS DO KNOWLEDGE CORE: {len(precedents)} registro(s)]")
+            for idx, prec in enumerate(precedents, 1):
+                continuity_lines.append(
+                    f"{idx}. [{prec['kind']} | Evidencia: {prec['evidence_level']}]: {prec['content']}"
+                )
 
         continuity_lines.append(f"\n[INBOX HUMANO PENDENTE]: {pending_count} notas ({unread_count} nao lidas)")
 
@@ -1130,6 +1192,8 @@ class HumanWorkspace:
             "offline_mode": True,
             "human_focus": latest_focus,
             "task_state": task_state,
+            "ai_memory": mem_info,
+            "knowledge_precedents": precedents,
             "inbox_summary": {
                 "pending_captured_count": pending_count,
                 "unread_count": unread_count,

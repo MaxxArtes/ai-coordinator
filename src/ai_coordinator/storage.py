@@ -139,6 +139,66 @@ def atomic_json(path: Path, data: Any) -> None:
     tmp.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
     tmp.replace(path)
 
+def get_trusted_kernel_identity() -> str:
+    """Retrieve verified operating system process user identity directly from kernel/security token.
+    Enforces strict anti-spoofing checks against environment variables (LOGNAME, USER, USERNAME, LNAME).
+    """
+    kernel_user = None
+    if os.name != "nt":
+        try:
+            import pwd
+            uid = os.geteuid()
+            kernel_user = pwd.getpwuid(uid).pw_name
+        except Exception:
+            pass
+    else:
+        try:
+            import ctypes
+            import ctypes.wintypes
+            advapi32 = ctypes.windll.advapi32
+            size = ctypes.wintypes.DWORD(256)
+            buf = ctypes.create_unicode_buffer(256)
+            advapi32.GetUserNameW.argtypes = [ctypes.c_wchar_p, ctypes.POINTER(ctypes.wintypes.DWORD)]
+            advapi32.GetUserNameW.restype = ctypes.wintypes.BOOL
+            if advapi32.GetUserNameW(buf, ctypes.byref(size)):
+                kernel_user = buf.value
+        except Exception:
+            pass
+
+    if not kernel_user:
+        import getpass
+        kernel_user = getpass.getuser()
+
+    sanitized = re.sub(r"[^a-zA-Z0-9_.-]", "_", str(kernel_user)).strip()
+    if not sanitized:
+        sanitized = "default_human"
+
+    # Anti-spoofing defense: if environment variables are manipulated, they must strictly match kernel user
+    for env_var in ("LOGNAME", "USER", "USERNAME", "LNAME"):
+        val = os.environ.get(env_var)
+        if val is not None and val.strip():
+            clean_env = re.sub(r"[^a-zA-Z0-9_.-]", "_", val.strip())
+            divergent = (clean_env.lower() != sanitized.lower()) if os.name == "nt" else (clean_env != sanitized)
+            if divergent:
+                raise HumanWorkspaceAccessDenied(
+                    f"Divergencia de seguranca detectada: variavel '{env_var}={val}' conflita com a identidade autenticada do processo ('{sanitized}')"
+                )
+
+    return sanitized
+
+def _secure_create_secret_file(path: Path, data: bytes) -> None:
+    """Create a private credential file atomically with 0600 permissions, strictly rejecting symlinks."""
+    if path.is_symlink():
+        raise PermissionError(f"Caminho de credencial '{path}' e um symlink; abortando gravacao")
+    flags = os.O_CREAT | os.O_WRONLY | os.O_EXCL
+    fd = os.open(str(path), flags, 0o600)
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(data)
+    except Exception:
+        os.close(fd)
+        raise
+
 
 class RunState:
     RESERVED = "reserved"
@@ -260,11 +320,15 @@ class Store:
 
         # Persistent security credentials and supervisor authentication
         auth_dir = self.root / "auth"
+        if auth_dir.is_symlink():
+            raise PermissionError(f"Diretorio de autenticacao '{auth_dir}' e um symlink; abortando")
         auth_dir.mkdir(parents=True, exist_ok=True)
         secret_file = auth_dir / "supervisor.secret"
         key_file = auth_dir / "supervisor.key"
 
         if secret_file.is_file() and key_file.is_file():
+            if secret_file.is_symlink() or key_file.is_symlink():
+                raise PermissionError("Arquivo de credencial e um symlink; abortando")
             self.supervisor_secret = secret_file.read_bytes()
             canonical_key = key_file.read_text(encoding="utf-8").strip()
             self.supervisor_key = canonical_key
@@ -277,14 +341,8 @@ class Store:
             self.supervisor_secret = secrets.token_bytes(32)
             self.supervisor_key = str(supervisor_key).strip() if supervisor_key else secrets.token_hex(32)
             self._supervisor_key_matched = True
-            secret_file.write_bytes(self.supervisor_secret)
-            key_file.write_text(self.supervisor_key, encoding="utf-8")
-            if os.name != "nt":
-                try:
-                    os.chmod(secret_file, 0o600)
-                    os.chmod(key_file, 0o600)
-                except Exception:
-                    pass
+            _secure_create_secret_file(secret_file, self.supervisor_secret)
+            _secure_create_secret_file(key_file, self.supervisor_key.encode("utf-8"))
 
         self.admin_token = secrets.token_hex(32)
         self.oracle = InvariantOracle(run_lookup=self.get_run_for_task, secret=self.supervisor_secret)
@@ -295,6 +353,8 @@ class Store:
             supervisor_secret=self.supervisor_secret,
             supervisor_key=self.supervisor_key,
         )
+        from .ai_memory_adapter import AIMemoryAdapter
+        self.ai_memory_adapter = AIMemoryAdapter()
         self.insight_engine = InsightEngine(self.db, self.experience_store)
         self.reconstructor = TrajectoryReconstructor(self)
         self._post_commit_scopes: List[List[Callable[[], Any]]] = []
@@ -464,10 +524,12 @@ class Store:
         principal: HumanPrincipal,
         project: Union[str, Path],
         task_id: Optional[str] = None,
+        ai_memory_adapter: Optional[Any] = None,
     ) -> Dict[str, Any]:
         """Compose a deterministic local continuity briefing combining human focus and verifiable task state."""
+        adapter = ai_memory_adapter or getattr(self, "ai_memory_adapter", None)
         return self.human_workspace.resume_human_project(
-            principal, project=project, store=self, task_id=task_id
+            principal, project=project, store=self, task_id=task_id, ai_memory_adapter=adapter
         )
 
     def resolve_cli_principal(
@@ -482,15 +544,7 @@ class Store:
         if os.environ.get("AI_COORDINATOR_ROLE") == "worker":
             raise HumanWorkspaceAccessDenied("Workers subordinados estao estritamente proibidos de acessar o Human Workspace")
 
-        effective_os_user = "default_human"
-        try:
-            import getpass
-            raw_user = getpass.getuser()
-            cleaned_user = re.sub(r"[^a-zA-Z0-9_.-]", "_", str(raw_user)).strip()
-            if cleaned_user:
-                effective_os_user = cleaned_user
-        except Exception:
-            pass
+        effective_os_user = get_trusted_kernel_identity()
 
         target_owner = (str(owner).strip() if owner else effective_os_user)
 
