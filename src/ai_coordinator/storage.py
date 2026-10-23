@@ -166,12 +166,11 @@ def get_trusted_kernel_identity() -> str:
             pass
 
     if not kernel_user:
-        import getpass
-        kernel_user = getpass.getuser()
+        raise HumanWorkspaceAccessDenied("Falha ao obter identidade de seguranca autenticada do processo pelo kernel")
 
     sanitized = re.sub(r"[^a-zA-Z0-9_.-]", "_", str(kernel_user)).strip()
     if not sanitized:
-        sanitized = "default_human"
+        raise HumanWorkspaceAccessDenied("Identidade de processo invalida ou vazia retornada pelo kernel")
 
     # Anti-spoofing defense: if environment variables are manipulated, they must strictly match kernel user
     for env_var in ("LOGNAME", "USER", "USERNAME", "LNAME"):
@@ -354,7 +353,13 @@ class Store:
             supervisor_key=self.supervisor_key,
         )
         from .ai_memory_adapter import AIMemoryAdapter
-        self.ai_memory_adapter = AIMemoryAdapter()
+        self.ai_memory_adapter = AIMemoryAdapter(
+            human_workspace=self.human_workspace,
+            endpoint=os.environ.get("AI_MEMORY_ENDPOINT"),
+            api_token=os.environ.get("AI_MEMORY_API_TOKEN"),
+            cli_bin=os.environ.get("AI_MEMORY_BIN"),
+            db_path=os.environ.get("AI_MEMORY_DB_PATH"),
+        )
         self.insight_engine = InsightEngine(self.db, self.experience_store)
         self.reconstructor = TrajectoryReconstructor(self)
         self._post_commit_scopes: List[List[Callable[[], Any]]] = []

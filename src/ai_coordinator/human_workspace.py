@@ -1100,11 +1100,15 @@ class HumanWorkspace:
 
         if ai_memory_adapter is not None and hasattr(ai_memory_adapter, "fetch_context"):
             try:
+                if getattr(ai_memory_adapter, "_human_workspace", None) is None:
+                    ai_memory_adapter._human_workspace = self
                 mem_info = ai_memory_adapter.fetch_context(
                     principal,
                     project=clean_proj,
                     workstream_id=workstream,
                 )
+            except HumanWorkspaceAccessDenied:
+                raise
             except Exception:
                 mem_info = {
                     "status": "error",
