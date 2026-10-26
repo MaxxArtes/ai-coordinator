@@ -558,26 +558,48 @@ class MacOsSeatbeltController:
         """Construct SBPL profile allowing write only to sandbox_root and denying coordinator files."""
         resolved_sbox = Path(sandbox_root).resolve()
         py_folder = Path(sys.executable).resolve().parent
+        coord_private = Path(coordinator_private_dir).resolve() if coordinator_private_dir else None
 
         profile_lines = [
             "(version 1)",
             "(deny default)",
             "(allow process-exec)",
             "(allow process-fork)",
-            "(allow sysctl-read)",
-            "(allow file-read* (subpath \"/System\") (subpath \"/usr\") (subpath \"/Library\") (subpath \"/dev\") (subpath \"/etc\") (subpath \"/private/etc\") (subpath \"/opt\"))",
-            f"(allow file-read* (subpath \"{Path(sys.prefix).resolve()}\"))",
-            f"(allow file-read* (subpath \"{Path(sys.base_prefix).resolve()}\"))",
-            f"(allow file-read* (subpath \"{py_folder}\"))",
-            f"(allow file-read* (subpath \"{resolved_sbox}\"))",
-            f"(allow file-write* (subpath \"{resolved_sbox}\"))",
+            "(allow sysctl*)",
+            "(allow mach-lookup)",
+            "(allow signal (target self))",
+            "(allow ipc-posix-shm)",
+            "(allow file-read-metadata)",
+            '(allow file-read* (subpath "/System") (subpath "/usr") (subpath "/Library") (subpath "/dev") (subpath "/etc") (subpath "/private/etc") (subpath "/opt") (subpath "/Applications"))',
+            f'(allow file-read* (subpath "{Path(sys.prefix).resolve()}"))',
+            f'(allow file-read* (subpath "{Path(sys.base_prefix).resolve()}"))',
+            f'(allow file-read* (subpath "{Path(sys.exec_prefix).resolve()}"))',
+            f'(allow file-read* (subpath "{py_folder}"))',
+            f'(allow file-read* (subpath "{resolved_sbox}"))',
+            f'(allow file-write* (subpath "{resolved_sbox}"))',
         ]
+
+        # Allow standard library & site-packages from sys.path
+        for p in sys.path:
+            try:
+                resolved_p = Path(p).resolve()
+                if resolved_p.exists() and resolved_p.is_dir():
+                    if coord_private and (coord_private == resolved_p or coord_private in resolved_p.parents):
+                        continue
+                    profile_lines.append(f'(allow file-read* (subpath "{resolved_p}"))')
+            except Exception:
+                pass
+
         if allowed_read_roots:
             for rd in allowed_read_roots:
                 if Path(rd).exists():
-                    profile_lines.append(f"(allow file-read* (subpath \"{Path(rd).resolve()}\"))")
-        if coordinator_private_dir and Path(coordinator_private_dir).exists():
-            profile_lines.append(f"(deny file* (subpath \"{Path(coordinator_private_dir).resolve()}\"))")
+                    resolved_rd = Path(rd).resolve()
+                    if coord_private and (coord_private == resolved_rd or coord_private in resolved_rd.parents):
+                        continue
+                    profile_lines.append(f'(allow file-read* (subpath "{resolved_rd}"))')
+
+        if coord_private and coord_private.exists():
+            profile_lines.append(f'(deny file* (subpath "{coord_private}"))')
 
         return "\n".join(profile_lines)
 

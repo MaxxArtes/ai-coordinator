@@ -159,7 +159,7 @@ except (PermissionError, OSError) as e:
 """
         code, stdout, stderr = self._run_worker_script(script)
         # Check positive proof first: worker was alive and functioning within sandbox
-        self.assertTrue(probe_status.exists(), "Positive proof failed: worker did not execute inside sandbox")
+        self.assertTrue(probe_status.exists(), f"Positive proof failed (code={code}, stdout={stdout}, stderr={stderr}): worker did not execute inside sandbox")
         self.assertEqual(probe_status.read_text(encoding="utf-8"), "PROBE_CONFIRMED")
 
         if self._is_os_boundary_enforced():
@@ -194,7 +194,7 @@ except (PermissionError, OSError) as e:
     sys.exit(42)
 """
         code, stdout, stderr = self._run_worker_script(script)
-        self.assertTrue(probe_status.exists(), "Positive proof failed: worker did not execute inside sandbox")
+        self.assertTrue(probe_status.exists(), f"Positive proof failed (code={code}, stdout={stdout}, stderr={stderr}): worker did not execute inside sandbox")
         self.assertEqual(probe_status.read_text(encoding="utf-8"), "PROBE_CONFIRMED")
 
         if self._is_os_boundary_enforced():
@@ -230,7 +230,7 @@ print(f"DENIED_COUNT: {{denied_count}}")
 sys.exit(42 if denied_count == 3 else 0)
 """
         code, stdout, stderr = self._run_worker_script(script)
-        self.assertTrue(probe_status.exists(), "Positive proof failed: worker did not execute inside sandbox")
+        self.assertTrue(probe_status.exists(), f"Positive proof failed (code={code}, stdout={stdout}, stderr={stderr}): worker did not execute inside sandbox")
         self.assertEqual(probe_status.read_text(encoding="utf-8"), "PROBE_CONFIRMED")
 
         if self._is_os_boundary_enforced():
@@ -265,7 +265,7 @@ except (PermissionError, OSError) as e:
     sys.exit(42)
 """
         code, stdout, stderr = self._run_worker_script(script)
-        self.assertTrue(probe_status.exists(), "Positive proof failed: worker did not execute inside sandbox")
+        self.assertTrue(probe_status.exists(), f"Positive proof failed (code={code}, stdout={stdout}, stderr={stderr}): worker did not execute inside sandbox")
         self.assertEqual(probe_status.read_text(encoding="utf-8"), "PROBE_CONFIRMED")
         self.assertFalse(target_sibling_write.exists())
         if self._is_os_boundary_enforced():
@@ -336,7 +336,7 @@ except (PermissionError, OSError) as e:
     sys.exit(42)
 """
         code, stdout, stderr = self._run_worker_script(script)
-        self.assertTrue(probe_status.exists(), "Positive proof failed: worker did not execute inside sandbox")
+        self.assertTrue(probe_status.exists(), f"Positive proof failed (code={code}, stdout={stdout}, stderr={stderr}): worker did not execute inside sandbox")
         self.assertEqual(probe_status.read_text(encoding="utf-8"), "PROBE_CONFIRMED")
 
         if self._is_os_boundary_enforced():
