@@ -71,6 +71,31 @@ A Fase 4B.5 do AI Coordinator introduz isolamento de processos e governança a n
   - Contra processos workers em sandbox (AppContainer / Landlock / Seatbelt): o isolamento do kernel impede acesso de leitura e escrita ao banco e ao diretório `auth/`.
   - Contra adulteração offline em disco: a assinatura HMAC com segredo mestre (`supervisor_secret`) impede forja de hashes ou assinaturas válidas sem conhecimento da chave.
   - Limite inerente de SO: Se um adversário obtiver credenciais de `root` ou `Administrador` no host do coordenador e comprometer a chave em memória ou `auth/supervisor.secret`, o host é considerado comprometido além das fronteiras de governança em nível de aplicação.
+
+### 7. Validação E2E Completa e Protocolo em Duas Fases (4B.6.1)
+- **Protocolo de Inicialização em Duas Fases (Gate G1: Inicialização Auditada)**:
+  - Eliminação da janela de execução não auditada: O `ProcessSupervisor.spawn()` suporta o parâmetro `start_suspended=True` (obrigatório para execuções de workers em produção via `cli.py`).
+  - No Windows, o processo é criado com a flag de kernel `CREATE_SUSPENDED`, imediatamente vinculado ao Job Object com limites de cotas e mantido suspenso.
+  - No POSIX (Linux/macOS), a contenção inicial utiliza sincronização unidirecional antes da chamada `execvp` do código do worker.
+  - Sequência rigorosa:
+    1. Preparação da sandbox e persistência de `sandbox_prepared`.
+    2. Criação do processo bloqueado no SO pelo supervisor.
+    3. Persistência de PID, identidade estável do kernel e evento `spawn` na trilha criptográfica com HMAC e sincronização com `fsync()` no arquivo desacoplado `auth/audit.anchor`.
+    4. Liberação da execução (`proc.resume()`) **estritamente após** a confirmação do commit de auditoria.
+    5. Se a persistência falhar, `terminate_tree(proc)` encerra o processo ainda suspenso sem que **nenhuma instrução** do worker seja executada (garantia validada experimentalmente via teste adversarial de arquivo sentinela).
+- **Âncora Externa Obrigatória e Durabilidade (Gate G6: Integridade)**:
+  - O arquivo externo `auth/audit.anchor` é de presença obrigatória para a verificação de integridade caso existam registros na trilha de auditoria. A sua remoção arbitrária invalida imediatamente o status de integridade.
+  - Gravação durável atômica utilizando buffer temporário, `flush()`, `os.fsync()` e substituição atômica via `replace`, com permissões restritas `0700` no diretório e `0600` no arquivo em POSIX.
+  - Método de recuperação e reconciliação durável (`reconcile_anchor()`): caso ocorra queda ou encerramento inesperado entre o commit SQLite e a atualização do arquivo, o coordenador pode reconstruir e sincronizar a âncora a partir do registro autenticado na tabela `worker_audit_anchors`.
+- **Garantia dos 8 Gates de Segurança (G1 a G8)**:
+  - **G1 — Inicialização auditada**: Nenhum worker executa instruções antes da confirmação e persistência do evento de spawn.
+  - **G2 — Sandbox efetiva**: Isolamento do filesystem (AppContainer / Landlock / Seatbelt) e contenção de Job Object mantêm segredos e arquivos do coordenador estritamente inacessíveis.
+  - **G3 — Broker integrado**: Solicitações via mailbox de arquivos `.broker` passam por validação obrigatória de caller PID, token de capacidade HMAC, cotas por ferramenta e auditoria pré e pós execução.
+  - **G4 — Memória real**: Recuperação e isolamento do ai-memory com escopo comprovado na origem e tratamento de dados recuperados como não-confiáveis.
+  - **G5 — Ciclo de vida**: Eventos de `sandbox_prepared`, `spawn`, `exit`, `timeout` e `termination` preservados em sequência cronológica linear auditável.
+  - **G6 — Integridade**: Encadeamento criptográfico SHA-256 e HMAC-SHA256 à prova de truncamento, remoção e adulteração por dupla ancoragem.
+  - **G7 — Compatibilidade**: Roteamento consistente e launchers testados em matriz multiplataforma (Windows, Linux, macOS).
+  - **G8 — Recuperação**: Reinício e re-instanciação do supervisor preservam histórico, autorizações de tokens e integridade.
 - **Auditoria Pré-Execução Fail-Closed no Tool Broker**:
   - Antes de invocar qualquer handler de ferramenta mutante ou de leitura, o broker persiste e comita o registro de autorização (`decision="allowed"`).
   - Caso ocorra falha de I/O, bloqueio ou persistência SQLite, o handler **nunca** é executado, impedindo categoricamente qualquer efeito colateral desprotegido.

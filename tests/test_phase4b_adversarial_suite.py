@@ -470,9 +470,19 @@ sys.exit(0)
             )
 
     def test_09_fail_closed_spawn_audit_failure_terminates_process_immediately(self):
-        """If worker audit persistence fails on spawn, process must be immediately terminated fail-closed."""
+        """If worker audit persistence fails on spawn, process must be immediately terminated fail-closed
+        without executing a single instruction (Gate G1)."""
+        marker_file = self.project_dir / "unauthorized_worker_exec.marker"
+        if marker_file.exists():
+            marker_file.unlink()
+
         mock_worker_py = self.project_dir / "hanging_worker.py"
-        mock_worker_py.write_text("import time; time.sleep(60)\n", encoding="utf-8")
+        # The worker tries to write a marker file as its very first instruction
+        mock_worker_py.write_text(f"""import time
+from pathlib import Path
+Path(r"{marker_file}").write_text("UNAUDITED_EXECUTION", encoding="utf-8")
+time.sleep(60)
+""", encoding="utf-8")
 
         cfg = {
             "limits": {
@@ -529,10 +539,11 @@ sys.exit(0)
         finally:
             self.worker_audit.record_event = original_record
 
-        # Process MUST be terminated and dead
+        # Gate G1 verification: Process MUST be terminated and dead, and MUST NOT have executed any instruction
         self.assertIsNotNone(spawn_captured_pid)
         time.sleep(0.5)
         self.assertFalse(safe_process_alive(spawn_captured_pid), "Worker process must be killed immediately when spawn audit fails")
+        self.assertFalse(marker_file.exists(), "Gate G1 violado: Worker executou instrucoes antes da auditoria de spawn!")
 
     def test_10_decoupled_external_anchor_file_catches_sqlite_table_tampering(self):
         """External anchor file in auth/ detects tampering even when SQLite anchor table is also cleared."""
@@ -569,6 +580,225 @@ sys.exit(0)
         ok, errors = self.worker_audit.verify_integrity(task_id=self.task_id, run_id=self.run_id)
         self.assertFalse(ok)
         self.assertTrue(any("ancora desacoplada" in e.lower() for e in errors))
+
+    def test_11_external_anchor_file_mandatory_and_tamper_evident(self):
+        """Gate G6: auth/audit.anchor is strictly mandatory and tamper-evident; deletion, corruption and desync are caught."""
+        # Record 3 events
+        for i in range(3):
+            self.worker_audit.record_event(
+                event_type=WorkerAuditEventType.TOOL_REQUESTED,
+                task_id=self.task_id,
+                run_id=self.run_id,
+                worker_pid=4000 + i,
+                details={"step": i},
+            )
+
+        # Baseline: valid
+        ok, errors = self.worker_audit.verify_integrity(task_id=self.task_id, run_id=self.run_id)
+        self.assertTrue(ok)
+        self.assertEqual(len(errors), 0)
+
+        anchor_file = self.worker_audit.anchor_file_path
+        self.assertIsNotNone(anchor_file)
+        self.assertTrue(anchor_file.is_file())
+
+        # Test Case 1: Arbitrary removal of external anchor file MUST fail integrity verification
+        backup_anchor = anchor_file.read_text(encoding="utf-8")
+        anchor_file.unlink()
+        ok_deleted, errors_deleted = self.worker_audit.verify_integrity(task_id=self.task_id, run_id=self.run_id)
+        self.assertFalse(ok_deleted)
+        self.assertTrue(any("ausente ou removido" in e.lower() for e in errors_deleted))
+
+        # Test Case 2: Desynchronized/corrupted anchor signature MUST fail integrity verification
+        corrupted_content = backup_anchor.replace("ANCHOR_V1|", "ANCHOR_V1|999|")
+        anchor_file.write_text(corrupted_content, encoding="utf-8")
+        ok_corrupt, errors_corrupt = self.worker_audit.verify_integrity(task_id=self.task_id, run_id=self.run_id)
+        self.assertFalse(ok_corrupt)
+        self.assertTrue(any("invalido" in e.lower() or "invalida" in e.lower() or "divergencia" in e.lower() or "truncamento" in e.lower() for e in errors_corrupt))
+
+        # Test Case 3: Recovery / reconciliation from verified SQLite anchor record
+        reconciled = self.worker_audit.reconcile_anchor()
+        self.assertTrue(reconciled)
+        ok_reconciled, errors_reconciled = self.worker_audit.verify_integrity(task_id=self.task_id, run_id=self.run_id)
+        self.assertTrue(ok_reconciled)
+        self.assertEqual(len(errors_reconciled), 0)
+
+    def test_12_two_phase_spawn_resumes_worker_strictly_after_audit_commitment(self):
+        """Gate G1 + G5: Successful run_worker() completes two-phase start: suspended -> audit -> resumed -> exit."""
+        worker_py = self.project_dir / "valid_worker.py"
+        worker_py.write_text("""import sys, json
+input_data = sys.stdin.readline().strip()
+res = {
+    "result": f"# SuccessWorkerResult\\nEcho: {input_data}\\n",
+    "usage": {"total_tokens": 15, "cost": 0.00015}
+}
+print(json.dumps(res))
+sys.exit(0)
+""", encoding="utf-8")
+
+        cfg = {
+            "limits": {
+                "input_chars": 5000,
+                "output_chars": 5000,
+                "worker_calls_per_task": 5,
+                "attempts_per_run": 1,
+                "timeout_seconds": 15,
+                "max_memory_bytes": 256 * 1024 * 1024,
+                "max_processes": 8,
+            },
+            "security": {
+                "enforce_filesystem_sandbox": True,
+            },
+            "routes": {
+                "general": {
+                    "candidates": [
+                        {"client": "openrouter", "model": "mock_adv_model", "plain_prompt": True}
+                    ]
+                }
+            },
+            "launchers": {
+                "openrouter": [sys.executable, str(worker_py)]
+            }
+        }
+
+        input_file = self.project_dir / "task_input_success.md"
+        input_file.write_text("Valid two-phase worker input", encoding="utf-8")
+
+        summary = run_worker(
+            store=self.store,
+            config=cfg,
+            ident=self.task_id,
+            category="general",
+            input_file=str(input_file),
+        )
+
+        self.assertEqual(summary["status"], "complete")
+        self.assertIn("# SuccessWorkerResult", summary.get("preview", ""))
+
+        # Verify audit records in SQLite
+        events = self.worker_audit.query_events(task_id=self.task_id)
+        evt_types = [e.event_type for e in events]
+        self.assertIn("sandbox_prepared", evt_types)
+        self.assertIn("spawn", evt_types)
+        self.assertIn("exit", evt_types)
+
+        # Integrity passes
+        ok, errs = self.worker_audit.verify_integrity(task_id=self.task_id)
+        self.assertTrue(ok)
+        self.assertEqual(len(errs), 0)
+
+    def test_13_integrated_e2e_eight_gates_verification(self):
+        """End-to-End verification integrating the 8 Gates (G1 to G8) in a full coordinator cycle."""
+        # 1. G4: ai-memory context retrieval with verified canonical scope
+        from ai_coordinator.ai_memory_adapter import AIMemoryAdapter
+        import sqlite3
+        fake_db = Path(self.temp_dir.name) / "e2e_ai_memory.sqlite"
+        conn = sqlite3.connect(fake_db)
+        cur = conn.cursor()
+        cur.execute("CREATE TABLE projects (id TEXT, name TEXT, repo_path TEXT)")
+        cur.execute("CREATE TABLE pages (id TEXT, workspace_id TEXT, project_id TEXT, path TEXT, title TEXT, body TEXT, created_at INTEGER, frontmatter_json TEXT, is_latest INTEGER)")
+        cur.execute("INSERT INTO projects VALUES (?, ?, ?)", ("proj_e2e", self.project_dir.name, str(self.project_dir)))
+        ws_id = str(uuid.uuid4())
+        cur.execute(
+            "INSERT INTO pages VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            ("p_e2e", "ws_e2e", "proj_e2e", "arch.md", "E2E Architecture", "E2E Verified Context", 1792600000, json.dumps({"workstream_id": ws_id}), 1),
+        )
+        conn.commit()
+        conn.close()
+
+        alice = self.store.create_human_principal("alice_e2e", supervisor_key=self.supervisor_key)
+        adapter = AIMemoryAdapter(
+            human_workspace=self.store.human_workspace,
+            db_path=fake_db,
+        )
+        self.assertTrue(adapter.is_available())
+        mem_res = adapter.fetch_context(alice, project=str(self.project_dir), workstream_id=ws_id)
+        self.assertEqual(mem_res["status"], "success")
+        self.assertEqual(len(mem_res["memories"]), 1)
+        self.assertIn("E2E Verified Context", mem_res["memories"][0]["content"])
+
+        # 2. G3: Tool broker mailbox registration and execution with HMAC capability token
+        my_pid = os.getpid()
+        token_str = self.broker.token_manager.issue_token(
+            task_id=self.task_id,
+            run_id=self.run_id,
+            worker_pid=my_pid,
+            project_root=self.project_dir,
+            allowed_tools=["echo_payload"],
+        )
+        req_dir = self.sandbox_dir / ".broker" / "requests"
+        req_dir.mkdir(parents=True, exist_ok=True)
+        req_file = req_dir / "valid_e2e_req.json"
+        req_file.write_text(json.dumps({
+            "token": token_str,
+            "tool": "echo_payload",
+            "parameters": {"payload": "valid_e2e_broker_request"},
+            "caller_pid": my_pid,
+        }), encoding="utf-8")
+        results = self.broker.process_mailbox(self.sandbox_dir, expected_worker_pid=my_pid)
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0]["status"], "success")
+        self.assertEqual(results[0]["response"]["result"]["echo"], "valid_e2e_broker_request")
+
+        # 3. G1, G2, G5: Worker lifecycle in sandbox with two-phase start
+        worker_e2e_py = self.project_dir / "worker_e2e.py"
+        worker_e2e_py.write_text("""import sys, json
+line = sys.stdin.readline().strip()
+res = {
+    "result": f"# E2ECompleteSuccess\\nProcessedContent: {line}\\n",
+    "usage": {"total_tokens": 42, "cost": 0.00042}
+}
+print(json.dumps(res))
+sys.exit(0)
+""", encoding="utf-8")
+
+        cfg = {
+            "limits": {
+                "input_chars": 5000,
+                "output_chars": 5000,
+                "worker_calls_per_task": 5,
+                "attempts_per_run": 1,
+                "timeout_seconds": 15,
+                "max_memory_bytes": 256 * 1024 * 1024,
+                "max_processes": 8,
+            },
+            "security": {
+                "enforce_filesystem_sandbox": True,
+            },
+            "routes": {
+                "general": {
+                    "candidates": [
+                        {"client": "openrouter", "model": "mock_adv_model", "plain_prompt": True}
+                    ]
+                }
+            },
+            "launchers": {
+                "openrouter": [sys.executable, str(worker_e2e_py)]
+            }
+        }
+        input_file = self.project_dir / "task_input_e2e.md"
+        input_file.write_text("E2E Integrated Mission Payload", encoding="utf-8")
+
+        summary = run_worker(
+            store=self.store,
+            config=cfg,
+            ident=self.task_id,
+            category="general",
+            input_file=str(input_file),
+        )
+        self.assertEqual(summary["status"], "complete")
+
+        # 4. G6: Integrity verification of audit log and external anchor
+        ok, errs = self.worker_audit.verify_integrity(task_id=self.task_id)
+        self.assertTrue(ok, f"Integrity failed: {errs}")
+        self.assertEqual(len(errs), 0)
+
+        # 5. G8: Supervisor recovery: re-instantiating Store and Broker retains state and verifies
+        recovered_store = Store(root=self.coordinator_dir, supervisor_key=self.supervisor_key)
+        recovered_audit = recovered_store.worker_audit
+        ok_rec, errs_rec = recovered_audit.verify_integrity(task_id=self.task_id)
+        self.assertTrue(ok_rec, f"Recovered integrity failed: {errs_rec}")
+        self.assertEqual(len(errs_rec), 0)
 
 
 if __name__ == "__main__":

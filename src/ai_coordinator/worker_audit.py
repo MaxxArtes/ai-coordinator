@@ -144,6 +144,11 @@ class WorkerAuditLogger:
             auth_dir = Path(self.store.root) / "auth"
             try:
                 auth_dir.mkdir(parents=True, exist_ok=True)
+                if os.name != "nt":
+                    try:
+                        os.chmod(auth_dir, 0o700)
+                    except Exception:
+                        pass
                 self.anchor_file_path = auth_dir / "audit.anchor"
             except Exception:
                 self.anchor_file_path = None
@@ -362,8 +367,21 @@ class WorkerAuditLogger:
                     try:
                         anchor_payload_line = f"ANCHOR_V1|{seq_num}|{chain_hash}|{created_at}|{anchor_sig}\n"
                         tmp_anchor = self.anchor_file_path.with_suffix(".tmp")
-                        tmp_anchor.write_text(anchor_payload_line, encoding="utf-8")
+                        with open(tmp_anchor, "w", encoding="utf-8") as f:
+                            f.write(anchor_payload_line)
+                            f.flush()
+                            os.fsync(f.fileno())
+                        if os.name != "nt":
+                            try:
+                                os.chmod(tmp_anchor, 0o600)
+                            except Exception:
+                                pass
                         tmp_anchor.replace(self.anchor_file_path)
+                        if os.name != "nt":
+                            try:
+                                os.chmod(self.anchor_file_path, 0o600)
+                            except Exception:
+                                pass
                     except Exception as ext_anc_err:
                         raise WorkerAuditPersistenceError(f"Falha ao persistir ancora externa desacoplada: {ext_anc_err}") from ext_anc_err
 
@@ -435,33 +453,39 @@ class WorkerAuditLogger:
             errors.append(f"Falha ao consultar tabela de ancoragem: {anchor_err}")
 
         # Check Decoupled External Anchor File
-        if self.anchor_file_path and self.anchor_file_path.is_file():
-            try:
-                raw_ext = self.anchor_file_path.read_text(encoding="utf-8").strip()
-                parts = raw_ext.split("|")
-                if len(parts) == 5 and parts[0] == "ANCHOR_V1":
-                    ext_seq = int(parts[1])
-                    ext_hash = parts[2]
-                    ext_time = parts[3]
-                    ext_sig = parts[4]
+        if self.anchor_file_path:
+            if not self.anchor_file_path.is_file():
+                if max_log_row or (anchor_rows and len(anchor_rows) > 0):
+                    errors.append(f"Arquivo desacoplado de ancoragem obrigatorio ({self.anchor_file_path.name}) ausente ou removido")
+            else:
+                try:
+                    raw_ext = self.anchor_file_path.read_text(encoding="utf-8").strip()
+                    parts = raw_ext.split("|")
+                    if len(parts) == 5 and parts[0] == "ANCHOR_V1":
+                        ext_seq = int(parts[1])
+                        ext_hash = parts[2]
+                        ext_time = parts[3]
+                        ext_sig = parts[4]
 
-                    expected_ext_payload = f"ANCHOR:{ext_seq}:{ext_hash}:{ext_time}"
-                    expected_ext_sig = hmac.new(self.supervisor_secret, expected_ext_payload.encode("ascii"), hashlib.sha256).hexdigest()
-                    if not hmac.compare_digest(ext_sig, expected_ext_sig):
-                        errors.append(f"Assinatura HMAC invalida no arquivo desacoplado de ancoragem ({self.anchor_file_path.name})")
+                        expected_ext_payload = f"ANCHOR:{ext_seq}:{ext_hash}:{ext_time}"
+                        expected_ext_sig = hmac.new(self.supervisor_secret, expected_ext_payload.encode("ascii"), hashlib.sha256).hexdigest()
+                        if not hmac.compare_digest(ext_sig, expected_ext_sig):
+                            errors.append(f"Assinatura HMAC invalida no arquivo desacoplado de ancoragem ({self.anchor_file_path.name})")
 
-                    if not max_log_row:
-                        errors.append(f"Truncamento total detectado via ancora desacoplada: log vazio, mas ancora externa seq {ext_seq} existe")
+                        if not max_log_row:
+                            errors.append(f"Truncamento total detectado via ancora desacoplada: log vazio, mas ancora externa seq {ext_seq} existe")
+                        else:
+                            max_seq, max_hash = max_log_row[0], max_log_row[1]
+                            if max_seq < ext_seq:
+                                errors.append(f"Truncamento de log detectado via ancora desacoplada: ultima sequencia ({max_seq}) e inferior a ancora externa ({ext_seq})")
+                            elif max_hash != ext_hash and max_seq == ext_seq:
+                                errors.append(f"Divergencia entre chain_hash do log ({max_hash}) e ancora desacoplada ({ext_hash}) na seq {ext_seq}")
+                            elif ext_seq < max_seq:
+                                errors.append(f"Divergencia de sincronizacao da ancora externa: sequencia externa ({ext_seq}) defasada em relacao ao log ({max_seq})")
                     else:
-                        max_seq, max_hash = max_log_row[0], max_log_row[1]
-                        if max_seq < ext_seq:
-                            errors.append(f"Truncamento de log detectado via ancora desacoplada: ultima sequencia ({max_seq}) e inferior a ancora externa ({ext_seq})")
-                        elif max_hash != ext_hash and max_seq == ext_seq:
-                            errors.append(f"Divergencia entre chain_hash do log ({max_hash}) e ancora desacoplada ({ext_hash}) na seq {ext_seq}")
-                else:
-                    errors.append(f"Formato invalido no arquivo desacoplado de ancoragem ({self.anchor_file_path.name})")
-            except Exception as ext_err:
-                errors.append(f"Falha ao consultar arquivo desacoplado de ancoragem: {ext_err}")
+                        errors.append(f"Formato invalido no arquivo desacoplado de ancoragem ({self.anchor_file_path.name})")
+                except Exception as ext_err:
+                    errors.append(f"Falha ao consultar arquivo desacoplado de ancoragem: {ext_err}")
 
         # 2. Sequential linear verification across the whole log
         all_rows = self.store.db.execute("""
@@ -597,3 +621,44 @@ class WorkerAuditLogger:
                 prev_hash=r[18] if len(r) > 18 and r[18] else GENESIS_HASH,
             ))
         return records
+
+    def reconcile_anchor(self) -> bool:
+        """Reconcile external anchor file from verified SQLite anchor record if desynchronized after unexpected shutdown."""
+        if not self.anchor_file_path or not hasattr(self.store, "db") or not self.store.db:
+            return False
+        with self._lock:
+            try:
+                row = self.store.db.execute("""
+                    SELECT last_sequence_number, last_chain_hash, anchor_signature, anchored_at
+                    FROM worker_audit_anchors
+                    ORDER BY id DESC LIMIT 1
+                """).fetchone()
+                if not row:
+                    return False
+                seq_num, chain_hash, sig, created_at = row
+                # Verify that SQLite anchor record is authentic before rewriting external anchor
+                expected_payload = f"ANCHOR:{seq_num}:{chain_hash}:{created_at}"
+                expected_sig = hmac.new(self.supervisor_secret, expected_payload.encode("ascii"), hashlib.sha256).hexdigest()
+                if not hmac.compare_digest(sig, expected_sig):
+                    return False
+
+                anchor_payload_line = f"ANCHOR_V1|{seq_num}|{chain_hash}|{created_at}|{sig}\n"
+                tmp_anchor = self.anchor_file_path.with_suffix(".tmp")
+                with open(tmp_anchor, "w", encoding="utf-8") as f:
+                    f.write(anchor_payload_line)
+                    f.flush()
+                    os.fsync(f.fileno())
+                if os.name != "nt":
+                    try:
+                        os.chmod(tmp_anchor, 0o600)
+                    except Exception:
+                        pass
+                tmp_anchor.replace(self.anchor_file_path)
+                if os.name != "nt":
+                    try:
+                        os.chmod(self.anchor_file_path, 0o600)
+                    except Exception:
+                        pass
+                return True
+            except Exception:
+                return False

@@ -1030,15 +1030,19 @@ class SupervisedProcess:
 
     def __init__(
         self,
-        proc: subprocess.Popen,
+        proc: Any,
         identity: ProcessIdentity,
         job_handle: Optional[int] = None,
         role: str = "worker",
+        is_suspended: bool = False,
+        sync_pipe_writer: Optional[int] = None,
     ):
         self.proc = proc
         self.identity = identity
         self.job_handle = job_handle
         self.role = role
+        self.is_suspended = is_suspended
+        self._sync_pipe_w = sync_pipe_writer
         self._closed = False
 
     @property
@@ -1096,9 +1100,42 @@ class SupervisedProcess:
                 pass
         return alive
 
+    def resume(self) -> bool:
+        """Resume process from suspended two-phase start state after audit confirmation."""
+        if not self.is_suspended:
+            return True
+        if os.name == "nt":
+            h_proc = getattr(self.proc, "h_process", None) or getattr(self.proc, "_handle", None)
+            if h_proc:
+                res = WindowsProcessController.resume_process(h_proc)
+                if res:
+                    self.is_suspended = False
+                return res
+            return False
+        else:
+            if self._sync_pipe_w is not None:
+                try:
+                    os.write(self._sync_pipe_w, b"G")
+                    os.close(self._sync_pipe_w)
+                except Exception:
+                    pass
+                finally:
+                    self._sync_pipe_w = None
+                    self.is_suspended = False
+            else:
+                self.is_suspended = False
+            return True
+
     def terminate(self, timeout_seconds: float = 5.0) -> TerminationResult:
         """Terminate this process and all descendants safely."""
         start = time.monotonic()
+        if self._sync_pipe_w is not None:
+            try:
+                os.close(self._sync_pipe_w)
+            except Exception:
+                pass
+            self._sync_pipe_w = None
+        self.is_suspended = False
         if os.name == "nt":
             if self.job_handle:
                 # Terminate all processes in the job atomically
@@ -1138,6 +1175,12 @@ class SupervisedProcess:
         """Clean up Win32 handles and process pipes."""
         if not self._closed:
             self._closed = True
+            if self._sync_pipe_w is not None:
+                try:
+                    os.close(self._sync_pipe_w)
+                except Exception:
+                    pass
+                self._sync_pipe_w = None
             for pipe in (self.proc.stdin, self.proc.stdout, self.proc.stderr):
                 if pipe and not getattr(pipe, "closed", True):
                     try:
@@ -1188,6 +1231,7 @@ class ProcessSupervisor:
         text: bool = True,
         encoding: str = "utf-8",
         errors: str = "replace",
+        start_suspended: bool = False,
     ) -> SupervisedProcess:
         """Spawn a supervised process with fail-closed Job Object on Windows or session on POSIX.
         Enforces pre-execution containment, environment sanitization, authorized directory boundaries,
@@ -1338,13 +1382,14 @@ class ProcessSupervisor:
                     WindowsProcessController.close_handle(job_handle)
                     raise RuntimeError(f"Falha ao vincular processo AppContainer {pi.dwProcessId} ao Job Object")
 
-                resumed = WindowsProcessController.resume_process(pi.hProcess)
-                if not resumed:
-                    kernel32.TerminateProcess(pi.hProcess, 1)
-                    kernel32.CloseHandle(pi.hProcess)
-                    kernel32.CloseHandle(pi.hThread)
-                    WindowsProcessController.close_handle(job_handle)
-                    raise RuntimeError(f"Falha ao resumir processo AppContainer {pi.dwProcessId}")
+                if not start_suspended:
+                    resumed = WindowsProcessController.resume_process(pi.hProcess)
+                    if not resumed:
+                        kernel32.TerminateProcess(pi.hProcess, 1)
+                        kernel32.CloseHandle(pi.hProcess)
+                        kernel32.CloseHandle(pi.hThread)
+                        WindowsProcessController.close_handle(job_handle)
+                        raise RuntimeError(f"Falha ao resumir processo AppContainer {pi.dwProcessId}")
 
             import msvcrt
             fd_out = msvcrt.open_osfhandle(h_read_out.value, os.O_RDONLY)
@@ -1366,7 +1411,13 @@ class ProcessSupervisor:
                 stderr=stderr_stream,
             )
             identity = cls.capture_identity(pi.dwProcessId)
-            return SupervisedProcess(proc=native_proc, identity=identity, job_handle=job_handle, role=role)
+            return SupervisedProcess(
+                proc=native_proc,
+                identity=identity,
+                job_handle=job_handle,
+                role=role,
+                is_suspended=start_suspended,
+            )
 
         # 4. Standard Popen Path (with POSIX limits and Landlock / Seatbelt integration)
         actual_cmd = list(cmd)
@@ -1409,7 +1460,33 @@ class ProcessSupervisor:
                 kwargs["start_new_session"] = True
                 kwargs["preexec_fn"] = _posix_worker_preexec
 
+        sync_pipe_w: Optional[int] = None
+        r_fd: Optional[int] = None
+        if os.name != "nt" and start_suspended and role == "worker":
+            r_fd, w_fd = os.pipe()
+            sync_pipe_w = w_fd
+            if "pass_fds" in kwargs:
+                kwargs["pass_fds"] = tuple(set(kwargs["pass_fds"]) | {r_fd})
+            else:
+                kwargs["pass_fds"] = (r_fd,)
+            trampoline_code = (
+                "import os, sys\n"
+                "fd = int(sys.argv[1])\n"
+                "token = os.read(fd, 1)\n"
+                "os.close(fd)\n"
+                "if token != b'G':\n"
+                "    sys.exit(1)\n"
+                "os.execvp(sys.argv[2], sys.argv[2:])\n"
+            )
+            actual_cmd = [sys.executable, "-c", trampoline_code, str(r_fd), *actual_cmd]
+
         proc = subprocess.Popen(actual_cmd, **kwargs)
+
+        if r_fd is not None:
+            try:
+                os.close(r_fd)
+            except Exception:
+                pass
 
         if os.name == "nt" and job_handle:
             proc_handle = getattr(proc, "_handle", None)
@@ -1422,12 +1499,20 @@ class ProcessSupervisor:
                 WindowsProcessController.close_handle(job_handle)
                 raise RuntimeError(f"Falha na ativacao da sandbox: falha ao vincular processo {proc.pid} ao Job Object")
 
-            resumed = WindowsProcessController.resume_process(proc_handle)
-            if not resumed:
-                if proc_handle:
-                    kernel32.TerminateProcess(proc_handle, 1)
-                WindowsProcessController.close_handle(job_handle)
-                raise RuntimeError(f"Falha ao resumir processo {proc.pid} apos vinculacao a sandbox")
+            if not start_suspended:
+                resumed = WindowsProcessController.resume_process(proc_handle)
+                if not resumed:
+                    if proc_handle:
+                        kernel32.TerminateProcess(proc_handle, 1)
+                    WindowsProcessController.close_handle(job_handle)
+                    raise RuntimeError(f"Falha ao resumir processo {proc.pid} apos vinculacao a sandbox")
 
         identity = cls.capture_identity(proc.pid)
-        return SupervisedProcess(proc=proc, identity=identity, job_handle=job_handle, role=role)
+        return SupervisedProcess(
+            proc=proc,
+            identity=identity,
+            job_handle=job_handle,
+            role=role,
+            is_suspended=start_suspended,
+            sync_pipe_writer=sync_pipe_w,
+        )

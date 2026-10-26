@@ -279,6 +279,7 @@ def run_worker(store, config, ident, category, input_file, max_attempts=None):
                     text=True,
                     encoding="utf-8",
                     errors="replace",
+                    start_suspended=True,
                 )
                 
                 # Two-phase phase 2: atomically persist process identity and transition to running
@@ -306,6 +307,13 @@ def run_worker(store, config, ident, category, input_file, max_attempts=None):
                     except Exception as spawn_audit_err:
                         terminate_tree(proc)
                         raise RuntimeError(f"Politica fail-closed violada: falha ao persistir auditoria de spawn do worker: {spawn_audit_err}") from spawn_audit_err
+
+                # Two-phase phase 3: Resume worker process strictly AFTER audit confirmation
+                if getattr(proc, "is_suspended", False):
+                    resumed = proc.resume()
+                    if not resumed:
+                        terminate_tree(proc)
+                        raise RuntimeError(f"Politica fail-closed violada: falha ao resumir processo worker PID {proc.pid} apos auditoria de spawn")
                 
                 from .streaming import SafeStreamConsumer
                 timeout = min(600, candidate.get("timeout_seconds", limits["timeout_seconds"]))
@@ -344,18 +352,15 @@ def run_worker(store, config, ident, category, input_file, max_attempts=None):
                 result = ""
             finally:
                 if proc is not None and proc.poll() is None:
-                    if hasattr(store, "worker_audit") and store.worker_audit:
-                        try:
-                            store.worker_audit.record_event(
-                                event_type="termination",
-                                task_id=ident,
-                                run_id=run_id,
-                                worker_pid=proc.pid,
-                                reason="Encerramento de processo ativo por terminate_tree",
-                            )
-                        except Exception:
-                            pass
                     terminate_tree(proc)
+                    if hasattr(store, "worker_audit") and store.worker_audit:
+                        store.worker_audit.record_event(
+                            event_type="termination",
+                            task_id=ident,
+                            run_id=run_id,
+                            worker_pid=proc.pid,
+                            reason="Encerramento de processo ativo por terminate_tree",
+                        )
                 if proc is not None and hasattr(store, "worker_audit") and store.worker_audit:
                     rc = stream_res.returncode if 'stream_res' in locals() and stream_res else proc.poll()
                     store.worker_audit.record_event(
