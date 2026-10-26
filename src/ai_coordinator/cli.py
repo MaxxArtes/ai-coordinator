@@ -214,8 +214,27 @@ def run_worker(store, config, ident, category, input_file, max_attempts=None):
                 cmd, stdin = worker_args(config, candidate, final, plain if candidate.get("plain_prompt") else prompt)
                 from .contracts import validate_headless_arguments
                 validate_headless_arguments(candidate["client"], "worker", cmd)
-                from .process import ProcessSupervisor
-                proc = ProcessSupervisor.spawn(cmd, cwd=folder, env=env, stdin=subprocess.PIPE if stdin is not None else subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, role="worker", use_job_object=True, text=True, encoding="utf-8", errors="replace")
+                from .process import ProcessSupervisor, ResourceLimits
+                worker_limits = ResourceLimits(
+                    max_memory_bytes=limits.get("max_memory_bytes"),
+                    max_cpu_time_seconds=float(limits.get("max_cpu_time_seconds", 0)) or None,
+                    max_processes=limits.get("max_processes"),
+                )
+                proc = ProcessSupervisor.spawn(
+                    cmd,
+                    cwd=folder,
+                    env=env,
+                    stdin=subprocess.PIPE if stdin is not None else subprocess.DEVNULL,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    role="worker",
+                    use_job_object=True,
+                    allowed_roots=[folder],
+                    resource_limits=worker_limits,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                )
                 
                 # Two-phase phase 2: atomically persist process identity and transition to running
                 store.transition_run(

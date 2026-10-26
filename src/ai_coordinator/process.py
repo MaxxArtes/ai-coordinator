@@ -792,6 +792,118 @@ class PosixProcessController:
 
 
 # ---------------------------------------------------------------------------
+# High-Level Safe Utilities & POSIX Resource Management
+# ---------------------------------------------------------------------------
+
+def _apply_posix_resource_limits(resource_limits: Optional[ResourceLimits]) -> None:
+    """Apply POSIX resource limits (address space, CPU time, process limit) via setrlimit."""
+    if not resource_limits or os.name == "nt":
+        return
+    try:
+        import resource
+    except ImportError:
+        return
+
+    if resource_limits.max_memory_bytes and resource_limits.max_memory_bytes > 0:
+        try:
+            resource.setrlimit(resource.RLIMIT_AS, (resource_limits.max_memory_bytes, resource_limits.max_memory_bytes))
+        except (ValueError, OSError):
+            pass
+    if resource_limits.max_cpu_time_seconds and resource_limits.max_cpu_time_seconds > 0:
+        try:
+            cpu_s = max(1, int(resource_limits.max_cpu_time_seconds))
+            resource.setrlimit(resource.RLIMIT_CPU, (cpu_s, cpu_s))
+        except (ValueError, OSError):
+            pass
+    if resource_limits.max_processes and resource_limits.max_processes > 0:
+        try:
+            resource.setrlimit(resource.RLIMIT_NPROC, (resource_limits.max_processes, resource_limits.max_processes))
+        except (ValueError, OSError):
+            pass
+
+
+class NativeWin32Process:
+    """Minimal Popen-compatible process wrapper for Win32 processes launched with STARTUPINFOEX."""
+
+    def __init__(
+        self,
+        h_process: int,
+        h_thread: int,
+        pid: int,
+        stdin: Optional[Any] = None,
+        stdout: Optional[Any] = None,
+        stderr: Optional[Any] = None,
+    ):
+        self._handle = int(h_process)
+        self._thread_handle = int(h_thread)
+        self.pid = int(pid)
+        self.stdin = stdin
+        self.stdout = stdout
+        self.stderr = stderr
+        self.returncode: Optional[int] = None
+        self._closed = False
+
+    def poll(self) -> Optional[int]:
+        if self.returncode is not None:
+            return self.returncode
+        if not self._handle:
+            return None
+        code = wintypes.DWORD()
+        if kernel32.GetExitCodeProcess(self._handle, ctypes.byref(code)):
+            if code.value != 259:  # STILL_ACTIVE
+                self.returncode = code.value
+                return self.returncode
+        return None
+
+    def wait(self, timeout: Optional[float] = None) -> int:
+        if self.returncode is not None:
+            return self.returncode
+        timeout_ms = 0xFFFFFFFF if timeout is None else max(1, int(timeout * 1000))
+        res = kernel32.WaitForSingleObject(self._handle, timeout_ms)
+        if res == 0x00000102:  # WAIT_TIMEOUT
+            raise subprocess.TimeoutExpired(cmd="native_win32", timeout=timeout)
+        self.poll()
+        return self.returncode if self.returncode is not None else 0
+
+    def communicate(self, input: Optional[str] = None, timeout: Optional[float] = None) -> Tuple[str, str]:
+        if input and self.stdin:
+            try:
+                self.stdin.write(input)
+                self.stdin.flush()
+                self.stdin.close()
+            except Exception:
+                pass
+        self.wait(timeout=timeout)
+        out = self.stdout.read() if self.stdout else ""
+        err = self.stderr.read() if self.stderr else ""
+        return out, err
+
+    def terminate(self) -> None:
+        if self._handle:
+            kernel32.TerminateProcess(self._handle, 1)
+
+    def kill(self) -> None:
+        self.terminate()
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        for stream in (self.stdin, self.stdout, self.stderr):
+            if stream and not getattr(stream, "closed", True):
+                try:
+                    stream.close()
+                except Exception:
+                    pass
+        if self._thread_handle:
+            kernel32.CloseHandle(self._thread_handle)
+            self._thread_handle = 0
+        if self._handle:
+            kernel32.CloseHandle(self._handle)
+            self._handle = 0
+
+
+# ---------------------------------------------------------------------------
 # High-Level Safe Utilities
 # ---------------------------------------------------------------------------
 
@@ -1061,22 +1173,30 @@ class ProcessSupervisor:
         use_job_object: bool = True,
         allowed_roots: Optional[Sequence[Union[str, Path]]] = None,
         resource_limits: Optional[ResourceLimits] = None,
+        fs_sandbox: Optional[Any] = None,
         text: bool = True,
         encoding: str = "utf-8",
         errors: str = "replace",
     ) -> SupervisedProcess:
         """Spawn a supervised process with fail-closed Job Object on Windows or session on POSIX.
-        Enforces pre-execution containment, environment sanitization, and authorized directory boundaries.
+        Enforces pre-execution containment, environment sanitization, authorized directory boundaries,
+        and optional OS-level filesystem sandbox (Windows AppContainer, Linux Landlock, macOS Seatbelt).
         """
         # 1. Directory Canonicalization & Boundary Validation
+        effective_cwd = cwd
+        effective_allowed = list(allowed_roots) if allowed_roots else []
+        if fs_sandbox is not None:
+            effective_cwd = fs_sandbox.sandbox_root
+            effective_allowed.append(fs_sandbox.sandbox_root)
+
         canon_cwd: Optional[str] = None
-        if cwd:
-            resolved_cwd = Path(cwd).resolve()
+        if effective_cwd:
+            resolved_cwd = Path(effective_cwd).resolve()
             if not resolved_cwd.is_dir():
                 raise ValueError(f"Diretorio de trabalho nao existe: {resolved_cwd}")
-            if allowed_roots:
+            if effective_allowed:
                 authorized = False
-                for r in allowed_roots:
+                for r in effective_allowed:
                     canon_root = Path(r).resolve()
                     try:
                         resolved_cwd.relative_to(canon_root)
@@ -1126,6 +1246,113 @@ class ProcessSupervisor:
                 # Spawn process suspended to eliminate the race window before assignment
                 creation_flags |= CREATE_SUSPENDED
 
+        # 3. Windows AppContainer execution path
+        if os.name == "nt" and fs_sandbox is not None and getattr(fs_sandbox, "windows_controller", None):
+            win_ctrl = fs_sandbox.windows_controller
+            si, attr_list = win_ctrl.build_startupinfo()
+
+            class SECURITY_ATTRIBUTES(ctypes.Structure):
+                _fields_ = [
+                    ("nLength", wintypes.DWORD),
+                    ("lpSecurityDescriptor", ctypes.c_void_p),
+                    ("bInheritHandle", wintypes.BOOL),
+                ]
+            sa = SECURITY_ATTRIBUTES()
+            sa.nLength = ctypes.sizeof(SECURITY_ATTRIBUTES)
+            sa.bInheritHandle = True
+
+            h_read_out, h_write_out = wintypes.HANDLE(), wintypes.HANDLE()
+            h_read_err, h_write_err = wintypes.HANDLE(), wintypes.HANDLE()
+            kernel32.CreatePipe(ctypes.byref(h_read_out), ctypes.byref(h_write_out), ctypes.byref(sa), 0)
+            kernel32.SetHandleInformation(h_read_out, 1, 0)
+            kernel32.CreatePipe(ctypes.byref(h_read_err), ctypes.byref(h_write_err), ctypes.byref(sa), 0)
+            kernel32.SetHandleInformation(h_read_err, 1, 0)
+
+            si.StartupInfo.dwFlags |= 0x00000100  # STARTF_USESTDHANDLES
+            si.StartupInfo.hStdOutput = h_write_out
+            si.StartupInfo.hStdError = h_write_err
+
+            from .fs_sandbox import PROCESS_INFORMATION, EXTENDED_STARTUPINFO_PRESENT
+            pi = PROCESS_INFORMATION()
+            flags = EXTENDED_STARTUPINFO_PRESENT | creation_flags
+            cmd_line = subprocess.list2cmdline(cmd) if isinstance(cmd, list) else str(cmd)
+
+            ok = kernel32.CreateProcessW(
+                None, cmd_line, None, None, True,
+                flags, None, canon_cwd,
+                ctypes.byref(si.StartupInfo), ctypes.byref(pi),
+            )
+            # Close write ends in supervisor parent
+            kernel32.CloseHandle(h_write_out)
+            kernel32.CloseHandle(h_write_err)
+
+            if not ok:
+                kernel32.CloseHandle(h_read_out)
+                kernel32.CloseHandle(h_read_err)
+                if job_handle:
+                    WindowsProcessController.close_handle(job_handle)
+                from .fs_sandbox import FileSandboxSecurityError
+                raise FileSandboxSecurityError(
+                    f"Falha ao iniciar processo em AppContainer (CreateProcessW={kernel32.GetLastError()})"
+                )
+
+            # Assign to Job Object before resuming
+            if job_handle:
+                assigned = WindowsProcessController.assign_to_job(job_handle, pi.dwProcessId, proc_handle=pi.hProcess)
+                if not assigned:
+                    kernel32.TerminateProcess(pi.hProcess, 1)
+                    kernel32.CloseHandle(pi.hProcess)
+                    kernel32.CloseHandle(pi.hThread)
+                    WindowsProcessController.close_handle(job_handle)
+                    raise RuntimeError(f"Falha ao vincular processo AppContainer {pi.dwProcessId} ao Job Object")
+
+                resumed = WindowsProcessController.resume_process(pi.hProcess)
+                if not resumed:
+                    kernel32.TerminateProcess(pi.hProcess, 1)
+                    kernel32.CloseHandle(pi.hProcess)
+                    kernel32.CloseHandle(pi.hThread)
+                    WindowsProcessController.close_handle(job_handle)
+                    raise RuntimeError(f"Falha ao resumir processo AppContainer {pi.dwProcessId}")
+
+            import msvcrt
+            fd_out = msvcrt.open_osfhandle(h_read_out.value, os.O_RDONLY)
+            fd_err = msvcrt.open_osfhandle(h_read_err.value, os.O_RDONLY)
+            stdout_stream = os.fdopen(fd_out, "r", encoding=encoding, errors=errors)
+            stderr_stream = os.fdopen(fd_err, "r", encoding=encoding, errors=errors)
+
+            native_proc = NativeWin32Process(
+                h_process=pi.hProcess,
+                h_thread=pi.hThread,
+                pid=pi.dwProcessId,
+                stdout=stdout_stream,
+                stderr=stderr_stream,
+            )
+            identity = cls.capture_identity(pi.dwProcessId)
+            return SupervisedProcess(proc=native_proc, identity=identity, job_handle=job_handle, role=role)
+
+        # 4. Standard Popen Path (with POSIX limits and Landlock / Seatbelt integration)
+        actual_cmd = list(cmd)
+        if os.name != "nt" and fs_sandbox is not None and sys.platform == "darwin":
+            from .fs_sandbox import MacOsSeatbeltController
+            if MacOsSeatbeltController.is_available():
+                profile_str = MacOsSeatbeltController.build_profile(
+                    fs_sandbox.sandbox_root,
+                    fs_sandbox.coordinator_private_dir,
+                    fs_sandbox.config.allowed_read_roots,
+                )
+                actual_cmd = ["/usr/bin/sandbox-exec", "-p", profile_str, *actual_cmd]
+
+        def _posix_worker_preexec() -> None:
+            _apply_posix_resource_limits(resource_limits)
+            if fs_sandbox is not None and sys.platform.startswith("linux"):
+                from .fs_sandbox import LinuxLandlockController
+                if LinuxLandlockController.is_available():
+                    landlock_fn = LinuxLandlockController.get_preexec_fn(
+                        fs_sandbox.sandbox_root,
+                        fs_sandbox.config.allowed_read_roots,
+                    )
+                    landlock_fn()
+
         kwargs: dict[str, Any] = {
             "cwd": canon_cwd,
             "env": worker_env,
@@ -1142,14 +1369,14 @@ class ProcessSupervisor:
         else:
             if role == "worker":
                 kwargs["start_new_session"] = True
+                kwargs["preexec_fn"] = _posix_worker_preexec
 
-        proc = subprocess.Popen(cmd, **kwargs)
+        proc = subprocess.Popen(actual_cmd, **kwargs)
 
         if os.name == "nt" and job_handle:
             proc_handle = getattr(proc, "_handle", None)
             assigned = WindowsProcessController.assign_to_job(job_handle, proc.pid, proc_handle=proc_handle)
             if not assigned:
-                # Fail-closed: terminate suspended process immediately without ever running a single instruction
                 if proc_handle:
                     kernel32.TerminateProcess(proc_handle, 1)
                 else:
@@ -1157,7 +1384,6 @@ class ProcessSupervisor:
                 WindowsProcessController.close_handle(job_handle)
                 raise RuntimeError(f"Falha na ativacao da sandbox: falha ao vincular processo {proc.pid} ao Job Object")
 
-            # Process is safely contained in the Job Object; now resume execution
             resumed = WindowsProcessController.resume_process(proc_handle)
             if not resumed:
                 if proc_handle:
