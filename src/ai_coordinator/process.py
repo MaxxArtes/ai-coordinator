@@ -1272,14 +1272,20 @@ class ProcessSupervisor:
             si.StartupInfo.hStdOutput = h_write_out
             si.StartupInfo.hStdError = h_write_err
 
-            from .fs_sandbox import PROCESS_INFORMATION, EXTENDED_STARTUPINFO_PRESENT
+            from .fs_sandbox import (
+                PROCESS_INFORMATION,
+                EXTENDED_STARTUPINFO_PRESENT,
+                CREATE_UNICODE_ENVIRONMENT,
+                build_win32_unicode_environment,
+            )
             pi = PROCESS_INFORMATION()
-            flags = EXTENDED_STARTUPINFO_PRESENT | creation_flags
+            flags = EXTENDED_STARTUPINFO_PRESENT | creation_flags | CREATE_UNICODE_ENVIRONMENT
             cmd_line = subprocess.list2cmdline(cmd) if isinstance(cmd, list) else str(cmd)
+            env_buf = build_win32_unicode_environment(worker_env)
 
             ok = kernel32.CreateProcessW(
                 None, cmd_line, None, None, True,
-                flags, None, canon_cwd,
+                flags, ctypes.byref(env_buf), canon_cwd,
                 ctypes.byref(si.StartupInfo), ctypes.byref(pi),
             )
             # Close write ends in supervisor parent

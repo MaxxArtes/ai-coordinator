@@ -139,6 +139,16 @@ LANDLOCK_ACCESS_FS_REFER = (1 << 13)
 LANDLOCK_ACCESS_FS_TRUNCATE = (1 << 14)
 
 
+CREATE_UNICODE_ENVIRONMENT = 0x00000400
+
+
+def build_win32_unicode_environment(env_dict: dict[str, str]) -> Any:
+    """Construct a Win32 Unicode environment block (null-separated KEY=VALUE pairs, double-null terminated)."""
+    items = sorted(env_dict.items(), key=lambda x: x[0].upper())
+    buffer_str = "\0".join(f"{k}={v}" for k, v in items) + "\0\0"
+    return ctypes.create_unicode_buffer(buffer_str)
+
+
 # ---------------------------------------------------------------------------
 # Policy and Configuration
 # ---------------------------------------------------------------------------
@@ -416,7 +426,8 @@ class LinuxLandlockController:
 
                 # 1. prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) is mandatory before Landlock
                 if libc.prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0:
-                    return
+                    os.write(2, b"FAIL-CLOSED: prctl(PR_SET_NO_NEW_PRIVS) failed\n")
+                    os._exit(43)
 
                 # 2. Define Landlock ruleset structure
                 class LandlockRulesetAttr(ctypes.Structure):
@@ -455,23 +466,33 @@ class LinuxLandlockController:
                     0,
                 )
                 if ruleset_fd < 0:
-                    return
+                    err = ctypes.get_errno()
+                    os.write(2, f"FAIL-CLOSED: SYS_landlock_create_ruleset failed (errno={err})\n".encode())
+                    os._exit(43)
 
                 # 3. Add Read+Write rule for sandbox_root
                 sbox_fd = os.open(str(resolved_sandbox), os.O_PATH | os.O_CLOEXEC)
-                if sbox_fd >= 0:
-                    path_rule = LandlockPathBeneathAttr(
-                        allowed_access=handled,
-                        parent_fd=sbox_fd,
-                    )
-                    syscall(
-                        SYS_landlock_add_rule,
-                        ruleset_fd,
-                        LANDLOCK_RULE_PATH_BENEATH,
-                        ctypes.byref(path_rule),
-                        0,
-                    )
-                    os.close(sbox_fd)
+                if sbox_fd < 0:
+                    os.close(ruleset_fd)
+                    os.write(2, b"FAIL-CLOSED: unable to open sandbox_root for Landlock rule\n")
+                    os._exit(43)
+
+                path_rule = LandlockPathBeneathAttr(
+                    allowed_access=handled,
+                    parent_fd=sbox_fd,
+                )
+                res = syscall(
+                    SYS_landlock_add_rule,
+                    ruleset_fd,
+                    LANDLOCK_RULE_PATH_BENEATH,
+                    ctypes.byref(path_rule),
+                    0,
+                )
+                os.close(sbox_fd)
+                if res != 0:
+                    os.close(ruleset_fd)
+                    os.write(2, b"FAIL-CLOSED: SYS_landlock_add_rule for sandbox_root failed\n")
+                    os._exit(43)
 
                 # 4. Add Read+Execute rules for system read roots
                 read_handled = (
@@ -500,10 +521,15 @@ class LinuxLandlockController:
                             pass
 
                 # 5. Restrict calling process
-                syscall(SYS_landlock_restrict_self, ruleset_fd, 0)
+                res_restrict = syscall(SYS_landlock_restrict_self, ruleset_fd, 0)
                 os.close(ruleset_fd)
-            except Exception:
-                pass
+                if res_restrict != 0:
+                    err = ctypes.get_errno()
+                    os.write(2, f"FAIL-CLOSED: SYS_landlock_restrict_self failed (errno={err})\n".encode())
+                    os._exit(43)
+            except Exception as e:
+                os.write(2, f"FAIL-CLOSED: Landlock setup unhandled error: {e}\n".encode())
+                os._exit(43)
 
         return _preexec
 

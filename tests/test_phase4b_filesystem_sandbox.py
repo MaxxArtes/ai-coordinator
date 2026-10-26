@@ -134,7 +134,21 @@ class Phase4B52FilesystemSandboxTests(unittest.TestCase):
 
     def test_01_worker_cannot_open_supervisor_secret(self):
         """Worker running in sandbox must be denied access by OS when attempting to read supervisor.secret."""
+        probe_file = self.sandbox_dir / "allowed_probe.txt"
+        probe_file.write_text("PROBE_AUTHORIZED_PAYLOAD", encoding="utf-8")
+        probe_status = self.sandbox_dir / "probe_status_01.txt"
+
         script = f"""import sys, pathlib
+# 1. Positive proof: worker operates legitimately within sandbox
+try:
+    probe = pathlib.Path("allowed_probe.txt").read_text(encoding="utf-8")
+    if probe != "PROBE_AUTHORIZED_PAYLOAD":
+        sys.exit(98)
+    pathlib.Path("probe_status_01.txt").write_text("PROBE_CONFIRMED", encoding="utf-8")
+except Exception:
+    sys.exit(99)
+
+# 2. Adversarial attempt: read coordinator secret
 try:
     data = pathlib.Path(r"{self.secret_file}").read_text(encoding="utf-8")
     print(f"LEAKED: {{data}}")
@@ -144,8 +158,11 @@ except (PermissionError, OSError) as e:
     sys.exit(42)
 """
         code, stdout, stderr = self._run_worker_script(script)
+        # Check positive proof first: worker was alive and functioning within sandbox
+        self.assertTrue(probe_status.exists(), "Positive proof failed: worker did not execute inside sandbox")
+        self.assertEqual(probe_status.read_text(encoding="utf-8"), "PROBE_CONFIRMED")
+
         if self._is_os_boundary_enforced():
-            # Code 42 = PermissionError handled in Python; Code -6 = SIGABRT enforced by OS kernel (e.g. macOS Seatbelt)
             self.assertIn(code, (42, -6))
             if code == 42:
                 self.assertIn("ACCESS_DENIED", stdout)
@@ -153,7 +170,21 @@ except (PermissionError, OSError) as e:
 
     def test_02_worker_cannot_open_coordination_sqlite(self):
         """Worker running in sandbox must be denied access by OS when opening coordination.sqlite."""
+        probe_file = self.sandbox_dir / "allowed_probe.txt"
+        probe_file.write_text("PROBE_AUTHORIZED_PAYLOAD", encoding="utf-8")
+        probe_status = self.sandbox_dir / "probe_status_02.txt"
+
         script = f"""import sys, pathlib
+# 1. Positive proof: worker operates legitimately within sandbox
+try:
+    probe = pathlib.Path("allowed_probe.txt").read_text(encoding="utf-8")
+    if probe != "PROBE_AUTHORIZED_PAYLOAD":
+        sys.exit(98)
+    pathlib.Path("probe_status_02.txt").write_text("PROBE_CONFIRMED", encoding="utf-8")
+except Exception:
+    sys.exit(99)
+
+# 2. Adversarial attempt: read SQLite file
 try:
     data = pathlib.Path(r"{self.sqlite_file}").read_bytes()
     print("LEAKED_SQLITE")
@@ -163,6 +194,9 @@ except (PermissionError, OSError) as e:
     sys.exit(42)
 """
         code, stdout, stderr = self._run_worker_script(script)
+        self.assertTrue(probe_status.exists(), "Positive proof failed: worker did not execute inside sandbox")
+        self.assertEqual(probe_status.read_text(encoding="utf-8"), "PROBE_CONFIRMED")
+
         if self._is_os_boundary_enforced():
             self.assertIn(code, (42, -6))
             if code == 42:
@@ -171,7 +205,21 @@ except (PermissionError, OSError) as e:
 
     def test_03_worker_cannot_read_wal_shm_and_backups(self):
         """Worker running in sandbox must be denied access to WAL, SHM, and coordinator backup files."""
+        probe_file = self.sandbox_dir / "allowed_probe.txt"
+        probe_file.write_text("PROBE_AUTHORIZED_PAYLOAD", encoding="utf-8")
+        probe_status = self.sandbox_dir / "probe_status_03.txt"
+
         script = f"""import sys, pathlib
+# 1. Positive proof: worker operates legitimately within sandbox
+try:
+    probe = pathlib.Path("allowed_probe.txt").read_text(encoding="utf-8")
+    if probe != "PROBE_AUTHORIZED_PAYLOAD":
+        sys.exit(98)
+    pathlib.Path("probe_status_03.txt").write_text("PROBE_CONFIRMED", encoding="utf-8")
+except Exception:
+    sys.exit(99)
+
+# 2. Adversarial attempt: read WAL, SHM, backups
 denied_count = 0
 for target in [r"{self.wal_file}", r"{self.shm_file}", r"{self.backup_file}"]:
     try:
@@ -182,6 +230,9 @@ print(f"DENIED_COUNT: {{denied_count}}")
 sys.exit(42 if denied_count == 3 else 0)
 """
         code, stdout, stderr = self._run_worker_script(script)
+        self.assertTrue(probe_status.exists(), "Positive proof failed: worker did not execute inside sandbox")
+        self.assertEqual(probe_status.read_text(encoding="utf-8"), "PROBE_CONFIRMED")
+
         if self._is_os_boundary_enforced():
             self.assertIn(code, (42, -6))
             if code == 42:
@@ -190,7 +241,21 @@ sys.exit(42 if denied_count == 3 else 0)
     def test_04_worker_cannot_write_to_sibling_tasks(self):
         """Worker running in sandbox must be denied write access to other sibling task directories."""
         target_sibling_write = self.sibling_task_dir / "pwned.txt"
+        probe_file = self.sandbox_dir / "allowed_probe.txt"
+        probe_file.write_text("PROBE_AUTHORIZED_PAYLOAD", encoding="utf-8")
+        probe_status = self.sandbox_dir / "probe_status_04.txt"
+
         script = f"""import sys, pathlib
+# 1. Positive proof: worker operates legitimately within sandbox
+try:
+    probe = pathlib.Path("allowed_probe.txt").read_text(encoding="utf-8")
+    if probe != "PROBE_AUTHORIZED_PAYLOAD":
+        sys.exit(98)
+    pathlib.Path("probe_status_04.txt").write_text("PROBE_CONFIRMED", encoding="utf-8")
+except Exception:
+    sys.exit(99)
+
+# 2. Adversarial attempt: write to sibling task
 try:
     pathlib.Path(r"{target_sibling_write}").write_text("PWNED", encoding="utf-8")
     print("LEAKED_WRITE")
@@ -200,6 +265,8 @@ except (PermissionError, OSError) as e:
     sys.exit(42)
 """
         code, stdout, stderr = self._run_worker_script(script)
+        self.assertTrue(probe_status.exists(), "Positive proof failed: worker did not execute inside sandbox")
+        self.assertEqual(probe_status.read_text(encoding="utf-8"), "PROBE_CONFIRMED")
         self.assertFalse(target_sibling_write.exists())
         if self._is_os_boundary_enforced():
             self.assertIn(code, (42, -6))
@@ -245,7 +312,21 @@ except (PermissionError, OSError) as e:
         mock_ssh_key.parent.mkdir(parents=True, exist_ok=True)
         mock_ssh_key.write_text("MOCK_PRIVATE_RSA_KEY", encoding="utf-8")
 
+        probe_file = self.sandbox_dir / "allowed_probe.txt"
+        probe_file.write_text("PROBE_AUTHORIZED_PAYLOAD", encoding="utf-8")
+        probe_status = self.sandbox_dir / "probe_status_07.txt"
+
         script = f"""import sys, pathlib
+# 1. Positive proof: worker operates legitimately within sandbox
+try:
+    probe = pathlib.Path("allowed_probe.txt").read_text(encoding="utf-8")
+    if probe != "PROBE_AUTHORIZED_PAYLOAD":
+        sys.exit(98)
+    pathlib.Path("probe_status_07.txt").write_text("PROBE_CONFIRMED", encoding="utf-8")
+except Exception:
+    sys.exit(99)
+
+# 2. Adversarial attempt: read home credentials
 try:
     data = pathlib.Path(r"{mock_ssh_key}").read_text(encoding="utf-8")
     print("LEAKED_HOME")
@@ -255,6 +336,9 @@ except (PermissionError, OSError) as e:
     sys.exit(42)
 """
         code, stdout, stderr = self._run_worker_script(script)
+        self.assertTrue(probe_status.exists(), "Positive proof failed: worker did not execute inside sandbox")
+        self.assertEqual(probe_status.read_text(encoding="utf-8"), "PROBE_CONFIRMED")
+
         if self._is_os_boundary_enforced():
             self.assertIn(code, (42, -6))
             if code == 42:
@@ -321,6 +405,92 @@ except (PermissionError, OSError) as e:
             sandbox.prepare()
             self.assertEqual(sandbox.boundary_status, "enforced_windows_appcontainer")
             sandbox.cleanup()
+
+    def test_10_e2e_cli_worker_delegation_with_filesystem_sandbox(self):
+        """End-to-end integration: run_worker uses ExecutionSandbox, produces valid output, and blocks secret leaks."""
+        from ai_coordinator.storage import Store
+        from ai_coordinator.cli import run_worker
+
+        e2e_root = self.base_root / "e2e_coordinator"
+        e2e_root.mkdir(parents=True, exist_ok=True)
+        store = Store(root=e2e_root)
+
+        # Create task
+        task = store.new(goal="E2E delegated task with sandbox", project=str(self.base_root))
+
+        # Create worker input
+        input_path = self.base_root / "e2e_input.txt"
+        input_path.write_text("Delegated payload for analysis.", encoding="utf-8")
+
+        # Mock worker client script: executes in Python, writes output, and attempts to read supervisor.secret
+        tools_dir = self.base_root / "worker_tools"
+        tools_dir.mkdir(parents=True, exist_ok=True)
+        mock_worker_py = tools_dir / "mock_worker_agent.py"
+        secret_to_probe = store.root / "auth" / "supervisor.secret"
+        mock_worker_py.write_text(f"""import sys, os, pathlib, json
+
+# Attempt adversarial probe against supervisor secret
+leak_attempt = "NONE"
+try:
+    leak_attempt = pathlib.Path(r"{secret_to_probe}").read_text(encoding="utf-8")
+except Exception as e:
+    leak_attempt = f"DENIED: {{type(e).__name__}}"
+
+result_payload = {{
+    "result": f"# Result\\nAnalysis completed successfully.\\nLeakStatus: {{leak_attempt}}\\n",
+    "usage": {{
+        "total_tokens": 25,
+        "cost": 0.0001
+    }}
+}}
+print(json.dumps(result_payload))
+sys.exit(0)
+""", encoding="utf-8")
+
+        config = {
+            "limits": {
+                "input_chars": 5000,
+                "output_chars": 5000,
+                "worker_calls_per_task": 5,
+                "attempts_per_run": 2,
+                "timeout_seconds": 15,
+                "max_memory_bytes": 256 * 1024 * 1024,
+                "max_processes": 8,
+            },
+            "security": {
+                "enforce_filesystem_sandbox": self._is_os_boundary_enforced(),
+            },
+            "routes": {
+                "general": {
+                    "candidates": [
+                        {"client": "openrouter", "model": "mock_model", "plain_prompt": True}
+                    ]
+                }
+            },
+            "launchers": {
+                "openrouter": [sys.executable, str(mock_worker_py)]
+            }
+        }
+
+        # Run worker through real CLI delegation
+        summary = run_worker(store, config, task["id"], "general", str(input_path))
+        self.assertEqual(summary.get("status"), "complete")
+
+        # Verify output exists and was imported into result.md
+        runs = store.runs(task["id"])
+        self.assertTrue(len(runs) > 0)
+        self.assertEqual(runs[0]["status"], "complete")
+
+        output_path = Path(runs[0]["output_path"])
+        self.assertTrue(output_path.exists())
+        result_content = output_path.read_text(encoding="utf-8")
+
+        # Verify that supervisor secret was NOT leaked
+        self.assertNotIn("SUPERVISOR_SECRET_KEY", result_content)
+        self.assertIn("Result", result_content)
+        self.assertIn("Analysis completed successfully.", result_content)
+        if self._is_os_boundary_enforced():
+            self.assertIn("LeakStatus: DENIED", result_content)
 
 
 if __name__ == "__main__":
