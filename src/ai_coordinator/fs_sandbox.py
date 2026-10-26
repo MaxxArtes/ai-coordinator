@@ -578,7 +578,13 @@ class MacOsSeatbeltController:
         profile_lines.append('(deny file-read* (regex #".*/tasks/[^/]+/sibling_[^/]+(/.*|$)"))')
 
         if coord_private:
-            profile_lines.append(f'(deny file* (subpath "{coord_private}"))')
+            str_path = str(coord_private)
+            profile_lines.append(f'(deny file* (subpath "{str_path}"))')
+            if str_path.startswith("/private/"):
+                profile_lines.append(f'(deny file* (subpath "{str_path[len("/private"):]}"))')
+            else:
+                profile_lines.append(f'(deny file* (subpath "/private{str_path}"))')
+            profile_lines.append(f'(deny file* (regex #".*/{coord_private.name}(/.*|$)"))')
 
         return "\n".join(profile_lines)
 
