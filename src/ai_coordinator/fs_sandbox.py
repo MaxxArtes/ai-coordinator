@@ -579,12 +579,17 @@ class MacOsSeatbeltController:
 
         if coord_private:
             str_path = str(coord_private)
-            profile_lines.append(f'(deny file* (subpath "{str_path}"))')
+            profile_lines.append(f'(deny file-read* (subpath "{str_path}"))')
+            profile_lines.append(f'(deny file-write* (subpath "{str_path}"))')
             if str_path.startswith("/private/"):
-                profile_lines.append(f'(deny file* (subpath "{str_path[len("/private"):]}"))')
+                non_private = str_path[len("/private"):]
+                profile_lines.append(f'(deny file-read* (subpath "{non_private}"))')
+                profile_lines.append(f'(deny file-write* (subpath "{non_private}"))')
             else:
-                profile_lines.append(f'(deny file* (subpath "/private{str_path}"))')
-            profile_lines.append(f'(deny file* (regex #".*/{coord_private.name}(/.*|$)"))')
+                profile_lines.append(f'(deny file-read* (subpath "/private{str_path}"))')
+                profile_lines.append(f'(deny file-write* (subpath "/private{str_path}"))')
+            profile_lines.append(f'(deny file-read* (regex #".*/{coord_private.name}(/.*|$)"))')
+            profile_lines.append(f'(deny file-write* (regex #".*/{coord_private.name}(/.*|$)"))')
 
         return "\n".join(profile_lines)
 
