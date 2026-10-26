@@ -221,7 +221,7 @@ def run_worker(store, config, ident, category, input_file, max_attempts=None):
                     max_cpu_time_seconds=float(limits.get("max_cpu_time_seconds", 0)) or None,
                     max_processes=limits.get("max_processes"),
                 )
-                enforce_fs = config.get("security", {}).get("enforce_filesystem_sandbox", False)
+                enforce_fs = config.get("security", {}).get("enforce_filesystem_sandbox", True)
                 fs_sandbox = None
                 try:
                     allowed_reads = [Path(sys.executable).parent]

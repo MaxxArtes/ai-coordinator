@@ -1248,9 +1248,6 @@ class ProcessSupervisor:
 
         # 3. Windows AppContainer execution path
         if os.name == "nt" and fs_sandbox is not None and getattr(fs_sandbox, "windows_controller", None):
-            win_ctrl = fs_sandbox.windows_controller
-            si, attr_list = win_ctrl.build_startupinfo()
-
             class SECURITY_ATTRIBUTES(ctypes.Structure):
                 _fields_ = [
                     ("nLength", wintypes.DWORD),
@@ -1268,9 +1265,23 @@ class ProcessSupervisor:
             kernel32.CreatePipe(ctypes.byref(h_read_err), ctypes.byref(h_write_err), ctypes.byref(sa), 0)
             kernel32.SetHandleInformation(h_read_err, 1, 0)
 
+            h_read_in, h_write_in = wintypes.HANDLE(), wintypes.HANDLE()
+            if stdin == subprocess.PIPE or stdin is not None:
+                kernel32.CreatePipe(ctypes.byref(h_read_in), ctypes.byref(h_write_in), ctypes.byref(sa), 0)
+                kernel32.SetHandleInformation(h_write_in, 1, 0)
+
+            inherited_handles = [h_write_out, h_write_err]
+            if h_read_in.value:
+                inherited_handles.append(h_read_in)
+
+            win_ctrl = fs_sandbox.windows_controller
+            si, attr_list = win_ctrl.build_startupinfo(inherited_handles=inherited_handles)
+
             si.StartupInfo.dwFlags |= 0x00000100  # STARTF_USESTDHANDLES
             si.StartupInfo.hStdOutput = h_write_out
             si.StartupInfo.hStdError = h_write_err
+            if h_read_in.value:
+                si.StartupInfo.hStdInput = h_read_in
 
             from .fs_sandbox import (
                 PROCESS_INFORMATION,
@@ -1288,13 +1299,17 @@ class ProcessSupervisor:
                 flags, ctypes.byref(env_buf), canon_cwd,
                 ctypes.byref(si.StartupInfo), ctypes.byref(pi),
             )
-            # Close write ends in supervisor parent
+            # Close child-side pipe handles in supervisor parent
             kernel32.CloseHandle(h_write_out)
             kernel32.CloseHandle(h_write_err)
+            if h_read_in.value:
+                kernel32.CloseHandle(h_read_in)
 
             if not ok:
                 kernel32.CloseHandle(h_read_out)
                 kernel32.CloseHandle(h_read_err)
+                if h_write_in.value:
+                    kernel32.CloseHandle(h_write_in)
                 if job_handle:
                     WindowsProcessController.close_handle(job_handle)
                 from .fs_sandbox import FileSandboxSecurityError
@@ -1326,10 +1341,16 @@ class ProcessSupervisor:
             stdout_stream = os.fdopen(fd_out, "r", encoding=encoding, errors=errors)
             stderr_stream = os.fdopen(fd_err, "r", encoding=encoding, errors=errors)
 
+            stdin_stream = None
+            if h_write_in.value:
+                fd_in = msvcrt.open_osfhandle(h_write_in.value, os.O_WRONLY)
+                stdin_stream = os.fdopen(fd_in, "w", encoding=encoding, errors=errors)
+
             native_proc = NativeWin32Process(
                 h_process=pi.hProcess,
                 h_thread=pi.hThread,
                 pid=pi.dwProcessId,
+                stdin=stdin_stream,
                 stdout=stdout_stream,
                 stderr=stderr_stream,
             )

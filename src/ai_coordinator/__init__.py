@@ -1,5 +1,33 @@
 """Portable shared task coordination for local AI coding agents."""
 from .api import Coordinator, open_coordinator
+from .tool_broker import (
+    ToolBroker,
+    ToolRegistry,
+    CapabilityTokenManager,
+    CapabilityToken,
+    ToolDefinition,
+    ToolPolicyMode,
+    ToolBrokerContext,
+    BrokerAuditRecord,
+    ToolBrokerError,
+    ToolAccessDeniedError,
+    InvalidCapabilityTokenError,
+    CapabilityTokenExpiredError,
+    CapabilityTokenRevokedError,
+    BrokerRateLimitExceededError,
+    CallerIdentityMismatchError,
+    MutationNotPermittedError,
+    ToolApprovalRequired,
+)
+from .fs_sandbox import (
+    ExecutionSandbox,
+    FileSandboxConfig,
+    FileSandboxSecurityError,
+    PathTraversalError,
+    ReparseEscapeError,
+    validate_contained_path,
+)
+
 from .process import (
     ProcessIdentity,
     ProcessSupervisor,
@@ -278,5 +306,28 @@ __all__ = [
     "calculate_upstream_prerequisites",
     "splice_alternative_route",
     "TrajectoryReconstructor",
+    "ToolBroker",
+    "ToolRegistry",
+    "CapabilityTokenManager",
+    "CapabilityToken",
+    "ToolDefinition",
+    "ToolPolicyMode",
+    "ToolBrokerContext",
+    "BrokerAuditRecord",
+    "ToolBrokerError",
+    "ToolAccessDeniedError",
+    "InvalidCapabilityTokenError",
+    "CapabilityTokenExpiredError",
+    "CapabilityTokenRevokedError",
+    "BrokerRateLimitExceededError",
+    "CallerIdentityMismatchError",
+    "MutationNotPermittedError",
+    "ToolApprovalRequired",
+    "ExecutionSandbox",
+    "FileSandboxConfig",
+    "FileSandboxSecurityError",
+    "PathTraversalError",
+    "ReparseEscapeError",
+    "validate_contained_path",
 ]
 __version__ = "0.4.0"

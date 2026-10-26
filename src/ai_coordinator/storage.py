@@ -362,6 +362,8 @@ class Store:
         )
         self.insight_engine = InsightEngine(self.db, self.experience_store)
         self.reconstructor = TrajectoryReconstructor(self)
+        from .tool_broker import ToolBroker
+        self.tool_broker = ToolBroker(store=self)
         self._post_commit_scopes: List[List[Callable[[], Any]]] = []
 
     def enter_savepoint_scope(self) -> None:

@@ -63,6 +63,7 @@ class ReparseEscapeError(FileSandboxSecurityError):
 
 if os.name == "nt":
     PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES = 0x00020009
+    PROC_THREAD_ATTRIBUTE_HANDLE_LIST = 0x00020002
     EXTENDED_STARTUPINFO_PRESENT = 0x00080000
     CREATE_SUSPENDED = 0x00000004
     CREATE_NO_WINDOW = 0x08000000
@@ -307,15 +308,16 @@ class WindowsAppContainerController:
 
         return self.sid_str
 
-    def build_startupinfo(self) -> Tuple[STARTUPINFOEXW, ctypes.c_char_p]:
-        """Construct STARTUPINFOEXW with PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES."""
+    def build_startupinfo(self, inherited_handles: Optional[Sequence[Any]] = None) -> Tuple[STARTUPINFOEXW, ctypes.c_char_p]:
+        """Construct STARTUPINFOEXW with PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES and restricted HANDLE_LIST."""
         if not self.sid_ptr:
             raise FileSandboxSecurityError("AppContainer profile nao inicializado")
 
+        attr_count = 2 if inherited_handles else 1
         size = ctypes.c_size_t(0)
-        kernel32.InitializeProcThreadAttributeList(None, 1, 0, ctypes.byref(size))
+        kernel32.InitializeProcThreadAttributeList(None, attr_count, 0, ctypes.byref(size))
         attr_list = ctypes.create_string_buffer(size.value)
-        if not kernel32.InitializeProcThreadAttributeList(attr_list, 1, 0, ctypes.byref(size)):
+        if not kernel32.InitializeProcThreadAttributeList(attr_list, attr_count, 0, ctypes.byref(size)):
             raise FileSandboxSecurityError("Falha ao inicializar ProcThreadAttributeList")
 
         sec_caps = SECURITY_CAPABILITIES()
@@ -338,6 +340,25 @@ class WindowsAppContainerController:
             raise FileSandboxSecurityError(
                 f"UpdateProcThreadAttribute falhou com codigo {kernel32.GetLastError()}"
             )
+
+        self._handle_arr = None
+        if inherited_handles:
+            handle_arr = (wintypes.HANDLE * len(inherited_handles))(*inherited_handles)
+            self._handle_arr = handle_arr
+            ok_handles = kernel32.UpdateProcThreadAttribute(
+                attr_list,
+                0,
+                PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
+                ctypes.byref(handle_arr),
+                ctypes.sizeof(handle_arr),
+                None,
+                None,
+            )
+            if not ok_handles:
+                kernel32.DeleteProcThreadAttributeList(attr_list)
+                raise FileSandboxSecurityError(
+                    f"UpdateProcThreadAttribute HANDLE_LIST falhou com codigo {kernel32.GetLastError()}"
+                )
 
         si = STARTUPINFOEXW()
         si.StartupInfo.cb = ctypes.sizeof(STARTUPINFOEXW)
