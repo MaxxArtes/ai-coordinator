@@ -145,8 +145,10 @@ except (PermissionError, OSError) as e:
 """
         code, stdout, stderr = self._run_worker_script(script)
         if self._is_os_boundary_enforced():
-            self.assertEqual(code, 42)
-            self.assertIn("ACCESS_DENIED", stdout)
+            # Code 42 = PermissionError handled in Python; Code -6 = SIGABRT enforced by OS kernel (e.g. macOS Seatbelt)
+            self.assertIn(code, (42, -6))
+            if code == 42:
+                self.assertIn("ACCESS_DENIED", stdout)
             self.assertNotIn("LEAKED", stdout)
 
     def test_02_worker_cannot_open_coordination_sqlite(self):
@@ -162,8 +164,9 @@ except (PermissionError, OSError) as e:
 """
         code, stdout, stderr = self._run_worker_script(script)
         if self._is_os_boundary_enforced():
-            self.assertEqual(code, 42)
-            self.assertIn("SQLITE_DENIED", stdout)
+            self.assertIn(code, (42, -6))
+            if code == 42:
+                self.assertIn("SQLITE_DENIED", stdout)
             self.assertNotIn("LEAKED_SQLITE", stdout)
 
     def test_03_worker_cannot_read_wal_shm_and_backups(self):
@@ -180,8 +183,9 @@ sys.exit(42 if denied_count == 3 else 0)
 """
         code, stdout, stderr = self._run_worker_script(script)
         if self._is_os_boundary_enforced():
-            self.assertEqual(code, 42)
-            self.assertIn("DENIED_COUNT: 3", stdout)
+            self.assertIn(code, (42, -6))
+            if code == 42:
+                self.assertIn("DENIED_COUNT: 3", stdout)
 
     def test_04_worker_cannot_write_to_sibling_tasks(self):
         """Worker running in sandbox must be denied write access to other sibling task directories."""
@@ -198,8 +202,9 @@ except (PermissionError, OSError) as e:
         code, stdout, stderr = self._run_worker_script(script)
         self.assertFalse(target_sibling_write.exists())
         if self._is_os_boundary_enforced():
-            self.assertEqual(code, 42)
-            self.assertIn("WRITE_DENIED", stdout)
+            self.assertIn(code, (42, -6))
+            if code == 42:
+                self.assertIn("WRITE_DENIED", stdout)
 
     def test_05_path_traversal_with_dotdot_and_absolute_paths_rejected(self):
         """Strict path canonicalization rejects ../ traversal and paths outside sandbox root."""
@@ -251,8 +256,9 @@ except (PermissionError, OSError) as e:
 """
         code, stdout, stderr = self._run_worker_script(script)
         if self._is_os_boundary_enforced():
-            self.assertEqual(code, 42)
-            self.assertIn("HOME_DENIED", stdout)
+            self.assertIn(code, (42, -6))
+            if code == 42:
+                self.assertIn("HOME_DENIED", stdout)
             self.assertNotIn("LEAKED_HOME", stdout)
 
     def test_08_supervisor_safely_imports_authorized_output(self):
