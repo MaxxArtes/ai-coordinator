@@ -54,8 +54,23 @@ A Fase 4B.5 do AI Coordinator introduz isolamento de processos e governança a n
 - **Encadeamento Sequencial Global Estrito**:
   - Numeração linear e encadeamento contínuo de ponta a ponta para toda a base `worker_audit_log` (`sequence_number = MAX(sequence_number) + 1`), eliminando partições por run ou gaps de verificação.
 - **Tabela de Ancoragem contra Truncamento de Cauda (`worker_audit_anchors`)**:
-  - チェック de integridade cruzada que registra o último `chain_hash` assinado com HMAC em tabela separada protegida por triggers de imutabilidade.
+  - Registro de integridade cruzada que armazena o último `chain_hash` assinado com HMAC em tabela separada protegida por triggers de imutabilidade.
   - `verify_integrity()` detecta tentativas de exclusão de registros recentes (tail truncation) comparando a maior sequência do log com a âncora assinada.
+
+### 6. Fechamento de Bloqueadores e Ancoragem Desacoplada (4B.6.0)
+- **Eliminação de Fallback Silencioso e Fail-Closed no Ciclo do Worker**:
+  - No módulo `cli.py`, todas as chamadas a `store.worker_audit.record_event()` executam sob política estritamente fail-closed:
+    - Se o registro de `sandbox_prepared` falhar, o worker é abortado antes da criação do processo (`ProcessSupervisor.spawn`).
+    - Se a gravação de `spawn` falhar após a criação do subprocesso, o supervisor invoca imediatamente `terminate_tree(proc)` e levanta `RuntimeError`, impedindo qualquer execução de comandos sem certidão de auditoria persistida.
+    - Se a persistência de `exit` falhar, o término é considerado violado e o resultado da execução é descartado.
+- **Arquitetura de Dupla Ancoragem Desacoplada do SQLite (`auth/audit.anchor`)**:
+  - **Limitação da Ancoragem In-Database**: Caso as âncoras fossem armazenadas exclusivamente no arquivo `coordination.sqlite`, um adversário com privilégio de escrita física no banco de dados e capacidade de remover triggers SQLite poderia simultaneamente truncar o log e a tabela de âncoras.
+  - **Mitigação com Âncora Externa Isolada**: A cada inserção de evento, o `WorkerAuditLogger` grava atomicamente o estado da âncora no arquivo externo desacoplado `store.root / "auth" / "audit.anchor"`, protegido por permissões NTFS/POSIX restritas (0700/0600) e inacessível às sandboxes de workers.
+  - **Detecção Híbrida**: O método `verify_integrity()` valida a coerência sequencial tanto contra a tabela interna `worker_audit_anchors` quanto contra o arquivo externo desacoplado `auth/audit.anchor`. Se o banco for manipulado offline para remover eventos recentes, o arquivo externo de âncora detecta e reporta imediatamente o truncamento.
+- **Modelo de Ameaças e Limites Teóricos**:
+  - Contra processos workers em sandbox (AppContainer / Landlock / Seatbelt): o isolamento do kernel impede acesso de leitura e escrita ao banco e ao diretório `auth/`.
+  - Contra adulteração offline em disco: a assinatura HMAC com segredo mestre (`supervisor_secret`) impede forja de hashes ou assinaturas válidas sem conhecimento da chave.
+  - Limite inerente de SO: Se um adversário obtiver credenciais de `root` ou `Administrador` no host do coordenador e comprometer a chave em memória ou `auth/supervisor.secret`, o host é considerado comprometido além das fronteiras de governança em nível de aplicação.
 - **Auditoria Pré-Execução Fail-Closed no Tool Broker**:
   - Antes de invocar qualquer handler de ferramenta mutante ou de leitura, o broker persiste e comita o registro de autorização (`decision="allowed"`).
   - Caso ocorra falha de I/O, bloqueio ou persistência SQLite, o handler **nunca** é executado, impedindo categoricamente qualquer efeito colateral desprotegido.

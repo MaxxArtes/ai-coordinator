@@ -245,15 +245,12 @@ def run_worker(store, config, ident, category, input_file, max_attempts=None):
                     fs_sandbox = ExecutionSandbox(sandbox_cfg)
                     fs_sandbox.prepare()
                     if hasattr(store, "worker_audit") and store.worker_audit:
-                        try:
-                            store.worker_audit.record_event(
-                                event_type="sandbox_prepared",
-                                task_id=ident,
-                                run_id=run_id,
-                                details={"sandbox_root": str(folder), "enforce_os_boundary": enforce_fs},
-                            )
-                        except Exception:
-                            pass
+                        store.worker_audit.record_event(
+                            event_type="sandbox_prepared",
+                            task_id=ident,
+                            run_id=run_id,
+                            details={"sandbox_root": str(folder), "enforce_os_boundary": enforce_fs},
+                        )
                 except Exception as sbox_err:
                     if hasattr(store, "worker_audit") and store.worker_audit:
                         try:
@@ -265,9 +262,7 @@ def run_worker(store, config, ident, category, input_file, max_attempts=None):
                             )
                         except Exception:
                             pass
-                    if enforce_fs:
-                        raise RuntimeError(f"Falha na ativacao da sandbox de filesystem obrigatoria: {sbox_err}")
-                    fs_sandbox = None
+                    raise RuntimeError(f"Politica fail-closed violada: falha na ativacao ou auditoria da sandbox obrigatoria: {sbox_err}") from sbox_err
 
                 proc = ProcessSupervisor.spawn(
                     cmd,
@@ -308,8 +303,9 @@ def run_worker(store, config, ident, category, input_file, max_attempts=None):
                             limits=limits,
                             details={"client": candidate["client"], "model": candidate["model"]},
                         )
-                    except Exception:
-                        pass
+                    except Exception as spawn_audit_err:
+                        terminate_tree(proc)
+                        raise RuntimeError(f"Politica fail-closed violada: falha ao persistir auditoria de spawn do worker: {spawn_audit_err}") from spawn_audit_err
                 
                 from .streaming import SafeStreamConsumer
                 timeout = min(600, candidate.get("timeout_seconds", limits["timeout_seconds"]))
@@ -336,16 +332,13 @@ def run_worker(store, config, ident, category, input_file, max_attempts=None):
             except (OSError, ValueError, RuntimeError, TimeoutError) as exc:
                 attempts[-1].update(status="failed", error=scrub(str(exc))[:1500], ended=now())
                 if isinstance(exc, TimeoutError) and hasattr(store, "worker_audit") and store.worker_audit:
-                    try:
-                        store.worker_audit.record_event(
-                            event_type="timeout",
-                            task_id=ident,
-                            run_id=run_id,
-                            worker_pid=proc.pid if proc else None,
-                            reason=f"Timeout atingido: {exc}",
-                        )
-                    except Exception:
-                        pass
+                    store.worker_audit.record_event(
+                        event_type="timeout",
+                        task_id=ident,
+                        run_id=run_id,
+                        worker_pid=proc.pid if proc else None,
+                        reason=f"Timeout atingido: {exc}",
+                    )
                 if isinstance(exc, (OSError, ValueError, TimeoutError)):
                     health.record(candidate['client'], candidate['model'], False, scrub(str(exc)))
                 result = ""
@@ -364,18 +357,15 @@ def run_worker(store, config, ident, category, input_file, max_attempts=None):
                             pass
                     terminate_tree(proc)
                 if proc is not None and hasattr(store, "worker_audit") and store.worker_audit:
-                    try:
-                        rc = stream_res.returncode if 'stream_res' in locals() and stream_res else proc.poll()
-                        store.worker_audit.record_event(
-                            event_type="exit",
-                            task_id=ident,
-                            run_id=run_id,
-                            worker_pid=proc.pid,
-                            resource_usage={"exit_code": rc},
-                            details={"client": candidate["client"], "status": "complete" if (rc == 0 and result) else "failed"},
-                        )
-                    except Exception:
-                        pass
+                    rc = stream_res.returncode if 'stream_res' in locals() and stream_res else proc.poll()
+                    store.worker_audit.record_event(
+                        event_type="exit",
+                        task_id=ident,
+                        run_id=run_id,
+                        worker_pid=proc.pid,
+                        resource_usage={"exit_code": rc},
+                        details={"client": candidate["client"], "status": "complete" if (rc == 0 and result) else "failed"},
+                    )
                 if fs_sandbox is not None:
                     try:
                         fs_sandbox.cleanup()

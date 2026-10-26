@@ -139,6 +139,15 @@ class WorkerAuditLogger:
             raise ValueError("supervisor_key obrigatoria para assinatura da trilha de auditoria")
 
         self._lock = getattr(store, "_lock", None) or threading.RLock()
+        self.anchor_file_path: Optional[Path] = None
+        if hasattr(self.store, "root") and self.store.root:
+            auth_dir = Path(self.store.root) / "auth"
+            try:
+                auth_dir.mkdir(parents=True, exist_ok=True)
+                self.anchor_file_path = auth_dir / "audit.anchor"
+            except Exception:
+                self.anchor_file_path = None
+
         self._init_table()
 
     def _init_table(self) -> None:
@@ -348,6 +357,16 @@ class WorkerAuditLogger:
 
                 self.store.db.commit()
 
+                # Decoupled external anchor file persistence
+                if self.anchor_file_path:
+                    try:
+                        anchor_payload_line = f"ANCHOR_V1|{seq_num}|{chain_hash}|{created_at}|{anchor_sig}\n"
+                        tmp_anchor = self.anchor_file_path.with_suffix(".tmp")
+                        tmp_anchor.write_text(anchor_payload_line, encoding="utf-8")
+                        tmp_anchor.replace(self.anchor_file_path)
+                    except Exception as ext_anc_err:
+                        raise WorkerAuditPersistenceError(f"Falha ao persistir ancora externa desacoplada: {ext_anc_err}") from ext_anc_err
+
             return WorkerAuditRecord(
                 event_id=event_id,
                 sequence_number=seq_num,
@@ -414,6 +433,35 @@ class WorkerAuditLogger:
                         errors.append(f"Divergencia entre o chain_hash do log ({max_hash}) e a ancora ({last_anc_hash}) na seq {last_anc_seq}")
         except Exception as anchor_err:
             errors.append(f"Falha ao consultar tabela de ancoragem: {anchor_err}")
+
+        # Check Decoupled External Anchor File
+        if self.anchor_file_path and self.anchor_file_path.is_file():
+            try:
+                raw_ext = self.anchor_file_path.read_text(encoding="utf-8").strip()
+                parts = raw_ext.split("|")
+                if len(parts) == 5 and parts[0] == "ANCHOR_V1":
+                    ext_seq = int(parts[1])
+                    ext_hash = parts[2]
+                    ext_time = parts[3]
+                    ext_sig = parts[4]
+
+                    expected_ext_payload = f"ANCHOR:{ext_seq}:{ext_hash}:{ext_time}"
+                    expected_ext_sig = hmac.new(self.supervisor_secret, expected_ext_payload.encode("ascii"), hashlib.sha256).hexdigest()
+                    if not hmac.compare_digest(ext_sig, expected_ext_sig):
+                        errors.append(f"Assinatura HMAC invalida no arquivo desacoplado de ancoragem ({self.anchor_file_path.name})")
+
+                    if not max_log_row:
+                        errors.append(f"Truncamento total detectado via ancora desacoplada: log vazio, mas ancora externa seq {ext_seq} existe")
+                    else:
+                        max_seq, max_hash = max_log_row[0], max_log_row[1]
+                        if max_seq < ext_seq:
+                            errors.append(f"Truncamento de log detectado via ancora desacoplada: ultima sequencia ({max_seq}) e inferior a ancora externa ({ext_seq})")
+                        elif max_hash != ext_hash and max_seq == ext_seq:
+                            errors.append(f"Divergencia entre chain_hash do log ({max_hash}) e ancora desacoplada ({ext_hash}) na seq {ext_seq}")
+                else:
+                    errors.append(f"Formato invalido no arquivo desacoplado de ancoragem ({self.anchor_file_path.name})")
+            except Exception as ext_err:
+                errors.append(f"Falha ao consultar arquivo desacoplado de ancoragem: {ext_err}")
 
         # 2. Sequential linear verification across the whole log
         all_rows = self.store.db.execute("""

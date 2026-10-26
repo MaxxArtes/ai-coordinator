@@ -50,7 +50,7 @@ from ai_coordinator.worker_audit import (
     compute_canonical_record_hash,
     GENESIS_HASH,
 )
-from ai_coordinator.process import ProcessSupervisor, ResourceLimits, safe_terminate_tree
+from ai_coordinator.process import ProcessSupervisor, ResourceLimits, safe_terminate_tree, safe_process_alive
 from ai_coordinator.fs_sandbox import ExecutionSandbox, FileSandboxConfig
 from ai_coordinator.cli import run_worker, terminate_tree
 
@@ -468,6 +468,107 @@ sys.exit(0)
                 parameters={"subpath": f"../coordinator_store"},
                 caller_pid=my_pid,
             )
+
+    def test_09_fail_closed_spawn_audit_failure_terminates_process_immediately(self):
+        """If worker audit persistence fails on spawn, process must be immediately terminated fail-closed."""
+        mock_worker_py = self.project_dir / "hanging_worker.py"
+        mock_worker_py.write_text("import time; time.sleep(60)\n", encoding="utf-8")
+
+        cfg = {
+            "limits": {
+                "input_chars": 5000,
+                "output_chars": 5000,
+                "worker_calls_per_task": 5,
+                "attempts_per_run": 1,
+                "timeout_seconds": 15,
+                "max_memory_bytes": 256 * 1024 * 1024,
+                "max_processes": 8,
+            },
+            "security": {
+                "enforce_filesystem_sandbox": True,
+            },
+            "routes": {
+                "general": {
+                    "candidates": [
+                        {"client": "openrouter", "model": "mock_adv_model", "plain_prompt": True}
+                    ]
+                }
+            },
+            "launchers": {
+                "openrouter": [sys.executable, str(mock_worker_py)]
+            }
+        }
+
+        input_file = self.project_dir / "task_input_fail_spawn.md"
+        input_file.write_text("Trigger fail-closed on spawn", encoding="utf-8")
+
+        # Monkey-patch record_event to fail on SPAWN
+        original_record = self.worker_audit.record_event
+        spawn_captured_pid = None
+
+        def fault_record_event(event_type, **kwargs):
+            nonlocal spawn_captured_pid
+            if event_type == "spawn" or event_type == WorkerAuditEventType.SPAWN:
+                spawn_captured_pid = kwargs.get("worker_pid")
+                raise WorkerAuditPersistenceError("Simulated disk error during spawn audit")
+            return original_record(event_type, **kwargs)
+
+        self.worker_audit.record_event = fault_record_event
+
+        try:
+            summary = run_worker(
+                store=self.store,
+                config=cfg,
+                ident=self.task_id,
+                category="general",
+                input_file=str(input_file),
+            )
+            # Run must report failure
+            self.assertEqual(summary["status"], "failed")
+            self.assertIn("Politica fail-closed violada", summary["attempts"][-1].get("error", ""))
+        finally:
+            self.worker_audit.record_event = original_record
+
+        # Process MUST be terminated and dead
+        self.assertIsNotNone(spawn_captured_pid)
+        time.sleep(0.5)
+        self.assertFalse(safe_process_alive(spawn_captured_pid), "Worker process must be killed immediately when spawn audit fails")
+
+    def test_10_decoupled_external_anchor_file_catches_sqlite_table_tampering(self):
+        """External anchor file in auth/ detects tampering even when SQLite anchor table is also cleared."""
+        # Record 4 events
+        for i in range(4):
+            self.worker_audit.record_event(
+                event_type=WorkerAuditEventType.TOOL_REQUESTED,
+                task_id=self.task_id,
+                run_id=self.run_id,
+                worker_pid=3000 + i,
+                details={"step": i},
+            )
+
+        # Baseline: pristine verification
+        ok, errors = self.worker_audit.verify_integrity(task_id=self.task_id, run_id=self.run_id)
+        self.assertTrue(ok)
+        self.assertEqual(len(errors), 0)
+
+        # Confirm decoupled anchor file was created
+        self.assertIsNotNone(self.worker_audit.anchor_file_path)
+        self.assertTrue(self.worker_audit.anchor_file_path.is_file())
+        raw_anchor = self.worker_audit.anchor_file_path.read_text(encoding="utf-8")
+        self.assertTrue(raw_anchor.startswith("ANCHOR_V1|4|"))
+
+        # Attacker with direct SQLite access drops triggers and deletes records from BOTH tables
+        self.store.db.execute("DROP TRIGGER prevent_worker_audit_delete")
+        self.store.db.execute("DROP TRIGGER prevent_worker_audit_anchor_delete")
+        self.store.db.execute("DELETE FROM worker_audit_log WHERE sequence_number >= 3")
+        self.store.db.execute("DELETE FROM worker_audit_anchors WHERE last_sequence_number >= 3")
+        self.store.db.commit()
+
+        # In-DB verification alone might think sequence 2 is the latest,
+        # but the decoupled external anchor file knows sequence 4 existed!
+        ok, errors = self.worker_audit.verify_integrity(task_id=self.task_id, run_id=self.run_id)
+        self.assertFalse(ok)
+        self.assertTrue(any("ancora desacoplada" in e.lower() for e in errors))
 
 
 if __name__ == "__main__":
