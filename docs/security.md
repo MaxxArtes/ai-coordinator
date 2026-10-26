@@ -39,7 +39,34 @@ A Fase 4B.5 do AI Coordinator introduz isolamento de processos e governança a n
 - **Normalização de Timestamp de Criação de Processos**: Comparação precisa em nanossegundos Unix (convertendo FILETIME de 100ns do Windows e jiffies do Linux), garantindo tolerância uniforme de 2.0 segundos contra reciclagem de PIDs em todas as plataformas.
 - **Imutabilidade SQL com Triggers**: As tabelas `worker_audit_log` e `tool_broker_audit` possuem triggers SQLite (`BEFORE UPDATE` e `BEFORE DELETE` acionando `RAISE(ABORT, ...)`), garantindo natureza estritamente append-only contra adulterações.
 - **Política de Falha Fechada (Fail-Closed)**: Operações de workers e ferramentas não são executadas se a persistência da trilha de auditoria falhar (`ToolAuditPersistenceError`, `WorkerAuditPersistenceError`).
-- **Encadeamento Criptográfico e Assinatura HMAC**: Registros em `worker_audit_log` são encadeados via `SHA-256(prev_hash || sequence || event_type || correlation_id || task_id || run_id || timestamp)` e assinados com HMAC-SHA256 pela chave secreta do supervisor, permitindo auditoria e detecção de adulteração de histórico (`verify_integrity()`).
+
+### 5. Consolidação e Testes Adversariais Integrados (4B.5.5)
+- **Auditoria Integrada no Ciclo de Vida Real do Worker**: Emissão automática e determinística de eventos no fluxo de execução supervisionada (`cli.py:run_worker`):
+  - `sandbox_prepared`: emitida após a montagem e restrição de permissões no filesystem (AppContainer / Landlock / Seatbelt).
+  - `sandbox_denied`: emitida se a inicialização de segurança falhar.
+  - `spawn`: emitida com o PID real do worker, identidade extraída do kernel, limites operacionais e parâmetros de rota.
+  - `timeout`: emitida se o tempo limite de execução for excedido.
+  - `termination`: emitida se a árvore de processos for ativamente terminada via `terminate_tree`.
+  - `exit`: emitida com o código de retorno, duração da execução e sumário de sucesso ou falha.
+- **Assinatura Canônica de Todos os Campos do Registro**:
+  - A carga de hash (`chain_hash`) cobre canônica e determinísticamente todos os 15 campos da tabela `worker_audit_log`: `prev_hash`, `sequence_number`, `task_id`, `run_id`, `worker_pid`, `process_identity_json`, `event_type`, `correlation_id`, `operational_revision`, `limits_json`, `resource_usage_json`, `reason`, `error`, `details_json` e `created_at`.
+  - Adulterações em qualquer campo (mesmo offline com triggers desativados no SQLite) quebram imediatamente a integridade criptográfica.
+- **Encadeamento Sequencial Global Estrito**:
+  - Numeração linear e encadeamento contínuo de ponta a ponta para toda a base `worker_audit_log` (`sequence_number = MAX(sequence_number) + 1`), eliminando partições por run ou gaps de verificação.
+- **Tabela de Ancoragem contra Truncamento de Cauda (`worker_audit_anchors`)**:
+  - チェック de integridade cruzada que registra o último `chain_hash` assinado com HMAC em tabela separada protegida por triggers de imutabilidade.
+  - `verify_integrity()` detecta tentativas de exclusão de registros recentes (tail truncation) comparando a maior sequência do log com a âncora assinada.
+- **Auditoria Pré-Execução Fail-Closed no Tool Broker**:
+  - Antes de invocar qualquer handler de ferramenta mutante ou de leitura, o broker persiste e comita o registro de autorização (`decision="allowed"`).
+  - Caso ocorra falha de I/O, bloqueio ou persistência SQLite, o handler **nunca** é executado, impedindo categoricamente qualquer efeito colateral desprotegido.
+  - Após a execução do handler, o broker grava o evento de conclusão (`completed`) ou erro (`error`) com sumário e duração.
+- **Identidade Obrigatória na Mailbox de Arquivos**:
+  - `process_mailbox` exige obrigatoriamente `expected_worker_pid: int` positivo, eliminando qualquer fallback permissivo para PIDs declarados em payloads JSON. Divergências entre o PID esperado da sandbox e o PID alegado são bloqueadas como ataques de spoofing (`CallerIdentityMismatchError`).
+- **Concorrência Segura e Proteção Multithread no Banco de Dados**:
+  - Conexão SQLite compartilhada no Store configurada com `check_same_thread=False` e sincronizada via `threading.RLock()` reentrante em `Store`, `ToolBroker` e `CapabilityTokenManager`.
+  - Controle de cotas (`max_calls`) atômico com serialização thread-safe, impedindo race conditions sob alta carga simultânea.
+- **Suíte de Testes Adversariais Integrados (`tests/test_phase4b_adversarial_suite.py`)**:
+  - Bateria automatizada cobrindo testes ponta a ponta de delegação real, fail-closed pré-efeito, adulteração de campos canônicos, truncamento de log, spoofing de mailbox, contenção concorrente e isolamento dos arquivos privados do coordenador.
 
 ## Ambiente do processo
 

@@ -22,6 +22,7 @@ import json
 import os
 from pathlib import Path
 import sqlite3
+import threading
 import time
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple, Union
 import uuid
@@ -165,7 +166,12 @@ class BrokerAuditRecord:
 class CapabilityTokenManager:
     """Issues and cryptographically validates HMAC-signed ephemeral capability tokens."""
 
-    def __init__(self, supervisor_secret: Union[str, bytes], store: Optional[Any] = None):
+    def __init__(
+        self,
+        supervisor_secret: Union[str, bytes],
+        store: Optional[Any] = None,
+        lock: Optional[threading.RLock] = None,
+    ):
         if isinstance(supervisor_secret, str):
             self.secret = supervisor_secret.encode("utf-8")
         else:
@@ -174,6 +180,7 @@ class CapabilityTokenManager:
             raise ValueError("supervisor_secret obrigatorio para emissao de tokens de capacidade")
 
         self.store = store
+        self._lock = lock or getattr(store, "_lock", None) or threading.RLock()
         self._active_tokens: Dict[str, CapabilityToken] = {}
         self._revoked_token_ids: Set[str] = set()
         self._init_token_table()
@@ -315,19 +322,20 @@ class CapabilityTokenManager:
 
         if hasattr(self.store, "db") and self.store.db:
             try:
-                row = self.store.db.execute(
-                    "SELECT revoked, calls_made, max_calls, expires_at FROM tool_broker_tokens WHERE token_id = ?",
-                    (token_id,)
-                ).fetchone()
-                if row:
-                    db_revoked, db_calls, db_max, db_exp = row
-                    if db_revoked:
-                        self._revoked_token_ids.add(token_id)
-                        raise CapabilityTokenRevokedError(f"Token de capacidade {token_id} foi revogado")
-                    if db_calls >= db_max:
-                        raise BrokerRateLimitExceededError(
-                            f"Limite de chamadas do token ({db_max}) atingido pelo worker"
-                        )
+                with self._lock:
+                    row = self.store.db.execute(
+                        "SELECT revoked, calls_made, max_calls, expires_at FROM tool_broker_tokens WHERE token_id = ?",
+                        (token_id,)
+                    ).fetchone()
+                    if row:
+                        db_revoked, db_calls, db_max, db_exp = row
+                        if db_revoked:
+                            self._revoked_token_ids.add(token_id)
+                            raise CapabilityTokenRevokedError(f"Token de capacidade {token_id} foi revogado")
+                        if db_calls >= db_max:
+                            raise BrokerRateLimitExceededError(
+                                f"Limite de chamadas do token ({db_max}) atingido pelo worker"
+                            )
             except sqlite3.Error as e:
                 raise ToolAuditPersistenceError(f"Falha de persistencia na verificacao de tokens: {e}") from e
 
@@ -401,38 +409,39 @@ class CapabilityTokenManager:
         # 9. Atomic increment in SQLite
         if hasattr(self.store, "db") and self.store.db:
             try:
-                cursor = self.store.db.execute("""
-                    UPDATE tool_broker_tokens
-                    SET calls_made = calls_made + 1
-                    WHERE token_id = ? AND calls_made < max_calls AND revoked = 0 AND expires_at > ?
-                """, (token_id, now))
-                self.store.db.commit()
-                if cursor.rowcount == 0:
-                    check_row = self.store.db.execute(
-                        "SELECT revoked, calls_made, max_calls, expires_at FROM tool_broker_tokens WHERE token_id = ?",
-                        (token_id,)
-                    ).fetchone()
-                    if check_row:
-                        if check_row[0]:
-                            self._revoked_token_ids.add(token_id)
-                            raise CapabilityTokenRevokedError(f"Token de capacidade {token_id} foi revogado")
-                        if check_row[1] >= check_row[2]:
-                            raise BrokerRateLimitExceededError(f"Limite de chamadas do token ({check_row[2]}) atingido pelo worker")
-                        if now >= check_row[3]:
-                            raise CapabilityTokenExpiredError("Token de capacidade expirado pelo TTL de seguranca")
-                    else:
-                        self.store.db.execute("""
-                            INSERT INTO tool_broker_tokens (
-                                token_id, task_id, run_id, worker_pid, worker_create_time_ns,
-                                project_root, allowed_tools_json, created_at, expires_at,
-                                max_calls, calls_made, nonce, revoked
-                            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, 0)
-                        """, (
-                            cap.token_id, cap.task_id, cap.run_id, cap.worker_pid, cap.worker_create_time_ns,
-                            cap.project_root, json.dumps(cap.allowed_tools), cap.created_at, cap.expires_at,
-                            cap.max_calls, cap.nonce
-                        ))
-                        self.store.db.commit()
+                with self._lock:
+                    cursor = self.store.db.execute("""
+                        UPDATE tool_broker_tokens
+                        SET calls_made = calls_made + 1
+                        WHERE token_id = ? AND calls_made < max_calls AND revoked = 0 AND expires_at > ?
+                    """, (token_id, now))
+                    self.store.db.commit()
+                    if cursor.rowcount == 0:
+                        check_row = self.store.db.execute(
+                            "SELECT revoked, calls_made, max_calls, expires_at FROM tool_broker_tokens WHERE token_id = ?",
+                            (token_id,)
+                        ).fetchone()
+                        if check_row:
+                            if check_row[0]:
+                                self._revoked_token_ids.add(token_id)
+                                raise CapabilityTokenRevokedError(f"Token de capacidade {token_id} foi revogado")
+                            if check_row[1] >= check_row[2]:
+                                raise BrokerRateLimitExceededError(f"Limite de chamadas do token ({check_row[2]}) atingido pelo worker")
+                            if now >= check_row[3]:
+                                raise CapabilityTokenExpiredError("Token de capacidade expirado pelo TTL de seguranca")
+                        else:
+                            self.store.db.execute("""
+                                INSERT INTO tool_broker_tokens (
+                                    token_id, task_id, run_id, worker_pid, worker_create_time_ns,
+                                    project_root, allowed_tools_json, created_at, expires_at,
+                                    max_calls, calls_made, nonce, revoked
+                                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, 0)
+                            """, (
+                                cap.token_id, cap.task_id, cap.run_id, cap.worker_pid, cap.worker_create_time_ns,
+                                cap.project_root, json.dumps(cap.allowed_tools), cap.created_at, cap.expires_at,
+                                cap.max_calls, cap.nonce
+                            ))
+                            self.store.db.commit()
             except sqlite3.Error as e:
                 raise ToolAuditPersistenceError(f"Falha de persistencia no contador de chamadas do token: {e}") from e
 
@@ -588,10 +597,11 @@ class ToolBroker:
         registry: Optional[ToolRegistry] = None,
     ):
         self.store = store
+        self._lock = getattr(store, "_lock", None) or threading.RLock()
         self.supervisor_key = getattr(store, "supervisor_key", "default_supervisor_key_hex")
         self.coordinator_private_dir = getattr(store, "root", None)
 
-        self.token_manager = token_manager or CapabilityTokenManager(self.supervisor_key, store=self.store)
+        self.token_manager = token_manager or CapabilityTokenManager(self.supervisor_key, store=self.store, lock=self._lock)
         self.registry = registry or ToolRegistry()
         self.audit_log: List[BrokerAuditRecord] = []
         self.pending_approvals: Dict[str, Dict[str, Any]] = {}
@@ -719,7 +729,7 @@ class ToolBroker:
                 run_id="unknown",
                 caller_pid=caller_pid,
                 tool_name=tool_name,
-                decision="invalid_token" if isinstance(auth_err, (InvalidCapabilityTokenError, CapabilityTokenExpiredError, CapabilityTokenRevokedError)) else "denied",
+                decision="rate_limited" if isinstance(auth_err, BrokerRateLimitExceededError) else ("invalid_token" if isinstance(auth_err, (InvalidCapabilityTokenError, CapabilityTokenExpiredError, CapabilityTokenRevokedError)) else "denied"),
                 duration_ms=duration_ms,
                 parameters_summary=param_summary,
                 error=str(auth_err),
@@ -873,7 +883,20 @@ class ToolBroker:
                         )
                         raise MutationNotPermittedError(msg)
 
-        # 7. Execute Tool Handler
+        # 7. Pre-execution fail-closed audit persistence: record authorization BEFORE running handler
+        self._record_audit(
+            correlation_id=correlation_id,
+            timestamp=iso_time,
+            task_id=task_id,
+            run_id=run_id,
+            caller_pid=caller_pid,
+            tool_name=tool_name,
+            decision="allowed",
+            duration_ms=0.0,
+            parameters_summary=param_summary,
+        )
+
+        # 8. Execute Tool Handler
         ctx = ToolBrokerContext(
             task_id=task_id,
             run_id=run_id,
@@ -892,12 +915,12 @@ class ToolBroker:
 
             self._record_audit(
                 correlation_id=correlation_id,
-                timestamp=iso_time,
+                timestamp=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
                 task_id=task_id,
                 run_id=run_id,
                 caller_pid=caller_pid,
                 tool_name=tool_name,
-                decision="allowed",
+                decision="completed",
                 duration_ms=duration_ms,
                 parameters_summary=param_summary,
                 result_summary=res_summary,
@@ -912,7 +935,7 @@ class ToolBroker:
             duration_ms = (time.monotonic() - start_time) * 1000.0
             self._record_audit(
                 correlation_id=correlation_id,
-                timestamp=iso_time,
+                timestamp=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
                 task_id=task_id,
                 run_id=run_id,
                 caller_pid=caller_pid,
@@ -939,9 +962,12 @@ class ToolBroker:
     def process_mailbox(
         self,
         sandbox_root: Union[str, Path],
-        expected_worker_pid: Optional[int] = None,
+        expected_worker_pid: int,
     ) -> List[Dict[str, Any]]:
-        """Process requests sent through the file-based sandbox mailbox with anti-symlink protection."""
+        """Process requests sent through the file-based sandbox mailbox with anti-symlink and anti-spoofing protection."""
+        if expected_worker_pid is None or int(expected_worker_pid) <= 0:
+            raise CallerIdentityMismatchError("Mailbox exige identificacao confiavel do worker supervisor (expected_worker_pid obrigatorio e positivo)")
+
         sbox = Path(sandbox_root).resolve()
         req_dir = sbox / ".broker" / "requests"
         res_dir = sbox / ".broker" / "responses"
@@ -978,14 +1004,11 @@ class ToolBroker:
                 declared_pid = payload.get("caller_pid")
 
                 # Anti-spoofing: verify caller PID against sandbox's expected worker PID
-                if expected_worker_pid is not None:
-                    if declared_pid is not None and int(declared_pid) != int(expected_worker_pid):
-                        raise CallerIdentityMismatchError(
-                            f"Mailbox spoofing detectado: caller_pid ({declared_pid}) diverge do worker da sandbox ({expected_worker_pid})"
-                        )
-                    effective_pid = int(expected_worker_pid)
-                else:
-                    effective_pid = int(declared_pid) if declared_pid is not None else None
+                if declared_pid is not None and int(declared_pid) != int(expected_worker_pid):
+                    raise CallerIdentityMismatchError(
+                        f"Mailbox spoofing detectado: caller_pid ({declared_pid}) diverge do worker da sandbox ({expected_worker_pid})"
+                    )
+                effective_pid = int(expected_worker_pid)
 
                 res = self.execute(
                     token_str=token_str,
@@ -1048,18 +1071,19 @@ class ToolBroker:
 
         if hasattr(self.store, "db") and self.store.db:
             try:
-                self.store.db.execute("""
-                    INSERT INTO tool_broker_audit (
+                with getattr(self, "_lock", threading.Lock()):
+                    self.store.db.execute("""
+                        INSERT INTO tool_broker_audit (
+                            correlation_id, task_id, run_id, caller_pid,
+                            tool_name, decision, parameters_summary,
+                            result_summary, error, duration_ms, created_at
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """, (
                         correlation_id, task_id, run_id, caller_pid,
                         tool_name, decision, parameters_summary,
-                        result_summary, error, duration_ms, created_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """, (
-                    correlation_id, task_id, run_id, caller_pid,
-                    tool_name, decision, parameters_summary,
-                    result_summary, error, duration_ms, timestamp
-                ))
-                self.store.db.commit()
+                        result_summary, error, duration_ms, timestamp
+                    ))
+                    self.store.db.commit()
             except Exception as e:
                 raise ToolAuditPersistenceError(f"Falha critica ao persistir auditoria do broker: {e}") from e
 

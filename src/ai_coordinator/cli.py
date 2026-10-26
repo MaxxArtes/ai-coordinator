@@ -244,7 +244,27 @@ def run_worker(store, config, ident, category, input_file, max_attempts=None):
                     )
                     fs_sandbox = ExecutionSandbox(sandbox_cfg)
                     fs_sandbox.prepare()
+                    if hasattr(store, "worker_audit") and store.worker_audit:
+                        try:
+                            store.worker_audit.record_event(
+                                event_type="sandbox_prepared",
+                                task_id=ident,
+                                run_id=run_id,
+                                details={"sandbox_root": str(folder), "enforce_os_boundary": enforce_fs},
+                            )
+                        except Exception:
+                            pass
                 except Exception as sbox_err:
+                    if hasattr(store, "worker_audit") and store.worker_audit:
+                        try:
+                            store.worker_audit.record_event(
+                                event_type="sandbox_denied",
+                                task_id=ident,
+                                run_id=run_id,
+                                error=str(sbox_err),
+                            )
+                        except Exception:
+                            pass
                     if enforce_fs:
                         raise RuntimeError(f"Falha na ativacao da sandbox de filesystem obrigatoria: {sbox_err}")
                     fs_sandbox = None
@@ -275,6 +295,21 @@ def run_worker(store, config, ident, category, input_file, max_attempts=None):
                     details=f"Spawned {candidate['client']} worker PID {proc.pid}",
                 )
                 store.record_heartbeat(run_id)
+
+                if hasattr(store, "worker_audit") and store.worker_audit:
+                    try:
+                        ident_dict = proc.identity.to_dict() if hasattr(proc.identity, "to_dict") else {"pid": proc.pid, "create_time_ns": getattr(proc.identity, "create_time_ns", None)}
+                        store.worker_audit.record_event(
+                            event_type="spawn",
+                            task_id=ident,
+                            run_id=run_id,
+                            worker_pid=proc.pid,
+                            process_identity=ident_dict,
+                            limits=limits,
+                            details={"client": candidate["client"], "model": candidate["model"]},
+                        )
+                    except Exception:
+                        pass
                 
                 from .streaming import SafeStreamConsumer
                 timeout = min(600, candidate.get("timeout_seconds", limits["timeout_seconds"]))
@@ -300,12 +335,47 @@ def run_worker(store, config, ident, category, input_file, max_attempts=None):
                 break
             except (OSError, ValueError, RuntimeError, TimeoutError) as exc:
                 attempts[-1].update(status="failed", error=scrub(str(exc))[:1500], ended=now())
+                if isinstance(exc, TimeoutError) and hasattr(store, "worker_audit") and store.worker_audit:
+                    try:
+                        store.worker_audit.record_event(
+                            event_type="timeout",
+                            task_id=ident,
+                            run_id=run_id,
+                            worker_pid=proc.pid if proc else None,
+                            reason=f"Timeout atingido: {exc}",
+                        )
+                    except Exception:
+                        pass
                 if isinstance(exc, (OSError, ValueError, TimeoutError)):
                     health.record(candidate['client'], candidate['model'], False, scrub(str(exc)))
                 result = ""
             finally:
                 if proc is not None and proc.poll() is None:
+                    if hasattr(store, "worker_audit") and store.worker_audit:
+                        try:
+                            store.worker_audit.record_event(
+                                event_type="termination",
+                                task_id=ident,
+                                run_id=run_id,
+                                worker_pid=proc.pid,
+                                reason="Encerramento de processo ativo por terminate_tree",
+                            )
+                        except Exception:
+                            pass
                     terminate_tree(proc)
+                if proc is not None and hasattr(store, "worker_audit") and store.worker_audit:
+                    try:
+                        rc = stream_res.returncode if 'stream_res' in locals() and stream_res else proc.poll()
+                        store.worker_audit.record_event(
+                            event_type="exit",
+                            task_id=ident,
+                            run_id=run_id,
+                            worker_pid=proc.pid,
+                            resource_usage={"exit_code": rc},
+                            details={"client": candidate["client"], "status": "complete" if (rc == 0 and result) else "failed"},
+                        )
+                    except Exception:
+                        pass
                 if fs_sandbox is not None:
                     try:
                         fs_sandbox.cleanup()

@@ -13,6 +13,7 @@ import hmac
 import json
 import os
 from pathlib import Path
+import threading
 import time
 from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 import uuid
@@ -23,6 +24,7 @@ class WorkerAuditEventType(str, Enum):
     SANDBOX_PREPARED = "sandbox_prepared"
     SANDBOX_DENIED = "sandbox_denied"
     TOOL_REQUESTED = "tool_requested"
+    TOOL_ALLOWED = "tool_allowed"
     TOOL_DENIED = "tool_denied"
     EXIT = "exit"
     TIMEOUT = "timeout"
@@ -63,7 +65,47 @@ class WorkerAuditRecord:
     chain_hash: str
     record_signature: str
     created_at: str
+    prev_hash: str = GENESIS_HASH
     id: Optional[int] = None
+
+
+def compute_canonical_record_hash(
+    prev_hash: str,
+    sequence_number: int,
+    task_id: str,
+    run_id: str,
+    worker_pid: Optional[int],
+    process_identity_json: Optional[str],
+    event_type: str,
+    correlation_id: str,
+    operational_revision: int,
+    limits_json: Optional[str],
+    resource_usage_json: Optional[str],
+    reason: Optional[str],
+    error: Optional[str],
+    details_json: Optional[str],
+    created_at: str,
+) -> str:
+    """Compute deterministic SHA-256 hash over canonical representation of all 15 audit fields."""
+    elements = [
+        prev_hash,
+        sequence_number,
+        task_id,
+        run_id,
+        worker_pid,
+        process_identity_json,
+        event_type,
+        correlation_id,
+        operational_revision,
+        limits_json,
+        resource_usage_json,
+        reason,
+        error,
+        details_json,
+        created_at,
+    ]
+    raw = json.dumps(elements, separators=(",", ":"), ensure_ascii=False)
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
 def sanitize_audit_payload(obj: Any) -> Any:
@@ -96,6 +138,7 @@ class WorkerAuditLogger:
         if not self.supervisor_secret:
             raise ValueError("supervisor_key obrigatoria para assinatura da trilha de auditoria")
 
+        self._lock = getattr(store, "_lock", None) or threading.RLock()
         self._init_table()
 
     def _init_table(self) -> None:
@@ -122,17 +165,28 @@ class WorkerAuditLogger:
                 details_json TEXT,
                 chain_hash TEXT NOT NULL,
                 record_signature TEXT NOT NULL,
-                created_at TEXT NOT NULL
+                created_at TEXT NOT NULL,
+                prev_hash TEXT NOT NULL DEFAULT '0000000000000000000000000000000000000000000000000000000000000000'
             )
         """)
+
+        # Backwards compatibility check for existing tables without prev_hash
+        try:
+            cursor = self.store.db.execute("PRAGMA table_info(worker_audit_log)")
+            cols = [row[1] for row in cursor.fetchall()]
+            if "prev_hash" not in cols:
+                self.store.db.execute("ALTER TABLE worker_audit_log ADD COLUMN prev_hash TEXT NOT NULL DEFAULT '0000000000000000000000000000000000000000000000000000000000000000'")
+        except Exception:
+            pass
 
         # Indexes for authorized queries
         self.store.db.execute("CREATE INDEX IF NOT EXISTS idx_worker_audit_task ON worker_audit_log(task_id, sequence_number)")
         self.store.db.execute("CREATE INDEX IF NOT EXISTS idx_worker_audit_run ON worker_audit_log(run_id)")
         self.store.db.execute("CREATE INDEX IF NOT EXISTS idx_worker_audit_corr ON worker_audit_log(correlation_id)")
         self.store.db.execute("CREATE INDEX IF NOT EXISTS idx_worker_audit_type ON worker_audit_log(event_type)")
+        self.store.db.execute("CREATE INDEX IF NOT EXISTS idx_worker_audit_seq ON worker_audit_log(sequence_number)")
 
-        # Strict SQL immutability triggers (block UPDATE and DELETE)
+        # Strict SQL immutability triggers on worker_audit_log (block UPDATE and DELETE)
         self.store.db.execute("""
             CREATE TRIGGER IF NOT EXISTS prevent_worker_audit_update
             BEFORE UPDATE ON worker_audit_log
@@ -147,6 +201,32 @@ class WorkerAuditLogger:
                 SELECT RAISE(ABORT, 'worker_audit_log e append-only e imutavel: DELETE proibido');
             END;
         """)
+
+        # Anchoring table for tail-truncation defense
+        self.store.db.execute("""
+            CREATE TABLE IF NOT EXISTS worker_audit_anchors (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                last_sequence_number INTEGER NOT NULL,
+                last_chain_hash TEXT NOT NULL,
+                anchor_signature TEXT NOT NULL,
+                anchored_at TEXT NOT NULL
+            )
+        """)
+        self.store.db.execute("""
+            CREATE TRIGGER IF NOT EXISTS prevent_worker_audit_anchor_update
+            BEFORE UPDATE ON worker_audit_anchors
+            BEGIN
+                SELECT RAISE(ABORT, 'worker_audit_anchors e append-only e imutavel: UPDATE proibido');
+            END;
+        """)
+        self.store.db.execute("""
+            CREATE TRIGGER IF NOT EXISTS prevent_worker_audit_anchor_delete
+            BEFORE DELETE ON worker_audit_anchors
+            BEGIN
+                SELECT RAISE(ABORT, 'worker_audit_anchors e append-only e imutavel: DELETE proibido');
+            END;
+        """)
+
         self.store.db.commit()
 
     def record_event(
@@ -180,56 +260,93 @@ class WorkerAuditLogger:
         clean_ident = sanitize_audit_payload(process_identity) if process_identity else None
 
         try:
-            # Query last sequence_number and chain_hash for this task & run (or globally)
-            row = self.store.db.execute("""
-                SELECT sequence_number, chain_hash
-                FROM worker_audit_log
-                WHERE task_id = ? AND run_id = ?
-                ORDER BY sequence_number DESC LIMIT 1
-            """, (str(task_id), str(run_id))).fetchone()
+            with self._lock:
+                # Query last sequence_number and chain_hash globally across the store
+                row = self.store.db.execute("""
+                    SELECT sequence_number, chain_hash
+                    FROM worker_audit_log
+                    ORDER BY sequence_number DESC, id DESC LIMIT 1
+                """).fetchone()
 
-            if row:
-                prev_seq, prev_hash = row[0], row[1]
-                seq_num = prev_seq + 1
-            else:
-                prev_hash = GENESIS_HASH
-                seq_num = 1
+                if row:
+                    prev_seq, prev_hash = row[0], row[1]
+                    seq_num = prev_seq + 1
+                else:
+                    prev_hash = GENESIS_HASH
+                    seq_num = 1
 
-            # Cryptographic hash chaining: H(prev_hash || seq || event_type || corr || task || run || created_at)
-            chain_payload = f"{prev_hash}:{seq_num}:{evt_type_str}:{corr_id}:{task_id}:{run_id}:{created_at}"
-            chain_hash = hashlib.sha256(chain_payload.encode("utf-8")).hexdigest()
+                ident_json = json.dumps(clean_ident, sort_keys=True, separators=(",", ":")) if clean_ident else None
+                limits_json = json.dumps(clean_limits, sort_keys=True, separators=(",", ":")) if clean_limits else None
+                usage_json = json.dumps(clean_usage, sort_keys=True, separators=(",", ":")) if clean_usage else None
+                details_json = json.dumps(clean_details, sort_keys=True, separators=(",", ":")) if clean_details else None
 
-            # Record HMAC signature
-            sig = hmac.new(self.supervisor_secret, chain_hash.encode("ascii"), hashlib.sha256).hexdigest()
+                # Canonical deterministic hash chaining over ALL 15 fields
+                chain_hash = compute_canonical_record_hash(
+                    prev_hash=prev_hash,
+                    sequence_number=seq_num,
+                    task_id=str(task_id),
+                    run_id=str(run_id),
+                    worker_pid=int(worker_pid) if worker_pid is not None else None,
+                    process_identity_json=ident_json,
+                    event_type=evt_type_str,
+                    correlation_id=corr_id,
+                    operational_revision=int(operational_revision),
+                    limits_json=limits_json,
+                    resource_usage_json=usage_json,
+                    reason=reason,
+                    error=error,
+                    details_json=details_json,
+                    created_at=created_at,
+                )
 
-            self.store.db.execute("""
-                INSERT INTO worker_audit_log (
-                    event_id, sequence_number, task_id, run_id, worker_pid,
-                    process_identity, event_type, correlation_id,
-                    operational_revision, limits_json, resource_usage_json,
-                    reason, error, details_json, chain_hash, record_signature,
-                    created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """, (
-                event_id,
-                seq_num,
-                str(task_id),
-                str(run_id),
-                int(worker_pid) if worker_pid is not None else None,
-                json.dumps(clean_ident) if clean_ident else None,
-                evt_type_str,
-                corr_id,
-                int(operational_revision),
-                json.dumps(clean_limits) if clean_limits else None,
-                json.dumps(clean_usage) if clean_usage else None,
-                reason,
-                error,
-                json.dumps(clean_details) if clean_details else None,
-                chain_hash,
-                sig,
-                created_at,
-            ))
-            self.store.db.commit()
+                # Record HMAC signature
+                sig = hmac.new(self.supervisor_secret, chain_hash.encode("ascii"), hashlib.sha256).hexdigest()
+
+                # Record tail-anchoring entry
+                anchor_payload = f"ANCHOR:{seq_num}:{chain_hash}:{created_at}"
+                anchor_sig = hmac.new(self.supervisor_secret, anchor_payload.encode("ascii"), hashlib.sha256).hexdigest()
+
+                self.store.db.execute("""
+                    INSERT INTO worker_audit_log (
+                        event_id, sequence_number, task_id, run_id, worker_pid,
+                        process_identity, event_type, correlation_id,
+                        operational_revision, limits_json, resource_usage_json,
+                        reason, error, details_json, chain_hash, record_signature,
+                        created_at, prev_hash
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """, (
+                    event_id,
+                    seq_num,
+                    str(task_id),
+                    str(run_id),
+                    int(worker_pid) if worker_pid is not None else None,
+                    ident_json,
+                    evt_type_str,
+                    corr_id,
+                    int(operational_revision),
+                    limits_json,
+                    usage_json,
+                    reason,
+                    error,
+                    details_json,
+                    chain_hash,
+                    sig,
+                    created_at,
+                    prev_hash,
+                ))
+
+                self.store.db.execute("""
+                    INSERT INTO worker_audit_anchors (
+                        last_sequence_number, last_chain_hash, anchor_signature, anchored_at
+                    ) VALUES (?, ?, ?, ?)
+                """, (
+                    seq_num,
+                    chain_hash,
+                    anchor_sig,
+                    created_at,
+                ))
+
+                self.store.db.commit()
 
             return WorkerAuditRecord(
                 event_id=event_id,
@@ -249,6 +366,7 @@ class WorkerAuditLogger:
                 chain_hash=chain_hash,
                 record_signature=sig,
                 created_at=created_at,
+                prev_hash=prev_hash,
             )
         except Exception as e:
             # Fail-closed policy: audit persistence failures must abort privileged execution
@@ -259,59 +377,113 @@ class WorkerAuditLogger:
         task_id: Optional[str] = None,
         run_id: Optional[str] = None,
     ) -> Tuple[bool, List[str]]:
-        """Verify cryptographic hash chaining and HMAC signatures across audit entries."""
+        """Verify cryptographic hash chaining, canonical payload integrity, HMAC, and tail truncation."""
         if not hasattr(self.store, "db") or not self.store.db:
             return False, ["Base de dados indisponivel"]
 
-        query = "SELECT * FROM worker_audit_log WHERE 1=1"
-        params: list[Any] = []
-        if task_id:
-            query += " AND task_id = ?"
-            params.append(str(task_id))
-        if run_id:
-            query += " AND run_id = ?"
-            params.append(str(run_id))
+        errors: List[str] = []
 
-        query += " ORDER BY sequence_number ASC, id ASC"
-        rows = self.store.db.execute(query, params).fetchall()
+        # 1. Verify Anchors against tail truncation
+        try:
+            anchor_rows = self.store.db.execute("""
+                SELECT last_sequence_number, last_chain_hash, anchor_signature, anchored_at
+                FROM worker_audit_anchors
+                ORDER BY id DESC LIMIT 1
+            """).fetchall()
 
-        if not rows:
-            return True, []
+            max_log_row = self.store.db.execute("""
+                SELECT sequence_number, chain_hash
+                FROM worker_audit_log
+                ORDER BY sequence_number DESC, id DESC LIMIT 1
+            """).fetchone()
 
-        errors = []
+            if anchor_rows:
+                last_anc_seq, last_anc_hash, last_anc_sig, last_anc_time = anchor_rows[0]
+                expected_anc_payload = f"ANCHOR:{last_anc_seq}:{last_anc_hash}:{last_anc_time}"
+                expected_anc_sig = hmac.new(self.supervisor_secret, expected_anc_payload.encode("ascii"), hashlib.sha256).hexdigest()
+                if not hmac.compare_digest(last_anc_sig, expected_anc_sig):
+                    errors.append(f"Assinatura HMAC invalida na tabela de ancoragem (ancora seq {last_anc_seq})")
+
+                if not max_log_row:
+                    errors.append(f"Truncamento total detectado: tabela worker_audit_log vazia, mas ancora seq {last_anc_seq} existe")
+                else:
+                    max_seq, max_hash = max_log_row[0], max_log_row[1]
+                    if max_seq < last_anc_seq:
+                        errors.append(f"Truncamento de log detectado: ultima sequencia no log ({max_seq}) e inferior a sequencia ancorada ({last_anc_seq})")
+                    elif max_hash != last_anc_hash and max_seq == last_anc_seq:
+                        errors.append(f"Divergencia entre o chain_hash do log ({max_hash}) e a ancora ({last_anc_hash}) na seq {last_anc_seq}")
+        except Exception as anchor_err:
+            errors.append(f"Falha ao consultar tabela de ancoragem: {anchor_err}")
+
+        # 2. Sequential linear verification across the whole log
+        all_rows = self.store.db.execute("""
+            SELECT
+                id, event_id, sequence_number, task_id, run_id, worker_pid,
+                process_identity, event_type, correlation_id, operational_revision,
+                limits_json, resource_usage_json, reason, error, details_json,
+                chain_hash, record_signature, created_at, prev_hash
+            FROM worker_audit_log
+            ORDER BY sequence_number ASC, id ASC
+        """).fetchall()
+
+        if not all_rows:
+            return len(errors) == 0, errors
+
         prev_hash = GENESIS_HASH
         expected_seq = 1
+        scoped_found = False
 
-        for r in rows:
-            # row mapping
-            # (id, event_id, sequence_number, task_id, run_id, worker_pid, process_identity,
-            #  event_type, correlation_id, operational_revision, limits_json, resource_usage_json,
-            #  reason, error, details_json, chain_hash, record_signature, created_at)
-            seq = r[2]
-            t_id = r[3]
-            r_id = r[4]
-            evt_type = r[7]
-            corr = r[8]
-            rec_chain = r[15]
-            rec_sig = r[16]
-            created = r[17]
+        for r in all_rows:
+            (
+                r_id, event_id, seq, t_id, r_un_id, w_pid,
+                proc_ident, evt_type, corr, op_rev,
+                lim_json, res_json, reas, err, det_json,
+                rec_chain, rec_sig, created, stored_prev_hash
+            ) = r
+
+            if task_id and t_id == str(task_id):
+                scoped_found = True
+            if run_id and r_un_id == str(run_id):
+                scoped_found = True
 
             if seq != expected_seq:
-                errors.append(f"Quebra de sequencia no evento {r[1]}: esperado {expected_seq}, encontrado {seq}")
+                errors.append(f"Quebra de sequencia no evento {event_id}: esperado {expected_seq}, encontrado {seq}")
 
-            # Recalculate hash
-            expected_payload = f"{prev_hash}:{seq}:{evt_type}:{corr}:{t_id}:{r_id}:{created}"
-            expected_chain = hashlib.sha256(expected_payload.encode("utf-8")).hexdigest()
+            if stored_prev_hash and stored_prev_hash != prev_hash:
+                errors.append(f"Divergencia de prev_hash no evento {event_id} (seq {seq})")
+
+            # Canonical hash recomputation over ALL fields
+            expected_chain = compute_canonical_record_hash(
+                prev_hash=prev_hash,
+                sequence_number=seq,
+                task_id=t_id,
+                run_id=r_un_id,
+                worker_pid=w_pid,
+                process_identity_json=proc_ident,
+                event_type=evt_type,
+                correlation_id=corr,
+                operational_revision=op_rev,
+                limits_json=lim_json,
+                resource_usage_json=res_json,
+                reason=reas,
+                error=err,
+                details_json=det_json,
+                created_at=created,
+            )
+
             if rec_chain != expected_chain:
-                errors.append(f"Adulteracao de chain_hash no evento {r[1]} (seq {seq})")
+                errors.append(f"Adulteracao de chain_hash no evento {event_id} (seq {seq})")
 
             # Verify HMAC
             expected_sig = hmac.new(self.supervisor_secret, rec_chain.encode("ascii"), hashlib.sha256).hexdigest()
             if not hmac.compare_digest(rec_sig, expected_sig):
-                errors.append(f"Assinatura HMAC invalida no evento {r[1]} (seq {seq})")
+                errors.append(f"Assinatura HMAC invalida no evento {event_id} (seq {seq})")
 
             prev_hash = rec_chain
             expected_seq += 1
+
+        if (task_id or run_id) and not scoped_found:
+            errors.append(f"Nenhum evento localizado para o escopo task_id='{task_id}' run_id='{run_id}'")
 
         return len(errors) == 0, errors
 
@@ -327,7 +499,14 @@ class WorkerAuditLogger:
         if not hasattr(self.store, "db") or not self.store.db:
             return []
 
-        query = "SELECT * FROM worker_audit_log WHERE 1=1"
+        query = """
+            SELECT
+                id, event_id, sequence_number, task_id, run_id, worker_pid,
+                process_identity, event_type, correlation_id, operational_revision,
+                limits_json, resource_usage_json, reason, error, details_json,
+                chain_hash, record_signature, created_at, prev_hash
+            FROM worker_audit_log WHERE 1=1
+        """
         params: list[Any] = []
         if task_id:
             query += " AND task_id = ?"
@@ -367,5 +546,6 @@ class WorkerAuditLogger:
                 chain_hash=r[15],
                 record_signature=r[16],
                 created_at=r[17],
+                prev_hash=r[18] if len(r) > 18 and r[18] else GENESIS_HASH,
             ))
         return records

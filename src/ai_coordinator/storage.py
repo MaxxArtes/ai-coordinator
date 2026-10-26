@@ -13,6 +13,7 @@ import re
 import secrets
 import shutil
 import sqlite3
+import threading
 import time
 from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Set, Tuple, Union
 import uuid
@@ -307,7 +308,8 @@ class Store:
     def __init__(self, root: Union[str, Path], supervisor_key: Optional[str] = None):
         self.root = Path(root)
         self.root.mkdir(parents=True, exist_ok=True)
-        self.db = sqlite3.connect(self.root / "coordination.sqlite", timeout=20.0)
+        self._lock = threading.RLock()
+        self.db = sqlite3.connect(self.root / "coordination.sqlite", timeout=20.0, check_same_thread=False)
         self.db.row_factory = sqlite3.Row
         self.db.execute("PRAGMA journal_mode=WAL")
         self.db.execute("PRAGMA synchronous=NORMAL")
