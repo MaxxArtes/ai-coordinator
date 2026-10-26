@@ -124,6 +124,14 @@ class Phase4B52FilesystemSandboxTests(unittest.TestCase):
             proc.close()
             sandbox.cleanup()
 
+    def _is_os_boundary_enforced(self) -> bool:
+        """Check if an OS-level mandatory boundary is active on the current host."""
+        return (
+            os.name == "nt"
+            or (sys.platform.startswith("linux") and LinuxLandlockController.is_available())
+            or (sys.platform == "darwin" and MacOsSeatbeltController.is_available())
+        )
+
     def test_01_worker_cannot_open_supervisor_secret(self):
         """Worker running in sandbox must be denied access by OS when attempting to read supervisor.secret."""
         script = f"""import sys, pathlib
@@ -136,8 +144,7 @@ except (PermissionError, OSError) as e:
     sys.exit(42)
 """
         code, stdout, stderr = self._run_worker_script(script)
-        # On Windows AppContainer or Landlock/Seatbelt, it returns code 42 with ACCESS_DENIED
-        if os.name == "nt":
+        if self._is_os_boundary_enforced():
             self.assertEqual(code, 42)
             self.assertIn("ACCESS_DENIED", stdout)
             self.assertNotIn("LEAKED", stdout)
@@ -154,7 +161,7 @@ except (PermissionError, OSError) as e:
     sys.exit(42)
 """
         code, stdout, stderr = self._run_worker_script(script)
-        if os.name == "nt":
+        if self._is_os_boundary_enforced():
             self.assertEqual(code, 42)
             self.assertIn("SQLITE_DENIED", stdout)
             self.assertNotIn("LEAKED_SQLITE", stdout)
@@ -172,7 +179,7 @@ print(f"DENIED_COUNT: {{denied_count}}")
 sys.exit(42 if denied_count == 3 else 0)
 """
         code, stdout, stderr = self._run_worker_script(script)
-        if os.name == "nt":
+        if self._is_os_boundary_enforced():
             self.assertEqual(code, 42)
             self.assertIn("DENIED_COUNT: 3", stdout)
 
@@ -190,7 +197,7 @@ except (PermissionError, OSError) as e:
 """
         code, stdout, stderr = self._run_worker_script(script)
         self.assertFalse(target_sibling_write.exists())
-        if os.name == "nt":
+        if self._is_os_boundary_enforced():
             self.assertEqual(code, 42)
             self.assertIn("WRITE_DENIED", stdout)
 
@@ -243,7 +250,7 @@ except (PermissionError, OSError) as e:
     sys.exit(42)
 """
         code, stdout, stderr = self._run_worker_script(script)
-        if os.name == "nt":
+        if self._is_os_boundary_enforced():
             self.assertEqual(code, 42)
             self.assertIn("HOME_DENIED", stdout)
             self.assertNotIn("LEAKED_HOME", stdout)

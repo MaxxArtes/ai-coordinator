@@ -189,36 +189,38 @@ def validate_contained_path(relative_or_abs_path: Union[str, Path], sandbox_root
     root_resolved = Path(sandbox_root).resolve()
     target = Path(relative_or_abs_path)
 
-    # 1. Reject paths that start with '/' or drive letters if given as relative import
+    # 1. Reject paths with '..' traversal attempts
+    parts = target.parts
+    if ".." in parts:
+        raise PathTraversalError(f"Tentativa de path traversal detectada com '..': '{relative_or_abs_path}'")
+
     if target.is_absolute():
+        unresolved_full = target
         resolved_target = target.resolve()
     else:
-        # Check raw parts for '..' traversal attempts
-        parts = target.parts
-        if ".." in parts:
-            raise PathTraversalError(f"Tentativa de path traversal detectada com '..': '{relative_or_abs_path}'")
-        resolved_target = (root_resolved / target).resolve()
+        unresolved_full = root_resolved / target
+        resolved_target = unresolved_full.resolve()
 
-    # 2. Check strict containment
+    # 2. Check if the path or any intermediate component is a symlink or reparse point
+    is_sym = False
+    curr = unresolved_full
+    while curr != root_resolved and curr != curr.parent:
+        if is_reparse_point_or_symlink(curr):
+            is_sym = True
+            break
+        curr = curr.parent
+
+    # 3. Check strict containment
     try:
         resolved_target.relative_to(root_resolved)
     except ValueError:
+        if is_sym:
+            raise ReparseEscapeError(
+                f"Fronteira violada: symlink/junction '{relative_or_abs_path}' aponta para fora da sandbox: '{resolved_target}'"
+            )
         raise PathTraversalError(
             f"Acesso negado: caminho '{relative_or_abs_path}' escapa da raiz autorizada '{root_resolved}'"
         )
-
-    # 3. Check for symlink / reparse point escape
-    curr = resolved_target
-    while curr != root_resolved and curr != curr.parent:
-        if is_reparse_point_or_symlink(curr):
-            try:
-                real_target = curr.resolve()
-                real_target.relative_to(root_resolved)
-            except ValueError:
-                raise ReparseEscapeError(
-                    f"Fronteira violada: symlink/junction '{curr}' aponta para fora da sandbox: '{curr.resolve()}'"
-                )
-        curr = curr.parent
 
     return resolved_target
 
@@ -390,7 +392,22 @@ class LinuxLandlockController:
     ) -> Callable[[], None]:
         """Construct preexec_fn for subprocess to enforce Landlock restrictions before worker executes."""
         resolved_sandbox = Path(sandbox_root).resolve()
-        resolved_read_roots = [Path(r).resolve() for r in allowed_read_roots]
+        system_roots = [
+            Path("/usr"),
+            Path("/lib"),
+            Path("/lib64"),
+            Path("/bin"),
+            Path("/sbin"),
+            Path("/etc"),
+            Path("/opt"),
+            Path("/dev"),
+            Path(sys.prefix),
+            Path(sys.base_prefix),
+        ]
+        all_read_roots = set(Path(r).resolve() for r in allowed_read_roots)
+        for sr in system_roots:
+            if sr.exists():
+                all_read_roots.add(sr.resolve())
 
         def _preexec() -> None:
             try:
@@ -462,7 +479,7 @@ class LinuxLandlockController:
                     | LANDLOCK_ACCESS_FS_READ_FILE
                     | LANDLOCK_ACCESS_FS_READ_DIR
                 )
-                for rd in resolved_read_roots:
+                for rd in all_read_roots:
                     if rd.exists():
                         try:
                             r_fd = os.open(str(rd), os.O_PATH | os.O_CLOEXEC)
@@ -522,7 +539,9 @@ class MacOsSeatbeltController:
             "(allow process-exec)",
             "(allow process-fork)",
             "(allow sysctl-read)",
-            "(allow file-read* (subpath \"/System\") (subpath \"/usr\") (subpath \"/Library\") (subpath \"/dev\"))",
+            "(allow file-read* (subpath \"/System\") (subpath \"/usr\") (subpath \"/Library\") (subpath \"/dev\") (subpath \"/etc\") (subpath \"/private/etc\") (subpath \"/opt\"))",
+            f"(allow file-read* (subpath \"{Path(sys.prefix).resolve()}\"))",
+            f"(allow file-read* (subpath \"{Path(sys.base_prefix).resolve()}\"))",
             f"(allow file-read* (subpath \"{py_folder}\"))",
             f"(allow file-read* (subpath \"{resolved_sbox}\"))",
             f"(allow file-write* (subpath \"{resolved_sbox}\"))",
