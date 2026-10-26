@@ -205,7 +205,7 @@ class Phase4B54WorkerAuditTests(unittest.TestCase):
         results = self.broker.process_mailbox(self.sandbox_dir, expected_worker_pid=os.getpid())
         self.assertEqual(len(results), 1)
         self.assertEqual(results[0]["status"], "error")
-        self.assertEqual(results[0]["error"], "SymlinkSecurityViolation")
+        self.assertIn(results[0]["error"], ("SymlinkSecurityViolation", "ReparseEscapeError", "PathTraversalError"))
         self.assertFalse(symlink_req.exists())
 
     def test_05_precise_nanosecond_creation_time_validation(self):

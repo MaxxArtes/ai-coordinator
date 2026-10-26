@@ -955,7 +955,6 @@ class ToolBroker:
         for req_file in sorted(req_dir.glob("*.json")):
             try:
                 # Anti-symlink and path containment protection
-                validate_contained_path(req_file, req_dir)
                 if req_file.is_symlink() or is_reparse_point_or_symlink(req_file):
                     status_obj = {
                         "status": "error",
@@ -968,6 +967,8 @@ class ToolBroker:
                         pass
                     results.append(status_obj)
                     continue
+
+                validate_contained_path(req_file, req_dir)
 
                 raw = req_file.read_text(encoding="utf-8")
                 payload = json.loads(raw)
