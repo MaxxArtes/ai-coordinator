@@ -18,6 +18,15 @@ from .tool_broker import (
     CallerIdentityMismatchError,
     MutationNotPermittedError,
     ToolApprovalRequired,
+    ToolAuditPersistenceError,
+)
+from .worker_audit import (
+    WorkerAuditEventType,
+    WorkerAuditRecord,
+    WorkerAuditLogger,
+    WorkerAuditError,
+    WorkerAuditPersistenceError,
+    WorkerAuditIntegrityError,
 )
 from .fs_sandbox import (
     ExecutionSandbox,
@@ -323,6 +332,13 @@ __all__ = [
     "CallerIdentityMismatchError",
     "MutationNotPermittedError",
     "ToolApprovalRequired",
+    "ToolAuditPersistenceError",
+    "WorkerAuditEventType",
+    "WorkerAuditRecord",
+    "WorkerAuditLogger",
+    "WorkerAuditError",
+    "WorkerAuditPersistenceError",
+    "WorkerAuditIntegrityError",
     "ExecutionSandbox",
     "FileSandboxConfig",
     "FileSandboxSecurityError",

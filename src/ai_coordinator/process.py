@@ -261,7 +261,7 @@ class WindowsProcessController:
 
     @staticmethod
     def get_creation_time(pid: int) -> Optional[int]:
-        """Query kernel creation time (100ns FILETIME) for a Windows process."""
+        """Query kernel creation time in Unix nanoseconds for a Windows process."""
         if pid <= 0 or os.name != "nt":
             return None
         h = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
@@ -273,14 +273,17 @@ class WindowsProcessController:
             kt = FILETIME()
             ut = FILETIME()
             if kernel32.GetProcessTimes(h, ctypes.byref(ct), ctypes.byref(et), ctypes.byref(kt), ctypes.byref(ut)):
-                return (ct.dwHighDateTime << 32) + ct.dwLowDateTime
+                filetime_100ns = (ct.dwHighDateTime << 32) + ct.dwLowDateTime
+                # 116444736000000000 is 100ns intervals between 1601-01-01 and 1970-01-01
+                unix_100ns = filetime_100ns - 116444736000000000
+                return unix_100ns * 100
             return None
         finally:
             kernel32.CloseHandle(h)
 
     @classmethod
     def is_running(cls, pid: int, expected_create_time_ns: Optional[int] = None) -> bool:
-        """Check if a Windows process is currently running and matches creation time."""
+        """Check if a Windows process is currently running and matches creation time in Unix nanoseconds."""
         if pid <= 0 or os.name != "nt":
             return False
         h = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE, False, pid)
@@ -293,8 +296,9 @@ class WindowsProcessController:
                 kt = FILETIME()
                 ut = FILETIME()
                 if kernel32.GetProcessTimes(h, ctypes.byref(ct), ctypes.byref(et), ctypes.byref(kt), ctypes.byref(ut)):
-                    actual = (ct.dwHighDateTime << 32) + ct.dwLowDateTime
-                    if actual != expected_create_time_ns:
+                    filetime_100ns = (ct.dwHighDateTime << 32) + ct.dwLowDateTime
+                    actual_ns = (filetime_100ns - 116444736000000000) * 100
+                    if actual_ns != expected_create_time_ns:
                         return False
                 else:
                     return False
@@ -431,7 +435,8 @@ class WindowsProcessController:
             kt = FILETIME()
             ut = FILETIME()
             if kernel32.GetProcessTimes(h_proc, ctypes.byref(ct), ctypes.byref(et), ctypes.byref(kt), ctypes.byref(ut)):
-                current_create_time = (ct.dwHighDateTime << 32) + ct.dwLowDateTime
+                filetime_100ns = (ct.dwHighDateTime << 32) + ct.dwLowDateTime
+                current_create_time = (filetime_100ns - 116444736000000000) * 100
                 if expected_create_time_ns is not None and current_create_time != expected_create_time_ns:
                     return TerminationResult(
                         success=False,
@@ -586,7 +591,13 @@ class PosixProcessController:
                 if rparen != -1:
                     fields = content[rparen + 1:].split()
                     if len(fields) >= 20:
-                        return int(fields[19])  # starttime in jiffies
+                        jiffies = int(fields[19])  # starttime in jiffies
+                        clk_tck = 100
+                        try:
+                            clk_tck = os.sysconf("SC_CLK_TCK")
+                        except Exception:
+                            pass
+                        return jiffies * (1_000_000_000 // clk_tck)
             except Exception:
                 pass
         # Fallback for macOS and non-Linux POSIX using `ps`

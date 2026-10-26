@@ -101,12 +101,12 @@ class Phase4B53ToolBrokerTests(unittest.TestCase):
 
         # 1. Unregistered tool
         with self.assertRaises(ToolAccessDeniedError) as ctx:
-            self.broker.execute(token_str, "unknown_malicious_tool", {})
+            self.broker.execute(token_str, "unknown_malicious_tool", {}, caller_pid=os.getpid())
         self.assertIn("nao cadastrada", str(ctx.exception).lower())
 
         # 2. Registered tool but NOT in token scope
         with self.assertRaises(ToolAccessDeniedError) as ctx:
-            self.broker.execute(token_str, "workspace_list_dir", {"subpath": "."})
+            self.broker.execute(token_str, "workspace_list_dir", {"subpath": "."}, caller_pid=os.getpid())
         self.assertIn("fora do escopo", str(ctx.exception).lower())
 
     def test_02_rejection_of_forged_or_tampered_token(self):
@@ -123,7 +123,7 @@ class Phase4B53ToolBrokerTests(unittest.TestCase):
         parts = token_str.split("_")
         tampered_sig = parts[0] + "_" + parts[1] + "_" + parts[2] + "_" + ("0" * len(parts[3]))
         with self.assertRaises(InvalidCapabilityTokenError):
-            self.broker.execute(tampered_sig, "workspace_read_file", {"path": "main.py"})
+            self.broker.execute(tampered_sig, "workspace_read_file", {"path": "main.py"}, caller_pid=os.getpid())
 
         # 2. Token issued by fake key
         fake_manager = CapabilityTokenManager(supervisor_secret="fake_adversary_key")
@@ -135,7 +135,7 @@ class Phase4B53ToolBrokerTests(unittest.TestCase):
             allowed_tools=["workspace_read_file"],
         )
         with self.assertRaises(InvalidCapabilityTokenError):
-            self.broker.execute(fake_token, "workspace_read_file", {"path": "main.py"})
+            self.broker.execute(fake_token, "workspace_read_file", {"path": "main.py"}, caller_pid=os.getpid())
 
     def test_03_rejection_of_expired_capability_token(self):
         """Capability tokens past their expiration deadline are rejected."""
@@ -151,7 +151,7 @@ class Phase4B53ToolBrokerTests(unittest.TestCase):
         time.sleep(0.15)
 
         with self.assertRaises(CapabilityTokenExpiredError):
-            self.broker.execute(token_str, "workspace_read_file", {"path": "main.py"})
+            self.broker.execute(token_str, "workspace_read_file", {"path": "main.py"}, caller_pid=os.getpid())
 
     def test_04_rejection_of_revoked_token(self):
         """Tokens revoked by the supervisor cannot be used for any subsequent tool calls."""
@@ -167,7 +167,7 @@ class Phase4B53ToolBrokerTests(unittest.TestCase):
         self.broker.token_manager.revoke_token(token_id)
 
         with self.assertRaises(CapabilityTokenRevokedError):
-            self.broker.execute(token_str, "workspace_read_file", {"path": "main.py"})
+            self.broker.execute(token_str, "workspace_read_file", {"path": "main.py"}, caller_pid=os.getpid())
 
     def test_05_rejection_of_task_or_run_spoofing(self):
         """Worker cannot use token issued for Task A to read from or manipulate Task B."""
@@ -187,7 +187,7 @@ class Phase4B53ToolBrokerTests(unittest.TestCase):
 
         # Attempt to escape project_root using absolute path to other project
         with self.assertRaises(ToolBrokerError):
-            self.broker.execute(token_str, "workspace_read_file", {"path": str(other_file)})
+            self.broker.execute(token_str, "workspace_read_file", {"path": str(other_file)}, caller_pid=os.getpid())
 
     def test_06_caller_identity_verification_and_pid_recycling_defense(self):
         """Broker verifies caller PID and creation time to prevent identity spoofing and PID recycling."""
@@ -233,18 +233,18 @@ class Phase4B53ToolBrokerTests(unittest.TestCase):
 
         # 1. read_supervisor_secret has DENY policy mode
         with self.assertRaises(ToolAccessDeniedError) as ctx:
-            self.broker.execute(token_str, "read_supervisor_secret", {})
+            self.broker.execute(token_str, "read_supervisor_secret", {}, caller_pid=os.getpid())
         self.assertIn("estritamente proibida", str(ctx.exception).lower())
 
         # 2. raw_sqlite_query has DENY policy mode
         with self.assertRaises(ToolAccessDeniedError) as ctx:
-            self.broker.execute(token_str, "raw_sqlite_query", {"query": "SELECT * FROM tasks"})
+            self.broker.execute(token_str, "raw_sqlite_query", {"query": "SELECT * FROM tasks"}, caller_pid=os.getpid())
         self.assertIn("estritamente proibida", str(ctx.exception).lower())
 
         # 3. workspace_read_file targeting supervisor.secret is rejected
         secret_file = self.store.root / "auth" / "supervisor.secret"
         with self.assertRaises(ToolAccessDeniedError):
-            self.broker.execute(token_str, "workspace_read_file", {"path": str(secret_file)})
+            self.broker.execute(token_str, "workspace_read_file", {"path": str(secret_file)}, caller_pid=os.getpid())
 
     def test_08_operational_limits_rate_limit_and_payload_size(self):
         """Worker exceeding call limits or payload size is denied with BrokerRateLimitExceededError."""
@@ -259,16 +259,16 @@ class Phase4B53ToolBrokerTests(unittest.TestCase):
         )
 
         # Call 1: OK
-        res1 = self.broker.execute(token_str, "echo_payload", {"payload": "first"})
+        res1 = self.broker.execute(token_str, "echo_payload", {"payload": "first"}, caller_pid=os.getpid())
         self.assertEqual(res1["status"], "success")
 
         # Call 2: OK
-        res2 = self.broker.execute(token_str, "echo_payload", {"payload": "second"})
+        res2 = self.broker.execute(token_str, "echo_payload", {"payload": "second"}, caller_pid=os.getpid())
         self.assertEqual(res2["status"], "success")
 
         # Call 3: Exceeded limit
         with self.assertRaises(BrokerRateLimitExceededError):
-            self.broker.execute(token_str, "echo_payload", {"payload": "third"})
+            self.broker.execute(token_str, "echo_payload", {"payload": "third"}, caller_pid=os.getpid())
 
         # 2. Payload size limit
         huge_payload = {"payload": "A" * 70_000}
@@ -280,7 +280,7 @@ class Phase4B53ToolBrokerTests(unittest.TestCase):
             allowed_tools=["echo_payload"],
         )
         with self.assertRaises(BrokerRateLimitExceededError):
-            self.broker.execute(fresh_token, "echo_payload", huge_payload)
+            self.broker.execute(fresh_token, "echo_payload", huge_payload, caller_pid=os.getpid())
 
     def test_09_human_approval_required_workflow(self):
         """Tool requiring approval pauses execution; supervisor approval allows clearance."""
@@ -294,7 +294,7 @@ class Phase4B53ToolBrokerTests(unittest.TestCase):
 
         # Initial call raises ToolApprovalRequired with approval_id
         with self.assertRaises(ToolApprovalRequired) as ctx:
-            self.broker.execute(token_str, "mutate_checkpoint", {"revision": 24})
+            self.broker.execute(token_str, "mutate_checkpoint", {"revision": 24}, caller_pid=os.getpid())
         approval_id = ctx.exception.approval_id
         self.assertTrue(bool(approval_id))
 
@@ -371,7 +371,7 @@ class Phase4B53ToolBrokerTests(unittest.TestCase):
         }), encoding="utf-8")
 
         # Supervisor processes mailbox
-        results = self.broker.process_mailbox(self.sandbox_dir)
+        results = self.broker.process_mailbox(self.sandbox_dir, expected_worker_pid=os.getpid())
         self.assertEqual(len(results), 1)
         self.assertEqual(results[0]["status"], "success")
 

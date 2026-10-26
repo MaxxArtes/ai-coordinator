@@ -32,6 +32,15 @@ A Fase 4B.5 do AI Coordinator introduz isolamento de processos e governança a n
 - **Trilha de Auditoria em SQLite (`tool_broker_audit`)**: Registro persistente e rastreável de todas as invocações, contendo correlation IDs, timestamps ISO 8601, identificadores de tarefa e worker, decisões tomadas (`executed`, `denied`, `invalid_token`, `rate_limited`, `requires_approval`), tempo de execução em milissegundos e sumário de parâmetros/resultados.
 - **Mailbox na Sandbox de Workers (`.broker/requests` e `.broker/responses`)**: Suporte a mediação assíncrona por arquivos para workers totalmente isolados que não possuem acesso direto a sockets ou IPC direto com o supervisor.
 
+### 4. Auditoria de Execução de Workers e Endurecimento do Broker (4B.5.4)
+- **Persistência SQLite de Tokens e Revogações (`tool_broker_tokens`)**: Tokens emitidos, contadores atômicos de chamadas (`calls_made`) e revogações persistem no banco de dados, impedindo revalidação indevida de tokens revogados após reinício do Store ou estouro de limites sob concorrência.
+- **Identidade e Anti-Spoofing na Mailbox**: O supervisor valida estritamente a identidade do processo worker da sandbox (`expected_worker_pid`). O PID não é inferido de campos declarativos não confiáveis no JSON da requisição.
+- **Proteção Anti-Symlink na Mailbox**: O diretório `.broker/requests` e `.broker/responses` é protegido contra reparse points e symlinks (`is_reparse_point_or_symlink` / `validate_contained_path`), impedindo escapes de leitura ou escrita fora da sandbox.
+- **Normalização de Timestamp de Criação de Processos**: Comparação precisa em nanossegundos Unix (convertendo FILETIME de 100ns do Windows e jiffies do Linux), garantindo tolerância uniforme de 2.0 segundos contra reciclagem de PIDs em todas as plataformas.
+- **Imutabilidade SQL com Triggers**: As tabelas `worker_audit_log` e `tool_broker_audit` possuem triggers SQLite (`BEFORE UPDATE` e `BEFORE DELETE` acionando `RAISE(ABORT, ...)`), garantindo natureza estritamente append-only contra adulterações.
+- **Política de Falha Fechada (Fail-Closed)**: Operações de workers e ferramentas não são executadas se a persistência da trilha de auditoria falhar (`ToolAuditPersistenceError`, `WorkerAuditPersistenceError`).
+- **Encadeamento Criptográfico e Assinatura HMAC**: Registros em `worker_audit_log` são encadeados via `SHA-256(prev_hash || sequence || event_type || correlation_id || task_id || run_id || timestamp)` e assinados com HMAC-SHA256 pela chave secreta do supervisor, permitindo auditoria e detecção de adulteração de histórico (`verify_integrity()`).
+
 ## Ambiente do processo
 
 `worker_environment.mode` controla as variáveis herdadas:
