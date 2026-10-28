@@ -165,7 +165,7 @@ sys.exit(0)
 
         if summary.get("status") != "complete":
             err = summary.get("attempts", [{}])[0].get("error", "unknown")
-            escaped = str(err).replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
+            escaped = " || ".join(str(err).splitlines())[:800]
             print(f"\n::error title=WorkerError::{escaped}\n", flush=True)
             self.fail(f"Worker execution failed: {err}")
         self.assertIn("# DelegatedSuccess", summary.get("preview", ""))
