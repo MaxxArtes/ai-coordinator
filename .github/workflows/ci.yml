@@ -52,6 +52,7 @@ jobs:
   release-candidate-artifacts:
     name: Build, verify, and archive release candidate artifacts
     runs-on: ubuntu-latest
+    needs: [python, opencode-package]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
