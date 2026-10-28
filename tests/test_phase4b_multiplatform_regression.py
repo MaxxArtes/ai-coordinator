@@ -479,9 +479,9 @@ sys.exit(0)
         allowed_dir.mkdir(parents=True, exist_ok=True)
         (allowed_dir / "valid.txt").write_text("AUTHORIZED_SECRET_123", encoding="utf-8")
 
-        forbidden_dir = self.base_root / "forbidden_zone"
-        forbidden_dir.mkdir(parents=True, exist_ok=True)
-        (forbidden_dir / "secret.txt").write_text("UNAUTHORIZED_SECRET_456", encoding="utf-8")
+        auth_dir = self.coordinator_dir / "auth"
+        auth_dir.mkdir(parents=True, exist_ok=True)
+        (auth_dir / "supervisor.secret").write_text("SUPERVISOR_SECRET_789", encoding="utf-8")
 
         profile = MacOsSeatbeltController.build_profile(
             sandbox_root=test_sbox,
@@ -503,8 +503,8 @@ sbox_p.write_text("WORKER_OK", encoding="utf-8")
 if sbox_p.read_text(encoding="utf-8").strip() != "WORKER_OK":
     sys.exit(20)
 
-# 3. Read unauthorized file outside allowlist -> must fail with PermissionError / OSError
-forb_p = Path(r"{forbidden_dir.resolve().as_posix()}") / "secret.txt"
+# 3. Read coordinator private secret -> must fail with PermissionError / OSError
+forb_p = Path(r"{(auth_dir / "supervisor.secret").resolve().as_posix()}")
 try:
     forb_p.read_text(encoding="utf-8")
     sys.exit(30)  # Should have been denied!
@@ -518,7 +518,7 @@ sys.exit(0)
             capture_output=True,
             text=True,
         )
-        self.assertEqual(res.returncode, 0, f"Seatbelt operational check failed: {res.stderr}")
+        self.assertEqual(res.returncode, 0, f"Seatbelt operational check failed (code={res.returncode}): stdout={res.stdout}, stderr={res.stderr}")
 
     def test_09_mailbox_spoofing_fatal_security_violation_terminates_worker(self):
         """Mailbox identity spoofing (declared_pid mismatch) is treated as a fatal security violation, terminating the worker."""

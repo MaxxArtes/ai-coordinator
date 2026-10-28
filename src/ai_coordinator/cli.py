@@ -346,7 +346,7 @@ def run_worker(store, config, ident, category, input_file, max_attempts=None):
 
                 def _process_worker_mailbox():
                     if hasattr(store, "tool_broker") and store.tool_broker:
-                        store.tool_broker.process_mailbox(folder, expected_worker_pid=proc.pid)
+                        store.tool_broker.process_mailbox(folder, expected_worker_pid=proc.pid, raise_on_fatal=True)
 
                 stream_res = consumer.consume(
                     proc,

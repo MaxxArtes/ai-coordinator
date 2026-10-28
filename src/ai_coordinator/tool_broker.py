@@ -963,6 +963,7 @@ class ToolBroker:
         self,
         sandbox_root: Union[str, Path],
         expected_worker_pid: int,
+        raise_on_fatal: bool = False,
     ) -> List[Dict[str, Any]]:
         """Process requests sent through the file-based sandbox mailbox with anti-symlink and anti-spoofing protection."""
         if expected_worker_pid is None or int(expected_worker_pid) <= 0:
@@ -986,9 +987,17 @@ class ToolBroker:
                         req_file.unlink()
                     except Exception:
                         pass
-                    raise ReparseEscapeError(
-                        f"Link simbolico ou reparse point detectado em arquivo de requisicao: {req_file.name}"
-                    )
+                    if raise_on_fatal:
+                        raise ReparseEscapeError(
+                            f"Link simbolico ou reparse point detectado em arquivo de requisicao: {req_file.name}"
+                        )
+                    status_obj = {
+                        "status": "error",
+                        "error": "SymlinkSecurityViolation",
+                        "message": f"Link simbolico ou reparse point detectado em arquivo de requisicao: {req_file.name}",
+                    }
+                    results.append(status_obj)
+                    continue
 
                 validate_contained_path(req_file, req_dir)
 
@@ -1035,8 +1044,10 @@ class ToolBroker:
                 ToolAuditPersistenceError,
             ) as fatal_sec_err:
                 # Critical security & integrity violations classified as fatal:
-                # DO NOT mask as JSON response! Propagate directly so on_poll / supervisor immediately terminates worker.
-                raise
+                # If raise_on_fatal=True (e.g. inside supervisor streaming loop), propagate directly to terminate worker!
+                if raise_on_fatal:
+                    raise
+                status_obj = {"status": "error", "error": type(fatal_sec_err).__name__, "message": str(fatal_sec_err)}
             except Exception as e:
                 # Recoverable operational errors (e.g. rate limit, tool not allowed, approval required, expired/revoked token, handler error)
                 status_obj = {"status": "error", "error": type(e).__name__, "message": str(e)}
@@ -1049,10 +1060,12 @@ class ToolBroker:
                         res_file.unlink()
                     except Exception:
                         pass
-                    raise ReparseEscapeError(f"Symlink detectado no caminho de resposta da mailbox: {res_file.name}")
+                    if raise_on_fatal:
+                        raise ReparseEscapeError(f"Symlink detectado no caminho de resposta da mailbox: {res_file.name}")
                 res_file.write_text(json.dumps(status_obj, indent=2), encoding="utf-8")
             except (ReparseEscapeError, FileSandboxSecurityError):
-                raise
+                if raise_on_fatal:
+                    raise
             except Exception as res_err:
                 raise OSError(f"Falha de seguranca ao gravar resposta da mailbox ({res_file.name}): {res_err}") from res_err
 
