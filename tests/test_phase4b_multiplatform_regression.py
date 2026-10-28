@@ -483,13 +483,14 @@ sys.exit(0)
         auth_dir.mkdir(parents=True, exist_ok=True)
         (auth_dir / "supervisor.secret").write_text("SUPERVISOR_SECRET_789", encoding="utf-8")
 
-        # Create an arbitrary outside file strictly located under /Users, which is not granted by system_roots
-        arbitrary_file = Path("/Users/Shared/ai_coord_unauthorized_test.txt")
-        try:
-            arbitrary_file.write_text("ARBITRARY_UNAUTHORIZED_DATA", encoding="utf-8")
-        except OSError:
-            arbitrary_file = Path.home() / "ai_coord_unauthorized_test.txt"
-            arbitrary_file.write_text("ARBITRARY_UNAUTHORIZED_DATA", encoding="utf-8")
+        # Create an exclusive temporary outside file strictly located under /Users, avoiding collision or overwriting pre-existing files
+        unique_file_name = f"ai_coord_unauthorized_{uuid.uuid4().hex}.txt"
+        shared_parent = Path("/Users/Shared")
+        if shared_parent.is_dir() and os.access(shared_parent, os.W_OK):
+            arbitrary_file = shared_parent / unique_file_name
+        else:
+            arbitrary_file = Path.home() / unique_file_name
+        arbitrary_file.write_text("ARBITRARY_UNAUTHORIZED_DATA", encoding="utf-8")
 
         profile = MacOsSeatbeltController.build_profile(
             sandbox_root=test_sbox,
