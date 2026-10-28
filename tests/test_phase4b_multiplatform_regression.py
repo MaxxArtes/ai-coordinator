@@ -164,10 +164,17 @@ sys.exit(0)
         )
 
         if summary.get("status") != "complete":
+            run_id = summary.get("run_id")
+            stderr_content = ""
+            if run_id:
+                err_file = self.coordinator_dir / "tasks" / self.task_id / "runs" / run_id / "stderr-0.log"
+                if err_file.exists():
+                    stderr_content = err_file.read_text(encoding="utf-8", errors="replace")
             err = summary.get("attempts", [{}])[0].get("error", "unknown")
-            escaped = " || ".join(str(err).splitlines())[:800]
+            full_msg = f"{err} || Stderr: {stderr_content}"
+            escaped = " || ".join(str(full_msg).splitlines())[:800]
             print(f"\n::error title=WorkerError::{escaped}\n", flush=True)
-            self.fail(f"Worker execution failed: {err}")
+            self.fail(f"Worker execution failed: {err}\nStderr: {stderr_content}")
         self.assertIn("# DelegatedSuccess", summary.get("preview", ""))
         self.assertIn("DelegatedWorkerPayloadContent12345", summary.get("preview", ""))
 

@@ -593,31 +593,64 @@ class MacOsSeatbeltController:
             "(deny file-write*)",
         ]
 
-        sbox_str = str(resolved_sbox)
-        profile_lines.append(f'(allow file-write* (subpath "{sbox_str}"))')
-        if sbox_str.startswith("/private/"):
-            non_priv = sbox_str[len("/private"):]
-            profile_lines.append(f'(allow file-write* (subpath "{non_priv}"))')
-        else:
-            profile_lines.append(f'(allow file-write* (subpath "/private{sbox_str}"))')
-
         # Deny sensitive supervisor, task siblings, and user credential directories
         profile_lines.append('(deny file-read* (regex #".*/(\\.ssh|\\.aws|\\.gnupg|mock_home)(/.*|$)"))')
         profile_lines.append('(deny file-read* (regex #".*/tasks/[^/]+/sibling_[^/]+(/.*|$)"))')
+        profile_lines.append('(deny file-write* (regex #".*/tasks/[^/]+/sibling_[^/]+(/.*|$)"))')
 
         if coord_private:
-            str_path = str(coord_private)
-            profile_lines.append(f'(deny file-read* (subpath "{str_path}"))')
-            profile_lines.append(f'(deny file-write* (subpath "{str_path}"))')
-            if str_path.startswith("/private/"):
-                non_private = str_path[len("/private"):]
-                profile_lines.append(f'(deny file-read* (subpath "{non_private}"))')
-                profile_lines.append(f'(deny file-write* (subpath "{non_private}"))')
+            is_ancestor = False
+            try:
+                resolved_sbox.relative_to(coord_private)
+                is_ancestor = True
+            except ValueError:
+                is_ancestor = False
+
+            if is_ancestor:
+                # When coordinator_private is an ancestor of sandbox_root (e.g. store.root in production),
+                # isolate specific coordinator-private directories and database files rather than the whole tree.
+                for priv_sub in ["auth", "backups", "checkpoints"]:
+                    sub_p = coord_private / priv_sub
+                    str_sub = str(sub_p)
+                    profile_lines.append(f'(deny file-read* (subpath "{str_sub}"))')
+                    profile_lines.append(f'(deny file-write* (subpath "{str_sub}"))')
+                    if str_sub.startswith("/private/"):
+                        profile_lines.append(f'(deny file-read* (subpath "{str_sub[len("/private"):]}"))')
+                        profile_lines.append(f'(deny file-write* (subpath "{str_sub[len("/private"):]}"))')
+                    else:
+                        profile_lines.append(f'(deny file-read* (subpath "/private{str_sub}"))')
+                        profile_lines.append(f'(deny file-write* (subpath "/private{str_sub}"))')
+                    profile_lines.append(f'(deny file-read* (regex #".*/{coord_private.name}/{priv_sub}(/.*|$)"))')
+                    profile_lines.append(f'(deny file-write* (regex #".*/{coord_private.name}/{priv_sub}(/.*|$)"))')
+
+                # Deny coordinator sqlite database, WAL and SHM files
+                profile_lines.append('(deny file-read* (regex #".*\\.sqlite(-wal|-shm)?$"))')
+                profile_lines.append('(deny file-write* (regex #".*\\.sqlite(-wal|-shm)?$"))')
             else:
-                profile_lines.append(f'(deny file-read* (subpath "/private{str_path}"))')
-                profile_lines.append(f'(deny file-write* (subpath "/private{str_path}"))')
-            profile_lines.append(f'(deny file-read* (regex #".*/{coord_private.name}(/.*|$)"))')
-            profile_lines.append(f'(deny file-write* (regex #".*/{coord_private.name}(/.*|$)"))')
+                str_path = str(coord_private)
+                profile_lines.append(f'(deny file-read* (subpath "{str_path}"))')
+                profile_lines.append(f'(deny file-write* (subpath "{str_path}"))')
+                if str_path.startswith("/private/"):
+                    non_private = str_path[len("/private"):]
+                    profile_lines.append(f'(deny file-read* (subpath "{non_private}"))')
+                    profile_lines.append(f'(deny file-write* (subpath "{non_private}"))')
+                else:
+                    profile_lines.append(f'(deny file-read* (subpath "/private{str_path}"))')
+                    profile_lines.append(f'(deny file-write* (subpath "/private{str_path}"))')
+                profile_lines.append(f'(deny file-read* (regex #".*/{coord_private.name}(/.*|$)"))')
+                profile_lines.append(f'(deny file-write* (regex #".*/{coord_private.name}(/.*|$)"))')
+
+        # Strictly grant read and write access to sandbox_root (both canonical and symlink variants)
+        sbox_str = str(resolved_sbox)
+        profile_lines.append(f'(allow file-read* (subpath "{sbox_str}"))')
+        profile_lines.append(f'(allow file-write* (subpath "{sbox_str}"))')
+        if sbox_str.startswith("/private/"):
+            non_priv = sbox_str[len("/private"):]
+            profile_lines.append(f'(allow file-read* (subpath "{non_priv}"))')
+            profile_lines.append(f'(allow file-write* (subpath "{non_priv}"))')
+        else:
+            profile_lines.append(f'(allow file-read* (subpath "/private{sbox_str}"))')
+            profile_lines.append(f'(allow file-write* (subpath "/private{sbox_str}"))')
 
         return "\n".join(profile_lines)
 
