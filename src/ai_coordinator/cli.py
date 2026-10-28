@@ -230,7 +230,7 @@ def run_worker(store, config, ident, category, input_file, max_attempts=None):
                             p = Path(str(arg)).resolve()
                             if p.is_file():
                                 parent = p.parent
-                                if store.root not in (parent, *parent.parents) and parent not in (store.root, *store.root.parents):
+                                if store.root not in (parent, *parent.parents):
                                     allowed_reads.append(parent)
                         except Exception:
                             pass

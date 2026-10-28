@@ -436,29 +436,230 @@ sys.exit(0)
             allowed_read_roots=allowed_reads,
         )
 
-        # 1. Must allow essential process execution and ioctl
-        self.assertIn("(allow process-exec)", profile)
+        # 1. Must NOT contain broad blanket allow
+        self.assertNotIn("(allow file-read*)", profile)
+
+        # 2. Must allow reading metadata and ioctl
+        self.assertIn("(allow file-read-metadata)", profile)
         self.assertIn("(allow file-ioctl)", profile)
 
-        # 2. Must deny broad user home directory reading and root profiles
-        self.assertIn('(deny file-read* (subpath "/Users"))', profile)
-        self.assertIn('(deny file-read* (subpath "/private/var/root"))', profile)
-        self.assertIn('(deny file-read* (subpath "/var/root"))', profile)
-
-        # 3. Must allow explicitly declared read roots and python runtime (overriding /Users block)
+        # 3. Must allow essential system roots and python prefix
+        self.assertIn('(allow file-read* (subpath "/System"))', profile)
+        self.assertIn('(allow file-read* (subpath "/usr"))', profile)
         self.assertIn(f'(allow file-read* (subpath "{Path(sys.prefix).resolve().as_posix()}"))', profile)
+
+        # 4. Must allow explicitly declared read roots
         self.assertIn(f'(allow file-read* (subpath "{self.project_dir.resolve().as_posix()}"))', profile)
         self.assertIn('(allow file-read* (subpath "/opt/custom_tool"))', profile)
 
-        # 4. Must deny coordinator private directories and SQLite files
+        # 5. Must deny credential directories, task siblings, and coordinator private directories
+        self.assertIn('(deny file-read* (regex #".*/(\\.ssh|\\.aws|\\.gnupg|mock_home)(/.*|$)"))', profile)
+        self.assertIn('(deny file-read* (regex #".*/tasks/[^/]+/sibling_[^/]+(/.*|$)"))', profile)
         self.assertIn('(deny file-read* (regex #".*\\.sqlite(-wal|-shm)?$"))', profile)
         self.assertIn('(deny file-write* (regex #".*\\.sqlite(-wal|-shm)?$"))', profile)
         self.assertIn(f'(deny file-read* (subpath "{(coord_priv / "auth").resolve().as_posix()}"))', profile)
 
-        # 5. Must grant sandbox_root both read and write at the end of the profile
+        # 6. Must grant sandbox_root both read and write at the end of the profile
         lines = profile.splitlines()
         self.assertIn(f'(allow file-read* (subpath "{sbox.resolve().as_posix()}"))', lines[-4:])
         self.assertIn(f'(allow file-write* (subpath "{sbox.resolve().as_posix()}"))', lines[-4:])
+
+    def test_08_macos_seatbelt_operational_containment_and_rejection(self):
+        """On macOS, execute sandbox-exec to verify authorized reads succeed and unauthorized reads are rejected."""
+        if sys.platform != "darwin":
+            self.skipTest("Operational macOS Seatbelt enforcement test only runs on darwin")
+
+        from ai_coordinator.fs_sandbox import MacOsSeatbeltController
+        if not MacOsSeatbeltController.is_available():
+            self.skipTest("sandbox-exec not available")
+
+        test_sbox = self.coordinator_dir / "tasks" / "op_task" / "runs" / "op_run"
+        test_sbox.mkdir(parents=True, exist_ok=True)
+        allowed_dir = self.base_root / "allowed_zone"
+        allowed_dir.mkdir(parents=True, exist_ok=True)
+        (allowed_dir / "valid.txt").write_text("AUTHORIZED_SECRET_123", encoding="utf-8")
+
+        forbidden_dir = self.base_root / "forbidden_zone"
+        forbidden_dir.mkdir(parents=True, exist_ok=True)
+        (forbidden_dir / "secret.txt").write_text("UNAUTHORIZED_SECRET_456", encoding="utf-8")
+
+        profile = MacOsSeatbeltController.build_profile(
+            sandbox_root=test_sbox,
+            coordinator_private_dir=self.coordinator_dir,
+            allowed_read_roots=[allowed_dir],
+        )
+
+        worker_script = f"""import sys, os
+from pathlib import Path
+
+# 1. Read authorized file -> must succeed
+auth_p = Path(r"{allowed_dir.resolve().as_posix()}") / "valid.txt"
+if auth_p.read_text(encoding="utf-8").strip() != "AUTHORIZED_SECRET_123":
+    sys.exit(10)
+
+# 2. Read and write in sandbox root -> must succeed
+sbox_p = Path(r"{test_sbox.resolve().as_posix()}") / "out.txt"
+sbox_p.write_text("WORKER_OK", encoding="utf-8")
+if sbox_p.read_text(encoding="utf-8").strip() != "WORKER_OK":
+    sys.exit(20)
+
+# 3. Read unauthorized file outside allowlist -> must fail with PermissionError / OSError
+forb_p = Path(r"{forbidden_dir.resolve().as_posix()}") / "secret.txt"
+try:
+    forb_p.read_text(encoding="utf-8")
+    sys.exit(30)  # Should have been denied!
+except (PermissionError, OSError):
+    pass
+
+sys.exit(0)
+"""
+        res = subprocess.run(
+            ["/usr/bin/sandbox-exec", "-p", profile, sys.executable, "-c", worker_script],
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(res.returncode, 0, f"Seatbelt operational check failed: {res.stderr}")
+
+    def test_09_mailbox_spoofing_fatal_security_violation_terminates_worker(self):
+        """Mailbox identity spoofing (declared_pid mismatch) is treated as a fatal security violation, terminating the worker."""
+        spoof_worker_py = self.project_dir / "spoof_worker.py"
+        spoof_worker_py.write_text("""import sys, json, time, os
+from pathlib import Path
+
+broker_dir = Path(".broker")
+token_file = broker_dir / "token"
+token = token_file.read_text(encoding="utf-8").strip() if token_file.exists() else ""
+
+req_dir = broker_dir / "requests"
+req_dir.mkdir(parents=True, exist_ok=True)
+spoofed_payload = {
+    "token": token,
+    "tool": "read_task_context",
+    "parameters": {},
+    "caller_pid": 999999,
+}
+(req_dir / "req_spoof.json").write_text(json.dumps(spoofed_payload), encoding="utf-8")
+
+# Keep worker alive waiting for response or supervisor termination
+for _ in range(100):
+    time.sleep(0.1)
+
+print(json.dumps({"result": "NOT_TERMINATED", "usage": {}}))
+sys.exit(0)
+""", encoding="utf-8")
+
+        cfg = {
+            "limits": {
+                "input_chars": 5000,
+                "output_chars": 5000,
+                "worker_calls_per_task": 5,
+                "attempts_per_run": 1,
+                "timeout_seconds": 10,
+            },
+            "security": {
+                "enforce_filesystem_sandbox": True,
+            },
+            "routes": {
+                "general": {
+                    "candidates": [
+                        {"client": "openrouter", "model": "mock_adv_model", "plain_prompt": True}
+                    ]
+                }
+            },
+            "launchers": {
+                "openrouter": [sys.executable, str(spoof_worker_py)]
+            }
+        }
+
+        input_file = self.project_dir / "task_input_spoof.md"
+        input_file.write_text("Spoofing test input", encoding="utf-8")
+
+        res = run_worker(
+            store=self.store,
+            config=cfg,
+            ident=self.task_id,
+            category="general",
+            input_file=str(input_file),
+        )
+
+        # Worker must have failed due to fail-closed identity violation
+        self.assertEqual(res.get("status"), "failed")
+        attempts = res.get("attempts", [])
+        self.assertTrue(len(attempts) > 0)
+        err_msg = attempts[-1].get("error", "")
+        self.assertTrue(
+            "CallerIdentityMismatchError" in err_msg or "spoofing" in err_msg.lower() or "seguranca" in err_msg.lower(),
+            f"Expected fatal security violation error message, got: {err_msg}"
+        )
+
+    def test_10_mailbox_tampered_token_fatal_security_violation_terminates_worker(self):
+        """Mailbox request with forged/tampered capability token is treated as a fatal security violation, terminating the worker."""
+        tamper_worker_py = self.project_dir / "tamper_worker.py"
+        tamper_worker_py.write_text("""import sys, json, time, os
+from pathlib import Path
+
+broker_dir = Path(".broker")
+token_file = broker_dir / "token"
+token = token_file.read_text(encoding="utf-8").strip() if token_file.exists() else ""
+
+req_dir = broker_dir / "requests"
+req_dir.mkdir(parents=True, exist_ok=True)
+tampered_payload = {
+    "token": token + "_forged_signature_attack",
+    "tool": "read_task_context",
+    "parameters": {},
+}
+(req_dir / "req_tampered.json").write_text(json.dumps(tampered_payload), encoding="utf-8")
+
+for _ in range(100):
+    time.sleep(0.1)
+
+print(json.dumps({"result": "NOT_TERMINATED", "usage": {}}))
+sys.exit(0)
+""", encoding="utf-8")
+
+        cfg = {
+            "limits": {
+                "input_chars": 5000,
+                "output_chars": 5000,
+                "worker_calls_per_task": 5,
+                "attempts_per_run": 1,
+                "timeout_seconds": 10,
+            },
+            "security": {
+                "enforce_filesystem_sandbox": True,
+            },
+            "routes": {
+                "general": {
+                    "candidates": [
+                        {"client": "openrouter", "model": "mock_adv_model", "plain_prompt": True}
+                    ]
+                }
+            },
+            "launchers": {
+                "openrouter": [sys.executable, str(tamper_worker_py)]
+            }
+        }
+
+        input_file = self.project_dir / "task_input_tamper.md"
+        input_file.write_text("Tamper test input", encoding="utf-8")
+
+        res = run_worker(
+            store=self.store,
+            config=cfg,
+            ident=self.task_id,
+            category="general",
+            input_file=str(input_file),
+        )
+
+        self.assertEqual(res.get("status"), "failed")
+        attempts = res.get("attempts", [])
+        self.assertTrue(len(attempts) > 0)
+        err_msg = attempts[-1].get("error", "")
+        self.assertTrue(
+            "InvalidCapabilityTokenError" in err_msg or "seguranca" in err_msg.lower() or "token" in err_msg.lower(),
+            f"Expected fatal token violation error message, got: {err_msg}"
+        )
 
 
 if __name__ == "__main__":

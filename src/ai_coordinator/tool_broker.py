@@ -27,7 +27,7 @@ import time
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple, Union
 import uuid
 
-from .fs_sandbox import validate_contained_path, PathTraversalError, ReparseEscapeError, is_reparse_point_or_symlink
+from .fs_sandbox import FileSandboxSecurityError, validate_contained_path, PathTraversalError, ReparseEscapeError, is_reparse_point_or_symlink
 from .process import ProcessSupervisor
 
 
@@ -982,17 +982,13 @@ class ToolBroker:
             try:
                 # Anti-symlink and path containment protection
                 if req_file.is_symlink() or is_reparse_point_or_symlink(req_file):
-                    status_obj = {
-                        "status": "error",
-                        "error": "SymlinkSecurityViolation",
-                        "message": f"Link simbolico ou reparse point detectado em arquivo de requisicao: {req_file.name}",
-                    }
                     try:
                         req_file.unlink()
-                    except Exception as unlink_err:
-                        raise ToolAccessDeniedError(f"Impossivel remover symlink malicioso na mailbox: {unlink_err}") from unlink_err
-                    results.append(status_obj)
-                    continue
+                    except Exception:
+                        pass
+                    raise ReparseEscapeError(
+                        f"Link simbolico ou reparse point detectado em arquivo de requisicao: {req_file.name}"
+                    )
 
                 validate_contained_path(req_file, req_dir)
 
@@ -1031,15 +1027,32 @@ class ToolBroker:
                     sandbox_root=sbox,
                 )
                 status_obj = {"status": "success", "response": res}
+            except (
+                CallerIdentityMismatchError,
+                InvalidCapabilityTokenError,
+                MutationNotPermittedError,
+                FileSandboxSecurityError,
+                ToolAuditPersistenceError,
+            ) as fatal_sec_err:
+                # Critical security & integrity violations classified as fatal:
+                # DO NOT mask as JSON response! Propagate directly so on_poll / supervisor immediately terminates worker.
+                raise
             except Exception as e:
+                # Recoverable operational errors (e.g. rate limit, tool not allowed, approval required, expired/revoked token, handler error)
                 status_obj = {"status": "error", "error": type(e).__name__, "message": str(e)}
 
             res_file = res_dir / f"res_{req_file.stem}.json"
             try:
                 validate_contained_path(res_file, res_dir)
                 if res_file.exists() and (res_file.is_symlink() or is_reparse_point_or_symlink(res_file)):
-                    res_file.unlink()
+                    try:
+                        res_file.unlink()
+                    except Exception:
+                        pass
+                    raise ReparseEscapeError(f"Symlink detectado no caminho de resposta da mailbox: {res_file.name}")
                 res_file.write_text(json.dumps(status_obj, indent=2), encoding="utf-8")
+            except (ReparseEscapeError, FileSandboxSecurityError):
+                raise
             except Exception as res_err:
                 raise OSError(f"Falha de seguranca ao gravar resposta da mailbox ({res_file.name}): {res_err}") from res_err
 

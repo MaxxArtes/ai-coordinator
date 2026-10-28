@@ -125,13 +125,15 @@ A Fase 4B.5 do AI Coordinator introduz isolamento de processos e governança a n
   - Documentação formal em `docs/test_matrix_and_skips.md` comprovando a equivalência funcional dos 3 testes ignorados em POSIX (`skipped=3`) com os mecanismos de contenção de processos do Windows NT Job Objects.
 
 ### 9. Revisão de Autenticação, Permissões e Recuperação de Falhas (4B.6.3)
-- **Propagação Fail-Closed de Exceções de Mailbox no Streaming**:
-  - Removido qualquer silenciamento de exceções (`pass`) durante o polling de mailbox em `SafeStreamConsumer.consume()`.
-  - Qualquer falha durante o processamento concorrente da mailbox (como violação de anti-spoofing, adulteração de symlink, falha de E/S ou indisponibilidade de auditoria) encerra imediatamente a árvore de processos do worker (`safe_terminate_tree`) e propaga a exceção, impedindo a continuidade de processos comprometidos.
-  - Eliminação de `pass` em `ToolBroker.process_mailbox()` nas rotinas de gravação de respostas e remoção de requisições, garantindo que inconsistências de filesystem sejam detectadas e tratadas como erro operacional.
-- **Allowlist Estrita de Leitura no Apple Seatbelt Sandbox (macOS)**:
-  - Eliminada a concessão ampla de leitura `(allow file-read*)`, substituindo-a por uma política de menor privilégio fundamentada em allowlist explícita (equivalente ao modelo Linux Landlock).
-  - O perfil Seatbelt concede leitura exclusivamente aos diretórios essenciais do sistema (`/System`, `/usr`, `/dev`, `/etc`), ao runtime Python (`sys.prefix`), às raízes explicitamente autorizadas (`allowed_read_roots`) e à raiz da sandbox do worker (`sandbox_root`), permitindo leitura de metadados (`allow file-read-metadata`) para resolução de imports e negando categoricamente qualquer acesso não-autorizado a pastas de usuários, diretórios temporários externos e ativos confidenciais do coordenador.
+- **Distinção entre Falhas Operacionais e Violações Críticas de Segurança na Mailbox**:
+  - Distinção rigorosa entre erros operacionais recuperáveis (como rate limits, ferramentas que exigem aprovação humana pendente, tokens expirados/revogados ou erros de parâmetros) e violações críticas de segurança/integridade.
+  - Violações críticas (divergência de identidade/spoofing de PID `CallerIdentityMismatchError`, adulteração de assinatura criptográfica `InvalidCapabilityTokenError`, tentativa de mutação de checkpoints ou credenciais `MutationNotPermittedError`, ataques de symlink/reparse point `FileSandboxSecurityError` ou falha de persistência de auditoria `ToolAuditPersistenceError`) **não são mascaradas como resposta JSON**. Elas são imediatamente propagadas até o `on_poll` do streaming supervisor.
+  - Ao capturar a exceção de segurança, `SafeStreamConsumer.consume()` encerra imediatamente a árvore inteira do processo worker (`safe_terminate_tree`), limpa os recursos e levanta `RuntimeError`, impedindo a continuação de processos desautorizados ou hostis.
+  - Falhas de I/O na gravação de respostas ou remoção de requisições (`res_file`, `req_file`) também são tratadas com fail-closed estrito (`raise OSError`).
+- **Allowlist Estrita de Leitura no Apple Seatbelt Sandbox (macOS — Menor Privilégio)**:
+  - Eliminação definitiva da diretiva ampla `(allow file-read*)`, adotando uma política baseada em `(deny default)` e menor privilégio estrito.
+  - O perfil Seatbelt concede leitura exclusivamente aos diretórios essenciais do sistema operacional (`/System`, `/System/Volumes`, `/usr`, `/Library`, `/dev`, `/etc`, `/private/var/folders`, `/private/var/db`, `/private/var/run`, `/opt`), ao interpretador e bibliotecas em execução (`sys.prefix`, `sys.base_prefix`, `sys.exec_prefix`, `sys.path`), às raízes de projeto explicitamente declaradas (`allowed_read_roots`) e à própria sandbox do worker (`sandbox_root`), acompanhado de `(allow file-read-metadata)` e `(allow file-ioctl)`.
+  - Qualquer leitura fora dessas raízes (incluindo pastas de usuários arbitrárias em `/Users`, credenciais em `.ssh`/`.aws`/`.gnupg`/`mock_home`, tarefas irmãs e ativos confidenciais do supervisor em `auth/`, `backups/`, `checkpoints/` e bases SQLite) é categoricamente bloqueada pelo kernel do macOS.
 
 ## Ambiente do processo
 
