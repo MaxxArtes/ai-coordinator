@@ -1478,7 +1478,7 @@ class ProcessSupervisor:
                 "    sys.exit(1)\n"
                 "os.execvp(sys.argv[2], sys.argv[2:])\n"
             )
-            actual_cmd = [sys.executable, "-c", trampoline_code, str(r_fd), *actual_cmd]
+            actual_cmd = [sys.executable, "-I", "-S", "-c", trampoline_code, str(r_fd), *actual_cmd]
 
         proc = subprocess.Popen(actual_cmd, **kwargs)
 

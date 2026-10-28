@@ -308,6 +308,27 @@ def run_worker(store, config, ident, category, input_file, max_attempts=None):
                         terminate_tree(proc)
                         raise RuntimeError(f"Politica fail-closed violada: falha ao persistir auditoria de spawn do worker: {spawn_audit_err}") from spawn_audit_err
 
+                # Capability Token provisioning for sandboxed worker
+                if hasattr(store, "tool_broker") and store.tool_broker:
+                    try:
+                        allowed = [
+                            t["name"] if isinstance(t, dict) else getattr(t, "name", str(t))
+                            for t in store.tool_broker.registry.list_tools()
+                        ]
+                        worker_token = store.tool_broker.token_manager.issue_token(
+                            task_id=ident,
+                            run_id=run_id,
+                            worker_pid=proc.pid,
+                            project_root=folder,
+                            allowed_tools=allowed,
+                        )
+                        broker_dir = folder / ".broker"
+                        broker_dir.mkdir(parents=True, exist_ok=True)
+                        (broker_dir / "token").write_text(worker_token, encoding="utf-8")
+                    except Exception as tok_err:
+                        terminate_tree(proc)
+                        raise RuntimeError(f"Politica fail-closed violada: falha ao provisionar token de capacidade do broker: {tok_err}") from tok_err
+
                 # Two-phase phase 3: Resume worker process strictly AFTER audit confirmation
                 if getattr(proc, "is_suspended", False):
                     resumed = proc.resume()
@@ -322,7 +343,17 @@ def run_worker(store, config, ident, category, input_file, max_attempts=None):
                     stderr_path=folder / f"stderr-{index}.log",
                     max_log_bytes=limits.get("max_log_bytes", 1_048_576),
                 )
-                stream_res = consumer.consume(proc, timeout_seconds=timeout, stdin_data=stdin)
+
+                def _process_worker_mailbox():
+                    if hasattr(store, "tool_broker") and store.tool_broker:
+                        store.tool_broker.process_mailbox(folder, expected_worker_pid=proc.pid)
+
+                stream_res = consumer.consume(
+                    proc,
+                    timeout_seconds=timeout,
+                    stdin_data=stdin,
+                    on_poll=_process_worker_mailbox,
+                )
                 store.record_heartbeat(run_id)
                 stdout, stderr = stream_res.stdout, stream_res.stderr
                 result = response_text(candidate["client"], stdout, final) if stream_res.returncode == 0 else ""

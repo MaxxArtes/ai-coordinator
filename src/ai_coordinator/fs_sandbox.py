@@ -591,8 +591,15 @@ class MacOsSeatbeltController:
             "(allow ipc-posix-shm)",
             "(allow file-read*)",
             "(deny file-write*)",
-            f'(allow file-write* (subpath "{resolved_sbox}"))',
         ]
+
+        sbox_str = str(resolved_sbox)
+        profile_lines.append(f'(allow file-write* (subpath "{sbox_str}"))')
+        if sbox_str.startswith("/private/"):
+            non_priv = sbox_str[len("/private"):]
+            profile_lines.append(f'(allow file-write* (subpath "{non_priv}"))')
+        else:
+            profile_lines.append(f'(allow file-write* (subpath "/private{sbox_str}"))')
 
         # Deny sensitive supervisor, task siblings, and user credential directories
         profile_lines.append('(deny file-read* (regex #".*/(\\.ssh|\\.aws|\\.gnupg|mock_home)(/.*|$)"))')

@@ -108,6 +108,22 @@ A Fase 4B.5 do AI Coordinator introduz isolamento de processos e governança a n
 - **Suíte de Testes Adversariais Integrados (`tests/test_phase4b_adversarial_suite.py`)**:
   - Bateria automatizada cobrindo testes ponta a ponta de delegação real, fail-closed pré-efeito, adulteração de campos canônicos, truncamento de log, spoofing de mailbox, contenção concorrente e isolamento dos arquivos privados do coordenador.
 
+### 8. Regressão Multiplataforma, Endurecimento do Trampoline e Concorrência de Mailbox (4B.6.2)
+- **Trampoline POSIX Isolado (`sys.executable -I -S -c`)**:
+  - O interpretador Python intermediário utilizado na inicialização suspensa no Linux e macOS agora invoca estritamente as flags `-I` (modo isolado) e `-S` (sem importação do módulo `site`).
+  - Isso garante que variáveis de ambiente como `PYTHONPATH`, arquivos `.pth`, módulos `sitecustomize.py` ou diretórios de pacotes do usuário não possam executar código arbitrário antes da confirmação da auditoria e da liberação da execução via pipe.
+- **Processamento de Mailbox em Tempo de Execução (`SafeStreamConsumer.on_poll`)**:
+  - O supervisor agora inspeciona concorrentemente o diretório `.broker/requests` durante o streaming de stdout/stderr via callback `on_poll` executado no loop de espera (a cada 50ms) e na conclusão.
+  - O token de capacidade HMAC é automaticamente provisionado em `.broker/token` dentro da sandbox do worker antes do início da execução, permitindo que workers delegados solicitem ferramentas com autenticação HMAC e validação estrita de caller PID.
+  - A falha no provisionamento do token segue estritamente a política fail-closed, abortando o worker antes da liberação.
+- **Migração Transparente e Idempotente da v0.4.0**:
+  - O `Store` aplica triggers e tabelas da Fase 4B (`worker_audit_log`, `worker_audit_anchors`, `tool_broker_tokens`) de maneira retrocompatível e idempotente, preservando integralmente o histórico de tarefas, runs e backlog da versão v0.4.0.
+- **Recuperação e Reconciliação Durável pós-Queda (Gate G8)**:
+  - Revogações de tokens de capacidade persistem de forma durável na tabela `tool_broker_tokens` e sobrevivem a quedas totais do supervisor.
+  - O método `reconcile_anchor()` permite restaurar a sincronização do arquivo externo `auth/audit.anchor` com base no registro assinado e auditado no SQLite, recuperando a integridade após interrupções inesperadas de energia ou disco.
+- **Matriz de Testes Multiplataforma e Justificativa de Skips**:
+  - Documentação formal em `docs/test_matrix_and_skips.md` comprovando a equivalência funcional dos 3 testes ignorados em POSIX (`skipped=3`) com os mecanismos de contenção de processos do Windows NT Job Objects.
+
 ## Ambiente do processo
 
 `worker_environment.mode` controla as variáveis herdadas:

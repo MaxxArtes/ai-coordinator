@@ -1005,9 +1005,22 @@ class ToolBroker:
 
                 # Anti-spoofing: verify caller PID against sandbox's expected worker PID
                 if declared_pid is not None and int(declared_pid) != int(expected_worker_pid):
-                    raise CallerIdentityMismatchError(
-                        f"Mailbox spoofing detectado: caller_pid ({declared_pid}) diverge do worker da sandbox ({expected_worker_pid})"
-                    )
+                    is_descendant = False
+                    if os.name != "nt":
+                        try:
+                            ppid_out = subprocess.check_output(
+                                ["ps", "-o", "ppid=", "-p", str(int(declared_pid))],
+                                text=True,
+                                stderr=subprocess.DEVNULL,
+                            ).strip()
+                            if ppid_out and int(ppid_out) == int(expected_worker_pid):
+                                is_descendant = True
+                        except Exception:
+                            pass
+                    if not is_descendant:
+                        raise CallerIdentityMismatchError(
+                            f"Mailbox spoofing detectado: caller_pid ({declared_pid}) diverge do worker da sandbox ({expected_worker_pid})"
+                        )
                 effective_pid = int(expected_worker_pid)
 
                 res = self.execute(
