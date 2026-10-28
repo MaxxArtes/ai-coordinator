@@ -165,7 +165,8 @@ sys.exit(0)
 
         if summary.get("status") != "complete":
             err = summary.get("attempts", [{}])[0].get("error", "unknown")
-            print(f"\n::error title=WorkerError::{err}\n", flush=True)
+            escaped = str(err).replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
+            print(f"\n::error title=WorkerError::{escaped}\n", flush=True)
             self.fail(f"Worker execution failed: {err}")
         self.assertIn("# DelegatedSuccess", summary.get("preview", ""))
         self.assertIn("DelegatedWorkerPayloadContent12345", summary.get("preview", ""))
