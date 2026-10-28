@@ -55,6 +55,8 @@ jobs:
     needs: [python, opencode-package]
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
@@ -69,7 +71,7 @@ jobs:
         run: python -m build --outdir dist
       - name: Build and verify all 5 release candidate artifacts
         run: python scripts/package_release_artifacts.py
-      - name: Verify clean install, CLI smoke, mandatory MCP extra, and realistic v0.4.0 migration
+      - name: Verify clean install, CLI smoke, mandatory MCP extra, and genuine v0.4.0 migration
         run: python scripts/verify_clean_install_and_migration.py
       - name: Compute SHA-256 checksums and export to Step Summary
         run: |
@@ -83,6 +85,9 @@ jobs:
             size=$(stat -c%s "$file")
             echo "| \`$file\` | \`$hash\` | $size |" >> $GITHUB_STEP_SUMMARY
           done < ../checksums.sha256
+          cp ../checksums.sha256 checksums.sha256
+          echo "=== VERIFIED SHA-256 CHECKSUMS ==="
+          cat checksums.sha256
       - name: Upload release candidate artifacts for independent audit
         uses: actions/upload-artifact@v4
         with:

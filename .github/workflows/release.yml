@@ -62,14 +62,31 @@ jobs:
           export RELEASE_VERSION="${RELEASE_TAG#v}"
           python scripts/package_release_artifacts.py
 
-      - name: Verify clean install, CLI smoke, mandatory MCP extra, and realistic v0.4.0 migration
+      - name: Verify clean install, CLI smoke, mandatory MCP extra, and genuine v0.4.0 migration
         env:
           RELEASE_TAG: ${{ inputs.release_tag || github.ref_name }}
         run: |
           export RELEASE_VERSION="${RELEASE_TAG#v}"
           python scripts/verify_clean_install_and_migration.py
 
-      - name: Publish GitHub Release with artifacts
+      - name: Generate cryptographic SHA-256 manifest
+        run: |
+          cd dist
+          sha256sum * | tee ../checksums.sha256
+          cp ../checksums.sha256 checksums.sha256
+          echo "### Official SHA-256 Manifest of Published Release Artifacts" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Artifact | SHA-256 Checksum |" >> $GITHUB_STEP_SUMMARY
+          echo "|---|---|" >> $GITHUB_STEP_SUMMARY
+          while read -r hash file; do
+            if [ "$file" != "checksums.sha256" ]; then
+              echo "| \`$file\` | \`$hash\` |" >> $GITHUB_STEP_SUMMARY
+            fi
+          done < ../checksums.sha256
+          echo "=== OFFICIAL RELEASE SHA-256 MANIFEST ==="
+          cat checksums.sha256
+
+      - name: Publish GitHub Release with artifacts and SHA-256 manifest
         if: |
           (github.event_name == 'push') ||
           (github.event_name == 'workflow_dispatch' && inputs.confirm_publish == true)

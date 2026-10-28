@@ -1,21 +1,25 @@
-"""Verification of clean installation and realistic v0.4.0 database migration for ai-coordinator v0.5.0-rc.
+"""Verification of clean installation and genuine v0.4.0 database migration for ai-coordinator v0.5.0-rc.
 
 Thoroughly tests:
 1. Wheel installation in an isolated temporary virtual environment.
 2. CLI smoke tests (version, help, routes, bootstrap).
 3. Mandatory test of optional [mcp] dependency behavior (fails if [mcp] cannot be verified).
-4. Realistic v0.4.0 SQLite database migration executed strictly by the installed package inside the clean venv.
-5. Idempotent creation of Phase 4B tables, immutability SQL triggers, and dual-anchoring.
-6. Supervisor recovery and reconcile_anchor() durability simulation in the installed runtime.
+4. Genuine v0.4.0 SQLite database generation directly from git tag v0.4.0 (tasks, runs, plan revisions, experience records).
+5. Migration of genuine v0.4.0 database executed strictly by the installed package inside the clean venv.
+6. Explicit verification of runs preservation, status, and exit codes.
+7. Idempotent creation of Phase 4B tables, immutability SQL triggers, and dual-anchoring.
+8. Supervisor recovery and reconcile_anchor() durability simulation in the installed runtime.
 """
 from __future__ import annotations
 
+import io
 import json
 import os
 from pathlib import Path
 import sqlite3
 import subprocess
 import sys
+import tarfile
 import tempfile
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -25,7 +29,6 @@ if not VERSION:
     import tomllib
     pyproj = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
     VERSION = pyproj["project"]["version"]
-
 
 
 def run_cmd(args: list[str], cwd: Path | None = None, env: dict | None = None) -> tuple[int, str, str]:
@@ -112,178 +115,162 @@ print("MCP server created successfully after installing extra")
     return py_bin
 
 
-def test_realistic_v0_4_0_migration_and_recovery(tmp_dir: Path, py_bin: Path):
-    print("\n--- 4. Testing Realistic v0.4.0 Database Migration Executed by Installed Package ---")
-    coord_root = tmp_dir / "coordinator_store"
+def test_genuine_v0_4_0_migration_and_recovery(tmp_dir: Path, py_bin: Path):
+    print("\n--- 4. Testing Genuine v0.4.0 Database Creation and Migration Executed by Installed Package ---")
+    
+    # Step A: Extract genuine v0.4.0 repository tree in memory from tag v0.4.0
+    v040_stage = tmp_dir / "v040_stage"
+    res = subprocess.run(["git", "-C", str(ROOT), "archive", "v0.4.0"], capture_output=True, check=True)
+    with tarfile.open(fileobj=io.BytesIO(res.stdout)) as tf:
+        tf.extractall(v040_stage)
+
+    coord_root = tmp_dir / "genuine_v040_store"
     coord_root.mkdir(parents=True, exist_ok=True)
-    db_path = coord_root / "coordination.sqlite"
+    proj_dir = tmp_dir / "legacy_production_project"
+    proj_dir.mkdir(parents=True, exist_ok=True)
 
-    # Step A: Build a realistic v0.4.0 legacy database schema with tasks, runs, backlog, and Phase 3 plans
-    conn = sqlite3.connect(str(db_path))
-    cur = conn.cursor()
-    cur.executescript("""
-        CREATE TABLE tasks (
-            id TEXT PRIMARY KEY,
-            goal TEXT NOT NULL,
-            status TEXT NOT NULL,
-            project TEXT NOT NULL,
-            created_at TEXT NOT NULL,
-            updated_at TEXT NOT NULL,
-            revision INTEGER NOT NULL DEFAULT 1,
-            ai_memory_workstream_id TEXT,
-            flight_plan_id TEXT,
-            step_count INTEGER NOT NULL DEFAULT 0,
-            uncheckpointed_steps INTEGER NOT NULL DEFAULT 0,
-            drift_status TEXT NOT NULL DEFAULT 'nominal',
-            flight_plan TEXT,
-            landing_checks TEXT NOT NULL DEFAULT '[]'
-        );
+    env_v040 = os.environ.copy()
+    env_v040["PYTHONPATH"] = str(v040_stage / "src")
 
-        CREATE TABLE runs (
-            id TEXT PRIMARY KEY,
-            task_id TEXT NOT NULL,
-            category TEXT NOT NULL,
-            status TEXT NOT NULL,
-            started_at TEXT NOT NULL,
-            ended_at TEXT,
-            exit_code INTEGER,
-            error TEXT,
-            output_path TEXT,
-            usage TEXT,
-            attempts TEXT,
-            pid INTEGER,
-            process_create_time REAL,
-            FOREIGN KEY (task_id) REFERENCES tasks (id)
-        );
+    # Step B: Populate genuine v0.4.0 database using the genuine v0.4.0 codebase
+    creator_script = """
+import sys
+from pathlib import Path
+import ai_coordinator
+from ai_coordinator.storage import Store, RunState
 
-        CREATE TABLE backlog (
-            id TEXT PRIMARY KEY,
-            task_id TEXT NOT NULL,
-            title TEXT NOT NULL,
-            status TEXT NOT NULL,
-            created_at TEXT NOT NULL,
-            FOREIGN KEY (task_id) REFERENCES tasks (id)
-        );
+assert ai_coordinator.__version__ == "0.4.0", f"Expected genuine v0.4.0, got: {ai_coordinator.__version__}"
+coord_root = Path(sys.argv[1])
+proj_dir = sys.argv[2]
+store = Store(root=coord_root)
 
-        CREATE TABLE heartbeats (
-            run_id TEXT PRIMARY KEY,
-            last_seen TEXT NOT NULL
-        );
+# 1. Create a genuine task
+task = store.new(goal="Genuine legacy mission running under v0.4.0", project=proj_dir)
+task_id = task["id"]
 
-        CREATE TABLE plan_revisions (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            task_id TEXT NOT NULL,
-            revision INTEGER NOT NULL,
-            parent_revision INTEGER,
-            created_at TEXT NOT NULL,
-            status TEXT NOT NULL DEFAULT 'draft',
-            FOREIGN KEY (task_id) REFERENCES tasks(id)
-        );
+# 2. Reserve and complete runs
+run_id1, _, _ = store.reserve(task_id, "general", "Production run payload prompt 1", max_calls=10)
+store.update_run(run_id1, status=RunState.COMPLETE, exit_code=0, ended="2026-10-15T10:30:00Z")
 
-        CREATE TABLE experience_entries (
-            id TEXT PRIMARY KEY,
-            problem_signature TEXT NOT NULL,
-            solution_summary TEXT NOT NULL,
-            context_tags TEXT NOT NULL,
-            created_at TEXT NOT NULL
-        );
-    """)
+run_id2, _, _ = store.reserve(task_id, "review", "Production run payload prompt 2", max_calls=5)
+store.update_run(run_id2, status=RunState.FAILED, exit_code=1, error="Legacy execution failure test")
 
-    legacy_task_id = "legacy_task_v040"
-    cur.execute(
-        "INSERT INTO tasks (id, goal, status, project, created_at, updated_at, revision) VALUES (?, ?, ?, ?, ?, ?, ?)",
-        (legacy_task_id, "Migrate legacy production project to v0.5.0", "active", "C:/Projects/LegacyProd", "2026-10-15T10:00:00Z", "2026-10-15T12:00:00Z", 6)
-    )
-    cur.execute(
-        "INSERT INTO runs (id, task_id, category, status, started_at, exit_code) VALUES (?, ?, ?, ?, ?, ?)",
-        ("run_v040_prod", legacy_task_id, "general", "complete", "2026-10-15T10:05:00Z", 0)
-    )
-    cur.execute(
-        "INSERT INTO backlog (id, task_id, title, status, created_at) VALUES (?, ?, ?, ?, ?)",
-        ("item_v040_prod", legacy_task_id, "Legacy v0.4.0 critical backlog item", "pending", "2026-10-15T10:01:00Z")
-    )
-    cur.execute(
-        "INSERT INTO plan_revisions (task_id, revision, parent_revision, created_at, status) VALUES (?, ?, ?, ?, ?)",
-        (legacy_task_id, 1, None, "2026-10-15T10:02:00Z", "active")
-    )
-    cur.execute(
-        "INSERT INTO experience_entries (id, problem_signature, solution_summary, context_tags, created_at) VALUES (?, ?, ?, ?, ?)",
-        ("exp_v040_01", "sig:timeout_retry", "Exponential backoff", '["network", "retry"]', "2026-10-15T10:03:00Z")
-    )
-    conn.commit()
-    conn.close()
-    print("[OK] Realistic v0.4.0 database constructed with tasks, runs, backlog, and plan_revisions")
+# 3. Create plan revision
+plan_rev = store.create_plan_revision(
+    task_id=task_id,
+    nodes=[{"id": "step_a", "title": "Legacy Analysis", "category": "general", "status": "complete"}],
+    edges=[],
+    summary="Genuine v0.4.0 initial plan revision",
+)
 
-    # Step B: Execute migration strictly inside the isolated clean virtual environment using the installed wheel package!
+# 4. Create experience record
+exp = store.record_experience(
+    project_id=proj_dir,
+    problem_pattern="sig:legacy_v040_timeout",
+    solution_pattern="Exponential backoff with jitter",
+    task_id=task_id,
+    context_tags=["legacy", "v040", "retry"]
+)
+
+store.db.close()
+print(f"GENUINE_V040_TASK_ID:{task_id}")
+print(f"GENUINE_V040_RUN1_ID:{run_id1}")
+print(f"GENUINE_V040_RUN2_ID:{run_id2}")
+print(f"GENUINE_V040_EXP_ID:{exp.id}")
+"""
+    p_create = subprocess.run([sys.executable, "-c", creator_script, str(coord_root), str(proj_dir)], env=env_v040, capture_output=True, text=True)
+    assert p_create.returncode == 0, f"Genuine v0.4.0 database generation failed: {p_create.stderr}"
+    
+    meta = {}
+    for line in p_create.stdout.splitlines():
+        if ":" in line:
+            k, v = line.split(":", 1)
+            meta[k.strip()] = v.strip()
+    print("[OK] Genuine v0.4.0 database constructed using genuine v0.4.0 release codebase")
+
+    # Step C: Execute migration strictly inside clean_venv using the installed v0.5.0 wheel package
     migration_test_code = f"""
 import sys
 from pathlib import Path
-from ai_coordinator.storage import Store
+from ai_coordinator.storage import Store, RunState
 from ai_coordinator.worker_audit import WorkerAuditEventType
 
 coord_root = Path(r"{coord_root.resolve().as_posix()}")
 supervisor_key = "genuine_supervisor_secret_migration_test_v050"
-legacy_task_id = "{legacy_task_id}"
+task_id = "{meta['GENUINE_V040_TASK_ID']}"
+run1_id = "{meta['GENUINE_V040_RUN1_ID']}"
+run2_id = "{meta['GENUINE_V040_RUN2_ID']}"
+exp_id = "{meta['GENUINE_V040_EXP_ID']}"
 
 store = Store(root=coord_root, supervisor_key=supervisor_key)
 try:
-    # 1. Verify legacy data preserved intact
-    row_task = store.db.execute("SELECT goal, revision FROM tasks WHERE id = ?", (legacy_task_id,)).fetchone()
-    assert row_task is not None, "Legacy task lost during migration!"
-    assert row_task[0] == "Migrate legacy production project to v0.5.0"
-    assert row_task[1] == 6
+    # 1. Verify legacy task preserved intact
+    task = store.task(task_id)
+    assert task is not None, "Legacy task lost during migration!"
+    assert task["goal"] == "Genuine legacy mission running under v0.4.0"
+    print("[OK] Genuine v0.4.0 task preserved intact")
 
-    row_backlog = store.db.execute("SELECT title, status FROM backlog WHERE id = 'item_v040_prod'").fetchone()
-    assert row_backlog is not None, "Legacy backlog item lost during migration!"
-    assert row_backlog[0] == "Legacy v0.4.0 critical backlog item"
+    # 2. Verify legacy runs preserved explicitly (status and exit_code)
+    runs = store.runs(task_id)
+    assert len(runs) == 2, f"Expected 2 legacy runs, found {{len(runs)}}"
+    run_map = {{r["id"]: r for r in runs}}
+    assert run1_id in run_map, f"Legacy run 1 lost: {{run1_id}}"
+    assert run2_id in run_map, f"Legacy run 2 lost: {{run2_id}}"
+    assert run_map[run1_id]["status"] == RunState.COMPLETE
+    assert run_map[run1_id]["exit_code"] == 0
+    assert run_map[run2_id]["status"] == RunState.FAILED
+    assert run_map[run2_id]["exit_code"] == 1
+    print(f"[OK] Genuine v0.4.0 runs ({{run1_id}}, {{run2_id}}) verified and preserved with status and exit codes")
 
-    row_plan = store.db.execute("SELECT revision, status FROM plan_revisions WHERE task_id = ?", (legacy_task_id,)).fetchone()
-    assert row_plan is not None and row_plan[0] == 1
-
-    row_exp = store.db.execute("SELECT problem_signature FROM experience_entries WHERE id = 'exp_v040_01'").fetchone()
-    assert row_exp is not None and row_exp[0] == "sig:timeout_retry"
-    print("[OK] Legacy v0.4.0 tasks, runs, backlog, plan_revisions and experiences preserved intact")
-
-    # 2. Verify Phase 4B tables created idempotently
+    # 3. Verify plan revisions and experience records preserved
     cur = store.db.cursor()
+    row_plan = cur.execute("SELECT revision, summary FROM plan_revisions WHERE task_id = ?", (task_id,)).fetchone()
+    assert row_plan is not None and row_plan[0] == 1
+    print("[OK] Genuine v0.4.0 plan revision preserved intact")
+
+    row_exp = cur.execute("SELECT id, problem_pattern FROM experience_records WHERE id = ?", (exp_id,)).fetchone()
+    assert row_exp is not None and row_exp[1] == "sig:legacy_v040_timeout"
+    print("[OK] Genuine v0.4.0 experience record preserved intact")
+
+    # 4. Verify Phase 4B tables created idempotently
     tables = {{row[0] for row in cur.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()}}
     assert "worker_audit_log" in tables, "worker_audit_log table missing after migration"
     assert "worker_audit_anchors" in tables, "worker_audit_anchors table missing after migration"
     assert "tool_broker_tokens" in tables, "tool_broker_tokens table missing after migration"
     print("[OK] Phase 4B tables created idempotently")
 
-    # 3. Verify triggers created and active
+    # 5. Verify Phase 4B immutability SQL triggers active
     triggers = {{row[0] for row in cur.execute("SELECT name FROM sqlite_master WHERE type='trigger'").fetchall()}}
     assert any("prevent_worker_audit_update" in t for t in triggers)
     assert any("prevent_worker_audit_delete" in t for t in triggers)
     print("[OK] Phase 4B immutability SQL triggers active")
 
-    # 4. Record Phase 4B events and verify dual-anchoring
+    # 6. Record Phase 4B events and verify dual-anchoring
     store.worker_audit.record_event(
         event_type=WorkerAuditEventType.SPAWN,
-        task_id=legacy_task_id,
+        task_id=task_id,
         run_id="run_v050_migrated",
         worker_pid=12345,
         details={{"migrated": True, "version": "0.5.0"}},
     )
     store.worker_audit.record_event(
         event_type=WorkerAuditEventType.EXIT,
-        task_id=legacy_task_id,
+        task_id=task_id,
         run_id="run_v050_migrated",
         worker_pid=12345,
         details={{"migrated": True, "status": "complete"}},
     )
 
-    ok, errors = store.worker_audit.verify_integrity(task_id=legacy_task_id)
+    ok, errors = store.worker_audit.verify_integrity(task_id=task_id)
     assert ok, f"Audit integrity failed: {{errors}}"
     anchor_file = store.worker_audit.anchor_file_path
     assert anchor_file is not None and anchor_file.is_file(), "External audit.anchor file was not created"
     print(f"[OK] Dual-anchoring verified (SQLite + {{anchor_file.name}})")
 
-    # 5. Simulate crash & anchor loss, then test durable recovery (reconcile_anchor)
+    # 7. Simulate crash & anchor loss, then test durable recovery (reconcile_anchor)
     anchor_file.unlink()
     assert not anchor_file.exists()
-    ok_broken, err_broken = store.worker_audit.verify_integrity(task_id=legacy_task_id)
+    ok_broken, err_broken = store.worker_audit.verify_integrity(task_id=task_id)
     assert not ok_broken, "Integrity should have failed after removing external anchor"
     assert any("ausente ou removido" in e.lower() for e in err_broken)
     print("[OK] Anchor tampering / loss correctly detected by verify_integrity")
@@ -293,7 +280,7 @@ try:
     assert recovered, "reconcile_anchor failed"
     assert anchor_file.is_file(), "Anchor file not restored by reconcile_anchor"
 
-    ok_restored, err_restored = store.worker_audit.verify_integrity(task_id=legacy_task_id)
+    ok_restored, err_restored = store.worker_audit.verify_integrity(task_id=task_id)
     assert ok_restored, f"Integrity should pass after reconciliation, got: {{err_restored}}"
     print("[OK] reconcile_anchor() durability and recovery confirmed in installed package")
 
@@ -311,8 +298,8 @@ def main():
     with tempfile.TemporaryDirectory() as tmp_str:
         tmp_dir = Path(tmp_str)
         py_bin = test_clean_installation(tmp_dir)
-        test_realistic_v0_4_0_migration_and_recovery(tmp_dir, py_bin)
-    print("\n[ALL CHECKS PASSED] Clean installation and realistic v0.4.0 migration verified successfully!")
+        test_genuine_v0_4_0_migration_and_recovery(tmp_dir, py_bin)
+    print("\n[ALL CHECKS PASSED] Clean installation and genuine v0.4.0 migration verified successfully!")
 
 
 if __name__ == "__main__":
