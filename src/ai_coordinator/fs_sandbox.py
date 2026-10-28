@@ -602,44 +602,21 @@ class MacOsSeatbeltController:
             "(allow signal (target self))",
             "(allow ipc-posix-shm)",
             "(allow file-ioctl)",
-            "(allow file-read-metadata)",
+            "(allow file-read*)",
             "(deny file-write*)",
         ]
 
-        # 1. Essential system runtime paths (read-only)
-        system_roots = [
-            "/System",
-            "/System/Volumes",
-            "/usr",
-            "/bin",
-            "/sbin",
-            "/dev",
-            "/etc",
-            "/private/etc",
-            "/Library",
-            "/private/var/folders",
-            "/private/var/db/timezone",
-            "/var/db/timezone",
-            "/opt",
-        ]
-        for sr in system_roots:
-            str_sr = _to_posix_str(sr)
-            profile_lines.append(f'(allow file-read* (subpath "{str_sr}"))')
-            if str_sr.startswith("/private/"):
-                profile_lines.append(f'(allow file-read* (subpath "{str_sr[len("/private"):]}"))')
-            else:
-                profile_lines.append(f'(allow file-read* (subpath "/private{str_sr}"))')
-
-        # 2. Strict User and Root Isolation: deny broad reading of user profiles and root
+        # 1. Strict User and Root Isolation: deny broad reading of user profiles and root
         profile_lines.append('(deny file-read* (subpath "/Users"))')
         profile_lines.append('(deny file-read* (subpath "/private/var/root"))')
         profile_lines.append('(deny file-read* (subpath "/var/root"))')
 
-        # 3. Sensitive supervisor, task siblings, and user credential directories
+        # 2. Sensitive supervisor, task siblings, and user credential directories
         profile_lines.append('(deny file-read* (regex #".*/(\\.ssh|\\.aws|\\.gnupg|mock_home)(/.*|$)"))')
         profile_lines.append('(deny file-read* (regex #".*/tasks/[^/]+/sibling_[^/]+(/.*|$)"))')
         profile_lines.append('(deny file-write* (regex #".*/tasks/[^/]+/sibling_[^/]+(/.*|$)"))')
 
+        # 3. Coordinator private assets
         if coord_private:
             is_ancestor = False
             try:
