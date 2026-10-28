@@ -135,6 +135,15 @@ A Fase 4B.5 do AI Coordinator introduz isolamento de processos e governança a n
   - O perfil Seatbelt concede leitura exclusivamente aos diretórios essenciais do sistema operacional (`/System`, `/System/Volumes`, `/usr`, `/Library`, `/dev`, `/etc`, `/private/var/folders`, `/private/var/db`, `/private/var/run`, `/opt`), ao interpretador e bibliotecas em execução (`sys.prefix`, `sys.base_prefix`, `sys.exec_prefix`, `sys.path`), às raízes de projeto explicitamente declaradas (`allowed_read_roots`) e à própria sandbox do worker (`sandbox_root`), acompanhado de `(allow file-read-metadata)` e `(allow file-ioctl)`.
   - Qualquer leitura fora dessas raízes (incluindo pastas de usuários arbitrárias em `/Users`, credenciais em `.ssh`/`.aws`/`.gnupg`/`mock_home`, tarefas irmãs e ativos confidenciais do supervisor em `auth/`, `backups/`, `checkpoints/` e bases SQLite) é categoricamente bloqueada pelo kernel do macOS.
 
+### 10. Documentação, Versionamento 0.5.0 e Fechamento de Provas de Segurança (4B.6.4)
+- **Sincronização de Versão 0.5.0 em Todo o Ecossistema**:
+  - Alinhamento atômico das declarações de versão no pacote Python (`pyproject.toml`, `src/ai_coordinator/__init__.py`), na CLI (`ai-coordinator --version`), no marketplace Claude Code (`.claude-plugin/marketplace.json`), no plugin Claude Code (`plugins/claude-code/.claude-plugin/plugin.json`) e no pacote OpenCode V2 (`plugins/opencode/package.json`).
+  - Verificação automatizada contínua via `scripts/check_support_matrix.py`.
+- **Prova Operacional do Menor Privilégio no macOS Seatbelt**:
+  - Validação experimental em runtime (`test_08` em `tests/test_phase4b_multiplatform_regression.py`) confirmando que tentativas do worker de ler arquivos arbitrários fora das raízes explicitamente autorizadas (`allowed_read_roots`) resultam imediatamente em `PermissionError` / `OSError`, comprovando a eficácia prática da contenção sob `(deny default)`.
+- **Verificação Determinística de Encerramento Físico de Processos**:
+  - Validação direta e determinística nos testes adversariais de mailbox (`test_09` e `test_10`) de que processos workers autores de violações fatais de segurança (spoofing de caller PID ou adulteração de tokens HMAC) são imediatamente terminados pelo supervisor no sistema operacional (`safe_process_alive(worker_pid) is False`).
+
 ## Ambiente do processo
 
 `worker_environment.mode` controla as variáveis herdadas:

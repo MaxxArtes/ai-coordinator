@@ -727,7 +727,7 @@ def _get_version() -> str:
             from . import __version__
             return __version__
         except Exception:
-            return "0.4.0"
+            return "0.5.0"
 
 def parser():
     p = argparse.ArgumentParser(prog="ai-coordinator", description=__doc__)

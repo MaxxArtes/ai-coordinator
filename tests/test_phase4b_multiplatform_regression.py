@@ -483,6 +483,10 @@ sys.exit(0)
         auth_dir.mkdir(parents=True, exist_ok=True)
         (auth_dir / "supervisor.secret").write_text("SUPERVISOR_SECRET_789", encoding="utf-8")
 
+        arbitrary_dir = self.base_root / "arbitrary_zone"
+        arbitrary_dir.mkdir(parents=True, exist_ok=True)
+        (arbitrary_dir / "arbitrary_outside.txt").write_text("ARBITRARY_UNAUTHORIZED_DATA", encoding="utf-8")
+
         profile = MacOsSeatbeltController.build_profile(
             sandbox_root=test_sbox,
             coordinator_private_dir=self.coordinator_dir,
@@ -511,6 +515,14 @@ try:
 except (PermissionError, OSError):
     pass
 
+# 4. Read arbitrary file outside authorized roots -> must fail with PermissionError / OSError
+arb_p = Path(r"{(arbitrary_dir / "arbitrary_outside.txt").resolve().as_posix()}")
+try:
+    arb_p.read_text(encoding="utf-8")
+    sys.exit(40)  # Should have been denied by default policy!
+except (PermissionError, OSError):
+    pass
+
 sys.exit(0)
 """
         res = subprocess.run(
@@ -529,6 +541,9 @@ from pathlib import Path
 broker_dir = Path(".broker")
 token_file = broker_dir / "token"
 token = token_file.read_text(encoding="utf-8").strip() if token_file.exists() else ""
+
+# Record worker PID to verify termination
+(broker_dir / "worker_spoof.pid").write_text(str(os.getpid()), encoding="utf-8")
 
 req_dir = broker_dir / "requests"
 req_dir.mkdir(parents=True, exist_ok=True)
@@ -592,6 +607,12 @@ sys.exit(0)
             f"Expected fatal security violation error message, got: {err_msg}"
         )
 
+        # Explicitly verify worker process termination
+        pid_files = list(self.coordinator_dir.glob("**/worker_spoof.pid"))
+        self.assertTrue(len(pid_files) > 0, "worker_spoof.pid was not found in sandbox")
+        worker_pid = int(pid_files[0].read_text(encoding="utf-8").strip())
+        self.assertFalse(safe_process_alive(worker_pid))
+
     def test_10_mailbox_tampered_token_fatal_security_violation_terminates_worker(self):
         """Mailbox request with forged/tampered capability token is treated as a fatal security violation, terminating the worker."""
         tamper_worker_py = self.project_dir / "tamper_worker.py"
@@ -601,6 +622,9 @@ from pathlib import Path
 broker_dir = Path(".broker")
 token_file = broker_dir / "token"
 token = token_file.read_text(encoding="utf-8").strip() if token_file.exists() else ""
+
+# Record worker PID to verify termination
+(broker_dir / "worker_tamper.pid").write_text(str(os.getpid()), encoding="utf-8")
 
 req_dir = broker_dir / "requests"
 req_dir.mkdir(parents=True, exist_ok=True)
@@ -660,6 +684,12 @@ sys.exit(0)
             "InvalidCapabilityTokenError" in err_msg or "seguranca" in err_msg.lower() or "token" in err_msg.lower(),
             f"Expected fatal token violation error message, got: {err_msg}"
         )
+
+        # Explicitly verify worker process termination
+        pid_files = list(self.coordinator_dir.glob("**/worker_tamper.pid"))
+        self.assertTrue(len(pid_files) > 0, "worker_tamper.pid was not found in sandbox")
+        worker_pid = int(pid_files[0].read_text(encoding="utf-8").strip())
+        self.assertFalse(safe_process_alive(worker_pid))
 
 
 if __name__ == "__main__":
