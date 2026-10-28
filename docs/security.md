@@ -124,6 +124,15 @@ A Fase 4B.5 do AI Coordinator introduz isolamento de processos e governança a n
 - **Matriz de Testes Multiplataforma e Justificativa de Skips**:
   - Documentação formal em `docs/test_matrix_and_skips.md` comprovando a equivalência funcional dos 3 testes ignorados em POSIX (`skipped=3`) com os mecanismos de contenção de processos do Windows NT Job Objects.
 
+### 9. Revisão de Autenticação, Permissões e Recuperação de Falhas (4B.6.3)
+- **Propagação Fail-Closed de Exceções de Mailbox no Streaming**:
+  - Removido qualquer silenciamento de exceções (`pass`) durante o polling de mailbox em `SafeStreamConsumer.consume()`.
+  - Qualquer falha durante o processamento concorrente da mailbox (como violação de anti-spoofing, adulteração de symlink, falha de E/S ou indisponibilidade de auditoria) encerra imediatamente a árvore de processos do worker (`safe_terminate_tree`) e propaga a exceção, impedindo a continuidade de processos comprometidos.
+  - Eliminação de `pass` em `ToolBroker.process_mailbox()` nas rotinas de gravação de respostas e remoção de requisições, garantindo que inconsistências de filesystem sejam detectadas e tratadas como erro operacional.
+- **Allowlist Estrita de Leitura no Apple Seatbelt Sandbox (macOS)**:
+  - Eliminada a concessão ampla de leitura `(allow file-read*)`, substituindo-a por uma política de menor privilégio fundamentada em allowlist explícita (equivalente ao modelo Linux Landlock).
+  - O perfil Seatbelt concede leitura exclusivamente aos diretórios essenciais do sistema (`/System`, `/usr`, `/dev`, `/etc`), ao runtime Python (`sys.prefix`), às raízes explicitamente autorizadas (`allowed_read_roots`) e à raiz da sandbox do worker (`sandbox_root`), permitindo leitura de metadados (`allow file-read-metadata`) para resolução de imports e negando categoricamente qualquer acesso não-autorizado a pastas de usuários, diretórios temporários externos e ativos confidenciais do coordenador.
+
 ## Ambiente do processo
 
 `worker_environment.mode` controla as variáveis herdadas:

@@ -270,8 +270,12 @@ class SafeStreamConsumer:
             if on_poll is not None:
                 try:
                     on_poll()
-                except Exception:
-                    pass
+                except Exception as poll_err:
+                    from .process import safe_terminate_tree
+                    safe_terminate_tree(proc, timeout_seconds=2.0)
+                    t_out.join(timeout=1.0)
+                    t_err.join(timeout=1.0)
+                    raise RuntimeError(f"Falha de seguranca no processamento da mailbox do worker: {poll_err}") from poll_err
             if not t_out.is_alive() and not t_err.is_alive():
                 break
             time.sleep(0.05)
@@ -291,8 +295,10 @@ class SafeStreamConsumer:
         if on_poll is not None:
             try:
                 on_poll()
-            except Exception:
-                pass
+            except Exception as poll_err:
+                from .process import safe_terminate_tree
+                safe_terminate_tree(proc, timeout_seconds=2.0)
+                raise RuntimeError(f"Falha de seguranca no processamento final da mailbox do worker: {poll_err}") from poll_err
 
         # Wait for exit code
         if hasattr(proc, "wait"):

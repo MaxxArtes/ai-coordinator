@@ -989,8 +989,8 @@ class ToolBroker:
                     }
                     try:
                         req_file.unlink()
-                    except Exception:
-                        pass
+                    except Exception as unlink_err:
+                        raise ToolAccessDeniedError(f"Impossivel remover symlink malicioso na mailbox: {unlink_err}") from unlink_err
                     results.append(status_obj)
                     continue
 
@@ -1040,14 +1040,14 @@ class ToolBroker:
                 if res_file.exists() and (res_file.is_symlink() or is_reparse_point_or_symlink(res_file)):
                     res_file.unlink()
                 res_file.write_text(json.dumps(status_obj, indent=2), encoding="utf-8")
-            except Exception:
-                pass
+            except Exception as res_err:
+                raise OSError(f"Falha de seguranca ao gravar resposta da mailbox ({res_file.name}): {res_err}") from res_err
 
             try:
                 if req_file.exists():
                     req_file.unlink()
-            except Exception:
-                pass
+            except Exception as unlink_err:
+                raise OSError(f"Falha de seguranca ao remover requisicao processada da mailbox ({req_file.name}): {unlink_err}") from unlink_err
             results.append(status_obj)
 
         return results

@@ -391,6 +391,76 @@ sys.exit(0)
         finally:
             restarted_store.db.close()
 
+    def test_06_mailbox_streaming_exception_fails_closed_and_terminates_worker(self):
+        """Streaming consumer must terminate worker and raise if mailbox on_poll raises an exception."""
+        from ai_coordinator.streaming import SafeStreamConsumer
+        import subprocess
+
+        # Long-running worker process
+        proc = subprocess.Popen(
+            [sys.executable, "-c", "import time; time.sleep(10)"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        consumer = SafeStreamConsumer(
+            stdout_path=self.project_dir / "stdout_poll.log",
+            stderr_path=self.project_dir / "stderr_poll.log",
+        )
+
+        def _faulty_poll():
+            raise ValueError("CriticalMailboxSecurityFailure")
+
+        try:
+            with self.assertRaises(RuntimeError) as cm:
+                consumer.consume(proc, timeout_seconds=5.0, on_poll=_faulty_poll)
+            self.assertIn("Falha de seguranca no processamento da mailbox", str(cm.exception))
+            self.assertIn("CriticalMailboxSecurityFailure", str(cm.exception))
+            # Verify process was terminated fail-closed
+            self.assertFalse(safe_process_alive(proc.pid))
+        finally:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+
+    def test_07_seatbelt_profile_enforces_strict_read_allowlist_without_blanket_allow(self):
+        """macOS Seatbelt Sandbox profile must construct a strict read allowlist without blanket (allow file-read*)."""
+        from ai_coordinator.fs_sandbox import MacOsSeatbeltController
+        sbox = self.coordinator_dir / "tasks" / "test_task" / "runs" / "test_run"
+        coord_priv = self.coordinator_dir
+        allowed_reads = [self.project_dir, Path("/opt/custom_tool")]
+
+        profile = MacOsSeatbeltController.build_profile(
+            sandbox_root=sbox,
+            coordinator_private_dir=coord_priv,
+            allowed_read_roots=allowed_reads,
+        )
+
+        # 1. Must NOT contain broad blanket allow
+        self.assertNotIn("(allow file-read*)", profile)
+
+        # 2. Must allow reading metadata
+        self.assertIn("(allow file-read-metadata)", profile)
+
+        # 3. Must allow reading system roots and python prefix
+        self.assertIn('(allow file-read* (subpath "/System"))', profile)
+        self.assertIn('(allow file-read* (subpath "/usr"))', profile)
+        self.assertIn(f'(allow file-read* (subpath "{Path(sys.prefix).resolve().as_posix()}"))', profile)
+
+        # 4. Must allow explicitly declared read roots
+        self.assertIn(f'(allow file-read* (subpath "{self.project_dir.resolve().as_posix()}"))', profile)
+        self.assertIn('(allow file-read* (subpath "/opt/custom_tool"))', profile)
+
+        # 5. Must deny coordinator private directories and SQLite files
+        self.assertIn('(deny file-read* (regex #".*\\.sqlite(-wal|-shm)?$"))', profile)
+        self.assertIn('(deny file-write* (regex #".*\\.sqlite(-wal|-shm)?$"))', profile)
+        self.assertIn(f'(deny file-read* (subpath "{(coord_priv / "auth").resolve().as_posix()}"))', profile)
+
+        # 6. Must grant sandbox_root both read and write at the end of the profile
+        lines = profile.splitlines()
+        self.assertIn(f'(allow file-read* (subpath "{sbox.resolve().as_posix()}"))', lines[-4:])
+        self.assertIn(f'(allow file-write* (subpath "{sbox.resolve().as_posix()}"))', lines[-4:])
+
 
 if __name__ == "__main__":
     unittest.main()

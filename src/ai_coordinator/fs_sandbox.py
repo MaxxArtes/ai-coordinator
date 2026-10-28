@@ -577,6 +577,18 @@ class MacOsSeatbeltController:
         allowed_read_roots: Optional[Sequence[Path]] = None,
     ) -> str:
         """Construct SBPL profile allowing write only to sandbox_root and denying coordinator files."""
+        def _to_posix_str(p: Union[str, Path]) -> str:
+            raw = str(p).replace("\\", "/")
+            if os.name == "nt" and raw.startswith("/") and (len(raw) < 2 or raw[1] != ":"):
+                return raw
+            resolved = Path(p).resolve()
+            s = str(resolved).replace("\\", "/")
+            if os.name == "nt" and len(s) >= 2 and s[1] == ":":
+                orig = str(p).replace("\\", "/")
+                if orig.startswith("/") and (len(orig) < 2 or orig[1] != ":"):
+                    return orig
+            return s
+
         resolved_sbox = Path(sandbox_root).resolve()
         coord_private = Path(coordinator_private_dir).resolve() if coordinator_private_dir else None
 
@@ -589,9 +601,45 @@ class MacOsSeatbeltController:
             "(allow mach-lookup)",
             "(allow signal (target self))",
             "(allow ipc-posix-shm)",
-            "(allow file-read*)",
+            "(allow file-read-metadata)",
             "(deny file-write*)",
         ]
+
+        # Allow reading essential system and runtime paths (strict allowlist)
+        system_roots = [
+            "/System",
+            "/usr",
+            "/dev",
+            "/etc",
+            "/private/etc",
+            "/Library/Preferences",
+            "/Library/Managed Preferences",
+            _to_posix_str(sys.prefix),
+            _to_posix_str(sys.base_prefix),
+        ]
+        for optional_p in ["/Library/Frameworks", "/opt", "/opt/homebrew", "/private/var/db/timezone", "/var/db/timezone"]:
+            if os.name != "nt":
+                if Path(optional_p).exists():
+                    system_roots.append(optional_p)
+            else:
+                system_roots.append(optional_p)
+
+        for sr in system_roots:
+            str_sr = _to_posix_str(sr)
+            profile_lines.append(f'(allow file-read* (subpath "{str_sr}"))')
+            if str_sr.startswith("/private/"):
+                profile_lines.append(f'(allow file-read* (subpath "{str_sr[len("/private"):]}"))')
+            else:
+                profile_lines.append(f'(allow file-read* (subpath "/private{str_sr}"))')
+
+        if allowed_read_roots:
+            for arr in allowed_read_roots:
+                str_arr = _to_posix_str(arr)
+                profile_lines.append(f'(allow file-read* (subpath "{str_arr}"))')
+                if str_arr.startswith("/private/"):
+                    profile_lines.append(f'(allow file-read* (subpath "{str_arr[len("/private"):]}"))')
+                else:
+                    profile_lines.append(f'(allow file-read* (subpath "/private{str_arr}"))')
 
         # Deny sensitive supervisor, task siblings, and user credential directories
         profile_lines.append('(deny file-read* (regex #".*/(\\.ssh|\\.aws|\\.gnupg|mock_home)(/.*|$)"))')
@@ -611,7 +659,7 @@ class MacOsSeatbeltController:
                 # isolate specific coordinator-private directories and database files rather than the whole tree.
                 for priv_sub in ["auth", "backups", "checkpoints"]:
                     sub_p = coord_private / priv_sub
-                    str_sub = str(sub_p)
+                    str_sub = _to_posix_str(sub_p)
                     profile_lines.append(f'(deny file-read* (subpath "{str_sub}"))')
                     profile_lines.append(f'(deny file-write* (subpath "{str_sub}"))')
                     if str_sub.startswith("/private/"):
@@ -627,7 +675,7 @@ class MacOsSeatbeltController:
                 profile_lines.append('(deny file-read* (regex #".*\\.sqlite(-wal|-shm)?$"))')
                 profile_lines.append('(deny file-write* (regex #".*\\.sqlite(-wal|-shm)?$"))')
             else:
-                str_path = str(coord_private)
+                str_path = _to_posix_str(coord_private)
                 profile_lines.append(f'(deny file-read* (subpath "{str_path}"))')
                 profile_lines.append(f'(deny file-write* (subpath "{str_path}"))')
                 if str_path.startswith("/private/"):
@@ -641,7 +689,7 @@ class MacOsSeatbeltController:
                 profile_lines.append(f'(deny file-write* (regex #".*/{coord_private.name}(/.*|$)"))')
 
         # Strictly grant read and write access to sandbox_root (both canonical and symlink variants)
-        sbox_str = str(resolved_sbox)
+        sbox_str = _to_posix_str(resolved_sbox)
         profile_lines.append(f'(allow file-read* (subpath "{sbox_str}"))')
         profile_lines.append(f'(allow file-write* (subpath "{sbox_str}"))')
         if sbox_str.startswith("/private/"):
