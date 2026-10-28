@@ -483,9 +483,13 @@ sys.exit(0)
         auth_dir.mkdir(parents=True, exist_ok=True)
         (auth_dir / "supervisor.secret").write_text("SUPERVISOR_SECRET_789", encoding="utf-8")
 
-        arbitrary_dir = self.base_root / "arbitrary_zone"
-        arbitrary_dir.mkdir(parents=True, exist_ok=True)
-        (arbitrary_dir / "arbitrary_outside.txt").write_text("ARBITRARY_UNAUTHORIZED_DATA", encoding="utf-8")
+        # Create an arbitrary outside file strictly located under /Users, which is not granted by system_roots
+        arbitrary_file = Path("/Users/Shared/ai_coord_unauthorized_test.txt")
+        try:
+            arbitrary_file.write_text("ARBITRARY_UNAUTHORIZED_DATA", encoding="utf-8")
+        except OSError:
+            arbitrary_file = Path.home() / "ai_coord_unauthorized_test.txt"
+            arbitrary_file.write_text("ARBITRARY_UNAUTHORIZED_DATA", encoding="utf-8")
 
         profile = MacOsSeatbeltController.build_profile(
             sandbox_root=test_sbox,
@@ -515,8 +519,8 @@ try:
 except (PermissionError, OSError):
     pass
 
-# 4. Read arbitrary file outside authorized roots -> must fail with PermissionError / OSError
-arb_p = Path(r"{(arbitrary_dir / "arbitrary_outside.txt").resolve().as_posix()}")
+# 4. Read arbitrary file outside authorized roots (under /Users) -> must fail with PermissionError / OSError
+arb_p = Path(r"{arbitrary_file.resolve().as_posix()}")
 try:
     arb_p.read_text(encoding="utf-8")
     sys.exit(40)  # Should have been denied by default policy!
@@ -525,12 +529,19 @@ except (PermissionError, OSError):
 
 sys.exit(0)
 """
-        res = subprocess.run(
-            ["/usr/bin/sandbox-exec", "-p", profile, sys.executable, "-c", worker_script],
-            capture_output=True,
-            text=True,
-        )
-        self.assertEqual(res.returncode, 0, f"Seatbelt operational check failed (code={res.returncode}): stdout={res.stdout}, stderr={res.stderr}")
+        try:
+            res = subprocess.run(
+                ["/usr/bin/sandbox-exec", "-p", profile, sys.executable, "-c", worker_script],
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(res.returncode, 0, f"Seatbelt operational check failed (code={res.returncode}): stdout={res.stdout}, stderr={res.stderr}")
+        finally:
+            try:
+                if arbitrary_file.exists():
+                    arbitrary_file.unlink()
+            except Exception:
+                pass
 
     def test_09_mailbox_spoofing_fatal_security_violation_terminates_worker(self):
         """Mailbox identity spoofing (declared_pid mismatch) is treated as a fatal security violation, terminating the worker."""
@@ -541,9 +552,6 @@ from pathlib import Path
 broker_dir = Path(".broker")
 token_file = broker_dir / "token"
 token = token_file.read_text(encoding="utf-8").strip() if token_file.exists() else ""
-
-# Record worker PID to verify termination
-(broker_dir / "worker_spoof.pid").write_text(str(os.getpid()), encoding="utf-8")
 
 req_dir = broker_dir / "requests"
 req_dir.mkdir(parents=True, exist_ok=True)
@@ -607,10 +615,15 @@ sys.exit(0)
             f"Expected fatal security violation error message, got: {err_msg}"
         )
 
-        # Explicitly verify worker process termination
-        pid_files = list(self.coordinator_dir.glob("**/worker_spoof.pid"))
-        self.assertTrue(len(pid_files) > 0, "worker_spoof.pid was not found in sandbox")
-        worker_pid = int(pid_files[0].read_text(encoding="utf-8").strip())
+        # Explicitly verify worker process termination using audited spawn event
+        spawn_events = self.store.worker_audit.query_events(task_id=self.task_id, event_type="spawn")
+        self.assertTrue(len(spawn_events) > 0, "Spawn event not found")
+        worker_pid = spawn_events[-1].worker_pid
+        self.assertIsNotNone(worker_pid)
+        for _ in range(30):
+            if not safe_process_alive(worker_pid):
+                break
+            time.sleep(0.1)
         self.assertFalse(safe_process_alive(worker_pid))
 
     def test_10_mailbox_tampered_token_fatal_security_violation_terminates_worker(self):
@@ -622,9 +635,6 @@ from pathlib import Path
 broker_dir = Path(".broker")
 token_file = broker_dir / "token"
 token = token_file.read_text(encoding="utf-8").strip() if token_file.exists() else ""
-
-# Record worker PID to verify termination
-(broker_dir / "worker_tamper.pid").write_text(str(os.getpid()), encoding="utf-8")
 
 req_dir = broker_dir / "requests"
 req_dir.mkdir(parents=True, exist_ok=True)
@@ -685,10 +695,15 @@ sys.exit(0)
             f"Expected fatal token violation error message, got: {err_msg}"
         )
 
-        # Explicitly verify worker process termination
-        pid_files = list(self.coordinator_dir.glob("**/worker_tamper.pid"))
-        self.assertTrue(len(pid_files) > 0, "worker_tamper.pid was not found in sandbox")
-        worker_pid = int(pid_files[0].read_text(encoding="utf-8").strip())
+        # Explicitly verify worker process termination using audited spawn event
+        spawn_events = self.store.worker_audit.query_events(task_id=self.task_id, event_type="spawn")
+        self.assertTrue(len(spawn_events) > 0, "Spawn event not found")
+        worker_pid = spawn_events[-1].worker_pid
+        self.assertIsNotNone(worker_pid)
+        for _ in range(30):
+            if not safe_process_alive(worker_pid):
+                break
+            time.sleep(0.1)
         self.assertFalse(safe_process_alive(worker_pid))
 
 
