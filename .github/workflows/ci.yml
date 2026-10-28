@@ -48,3 +48,45 @@ jobs:
       - name: Inspect npm package contents
         working-directory: plugins/opencode
         run: npm pack --dry-run --ignore-scripts
+
+  release-candidate-artifacts:
+    name: Build, verify, and archive release candidate artifacts
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22.22.2"
+      - name: Install packaging dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install build
+      - name: Build Python distributions (wheel and sdist)
+        run: python -m build --outdir dist
+      - name: Build and verify all 5 release candidate artifacts
+        run: python scripts/package_release_artifacts.py
+      - name: Verify clean install, CLI smoke, mandatory MCP extra, and realistic v0.4.0 migration
+        run: python scripts/verify_clean_install_and_migration.py
+      - name: Compute SHA-256 checksums and export to Step Summary
+        run: |
+          echo "### Release Candidate Artifacts (v0.5.0)" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Artifact | SHA-256 Checksum | Size (bytes) |" >> $GITHUB_STEP_SUMMARY
+          echo "|---|---|---|" >> $GITHUB_STEP_SUMMARY
+          cd dist
+          sha256sum * | tee ../checksums.sha256
+          while read -r hash file; do
+            size=$(stat -c%s "$file")
+            echo "| \`$file\` | \`$hash\` | $size |" >> $GITHUB_STEP_SUMMARY
+          done < ../checksums.sha256
+      - name: Upload release candidate artifacts for independent audit
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-artifacts-v0.5.0
+          path: |
+            dist/*
+            checksums.sha256
+          retention-days: 14

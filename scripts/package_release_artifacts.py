@@ -21,7 +21,12 @@ import zipfile
 
 ROOT = Path(__file__).resolve().parents[1]
 DIST = ROOT / "dist"
-VERSION = "0.5.0"
+VERSION = os.environ.get("RELEASE_VERSION")
+if not VERSION:
+    import tomllib
+    pyproj = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+    VERSION = pyproj["project"]["version"]
+
 
 
 def make_zip(source_dir: Path, out_zip: Path, extra_files: list[Path] = None):
