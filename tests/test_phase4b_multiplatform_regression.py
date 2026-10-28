@@ -439,24 +439,28 @@ sys.exit(0)
         # 1. Must NOT contain broad blanket allow
         self.assertNotIn("(allow file-read*)", profile)
 
-        # 2. Must allow reading metadata
+        # 2. Must allow reading metadata and ioctl
         self.assertIn("(allow file-read-metadata)", profile)
+        self.assertIn("(allow file-ioctl)", profile)
 
         # 3. Must allow reading system roots and python prefix
         self.assertIn('(allow file-read* (subpath "/System"))', profile)
         self.assertIn('(allow file-read* (subpath "/usr"))', profile)
         self.assertIn(f'(allow file-read* (subpath "{Path(sys.prefix).resolve().as_posix()}"))', profile)
 
-        # 4. Must allow explicitly declared read roots
+        # 4. Must deny broad user home directory reading
+        self.assertIn('(deny file-read* (subpath "/Users"))', profile)
+
+        # 5. Must allow explicitly declared read roots
         self.assertIn(f'(allow file-read* (subpath "{self.project_dir.resolve().as_posix()}"))', profile)
         self.assertIn('(allow file-read* (subpath "/opt/custom_tool"))', profile)
 
-        # 5. Must deny coordinator private directories and SQLite files
+        # 6. Must deny coordinator private directories and SQLite files
         self.assertIn('(deny file-read* (regex #".*\\.sqlite(-wal|-shm)?$"))', profile)
         self.assertIn('(deny file-write* (regex #".*\\.sqlite(-wal|-shm)?$"))', profile)
         self.assertIn(f'(deny file-read* (subpath "{(coord_priv / "auth").resolve().as_posix()}"))', profile)
 
-        # 6. Must grant sandbox_root both read and write at the end of the profile
+        # 7. Must grant sandbox_root both read and write at the end of the profile
         lines = profile.splitlines()
         self.assertIn(f'(allow file-read* (subpath "{sbox.resolve().as_posix()}"))', lines[-4:])
         self.assertIn(f'(allow file-write* (subpath "{sbox.resolve().as_posix()}"))', lines[-4:])

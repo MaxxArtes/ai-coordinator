@@ -601,29 +601,27 @@ class MacOsSeatbeltController:
             "(allow mach-lookup)",
             "(allow signal (target self))",
             "(allow ipc-posix-shm)",
+            "(allow file-ioctl)",
             "(allow file-read-metadata)",
             "(deny file-write*)",
         ]
 
-        # Allow reading essential system and runtime paths (strict allowlist)
+        # 1. Essential system runtime paths (read-only)
         system_roots = [
             "/System",
+            "/System/Volumes",
             "/usr",
+            "/bin",
+            "/sbin",
             "/dev",
             "/etc",
             "/private/etc",
-            "/Library/Preferences",
-            "/Library/Managed Preferences",
-            _to_posix_str(sys.prefix),
-            _to_posix_str(sys.base_prefix),
+            "/Library",
+            "/private/var/folders",
+            "/private/var/db/timezone",
+            "/var/db/timezone",
+            "/opt",
         ]
-        for optional_p in ["/Library/Frameworks", "/opt", "/opt/homebrew", "/private/var/db/timezone", "/var/db/timezone"]:
-            if os.name != "nt":
-                if Path(optional_p).exists():
-                    system_roots.append(optional_p)
-            else:
-                system_roots.append(optional_p)
-
         for sr in system_roots:
             str_sr = _to_posix_str(sr)
             profile_lines.append(f'(allow file-read* (subpath "{str_sr}"))')
@@ -632,16 +630,12 @@ class MacOsSeatbeltController:
             else:
                 profile_lines.append(f'(allow file-read* (subpath "/private{str_sr}"))')
 
-        if allowed_read_roots:
-            for arr in allowed_read_roots:
-                str_arr = _to_posix_str(arr)
-                profile_lines.append(f'(allow file-read* (subpath "{str_arr}"))')
-                if str_arr.startswith("/private/"):
-                    profile_lines.append(f'(allow file-read* (subpath "{str_arr[len("/private"):]}"))')
-                else:
-                    profile_lines.append(f'(allow file-read* (subpath "/private{str_arr}"))')
+        # 2. Strict User and Root Isolation: deny broad reading of user profiles and root
+        profile_lines.append('(deny file-read* (subpath "/Users"))')
+        profile_lines.append('(deny file-read* (subpath "/private/var/root"))')
+        profile_lines.append('(deny file-read* (subpath "/var/root"))')
 
-        # Deny sensitive supervisor, task siblings, and user credential directories
+        # 3. Sensitive supervisor, task siblings, and user credential directories
         profile_lines.append('(deny file-read* (regex #".*/(\\.ssh|\\.aws|\\.gnupg|mock_home)(/.*|$)"))')
         profile_lines.append('(deny file-read* (regex #".*/tasks/[^/]+/sibling_[^/]+(/.*|$)"))')
         profile_lines.append('(deny file-write* (regex #".*/tasks/[^/]+/sibling_[^/]+(/.*|$)"))')
@@ -687,6 +681,24 @@ class MacOsSeatbeltController:
                     profile_lines.append(f'(deny file-write* (subpath "/private{str_path}"))')
                 profile_lines.append(f'(deny file-read* (regex #".*/{coord_private.name}(/.*|$)"))')
                 profile_lines.append(f'(deny file-write* (regex #".*/{coord_private.name}(/.*|$)"))')
+
+        # 5. Explicitly authorized runtime paths and read roots (overrides /Users block for legitimate execution)
+        runtime_roots = [_to_posix_str(sys.prefix), _to_posix_str(sys.base_prefix)]
+        for rr in runtime_roots:
+            profile_lines.append(f'(allow file-read* (subpath "{rr}"))')
+            if rr.startswith("/private/"):
+                profile_lines.append(f'(allow file-read* (subpath "{rr[len("/private"):]}"))')
+            else:
+                profile_lines.append(f'(allow file-read* (subpath "/private{rr}"))')
+
+        if allowed_read_roots:
+            for arr in allowed_read_roots:
+                str_arr = _to_posix_str(arr)
+                profile_lines.append(f'(allow file-read* (subpath "{str_arr}"))')
+                if str_arr.startswith("/private/"):
+                    profile_lines.append(f'(allow file-read* (subpath "{str_arr[len("/private"):]}"))')
+                else:
+                    profile_lines.append(f'(allow file-read* (subpath "/private{str_arr}"))')
 
         # Strictly grant read and write access to sandbox_root (both canonical and symlink variants)
         sbox_str = _to_posix_str(resolved_sbox)
