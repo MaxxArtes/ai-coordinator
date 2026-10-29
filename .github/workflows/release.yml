@@ -10,6 +10,11 @@ on:
         description: Existing release tag to publish to GitHub Packages (for example v0.2.0)
         required: true
         type: string
+      confirm_publish:
+        description: Explicit confirmation to publish packages (type true)
+        required: false
+        type: boolean
+        default: false
 
 permissions:
   contents: write
@@ -46,40 +51,64 @@ jobs:
           test "$(git describe --tags --exact-match HEAD)" = "$RELEASE_TAG"
           npm pack --dry-run --ignore-scripts ./plugins/opencode
 
-      - name: Build Python wheel and source archive
+      - name: Build Python distributions (wheel and sdist)
         run: |
           python -m build --outdir dist
 
-      - name: Package skill, Claude plugin, and OpenCode plugin
+      - name: Package and verify all 5 release artifacts
         env:
           RELEASE_TAG: ${{ inputs.release_tag || github.ref_name }}
         run: |
-          RELEASE_VERSION="${RELEASE_TAG#v}"
-          staging="$RUNNER_TEMP/ai-coordinator-release"
-          mkdir -p "$staging/skill" "$staging/claude" "$staging/opencode" dist
-          cp -R skills/ai-coordinator "$staging/skill/ai-coordinator"
-          cp -R plugins/claude-code/. "$staging/claude/"
-          cp -R plugins/opencode/. "$staging/opencode/"
-          cp LICENSE NOTICE "$staging/skill/"
-          cp LICENSE NOTICE "$staging/claude/"
-          cp LICENSE NOTICE "$staging/opencode/"
-          (cd "$staging/skill" && zip -qr "$GITHUB_WORKSPACE/dist/ai-coordinator-skill-${RELEASE_VERSION}.zip" .)
-          (cd "$staging/claude" && zip -qr "$GITHUB_WORKSPACE/dist/ai-coordinator-claude-plugin-${RELEASE_VERSION}.zip" .)
-          npm pack "$staging/opencode" --pack-destination dist
+          export RELEASE_VERSION="${RELEASE_TAG#v}"
+          python scripts/package_release_artifacts.py
 
-      - name: Publish GitHub Release with artifacts
-        if: github.event_name == 'push'
+      - name: Verify clean install, CLI smoke, mandatory MCP extra, and genuine v0.4.0 migration
+        env:
+          RELEASE_TAG: ${{ inputs.release_tag || github.ref_name }}
+        run: |
+          export RELEASE_VERSION="${RELEASE_TAG#v}"
+          python scripts/verify_clean_install_and_migration.py
+
+      - name: Generate cryptographic SHA-256 manifest
+        run: |
+          cd dist
+          sha256sum * | tee ../checksums.sha256
+          cp ../checksums.sha256 checksums.sha256
+          echo "### Official SHA-256 Manifest of Published Release Artifacts" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Artifact | SHA-256 Checksum |" >> $GITHUB_STEP_SUMMARY
+          echo "|---|---|" >> $GITHUB_STEP_SUMMARY
+          while read -r hash file; do
+            if [ "$file" != "checksums.sha256" ]; then
+              echo "| \`$file\` | \`$hash\` |" >> $GITHUB_STEP_SUMMARY
+            fi
+          done < ../checksums.sha256
+          echo "=== OFFICIAL RELEASE SHA-256 MANIFEST ==="
+          cat checksums.sha256
+
+      - name: Publish GitHub Release with artifacts and SHA-256 manifest
+        if: |
+          (github.event_name == 'push') ||
+          (github.event_name == 'workflow_dispatch' && inputs.confirm_publish == true)
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          notes="docs/releases/${GITHUB_REF_NAME}.md"
+          TAG_NAME="${{ inputs.release_tag || github.ref_name }}"
+          notes="docs/releases/${TAG_NAME}.md"
+          PRERELEASE_FLAG=""
+          if [[ "$TAG_NAME" == *"-rc"* ]]; then
+            PRERELEASE_FLAG="--prerelease"
+          fi
           if [ -f "$notes" ]; then
-            gh release create "$GITHUB_REF_NAME" dist/* --verify-tag --notes-file "$notes"
+            gh release create "$TAG_NAME" dist/* --verify-tag $PRERELEASE_FLAG --notes-file "$notes"
           else
-            gh release create "$GITHUB_REF_NAME" dist/* --verify-tag --generate-notes
+            gh release create "$TAG_NAME" dist/* --verify-tag $PRERELEASE_FLAG --generate-notes
           fi
 
       - name: Publish OpenCode npm package to GitHub Packages
+        if: |
+          !contains(inputs.release_tag || github.ref_name, '-rc') &&
+          (github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.confirm_publish == true))
         env:
           NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: npm publish --ignore-scripts ./plugins/opencode

@@ -1,5 +1,42 @@
 """Portable shared task coordination for local AI coding agents."""
 from .api import Coordinator, open_coordinator
+from .tool_broker import (
+    ToolBroker,
+    ToolRegistry,
+    CapabilityTokenManager,
+    CapabilityToken,
+    ToolDefinition,
+    ToolPolicyMode,
+    ToolBrokerContext,
+    BrokerAuditRecord,
+    ToolBrokerError,
+    ToolAccessDeniedError,
+    InvalidCapabilityTokenError,
+    CapabilityTokenExpiredError,
+    CapabilityTokenRevokedError,
+    BrokerRateLimitExceededError,
+    CallerIdentityMismatchError,
+    MutationNotPermittedError,
+    ToolApprovalRequired,
+    ToolAuditPersistenceError,
+)
+from .worker_audit import (
+    WorkerAuditEventType,
+    WorkerAuditRecord,
+    WorkerAuditLogger,
+    WorkerAuditError,
+    WorkerAuditPersistenceError,
+    WorkerAuditIntegrityError,
+)
+from .fs_sandbox import (
+    ExecutionSandbox,
+    FileSandboxConfig,
+    FileSandboxSecurityError,
+    PathTraversalError,
+    ReparseEscapeError,
+    validate_contained_path,
+)
+
 from .process import (
     ProcessIdentity,
     ProcessSupervisor,
@@ -140,8 +177,28 @@ from .reconstruction import (
     splice_alternative_route,
     TrajectoryReconstructor,
 )
+from .human_workspace import (
+    HumanWorkspace,
+    HumanPrincipal,
+    HumanInboxState,
+    HumanInboxReadState,
+    HumanInboxItemKind,
+    HumanWorkspaceError,
+    HumanWorkspaceAccessDenied,
+    HumanWorkspaceConflict,
+    HumanWorkspaceNotFoundError,
+)
 
 __all__ = [
+    "HumanWorkspace",
+    "HumanPrincipal",
+    "HumanInboxState",
+    "HumanInboxReadState",
+    "HumanInboxItemKind",
+    "HumanWorkspaceError",
+    "HumanWorkspaceAccessDenied",
+    "HumanWorkspaceConflict",
+    "HumanWorkspaceNotFoundError",
     "KnowledgeLearning",
     "KnowledgeAccessDenied",
     "KnowledgeConflict",
@@ -258,5 +315,35 @@ __all__ = [
     "calculate_upstream_prerequisites",
     "splice_alternative_route",
     "TrajectoryReconstructor",
+    "ToolBroker",
+    "ToolRegistry",
+    "CapabilityTokenManager",
+    "CapabilityToken",
+    "ToolDefinition",
+    "ToolPolicyMode",
+    "ToolBrokerContext",
+    "BrokerAuditRecord",
+    "ToolBrokerError",
+    "ToolAccessDeniedError",
+    "InvalidCapabilityTokenError",
+    "CapabilityTokenExpiredError",
+    "CapabilityTokenRevokedError",
+    "BrokerRateLimitExceededError",
+    "CallerIdentityMismatchError",
+    "MutationNotPermittedError",
+    "ToolApprovalRequired",
+    "ToolAuditPersistenceError",
+    "WorkerAuditEventType",
+    "WorkerAuditRecord",
+    "WorkerAuditLogger",
+    "WorkerAuditError",
+    "WorkerAuditPersistenceError",
+    "WorkerAuditIntegrityError",
+    "ExecutionSandbox",
+    "FileSandboxConfig",
+    "FileSandboxSecurityError",
+    "PathTraversalError",
+    "ReparseEscapeError",
+    "validate_contained_path",
 ]
-__version__ = "0.4.0"
+__version__ = "0.5.0"

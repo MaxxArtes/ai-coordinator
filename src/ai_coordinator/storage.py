@@ -11,9 +11,11 @@ import os
 from pathlib import Path
 import re
 import secrets
+import shutil
 import sqlite3
+import threading
 import time
-from typing import Any, Dict, List, Optional, Set, Tuple, Union
+from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Set, Tuple, Union
 import uuid
 
 from .process import safe_process_alive, ProcessSupervisor
@@ -84,6 +86,17 @@ from .insights import (
 )
 from .knowledge import UnifiedKnowledgeCore
 from .knowledge_learning import KnowledgeLearning
+from .human_workspace import (
+    HumanWorkspace,
+    HumanPrincipal,
+    HumanInboxState,
+    HumanInboxReadState,
+    HumanInboxItemKind,
+    HumanWorkspaceError,
+    HumanWorkspaceAccessDenied,
+    HumanWorkspaceConflict,
+    HumanWorkspaceNotFoundError,
+)
 from .reconstruction import (
     TrajectoryReconstructor,
     AlternativeRoutePreview,
@@ -126,6 +139,65 @@ def atomic_json(path: Path, data: Any) -> None:
     tmp = path.with_suffix(f".tmp-{uuid.uuid4().hex[:8]}")
     tmp.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
     tmp.replace(path)
+
+def get_trusted_kernel_identity() -> str:
+    """Retrieve verified operating system process user identity directly from kernel/security token.
+    Enforces strict anti-spoofing checks against environment variables (LOGNAME, USER, USERNAME, LNAME).
+    """
+    kernel_user = None
+    if os.name != "nt":
+        try:
+            import pwd
+            uid = os.geteuid()
+            kernel_user = pwd.getpwuid(uid).pw_name
+        except Exception:
+            pass
+    else:
+        try:
+            import ctypes
+            import ctypes.wintypes
+            advapi32 = ctypes.windll.advapi32
+            size = ctypes.wintypes.DWORD(256)
+            buf = ctypes.create_unicode_buffer(256)
+            advapi32.GetUserNameW.argtypes = [ctypes.c_wchar_p, ctypes.POINTER(ctypes.wintypes.DWORD)]
+            advapi32.GetUserNameW.restype = ctypes.wintypes.BOOL
+            if advapi32.GetUserNameW(buf, ctypes.byref(size)):
+                kernel_user = buf.value
+        except Exception:
+            pass
+
+    if not kernel_user:
+        raise HumanWorkspaceAccessDenied("Falha ao obter identidade de seguranca autenticada do processo pelo kernel")
+
+    sanitized = re.sub(r"[^a-zA-Z0-9_.-]", "_", str(kernel_user)).strip()
+    if not sanitized:
+        raise HumanWorkspaceAccessDenied("Identidade de processo invalida ou vazia retornada pelo kernel")
+
+    # Anti-spoofing defense: if environment variables are manipulated, they must strictly match kernel user
+    for env_var in ("LOGNAME", "USER", "USERNAME", "LNAME"):
+        val = os.environ.get(env_var)
+        if val is not None and val.strip():
+            clean_env = re.sub(r"[^a-zA-Z0-9_.-]", "_", val.strip())
+            divergent = (clean_env.lower() != sanitized.lower()) if os.name == "nt" else (clean_env != sanitized)
+            if divergent:
+                raise HumanWorkspaceAccessDenied(
+                    f"Divergencia de seguranca detectada: variavel '{env_var}={val}' conflita com a identidade autenticada do processo ('{sanitized}')"
+                )
+
+    return sanitized
+
+def _secure_create_secret_file(path: Path, data: bytes) -> None:
+    """Create a private credential file atomically with 0600 permissions, strictly rejecting symlinks."""
+    if path.is_symlink():
+        raise PermissionError(f"Caminho de credencial '{path}' e um symlink; abortando gravacao")
+    flags = os.O_CREAT | os.O_WRONLY | os.O_EXCL
+    fd = os.open(str(path), flags, 0o600)
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(data)
+    except Exception:
+        os.close(fd)
+        raise
 
 
 class RunState:
@@ -236,7 +308,8 @@ class Store:
     def __init__(self, root: Union[str, Path], supervisor_key: Optional[str] = None):
         self.root = Path(root)
         self.root.mkdir(parents=True, exist_ok=True)
-        self.db = sqlite3.connect(self.root / "coordination.sqlite", timeout=20.0)
+        self._lock = threading.RLock()
+        self.db = sqlite3.connect(self.root / "coordination.sqlite", timeout=20.0, check_same_thread=False)
         self.db.row_factory = sqlite3.Row
         self.db.execute("PRAGMA journal_mode=WAL")
         self.db.execute("PRAGMA synchronous=NORMAL")
@@ -245,14 +318,85 @@ class Store:
         self.mission_control = MissionControl(self)
         self.resource_ledger = ResourceLedger(self.db, backup_dir=self.root / "backups")
         self.experience_store = ExperienceStore(self.db)
-        self.supervisor_secret = secrets.token_bytes(32)
-        self.supervisor_key = str(supervisor_key).strip() if supervisor_key else secrets.token_hex(32)
+
+        # Persistent security credentials and supervisor authentication
+        auth_dir = self.root / "auth"
+        if auth_dir.is_symlink():
+            raise PermissionError(f"Diretorio de autenticacao '{auth_dir}' e um symlink; abortando")
+        auth_dir.mkdir(parents=True, exist_ok=True)
+        secret_file = auth_dir / "supervisor.secret"
+        key_file = auth_dir / "supervisor.key"
+
+        if secret_file.is_file() and key_file.is_file():
+            if secret_file.is_symlink() or key_file.is_symlink():
+                raise PermissionError("Arquivo de credencial e um symlink; abortando")
+            self.supervisor_secret = secret_file.read_bytes()
+            canonical_key = key_file.read_text(encoding="utf-8").strip()
+            self.supervisor_key = canonical_key
+            self._supervisor_key_matched = (
+                hmac.compare_digest(str(supervisor_key).strip(), canonical_key)
+                if supervisor_key
+                else False
+            )
+        else:
+            self.supervisor_secret = secrets.token_bytes(32)
+            self.supervisor_key = str(supervisor_key).strip() if supervisor_key else secrets.token_hex(32)
+            self._supervisor_key_matched = True
+            _secure_create_secret_file(secret_file, self.supervisor_secret)
+            _secure_create_secret_file(key_file, self.supervisor_key.encode("utf-8"))
+
         self.admin_token = secrets.token_hex(32)
         self.oracle = InvariantOracle(run_lookup=self.get_run_for_task, secret=self.supervisor_secret)
         self.knowledge_core = UnifiedKnowledgeCore(self.db, oracle=self.oracle)
         self.knowledge_learning = KnowledgeLearning(self.knowledge_core)
+        self.human_workspace = HumanWorkspace(
+            self.db,
+            supervisor_secret=self.supervisor_secret,
+            supervisor_key=self.supervisor_key,
+        )
+        from .ai_memory_adapter import AIMemoryAdapter
+        self.ai_memory_adapter = AIMemoryAdapter(
+            human_workspace=self.human_workspace,
+            endpoint=os.environ.get("AI_MEMORY_ENDPOINT"),
+            api_token=os.environ.get("AI_MEMORY_API_TOKEN"),
+            cli_bin=os.environ.get("AI_MEMORY_BIN"),
+            db_path=os.environ.get("AI_MEMORY_DB_PATH"),
+        )
         self.insight_engine = InsightEngine(self.db, self.experience_store)
         self.reconstructor = TrajectoryReconstructor(self)
+        from .worker_audit import WorkerAuditLogger
+        self.worker_audit = WorkerAuditLogger(store=self, supervisor_key=self.supervisor_key)
+        from .tool_broker import ToolBroker
+        self.tool_broker = ToolBroker(store=self)
+        self._post_commit_scopes: List[List[Callable[[], Any]]] = []
+
+    def enter_savepoint_scope(self) -> None:
+        """Create a new scope level for post-commit actions inside an inner savepoint."""
+        if not self._post_commit_scopes:
+            self._post_commit_scopes = [[]]
+        self._post_commit_scopes.append([])
+
+    def release_savepoint_scope(self) -> None:
+        """Merge inner savepoint actions into outer scope upon successful savepoint release."""
+        if len(self._post_commit_scopes) > 1:
+            popped = self._post_commit_scopes.pop()
+            self._post_commit_scopes[-1].extend(popped)
+
+    def rollback_savepoint_scope(self) -> None:
+        """Discard inner savepoint actions when the savepoint rolls back."""
+        if len(self._post_commit_scopes) > 1:
+            self._post_commit_scopes.pop()
+
+    def defer_post_commit(self, action: Callable[[], Any]) -> None:
+        """Register an action to be executed only after the outermost transaction commits.
+        If no transaction is currently open, executes immediately.
+        """
+        if not self.db.in_transaction:
+            action()
+        else:
+            if not self._post_commit_scopes:
+                self._post_commit_scopes = [[]]
+            self._post_commit_scopes[-1].append(action)
 
     def issue_admin_override_token(self, supervisor_key: str, justification: str) -> str:
         """Issue an authentic supervisor override token for audited administrative operations.
@@ -286,6 +430,163 @@ class Store:
             exit_code=exit_code,
             nonce=nonce,
         )
+
+    def issue_human_session_token(self, owner_id: str, supervisor_key: str) -> str:
+        """Issue an authentic HMAC session token binding the human owner identity.
+        Requires genuine supervisor authentication key.
+        """
+        return self.human_workspace.issue_session_token(owner_id, supervisor_key=supervisor_key)
+
+    def create_human_principal(
+        self,
+        owner_id: str,
+        supervisor_key: Optional[str] = None,
+        session_token: Optional[str] = None,
+    ) -> HumanPrincipal:
+        """Create an authenticated HumanPrincipal for human workspace operations."""
+        if session_token is None:
+            if not supervisor_key:
+                raise HumanWorkspaceAccessDenied("Chave de supervisor obrigatoria para emissao de nova sessao humana")
+            session_token = self.issue_human_session_token(owner_id, supervisor_key=supervisor_key)
+        return HumanPrincipal(owner_id=owner_id, role="human", session_token=session_token)
+
+    def convert_inbox_item_to_task(
+        self,
+        principal: HumanPrincipal,
+        item_id: str,
+        *,
+        project: Optional[Union[str, Path]] = None,
+        goal: Optional[str] = None,
+        expected_revision: Optional[int] = None,
+        status: str = "backlog",
+        flight_plan: Optional[Union[Dict[str, Any], FlightPlan]] = None,
+        ai_memory_workstream_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Convert a private human inbox item into a backlog task atomically and idempotently."""
+        if status != "backlog":
+            raise ValueError("Tarefas convertidas a partir do Human Inbox devem obrigatoriamente possuir status 'backlog'")
+        return self.human_workspace.convert_to_task(
+            principal=principal,
+            item_id=item_id,
+            store=self,
+            project=project,
+            goal=goal,
+            expected_revision=expected_revision,
+            status=status,
+            flight_plan=flight_plan,
+            ai_memory_workstream_id=ai_memory_workstream_id,
+        )
+
+    def save_focus_checkpoint(
+        self,
+        principal: HumanPrincipal,
+        project: Union[str, Path],
+        intent: str,
+        *,
+        task_id: Optional[str] = None,
+        decisions: Sequence[str] = (),
+        priorities: Sequence[str] = (),
+        blockers: Sequence[str] = (),
+        open_questions: Sequence[str] = (),
+        next_action: str = "",
+        context: Optional[Mapping[str, Any]] = None,
+        expected_revision: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        """Record an immutable, append-only cognitive focus checkpoint for the human owner."""
+        return self.human_workspace.save_focus_checkpoint(
+            principal,
+            project=project,
+            intent=intent,
+            task_id=task_id,
+            decisions=decisions,
+            priorities=priorities,
+            blockers=blockers,
+            open_questions=open_questions,
+            next_action=next_action,
+            context=context,
+            expected_revision=expected_revision,
+        )
+
+    def get_latest_focus_checkpoint(
+        self,
+        principal: HumanPrincipal,
+        project: Union[str, Path],
+        task_id: Optional[str] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """Retrieve the latest authorized cognitive focus checkpoint for the human owner."""
+        return self.human_workspace.get_latest_focus_checkpoint(
+            principal, project=project, task_id=task_id
+        )
+
+    def list_focus_checkpoints(
+        self,
+        principal: HumanPrincipal,
+        project: Union[str, Path],
+        task_id: Optional[str] = None,
+        limit: int = 10,
+    ) -> List[Dict[str, Any]]:
+        """List historical focus checkpoints for owner and project in descending revision order."""
+        return self.human_workspace.list_focus_checkpoints(
+            principal, project=project, task_id=task_id, limit=limit
+        )
+
+    def resume_human_project(
+        self,
+        principal: HumanPrincipal,
+        project: Union[str, Path],
+        task_id: Optional[str] = None,
+        ai_memory_adapter: Optional[Any] = None,
+    ) -> Dict[str, Any]:
+        """Compose a deterministic local continuity briefing combining human focus and verifiable task state."""
+        adapter = ai_memory_adapter or getattr(self, "ai_memory_adapter", None)
+        return self.human_workspace.resume_human_project(
+            principal, project=project, store=self, task_id=task_id, ai_memory_adapter=adapter
+        )
+
+    def resolve_cli_principal(
+        self,
+        owner: Optional[str] = None,
+        session_token: Optional[str] = None,
+        supervisor_key: Optional[str] = None,
+    ) -> HumanPrincipal:
+        """Resolve and authenticate a HumanPrincipal for CLI operations with strict privilege separation.
+        Prevents arbitrary owner impersonation, ephemeral key fabrication, and worker bypass.
+        """
+        if os.environ.get("AI_COORDINATOR_ROLE") == "worker":
+            raise HumanWorkspaceAccessDenied("Workers subordinados estao estritamente proibidos de acessar o Human Workspace")
+
+        effective_os_user = get_trusted_kernel_identity()
+
+        target_owner = (str(owner).strip() if owner else effective_os_user)
+
+        # 1. Prioritize explicit session token if provided
+        if session_token:
+            clean_token = str(session_token).strip()
+            expected_prefix = f"hsess_{target_owner}_"
+            if not clean_token.startswith(expected_prefix):
+                raise HumanWorkspaceAccessDenied("Token de sessao invalido: proprietario informado diverge do token apresentado")
+            principal = HumanPrincipal(owner_id=target_owner, role="human", session_token=clean_token)
+            self.human_workspace.verify_principal(principal, require_session_token=True)
+            return principal
+
+        # 2. Check supervisor key authentication
+        if supervisor_key:
+            clean_key = str(supervisor_key).strip()
+            if not hmac.compare_digest(clean_key, self.supervisor_key):
+                raise HumanWorkspaceAccessDenied("Autenticacao negada: chave de supervisor invalida")
+            issued_token = self.human_workspace.issue_session_token(target_owner, supervisor_key=clean_key)
+            return HumanPrincipal(owner_id=target_owner, role="human", session_token=issued_token)
+
+        # 3. No supervisor key and no session token:
+        # Caller wants to act as another owner without supervisor credentials -> REJECT
+        if owner and owner != effective_os_user:
+            raise HumanWorkspaceAccessDenied(
+                f"Acesso negado: a selecao de outro proprietario ('{owner}') requer credencial de supervisor autenticada"
+            )
+
+        # 4. Local OS user acting as themselves backed by local protected file permissions
+        issued_token = self.human_workspace.issue_session_token(effective_os_user, supervisor_key=self.supervisor_key)
+        return HumanPrincipal(owner_id=effective_os_user, role="human", session_token=issued_token)
 
     def get_run_for_task(self, task_id: str, run_id: str) -> Optional[Dict[str, Any]]:
         """Lookup execution run record for a specific task."""
@@ -618,16 +919,26 @@ class Store:
     @contextlib.contextmanager
     def transaction(self):
         """Context manager executing BEGIN IMMEDIATE for atomic, isolated writes (re-entrant)."""
-        if self.db.in_transaction:
+        is_outer = not self.db.in_transaction
+        if not is_outer:
             yield
         else:
+            self._post_commit_scopes = [[]]
             self.db.execute("BEGIN IMMEDIATE")
             try:
                 yield
                 self.db.commit()
             except BaseException:
                 self.db.rollback()
+                self._post_commit_scopes.clear()
                 raise
+            else:
+                actions = []
+                for s in self._post_commit_scopes:
+                    actions.extend(s)
+                self._post_commit_scopes.clear()
+                for act in actions:
+                    act()
 
     def _record_event(
         self,
@@ -669,12 +980,93 @@ class Store:
     def mirror(self, value: Dict[str, Any]) -> None:
         atomic_json(self.root / "tasks" / value["id"] / "state.json", value)
 
+    def reconcile_task_mirrors(self) -> Dict[str, Any]:
+        """Reconcile disk mirrors with SQLite: quarantine unverified folders, ignore symlinks/system dirs,
+        and repair missing or stale mirrors for existing tasks.
+        """
+        tasks_dir = self.root / "tasks"
+        quarantine_dir = self.root / "quarantine" / "tasks"
+        report: Dict[str, List[Any]] = {
+            "quarantined": [],
+            "repaired": [],
+            "skipped": [],
+        }
+
+        # 1. Inspect existing directories in tasks/
+        if tasks_dir.is_dir():
+            for entry in list(tasks_dir.iterdir()):
+                # Symlink protection: never follow or remove targets of symlinks
+                if entry.is_symlink():
+                    report["skipped"].append({"name": entry.name, "reason": "symlink"})
+                    continue
+
+                if not entry.is_dir():
+                    continue
+
+                name = entry.name
+                # Ignore non-task directories and hidden directories (.quarantine, .git, etc.)
+                if name.startswith(".") or not re.fullmatch(r"[a-z0-9_-]{8,64}", name):
+                    report["skipped"].append({"name": name, "reason": "invalid_id_format"})
+                    continue
+
+                # Check if this task exists in SQLite
+                row = self.db.execute("SELECT 1 FROM tasks WHERE id = ?", (name,)).fetchone()
+                if not row:
+                    # Orphaned folder: move safely to quarantine preserving all files/logs/evidence
+                    quarantine_dir.mkdir(parents=True, exist_ok=True)
+                    stamp = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+                    dest = quarantine_dir / f"{name}_{stamp}"
+                    shutil.move(str(entry), str(dest))
+                    report["quarantined"].append(name)
+
+        # 2. Repair missing or desynchronized mirrors for valid tasks in SQLite
+        rows = self.db.execute("SELECT id, revision FROM tasks").fetchall()
+        for r in rows:
+            tid = r["id"]
+            expected_rev = r["revision"]
+            target_task_dir = tasks_dir / tid
+            # Symlink protection on target directory
+            if target_task_dir.is_symlink():
+                report["skipped"].append({"name": tid, "reason": "symlink_path"})
+                continue
+            state_file = target_task_dir / "state.json"
+            if state_file.is_symlink():
+                report["skipped"].append({"name": tid, "reason": "symlink_file"})
+                continue
+            needs_repair = False
+            if not state_file.is_file():
+                needs_repair = True
+            else:
+                try:
+                    disk_data = json.loads(state_file.read_text(encoding="utf-8"))
+                    if disk_data.get("revision") != expected_rev:
+                        needs_repair = True
+                except Exception:
+                    needs_repair = True
+
+            if needs_repair:
+                try:
+                    task_data = self.task(tid)
+                    self.mirror(task_data)
+                    report["repaired"].append(tid)
+                except Exception:
+                    pass
+
+        return report
+
+    def cleanup_orphaned_task_mirrors(self) -> List[str]:
+        """Backward-compatible helper: invokes reconcile_task_mirrors and returns quarantined IDs."""
+        result = self.reconcile_task_mirrors()
+        return result["quarantined"]
+
     def new(
         self,
         project: Union[str, Path],
         goal: str,
         ai_memory_workstream_id: Optional[str] = None,
-        flight_plan: Optional[Union[Dict[str, Any], FlightPlan]] = None
+        flight_plan: Optional[Union[Dict[str, Any], FlightPlan]] = None,
+        status: str = "active",
+        mirror: bool = True,
     ) -> Dict[str, Any]:
         if not goal.strip() or len(goal) > 1500:
             raise ValueError("Objetivo deve ter 1 a 1500 caracteres")
@@ -695,7 +1087,7 @@ class Store:
         with self.transaction():
             self.db.execute(
                 "INSERT INTO tasks (id,project,goal,status,revision,snapshot,created,updated,ai_memory_workstream_id,step_count,uncheckpointed_steps,drift_status) VALUES (?,?,?,?,?,?,?,?,?,0,0,'nominal')",
-                (ident, project_path(project), scrub(goal), "active", 1,
+                (ident, project_path(project), scrub(goal), status, 1,
                  json.dumps(snapshot), stamp, stamp, linked_workstream),
             )
             if flight_plan:
@@ -709,7 +1101,9 @@ class Store:
                     flight_plan.task_id = ident
                     self.mission_control.set_flight_plan(flight_plan)
             created_task = self.task(ident)
-            self.mirror(created_task)
+        # Mirror is executed ONLY after the outermost transaction has committed!
+        if mirror:
+            self.defer_post_commit(lambda: self.mirror(created_task))
         return created_task
 
     def context(self, project: Union[str, Path]) -> List[Dict[str, Any]]:
@@ -744,7 +1138,7 @@ class Store:
             )
             self.mission_control.on_checkpoint_recorded(ident)
             updated_task = self.task(ident)
-            self.mirror(updated_task)
+        self.defer_post_commit(lambda: self.mirror(updated_task))
         return updated_task
 
     def runs(self, ident: str) -> List[Dict[str, Any]]:
@@ -968,6 +1362,7 @@ class Store:
 
     def reconcile(self, task_id: Optional[str] = None, silence_threshold_seconds: float = 60.0) -> List[Dict[str, Any]]:
         """Conservative recovery and reconciliation for active runs without fabricating terminal outcomes."""
+        self.reconcile_task_mirrors()
         reconciled = []
         with self.transaction():
             query = "SELECT * FROM runs WHERE status IN (?, ?, ?, ?, ?, ?, ?)"

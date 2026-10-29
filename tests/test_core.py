@@ -236,5 +236,32 @@ class McpAndApiParityTests(unittest.TestCase):
                 self.assertIn("claude", passed_config.get("disabled_worker_clients", []))
 
 
+class CliVersionTests(unittest.TestCase):
+    def test_cli_parser_version_flag(self):
+        import io
+        from contextlib import redirect_stdout
+        from ai_coordinator.cli import parser, _get_version
+        p = parser()
+        out = io.StringIO()
+        with redirect_stdout(out), self.assertRaises(SystemExit) as cm:
+            p.parse_args(["--version"])
+        self.assertEqual(cm.exception.code, 0)
+        output = out.getvalue().strip()
+        expected = f"ai-coordinator {_get_version()}"
+        self.assertEqual(output, expected)
+
+    def test_cli_entrypoint_version_flag(self):
+        import subprocess, sys
+        from ai_coordinator.cli import _get_version
+        res = subprocess.run(
+            [sys.executable, "-c", "from ai_coordinator.cli import main; main()", "--version"],
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(res.returncode, 0, f"Falha na execucao do CLI. Stderr: {res.stderr}")
+        expected = f"ai-coordinator {_get_version()}"
+        self.assertEqual(res.stdout.strip(), expected)
+
+
 if __name__ == "__main__":
     unittest.main()
