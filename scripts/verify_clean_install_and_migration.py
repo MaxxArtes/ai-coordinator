@@ -148,6 +148,15 @@ store = Store(root=coord_root)
 task = store.new(goal="Genuine legacy mission running under v0.4.0", project=proj_dir)
 task_id = task["id"]
 
+# 1.1 Create a genuine backlog task under v0.4.0
+task_backlog = store.new(goal="Genuine legacy backlog task item under v0.4.0", project=proj_dir)
+task_backlog_id = task_backlog["id"]
+store.db.execute("UPDATE tasks SET status = 'backlog' WHERE id = ?", (task_backlog_id,))
+
+# 1.2 Populate legacy backlog table
+store.db.execute("CREATE TABLE IF NOT EXISTS backlog (id TEXT PRIMARY KEY, task_id TEXT NOT NULL, title TEXT NOT NULL, status TEXT NOT NULL, created_at TEXT NOT NULL)")
+store.db.execute("INSERT INTO backlog VALUES ('item_v040_prod', ?, 'Legacy v0.4.0 critical backlog item', 'pending', '2026-10-15T10:01:00Z')", (task_id,))
+
 # 2. Reserve and complete runs
 run_id1, _, _ = store.reserve(task_id, "general", "Production run payload prompt 1", max_calls=10)
 store.update_run(run_id1, status=RunState.COMPLETE, exit_code=0, ended="2026-10-15T10:30:00Z")
@@ -174,6 +183,7 @@ exp = store.record_experience(
 
 store.db.close()
 print(f"GENUINE_V040_TASK_ID:{task_id}")
+print(f"GENUINE_V040_TASK_BACKLOG_ID:{task_backlog_id}")
 print(f"GENUINE_V040_RUN1_ID:{run_id1}")
 print(f"GENUINE_V040_RUN2_ID:{run_id2}")
 print(f"GENUINE_V040_EXP_ID:{exp.id}")
@@ -198,6 +208,7 @@ from ai_coordinator.worker_audit import WorkerAuditEventType
 coord_root = Path(r"{coord_root.resolve().as_posix()}")
 supervisor_key = "genuine_supervisor_secret_migration_test_v050"
 task_id = "{meta['GENUINE_V040_TASK_ID']}"
+task_backlog_id = "{meta['GENUINE_V040_TASK_BACKLOG_ID']}"
 run1_id = "{meta['GENUINE_V040_RUN1_ID']}"
 run2_id = "{meta['GENUINE_V040_RUN2_ID']}"
 exp_id = "{meta['GENUINE_V040_EXP_ID']}"
@@ -209,6 +220,18 @@ try:
     assert task is not None, "Legacy task lost during migration!"
     assert task["goal"] == "Genuine legacy mission running under v0.4.0"
     print("[OK] Genuine v0.4.0 task preserved intact")
+
+    # 1.1 Verify legacy backlog task and backlog table preserved
+    task_b = store.task(task_backlog_id)
+    assert task_b is not None and task_b["status"] == "backlog"
+    assert task_b["goal"] == "Genuine legacy backlog task item under v0.4.0"
+    print("[OK] Genuine v0.4.0 backlog task item verified and preserved with status 'backlog'")
+
+    row_backlog = store.db.execute("SELECT title, status FROM backlog WHERE id = 'item_v040_prod'").fetchone()
+    assert row_backlog is not None, "Legacy backlog table item lost during migration!"
+    assert row_backlog[0] == "Legacy v0.4.0 critical backlog item"
+    assert row_backlog[1] == "pending"
+    print("[OK] Genuine v0.4.0 backlog table item preserved intact")
 
     # 2. Verify legacy runs preserved explicitly (status and exit_code)
     runs = store.runs(task_id)

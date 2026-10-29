@@ -7,7 +7,7 @@ e este projeto adere ao [Versionamento Semântico](https://semver.org/lang/pt-BR
 
 ---
 
-## [0.5.0] - Não publicado / Release Candidate (2026-10-28)
+## [0.5.0] - 2026-10-29
 
 Esta versão consolida a conclusão da **Fase 4B (Human-AI Cognitive Workspace)**, introduzindo isolamento de processos e filesystem em nível de sistema operacional (OS-level sandboxing), governança e autorização segura de ferramentas via Tool Broker com tokens HMAC, trilha de auditoria criptográfica imutável com dupla ancoragem e integração ao ecossistema `ai-memory`.
 
