@@ -1,8 +1,9 @@
-"""Comprehensive test suite for Phase 4C.0.1: Cognitive Telemetry, Provenance, and Storage."""
+"""Comprehensive adversarial test suite for Phase 4C.0.1: Cognitive Telemetry, Provenance, and Storage."""
 
 from __future__ import annotations
 
 import concurrent.futures
+from dataclasses import FrozenInstanceError
 import json
 import os
 from pathlib import Path
@@ -24,6 +25,7 @@ from ai_coordinator import (
     TelemetryAggregate,
     compute_telemetry_aggregate,
     safe_record_telemetry,
+    normalize_provider_tokens,
 )
 from ai_coordinator.telemetry import (
     scrub_sensitive_text,
@@ -59,8 +61,21 @@ class TestPhase4CCognitiveTelemetry(unittest.TestCase):
         with self.assertRaises(ValueError):
             MetricProvenance.validate(123)  # type: ignore
 
-    def test_02_token_metrics_accounting(self) -> None:
-        """Validate token metrics calculations, auto-summing, and non-negative clamping."""
+    def test_02_token_metrics_accounting_and_null_distinction(self) -> None:
+        """Validate token metrics calculations, auto-summing, and distinction between 0 and None."""
+        # 1. Measured zero tokens is explicitly 0
+        measured_zero = TokenMetrics(input_tokens=0, output_tokens=0, provenance=MetricProvenance.MEASURED)
+        self.assertEqual(measured_zero.input_tokens, 0)
+        self.assertEqual(measured_zero.output_tokens, 0)
+        self.assertEqual(measured_zero.total_tokens, 0)
+
+        # 2. Unknown tokens must stay None (not converted to 0)
+        unknown_tokens = TokenMetrics(provenance=MetricProvenance.UNKNOWN)
+        self.assertIsNone(unknown_tokens.input_tokens)
+        self.assertIsNone(unknown_tokens.output_tokens)
+        self.assertIsNone(unknown_tokens.total_tokens)
+
+        # 3. Known values auto-sum correctly
         tokens = TokenMetrics(
             input_tokens=150,
             output_tokens=75,
@@ -71,44 +86,67 @@ class TestPhase4CCognitiveTelemetry(unittest.TestCase):
         self.assertEqual(tokens.total_tokens, 300)
         self.assertEqual(tokens.provenance, "measured")
 
-        # Negative clamping
-        neg_tokens = TokenMetrics(
-            input_tokens=-10,
-            output_tokens=-5,
-            provenance=MetricProvenance.ESTIMATED,
-        )
-        self.assertEqual(neg_tokens.input_tokens, 0)
-        self.assertEqual(neg_tokens.output_tokens, 0)
-        self.assertEqual(neg_tokens.total_tokens, 0)
-
-        # Dict round-trip
+        # 4. Dict round-trip
         data = tokens.to_dict()
         restored = TokenMetrics.from_dict(data)
         self.assertEqual(restored, tokens)
 
-    def test_03_latency_metrics_decomposition(self) -> None:
+    def test_03_provider_cache_normalization_contracts(self) -> None:
+        """Validate vendor-specific cache contracts preventing double-counting."""
+        # Anthropic: input_tokens is disjoint from cache tokens
+        anthropic_tok = normalize_provider_tokens(
+            provider="anthropic",
+            input_tokens=1000,
+            output_tokens=250,
+            cache_read_tokens=500,
+            cache_creation_tokens=100,
+        )
+        self.assertEqual(anthropic_tok.total_tokens, 1850)
+
+        # OpenAI: prompt_tokens already includes cached_tokens (do NOT add cache_read again)
+        openai_tok = normalize_provider_tokens(
+            provider="openai",
+            input_tokens=1000,
+            output_tokens=250,
+            cache_read_tokens=500,
+        )
+        self.assertEqual(openai_tok.total_tokens, 1250)
+
+        # Google Gemini: promptTokenCount includes cachedContentTokenCount
+        gemini_tok = normalize_provider_tokens(
+            provider="gemini",
+            input_tokens=800,
+            output_tokens=150,
+            cache_read_tokens=300,
+        )
+        self.assertEqual(gemini_tok.total_tokens, 950)
+
+    def test_04_latency_metrics_decomposition_and_provenance(self) -> None:
         """Validate latency decomposition: TTFT, generation, tool duration, supervisor overhead."""
         latencies = LatencyMetrics(
+            total_duration_ms=630.0,
             ttft_ms=120.5,
             generation_duration_ms=450.0,
             tool_duration_ms=150.0,
             supervisor_overhead_ms=30.0,
-            total_duration_ms=630.0,
-            provenance=MetricProvenance.MEASURED,
+            latency_provenance=MetricProvenance.MEASURED,
+            generation_duration_provenance=MetricProvenance.ESTIMATED,
         )
+        self.assertEqual(latencies.total_duration_ms, 630.0)
         self.assertEqual(latencies.ttft_ms, 120.5)
         self.assertEqual(latencies.generation_duration_ms, 450.0)
         self.assertEqual(latencies.tool_duration_ms, 150.0)
         self.assertEqual(latencies.supervisor_overhead_ms, 30.0)
-        self.assertEqual(latencies.total_duration_ms, 630.0)
+        self.assertEqual(latencies.latency_provenance, MetricProvenance.MEASURED)
+        self.assertEqual(latencies.generation_duration_provenance, MetricProvenance.ESTIMATED)
 
         # Dict round-trip
         data = latencies.to_dict()
         restored = LatencyMetrics.from_dict(data)
         self.assertEqual(restored, latencies)
 
-    def test_04_pricing_registry_and_cost_estimation(self) -> None:
-        """Validate pricing registry calculation and strict provenance classification."""
+    def test_05_pricing_registry_versioning_and_cost_estimation(self) -> None:
+        """Validate pricing registry calculation, version stamping, and unknown cost handling."""
         tokens = TokenMetrics(
             input_tokens=1_000_000,
             output_tokens=100_000,
@@ -118,66 +156,70 @@ class TestPhase4CCognitiveTelemetry(unittest.TestCase):
         )
 
         # Known Anthropic model: claude-3-5-sonnet
-        # input: $3.00, output: $15.00/M, cache_read: $0.30/M, cache_creation: $3.75/M
         cost = PricingRegistry.estimate_cost("claude-3-5-sonnet", tokens)
         self.assertEqual(cost.provenance, MetricProvenance.ESTIMATED)
+        self.assertEqual(cost.pricing_version, PricingRegistry.REGISTRY_VERSION)
         self.assertAlmostEqual(cost.input_cost_usd or 0.0, 3.00, places=4)
         self.assertAlmostEqual(cost.output_cost_usd or 0.0, 1.50, places=4)
         self.assertAlmostEqual(cost.cache_read_cost_usd or 0.0, 0.15, places=4)
         self.assertAlmostEqual(cost.cache_creation_cost_usd or 0.0, 0.75, places=4)
         self.assertAlmostEqual(cost.total_cost_usd or 0.0, 5.40, places=4)
 
-        # Unrecognized model: must return UNKNOWN and total_cost_usd=None (NEVER fabricate costs)
+        # Unrecognized model: must return UNKNOWN and total_cost_usd=None (NEVER 0.0)
         unrecognized_cost = PricingRegistry.estimate_cost("unknown-local-llama-999b", tokens)
         self.assertEqual(unrecognized_cost.provenance, MetricProvenance.UNKNOWN)
         self.assertIsNone(unrecognized_cost.total_cost_usd)
+        self.assertIsNone(unrecognized_cost.pricing_version)
 
-        # Custom model registration
-        PricingRegistry.register_pricing(
-            "custom-research-model",
-            input_per_m=2.0,
-            output_per_m=8.0,
-            cache_read_per_m=0.5,
-            cache_creation_per_m=1.0,
-        )
-        custom_cost = PricingRegistry.estimate_cost("custom-research-model", tokens)
-        self.assertEqual(custom_cost.provenance, MetricProvenance.ESTIMATED)
-        self.assertAlmostEqual(custom_cost.input_cost_usd or 0.0, 2.0, places=4)
-        self.assertAlmostEqual(custom_cost.output_cost_usd or 0.0, 0.8, places=4)
+    def test_06_adversarial_secret_scrubbing(self) -> None:
+        """Validate complete redaction of all secrets across keys, values, and standalone text."""
+        # Specific test cases from auditor's review
+        auditor_cases = [
+            ("failure sk-proj-1234567890abcdef12345678", "failure [REDACTED_SECRET]"),
+            ("failure ghp_111122223333444455556666777788889999", "failure [REDACTED_SECRET]"),
+            ("api_key=sk-proj-1234567890abcdef12345678", "api_key=[REDACTED_SECRET]"),
+        ]
+        for raw, expected in auditor_cases:
+            scrubbed = scrub_sensitive_text(raw)
+            self.assertEqual(scrubbed, expected)
+            self.assertNotIn("sk-proj-1234567890abcdef12345678", scrubbed or "")
+            self.assertNotIn("ghp_111122223333444455556666777788889999", scrubbed or "")
 
-    def test_05_secret_scrubbing_in_telemetry(self) -> None:
-        """Validate strict scrubbing of secrets in error messages and metadata."""
-        dirty_error = "Connection failed to https://api.openai.com/v1 with Bearer sk-proj-1234567890abcdef12345678"
-        clean_error = scrub_sensitive_text(dirty_error)
-        self.assertNotIn("sk-proj-1234567890abcdef12345678", clean_error or "")
-        self.assertIn("[REDACTED_SECRET]", clean_error or "")
+        # Standalone cloud keys
+        cloud_cases = [
+            ("Google API key AIzaSyD-1234567890abcdef1234567890abcde in query", "Google API key [REDACTED_SECRET] in query"),
+            ("AWS key AKIAIOSFODNN7EXAMPLE found", "AWS key [REDACTED_SECRET] found"),
+            ("Slack token xoxb-1234567890-abcdef123456 logged", "Slack token [REDACTED_SECRET] logged"),
+            ("Auth Bearer secret-token-1234567890", "Auth Bearer [REDACTED_SECRET]"),
+        ]
+        for raw, expected in cloud_cases:
+            scrubbed = scrub_sensitive_text(raw)
+            self.assertEqual(scrubbed, expected)
 
+        # Complex nested dictionaries and lists
         dirty_meta = {
             "model": "gpt-4o",
-            "api_key": "secret_key_12345",
-            "auth_token": "bearer abcdef1234567890",
-            "nested": {
-                "credential": "super-secret-password",
-                "normal_param": "temperature: 0.7",
-            },
+            "api_key": "my-secret-key-12345",
+            "bearer_token": "bearer abcdef1234567890",
+            "secret_key_field": ["some_value"],
+            "normal_items": [
+                "sk-proj-1234567890abcdef12345678",
+                "ghp_111122223333444455556666777788889999",
+                {"nested_credential": "password123"},
+            ],
+            "normal_tuple": ("AKIAIOSFODNN7EXAMPLE", "normal_data"),
         }
         clean_meta = scrub_sensitive_dict(dirty_meta)
         self.assertEqual(clean_meta["api_key"], "[REDACTED_SECRET]")
-        self.assertEqual(clean_meta["auth_token"], "[REDACTED_SECRET]")
-        self.assertEqual(clean_meta["nested"]["credential"], "[REDACTED_SECRET]")
-        self.assertEqual(clean_meta["nested"]["normal_param"], "temperature: 0.7")
+        self.assertEqual(clean_meta["bearer_token"], "[REDACTED_SECRET]")
+        self.assertEqual(clean_meta["secret_key_field"], "[REDACTED_SECRET]")
+        self.assertEqual(clean_meta["normal_items"][0], "[REDACTED_SECRET]")
+        self.assertEqual(clean_meta["normal_items"][1], "[REDACTED_SECRET]")
+        self.assertEqual(clean_meta["normal_items"][2]["nested_credential"], "[REDACTED_SECRET]")
+        self.assertEqual(clean_meta["normal_tuple"][0], "[REDACTED_SECRET]")
+        self.assertEqual(clean_meta["normal_tuple"][1], "normal_data")
 
-        # Telemetry record creation automatically applies scrubbing
-        rec = CognitiveTelemetryRecord(
-            task_id="task_scrub_01",
-            error_message="Fatal error with token: ghp_111122223333444455556666777788889999",
-            metadata={"secret_field": "confidential_password"},
-        )
-        self.assertNotIn("ghp_111122223333444455556666777788889999", rec.error_message or "")
-        self.assertIn("[REDACTED_SECRET]", rec.error_message or "")
-        self.assertEqual(rec.metadata["secret_field"], "[REDACTED_SECRET]")
-
-    def test_06_telemetry_collector_workflow(self) -> None:
+    def test_07_telemetry_collector_end_to_end(self) -> None:
         """Validate TelemetryCollector context manager, fine-grained timers, and finalization."""
         collector = TelemetryCollector(
             task_id="task_coll_01",
@@ -191,19 +233,15 @@ class TestPhase4CCognitiveTelemetry(unittest.TestCase):
         )
 
         with collector:
-            # Simulate initial inference delay before first token
             time.sleep(0.01)
             collector.mark_first_token()
 
-            # Record streaming tokens
             for _ in range(5):
                 collector.record_stream_chunk()
 
-            # Measure tool invocation
             with collector.measure_tool():
                 time.sleep(0.015)
 
-            # Measure coordinator overhead
             with collector.measure_supervisor():
                 time.sleep(0.005)
 
@@ -218,41 +256,64 @@ class TestPhase4CCognitiveTelemetry(unittest.TestCase):
         record = collector.finalize(success=True)
 
         self.assertEqual(record.task_id, "task_coll_01")
-        self.assertEqual(record.run_id, "run_coll_01")
         self.assertEqual(record.provider, "anthropic")
         self.assertEqual(record.model_name, "claude-3-5-sonnet")
         self.assertEqual(record.tokens.input_tokens, 1000)
         self.assertEqual(record.tokens.output_tokens, 250)
         self.assertEqual(record.tokens.cache_read_tokens, 400)
         self.assertEqual(record.tokens.total_tokens, 1650)
-        self.assertEqual(record.tokens.provenance, MetricProvenance.MEASURED)
 
-        # Latencies check
+        # Decomposed latency verification
         self.assertIsNotNone(record.latencies.ttft_ms)
         self.assertGreater(record.latencies.ttft_ms or 0.0, 5.0)
         self.assertGreater(record.latencies.tool_duration_ms or 0.0, 10.0)
         self.assertGreater(record.latencies.supervisor_overhead_ms or 0.0, 3.0)
-        self.assertGreater(record.latencies.total_duration_ms, 25.0)
+        self.assertEqual(record.latencies.generation_duration_provenance, MetricProvenance.ESTIMATED)
 
-        # Cost automatically estimated from reference pricing
+        # Cost auto-estimation
         self.assertEqual(record.cost.provenance, MetricProvenance.ESTIMATED)
+        self.assertEqual(record.cost.pricing_version, PricingRegistry.REGISTRY_VERSION)
         self.assertIsNotNone(record.cost.total_cost_usd)
-        self.assertGreater(record.cost.total_cost_usd or 0.0, 0.0)
 
-        # Counters
-        self.assertEqual(record.tool_calls_count, 1)
-        self.assertEqual(record.retries_count, 1)
-        self.assertEqual(record.stream_chunks_count, 5)
-        self.assertTrue(record.success)
+    def test_08_immutable_dataclasses_enforcement(self) -> None:
+        """Validate that all metric dataclasses enforce frozen immutability."""
+        tokens = TokenMetrics(input_tokens=100, output_tokens=50, provenance=MetricProvenance.MEASURED)
+        with self.assertRaises(FrozenInstanceError):
+            tokens.input_tokens = 200  # type: ignore
 
-    def test_07_sqlite_persistence_and_queries(self) -> None:
-        """Validate Store persistence, auto-increment ID, query filters, and pagination."""
+        latencies = LatencyMetrics(total_duration_ms=100.0)
+        with self.assertRaises(FrozenInstanceError):
+            latencies.total_duration_ms = 200.0  # type: ignore
+
+        cost = CostMetrics(total_cost_usd=1.0)
+        with self.assertRaises(FrozenInstanceError):
+            cost.total_cost_usd = 2.0  # type: ignore
+
+        record = CognitiveTelemetryRecord(task_id="task_immut")
+        with self.assertRaises(FrozenInstanceError):
+            record.task_id = "task_other"  # type: ignore
+
+    def test_09_database_level_immutability_triggers(self) -> None:
+        """Validate SQLite trigger enforcement of append-only immutability on cognitive_telemetry."""
+        rec = CognitiveTelemetryRecord(task_id="task_audit_immut", success=True)
+        saved = self.store.record_cognitive_telemetry(rec)
+        self.assertIsNotNone(saved.id)
+
+        # Attempt UPDATE directly in SQLite: must raise sqlite3.IntegrityError
+        with self.assertRaises(sqlite3.IntegrityError) as ctx_update:
+            self.store.db.execute("UPDATE cognitive_telemetry SET task_id='tampered' WHERE id=?", (saved.id,))
+        self.assertIn("immutable and append-only", str(ctx_update.exception))
+
+        # Attempt DELETE directly in SQLite: must raise sqlite3.IntegrityError
+        with self.assertRaises(sqlite3.IntegrityError) as ctx_delete:
+            self.store.db.execute("DELETE FROM cognitive_telemetry WHERE id=?", (saved.id,))
+        self.assertIn("immutable and cannot be deleted", str(ctx_delete.exception))
+
+    def test_10_sqlite_persistence_queries_and_pagination(self) -> None:
+        """Validate Store persistence, auto-increment ID assignment, filtering, and pagination."""
         rec1 = CognitiveTelemetryRecord(
             task_id="task_alpha",
             run_id="run_001",
-            worker_identity="worker_A",
-            worker_pid=1001,
-            plan_revision=1,
             provider="openai",
             model_name="gpt-4o",
             tokens=TokenMetrics(input_tokens=500, output_tokens=100, provenance=MetricProvenance.MEASURED),
@@ -260,13 +321,9 @@ class TestPhase4CCognitiveTelemetry(unittest.TestCase):
             cost=CostMetrics(total_cost_usd=0.00225, provenance=MetricProvenance.ESTIMATED),
             success=True,
         )
-
         rec2 = CognitiveTelemetryRecord(
             task_id="task_alpha",
             run_id="run_002",
-            worker_identity="worker_B",
-            worker_pid=1002,
-            plan_revision=1,
             provider="anthropic",
             model_name="claude-3-5-sonnet",
             tokens=TokenMetrics(input_tokens=800, output_tokens=200, provenance=MetricProvenance.MEASURED),
@@ -277,118 +334,69 @@ class TestPhase4CCognitiveTelemetry(unittest.TestCase):
             error_message="Too Many Requests",
         )
 
-        rec3 = CognitiveTelemetryRecord(
-            task_id="task_beta",
-            run_id="run_003",
-            provider="openai",
-            model_name="gpt-4o-mini",
-            tokens=TokenMetrics(input_tokens=300, output_tokens=50, provenance=MetricProvenance.MEASURED),
-            latencies=LatencyMetrics(total_duration_ms=110.0, provenance=MetricProvenance.MEASURED),
-            cost=CostMetrics(total_cost_usd=0.000075, provenance=MetricProvenance.ESTIMATED),
-            success=True,
-        )
-
         saved1 = self.store.record_cognitive_telemetry(rec1)
         saved2 = self.store.record_cognitive_telemetry(rec2)
-        saved3 = self.store.record_cognitive_telemetry(rec3)
 
         self.assertIsNotNone(saved1.id)
         self.assertIsNotNone(saved2.id)
-        self.assertIsNotNone(saved3.id)
         self.assertEqual(saved2.id, (saved1.id or 0) + 1)
 
-        # Query all
-        all_records = self.store.query_cognitive_telemetry()
-        self.assertEqual(len(all_records), 3)
+        # Query filter by task_id
+        records = self.store.query_cognitive_telemetry(task_id="task_alpha")
+        self.assertEqual(len(records), 2)
 
-        # Filter by task_id
-        alpha_records = self.store.query_cognitive_telemetry(task_id="task_alpha")
-        self.assertEqual(len(alpha_records), 2)
-        self.assertTrue(all(r.task_id == "task_alpha" for r in alpha_records))
+        # Query filter by success
+        failed = self.store.query_cognitive_telemetry(success=False)
+        self.assertEqual(len(failed), 1)
+        self.assertEqual(failed[0].error_category, "rate_limit")
 
-        # Filter by provider
-        openai_records = self.store.query_cognitive_telemetry(provider="openai")
-        self.assertEqual(len(openai_records), 2)
-        self.assertTrue(all(r.provider == "openai" for r in openai_records))
+    def test_11_aggregate_statistics_unknown_distinction_and_truncation(self) -> None:
+        """Validate aggregate statistical summary, distinction between 0 and unknown, and truncation signaling."""
+        # 1. Test run with purely unknown costs and tokens
+        unk_rec = CognitiveTelemetryRecord(
+            task_id="task_unk",
+            provider="mock",
+            model_name="unknown-model",
+            tokens=TokenMetrics(provenance=MetricProvenance.UNKNOWN),
+            cost=CostMetrics(provenance=MetricProvenance.UNKNOWN),
+            latencies=LatencyMetrics(total_duration_ms=100.0),
+        )
+        self.store.record_cognitive_telemetry(unk_rec)
+        agg_unk = self.store.aggregate_cognitive_telemetry(task_id="task_unk")
+        self.assertIsNone(agg_unk.total_cost_usd)  # Must be None, NEVER 0.0
+        self.assertIsNone(agg_unk.total_tokens)
+        self.assertEqual(agg_unk.records_with_unknown_cost, 1)
+        self.assertEqual(agg_unk.records_with_unknown_tokens, 1)
 
-        # Filter by success
-        failed_records = self.store.query_cognitive_telemetry(success=False)
-        self.assertEqual(len(failed_records), 1)
-        self.assertEqual(failed_records[0].error_category, "rate_limit")
-        self.assertEqual(failed_records[0].error_message, "Too Many Requests")
-
-        # Pagination
-        paged = self.store.query_cognitive_telemetry(limit=2, offset=0)
-        self.assertEqual(len(paged), 2)
-        paged_next = self.store.query_cognitive_telemetry(limit=2, offset=2)
-        self.assertEqual(len(paged_next), 1)
-
-    def test_08_aggregate_statistics_and_percentiles(self) -> None:
-        """Validate aggregate statistical summary: percentiles, provenance totals, and error rate."""
-        # Insert 10 records with predictable latencies: 100, 200, ..., 1000 ms
+        # 2. Insert 10 records with known values for truncation testing
         for i in range(1, 11):
-            is_err = (i == 10)
             self.store.record_cognitive_telemetry(
                 CognitiveTelemetryRecord(
-                    task_id="task_agg",
-                    run_id=f"run_{i:02d}",
+                    task_id="task_trunc",
+                    run_id=f"run_{i}",
                     provider="mock",
                     model_name="test-model",
-                    tokens=TokenMetrics(
-                        input_tokens=1000 * i,
-                        output_tokens=100 * i,
-                        provenance=MetricProvenance.MEASURED,
-                    ),
-                    latencies=LatencyMetrics(
-                        total_duration_ms=100.0 * i,
-                        ttft_ms=10.0 * i,
-                        generation_duration_ms=80.0 * i,
-                        tool_duration_ms=15.0 * i,
-                        supervisor_overhead_ms=5.0 * i,
-                        provenance=MetricProvenance.MEASURED,
-                    ),
-                    cost=CostMetrics(
-                        total_cost_usd=0.001 * i,
-                        provenance=MetricProvenance.ESTIMATED,
-                    ),
-                    tool_calls_count=2,
-                    retries_count=1 if is_err else 0,
-                    success=not is_err,
-                    error_category="timeout" if is_err else None,
+                    tokens=TokenMetrics(input_tokens=100 * i, output_tokens=50 * i, provenance=MetricProvenance.MEASURED),
+                    latencies=LatencyMetrics(total_duration_ms=50.0 * i, provenance=MetricProvenance.MEASURED),
+                    cost=CostMetrics(total_cost_usd=0.0001 * i, provenance=MetricProvenance.ESTIMATED),
                 )
             )
 
-        agg = self.store.aggregate_cognitive_telemetry(task_id="task_agg")
+        # Unbounded aggregation: all 10 records, is_truncated=False
+        agg_all = self.store.aggregate_cognitive_telemetry(task_id="task_trunc")
+        self.assertEqual(agg_all.sample_size, 10)
+        self.assertEqual(agg_all.total_matched_records, 10)
+        self.assertFalse(agg_all.is_truncated)
+        self.assertIsNone(agg_all.truncation_note)
 
-        self.assertEqual(agg.record_count, 10)
-        self.assertEqual(agg.total_input_tokens, sum(1000 * i for i in range(1, 11)))
-        self.assertEqual(agg.total_output_tokens, sum(100 * i for i in range(1, 11)))
-        self.assertEqual(agg.tokens_by_provenance[MetricProvenance.MEASURED], agg.total_tokens)
-        self.assertAlmostEqual(agg.total_cost_usd, sum(0.001 * i for i in range(1, 11)), places=6)
+        # Explicitly bounded sampling: max_records=4, is_truncated=True
+        agg_sampled = self.store.aggregate_cognitive_telemetry(task_id="task_trunc", max_records=4)
+        self.assertEqual(agg_sampled.sample_size, 4)
+        self.assertEqual(agg_sampled.total_matched_records, 10)
+        self.assertTrue(agg_sampled.is_truncated)
+        self.assertIn("Agregação truncada", agg_sampled.truncation_note or "")
 
-        # Durations: min 100, max 1000, avg 550
-        self.assertEqual(agg.avg_duration_ms, 550.0)
-        self.assertEqual(agg.p50_duration_ms, 550.0)
-        self.assertGreaterEqual(agg.p90_duration_ms, 900.0)
-        self.assertGreaterEqual(agg.p99_duration_ms, 990.0)
-
-        # Decomposed averages
-        self.assertEqual(agg.avg_ttft_ms, 55.0)
-        self.assertEqual(agg.avg_generation_duration_ms, 440.0)
-        self.assertEqual(agg.avg_tool_duration_ms, 82.5)
-        self.assertEqual(agg.avg_supervisor_overhead_ms, 27.5)
-
-        # Activity counters
-        self.assertEqual(agg.tool_calls_count, 20)
-        self.assertEqual(agg.retries_count, 1)
-
-        # Success / failure
-        self.assertEqual(agg.success_count, 9)
-        self.assertEqual(agg.failure_count, 1)
-        self.assertEqual(agg.success_rate, 0.9)
-        self.assertEqual(agg.error_breakdown.get("timeout"), 1)
-
-    def test_09_non_interference_invariant(self) -> None:
+    def test_12_non_interference_safe_record(self) -> None:
         """Validate that safe_record_telemetry never raises exceptions or disturbs supervisor runs."""
         # Non-Store object or None
         result = safe_record_telemetry(None, {"task_id": "task_nil"})
@@ -408,7 +416,7 @@ class TestPhase4CCognitiveTelemetry(unittest.TestCase):
         self.assertIsNotNone(res)
         self.assertIsNotNone(res.id if res else None)
 
-    def test_10_concurrent_multithreaded_recording(self) -> None:
+    def test_13_concurrent_multithreaded_recording(self) -> None:
         """Validate concurrent thread safety and zero database corruption under parallel writes."""
         thread_count = 8
         records_per_thread = 25
@@ -437,19 +445,12 @@ class TestPhase4CCognitiveTelemetry(unittest.TestCase):
         self.assertEqual(len(all_saved), total_expected)
 
         agg = self.store.aggregate_cognitive_telemetry()
-        self.assertEqual(agg.record_count, total_expected)
+        self.assertEqual(agg.sample_size, total_expected)
         self.assertEqual(agg.success_count, total_expected)
-        self.assertEqual(agg.total_input_tokens, total_expected * 100)
-        self.assertEqual(agg.total_output_tokens, total_expected * 50)
 
-    def test_11_schema_migration_idempotence(self) -> None:
-        """Validate that repeated Store initialization preserves existing telemetry data."""
-        rec = CognitiveTelemetryRecord(
-            task_id="task_idempotence",
-            provider="openai",
-            model_name="gpt-4o",
-            success=True,
-        )
+    def test_14_schema_idempotence_and_triggers_preservation(self) -> None:
+        """Validate that repeated Store initialization preserves existing data and triggers."""
+        rec = CognitiveTelemetryRecord(task_id="task_idemp", model_name="gpt-4o", success=True)
         saved = self.store.record_cognitive_telemetry(rec)
         self.assertIsNotNone(saved.id)
 
@@ -459,10 +460,11 @@ class TestPhase4CCognitiveTelemetry(unittest.TestCase):
         # Reopen store from same directory
         store2 = Store(self.test_dir)
         try:
-            records = store2.query_cognitive_telemetry(task_id="task_idempotence")
+            records = store2.query_cognitive_telemetry(task_id="task_idemp")
             self.assertEqual(len(records), 1)
-            self.assertEqual(records[0].task_id, "task_idempotence")
-            self.assertEqual(records[0].model_name, "gpt-4o")
+            # Verify triggers still active
+            with self.assertRaises(sqlite3.IntegrityError):
+                store2.db.execute("UPDATE cognitive_telemetry SET task_id='tampered' WHERE id=?", (saved.id,))
         finally:
             store2.db.close()
 

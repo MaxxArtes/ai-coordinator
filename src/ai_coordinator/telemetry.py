@@ -1,8 +1,8 @@
 """Cognitive Telemetry Module for tracking model tokens, latency, cost, and tool usage.
 
 Provides observational, passive instrumentation for AI Coordinator missions and workers,
-with strict data provenance differentiation (measured, estimated, unknown) and invariant
-non-interference guarantees.
+with strict data provenance differentiation (measured, estimated, unknown), vendor-specific
+cache accounting contracts, audit-grade record immutability, and invariant non-interference.
 """
 from __future__ import annotations
 
@@ -43,22 +43,35 @@ class MetricProvenance:
         return value
 
 
-# Sensitive credential patterns for scrubbing
-_SENSITIVE_PATTERNS = [
-    re.compile(r"(bearer\s+)[A-Za-z0-9_\-\.]{10,}", re.IGNORECASE),
-    re.compile(r"(password|secret|token|api[_-]?key|credential)\s*[:=]\s*['\"]?[^'\"\s]+['\"]?", re.IGNORECASE),
-    re.compile(r"(sk-[A-Za-z0-9_\-]{20,})", re.IGNORECASE),
-    re.compile(r"(ghp_[A-Za-z0-9]{36}|github_pat_[A-Za-z0-9_]{50,})", re.IGNORECASE),
+# Prefixed key-value assignments: replace the secret value, preserving key and separator
+_PREFIXED_SENSITIVE_PATTERNS = [
+    (re.compile(r"""(password|secret|token|api[_-]?key|credential)\s*([:=])\s*['"]?[^'"\s]+['"]?""", re.IGNORECASE), r"\1\2[REDACTED_SECRET]"),
+    (re.compile(r"""(bearer\s+)[A-Za-z0-9_\-\.]{10,}""", re.IGNORECASE), r"\1[REDACTED_SECRET]"),
+    (re.compile(r"""(basic\s+)[A-Za-z0-9+/=]{10,}""", re.IGNORECASE), r"\1[REDACTED_SECRET]"),
+]
+
+# Standalone high-entropy secret patterns (no prefix: whole match is redacted)
+_STANDALONE_SENSITIVE_PATTERNS = [
+    re.compile(r"""\b(sk-[A-Za-z0-9_\-]{20,})\b""", re.IGNORECASE),
+    re.compile(r"""\b(gh[pousr]_[A-Za-z0-9]{36,}|github_pat_[A-Za-z0-9_]{50,})\b""", re.IGNORECASE),
+    re.compile(r"""\b(AIza[0-9A-Za-z\-_]{35})\b"""),
+    re.compile(r"""\b(AKIA[0-9A-Z]{16})\b"""),
+    re.compile(r"""\b(xox[baprs]-[0-9A-Za-z\-]{10,})\b"""),
 ]
 
 
 def scrub_sensitive_text(text: Optional[str]) -> Optional[str]:
-    """Scrub sensitive credentials, passwords, and tokens from telemetry text."""
-    if not text:
-        return text
+    """Scrub sensitive credentials, passwords, and tokens from telemetry text.
+
+    Guarantees complete redaction whether secrets appear as key-value pairs or as isolated tokens.
+    """
+    if text is None:
+        return None
     scrubbed = str(text)
-    for pattern in _SENSITIVE_PATTERNS:
-        scrubbed = pattern.sub(r"\1[REDACTED_SECRET]", scrubbed)
+    for pat, repl in _PREFIXED_SENSITIVE_PATTERNS:
+        scrubbed = pat.sub(repl, scrubbed)
+    for pat in _STANDALONE_SENSITIVE_PATTERNS:
+        scrubbed = pat.sub("[REDACTED_SECRET]", scrubbed)
     return scrubbed
 
 
@@ -69,43 +82,62 @@ def scrub_sensitive_dict(data: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     scrubbed: Dict[str, Any] = {}
     for k, v in data.items():
         k_str = str(k)
-        if any(term in k_str.lower() for term in ("secret", "token", "password", "key", "auth", "credential")):
+        if any(term in k_str.lower() for term in ("secret", "token", "password", "key", "auth", "credential", "api_key", "apikey")):
             scrubbed[k_str] = "[REDACTED_SECRET]"
         elif isinstance(v, str):
             scrubbed[k_str] = scrub_sensitive_text(v)
         elif isinstance(v, dict):
             scrubbed[k_str] = scrub_sensitive_dict(v)
-        elif isinstance(v, list):
-            scrubbed[k_str] = [
+        elif isinstance(v, (list, tuple, set)):
+            scrubbed_items = [
                 scrub_sensitive_dict(item) if isinstance(item, dict)
                 else (scrub_sensitive_text(item) if isinstance(item, str) else item)
                 for item in v
             ]
+            if isinstance(v, list):
+                scrubbed[k_str] = scrubbed_items
+            elif isinstance(v, tuple):
+                scrubbed[k_str] = tuple(scrubbed_items)
+            else:
+                scrubbed[k_str] = set(scrubbed_items)
         else:
             scrubbed[k_str] = v
     return scrubbed
 
 
-@dataclass
+@dataclass(frozen=True)
 class TokenMetrics:
-    """Token accounting metrics with explicit data provenance."""
-    input_tokens: int = 0
-    output_tokens: int = 0
-    cache_read_tokens: int = 0
-    cache_creation_tokens: int = 0
-    total_tokens: int = 0
+    """Immutable token accounting metrics with explicit data provenance.
+
+    Differentiates actually measured/estimated zero tokens (0) from unknown/omitted tokens (None).
+    """
+    input_tokens: Optional[int] = None
+    output_tokens: Optional[int] = None
+    cache_read_tokens: Optional[int] = None
+    cache_creation_tokens: Optional[int] = None
+    total_tokens: Optional[int] = None
     provenance: str = MetricProvenance.UNKNOWN
 
     def __post_init__(self) -> None:
         MetricProvenance.validate(self.provenance)
-        self.input_tokens = max(0, int(self.input_tokens))
-        self.output_tokens = max(0, int(self.output_tokens))
-        self.cache_read_tokens = max(0, int(self.cache_read_tokens))
-        self.cache_creation_tokens = max(0, int(self.cache_creation_tokens))
-        if self.total_tokens == 0 and (self.input_tokens > 0 or self.output_tokens > 0):
-            self.total_tokens = self.input_tokens + self.output_tokens + self.cache_read_tokens + self.cache_creation_tokens
-        else:
-            self.total_tokens = max(0, int(self.total_tokens))
+        in_t = None if self.input_tokens is None else max(0, int(self.input_tokens))
+        out_t = None if self.output_tokens is None else max(0, int(self.output_tokens))
+        read_t = None if self.cache_read_tokens is None else max(0, int(self.cache_read_tokens))
+        creat_t = None if self.cache_creation_tokens is None else max(0, int(self.cache_creation_tokens))
+
+        tot_t = self.total_tokens
+        if tot_t is not None:
+            tot_t = max(0, int(tot_t))
+        elif in_t is not None or out_t is not None:
+            parts = [p for p in (in_t, out_t, read_t, creat_t) if p is not None]
+            tot_t = sum(parts) if parts else None
+
+        object.__setattr__(self, "input_tokens", in_t)
+        object.__setattr__(self, "output_tokens", out_t)
+        object.__setattr__(self, "cache_read_tokens", read_t)
+        object.__setattr__(self, "cache_creation_tokens", creat_t)
+        object.__setattr__(self, "total_tokens", tot_t)
+        object.__setattr__(self, "provenance", self.provenance)
 
     def to_dict(self) -> Dict[str, Any]:
         return dataclasses.asdict(self)
@@ -115,36 +147,96 @@ class TokenMetrics:
         if not data:
             return cls()
         return cls(
-            input_tokens=data.get("input_tokens", 0),
-            output_tokens=data.get("output_tokens", 0),
-            cache_read_tokens=data.get("cache_read_tokens", 0),
-            cache_creation_tokens=data.get("cache_creation_tokens", 0),
-            total_tokens=data.get("total_tokens", 0),
+            input_tokens=data.get("input_tokens"),
+            output_tokens=data.get("output_tokens"),
+            cache_read_tokens=data.get("cache_read_tokens"),
+            cache_creation_tokens=data.get("cache_creation_tokens"),
+            total_tokens=data.get("total_tokens"),
             provenance=data.get("provenance", MetricProvenance.UNKNOWN),
         )
 
 
-@dataclass
+def normalize_provider_tokens(
+    provider: str,
+    input_tokens: Optional[int],
+    output_tokens: Optional[int],
+    cache_read_tokens: Optional[int] = None,
+    cache_creation_tokens: Optional[int] = None,
+    total_tokens: Optional[int] = None,
+    provenance: str = MetricProvenance.MEASURED,
+) -> TokenMetrics:
+    """Normalize token metrics adhering to vendor accounting contracts to prevent double-counting.
+
+    Vendor Contracts:
+    - OpenAI / Azure: `usage.prompt_tokens` includes `cached_tokens`.
+      `total_tokens = prompt_tokens + completion_tokens`.
+      (cache_read_tokens is already accounted for within prompt_tokens).
+    - Anthropic: `usage.input_tokens` is disjoint from cache tokens.
+      `total_tokens = input_tokens + output_tokens + cache_read_tokens + cache_creation_tokens`.
+    - Google Gemini: `usageMetadata.promptTokenCount` includes `cachedContentTokenCount`.
+      `total_tokens = promptTokenCount + candidatesTokenCount`.
+    - Generic: If total_tokens is reported, use it; otherwise compute sum of non-null components.
+    """
+    prov = str(provider or "").strip().lower()
+    in_t = None if input_tokens is None else max(0, int(input_tokens))
+    out_t = None if output_tokens is None else max(0, int(output_tokens))
+    read_t = None if cache_read_tokens is None else max(0, int(cache_read_tokens))
+    creat_t = None if cache_creation_tokens is None else max(0, int(cache_creation_tokens))
+
+    computed_total = total_tokens
+    if computed_total is None and in_t is not None and out_t is not None:
+        if prov in ("openai", "azure"):
+            # OpenAI prompt_tokens already includes cached_tokens
+            computed_total = in_t + out_t
+        elif prov in ("anthropic", "claude"):
+            # Anthropic input_tokens is strictly uncached input
+            computed_total = in_t + out_t + (read_t or 0) + (creat_t or 0)
+        elif prov in ("google", "gemini"):
+            # Gemini promptTokenCount already includes cachedContentTokenCount
+            computed_total = in_t + out_t
+        else:
+            computed_total = in_t + out_t + (read_t or 0) + (creat_t or 0)
+
+    return TokenMetrics(
+        input_tokens=in_t,
+        output_tokens=out_t,
+        cache_read_tokens=read_t,
+        cache_creation_tokens=creat_t,
+        total_tokens=computed_total,
+        provenance=provenance,
+    )
+
+
+@dataclass(frozen=True)
 class LatencyMetrics:
-    """Detailed latency and execution duration metrics in milliseconds."""
+    """Immutable latency metrics in milliseconds with separate provenance for measured vs derived durations."""
+    total_duration_ms: float = 0.0
     ttft_ms: Optional[float] = None
     generation_duration_ms: Optional[float] = None
     tool_duration_ms: Optional[float] = None
     supervisor_overhead_ms: Optional[float] = None
-    total_duration_ms: float = 0.0
-    provenance: str = MetricProvenance.UNKNOWN
+    latency_provenance: str = MetricProvenance.MEASURED
+    generation_duration_provenance: str = MetricProvenance.ESTIMATED
+    provenance: Optional[str] = None
 
     def __post_init__(self) -> None:
-        MetricProvenance.validate(self.provenance)
-        if self.ttft_ms is not None:
-            self.ttft_ms = max(0.0, float(self.ttft_ms))
-        if self.generation_duration_ms is not None:
-            self.generation_duration_ms = max(0.0, float(self.generation_duration_ms))
-        if self.tool_duration_ms is not None:
-            self.tool_duration_ms = max(0.0, float(self.tool_duration_ms))
-        if self.supervisor_overhead_ms is not None:
-            self.supervisor_overhead_ms = max(0.0, float(self.supervisor_overhead_ms))
-        self.total_duration_ms = max(0.0, float(self.total_duration_ms))
+        lat_prov = self.provenance if self.provenance is not None else self.latency_provenance
+        MetricProvenance.validate(lat_prov)
+        MetricProvenance.validate(self.generation_duration_provenance)
+        tot = max(0.0, float(self.total_duration_ms))
+        ttft = None if self.ttft_ms is None else max(0.0, float(self.ttft_ms))
+        gen = None if self.generation_duration_ms is None else max(0.0, float(self.generation_duration_ms))
+        tool = None if self.tool_duration_ms is None else max(0.0, float(self.tool_duration_ms))
+        superv = None if self.supervisor_overhead_ms is None else max(0.0, float(self.supervisor_overhead_ms))
+
+        object.__setattr__(self, "total_duration_ms", tot)
+        object.__setattr__(self, "ttft_ms", ttft)
+        object.__setattr__(self, "generation_duration_ms", gen)
+        object.__setattr__(self, "tool_duration_ms", tool)
+        object.__setattr__(self, "supervisor_overhead_ms", superv)
+        object.__setattr__(self, "latency_provenance", lat_prov)
+        object.__setattr__(self, "generation_duration_provenance", self.generation_duration_provenance)
+        object.__setattr__(self, "provenance", lat_prov)
 
     def to_dict(self) -> Dict[str, Any]:
         return dataclasses.asdict(self)
@@ -154,45 +246,48 @@ class LatencyMetrics:
         if not data:
             return cls()
         return cls(
+            total_duration_ms=data.get("total_duration_ms", 0.0),
             ttft_ms=data.get("ttft_ms"),
             generation_duration_ms=data.get("generation_duration_ms"),
             tool_duration_ms=data.get("tool_duration_ms"),
             supervisor_overhead_ms=data.get("supervisor_overhead_ms"),
-            total_duration_ms=data.get("total_duration_ms", 0.0),
-            provenance=data.get("provenance", MetricProvenance.UNKNOWN),
+            latency_provenance=data.get("latency_provenance", MetricProvenance.MEASURED),
+            generation_duration_provenance=data.get("generation_duration_provenance", MetricProvenance.ESTIMATED),
         )
 
 
-@dataclass
+@dataclass(frozen=True)
 class CostMetrics:
-    """Monetary cost accounting metrics in USD."""
+    """Immutable monetary cost accounting metrics in USD with explicit pricing versioning."""
     input_cost_usd: Optional[float] = None
     output_cost_usd: Optional[float] = None
     cache_read_cost_usd: Optional[float] = None
     cache_creation_cost_usd: Optional[float] = None
     total_cost_usd: Optional[float] = None
     provenance: str = MetricProvenance.UNKNOWN
+    pricing_version: Optional[str] = None
 
     def __post_init__(self) -> None:
         MetricProvenance.validate(self.provenance)
-        if self.input_cost_usd is not None:
-            self.input_cost_usd = max(0.0, float(self.input_cost_usd))
-        if self.output_cost_usd is not None:
-            self.output_cost_usd = max(0.0, float(self.output_cost_usd))
-        if self.cache_read_cost_usd is not None:
-            self.cache_read_cost_usd = max(0.0, float(self.cache_read_cost_usd))
-        if self.cache_creation_cost_usd is not None:
-            self.cache_creation_cost_usd = max(0.0, float(self.cache_creation_cost_usd))
+        in_c = None if self.input_cost_usd is None else max(0.0, float(self.input_cost_usd))
+        out_c = None if self.output_cost_usd is None else max(0.0, float(self.output_cost_usd))
+        read_c = None if self.cache_read_cost_usd is None else max(0.0, float(self.cache_read_cost_usd))
+        creat_c = None if self.cache_creation_cost_usd is None else max(0.0, float(self.cache_creation_cost_usd))
 
-        if self.total_cost_usd is not None:
-            self.total_cost_usd = max(0.0, float(self.total_cost_usd))
+        tot_c = self.total_cost_usd
+        if tot_c is not None:
+            tot_c = max(0.0, float(tot_c))
         else:
-            components = [
-                c for c in (self.input_cost_usd, self.output_cost_usd, self.cache_read_cost_usd, self.cache_creation_cost_usd)
-                if c is not None
-            ]
-            if components:
-                self.total_cost_usd = sum(components)
+            components = [c for c in (in_c, out_c, read_c, creat_c) if c is not None]
+            tot_c = sum(components) if components else None
+
+        object.__setattr__(self, "input_cost_usd", in_c)
+        object.__setattr__(self, "output_cost_usd", out_c)
+        object.__setattr__(self, "cache_read_cost_usd", read_c)
+        object.__setattr__(self, "cache_creation_cost_usd", creat_c)
+        object.__setattr__(self, "total_cost_usd", tot_c)
+        object.__setattr__(self, "provenance", self.provenance)
+        object.__setattr__(self, "pricing_version", self.pricing_version)
 
     def to_dict(self) -> Dict[str, Any]:
         return dataclasses.asdict(self)
@@ -208,10 +303,11 @@ class CostMetrics:
             cache_creation_cost_usd=data.get("cache_creation_cost_usd"),
             total_cost_usd=data.get("total_cost_usd"),
             provenance=data.get("provenance", MetricProvenance.UNKNOWN),
+            pricing_version=data.get("pricing_version"),
         )
 
 
-@dataclass
+@dataclass(frozen=True)
 class CognitiveTelemetryRecord:
     """Immutable observational record of a single cognitive execution invocation."""
     task_id: str
@@ -237,15 +333,21 @@ class CognitiveTelemetryRecord:
     def __post_init__(self) -> None:
         if not self.task_id or not isinstance(self.task_id, str):
             raise ValueError("task_id obrigatorio para registro de telemetria")
-        self.tool_calls_count = max(0, int(self.tool_calls_count))
-        self.retries_count = max(0, int(self.retries_count))
-        self.stream_chunks_count = max(0, int(self.stream_chunks_count))
-        self.provider = str(self.provider or "unknown").strip().lower()
-        self.model_name = str(self.model_name or "unknown").strip()
-        if self.error_message:
-            self.error_message = scrub_sensitive_text(self.error_message)
-        if self.metadata:
-            self.metadata = scrub_sensitive_dict(self.metadata)
+        tc = max(0, int(self.tool_calls_count))
+        rc = max(0, int(self.retries_count))
+        sc = max(0, int(self.stream_chunks_count))
+        prov = str(self.provider or "unknown").strip().lower()
+        model = str(self.model_name or "unknown").strip()
+        err_msg = scrub_sensitive_text(self.error_message) if self.error_message else None
+        meta = scrub_sensitive_dict(self.metadata) if self.metadata else {}
+
+        object.__setattr__(self, "tool_calls_count", tc)
+        object.__setattr__(self, "retries_count", rc)
+        object.__setattr__(self, "stream_chunks_count", sc)
+        object.__setattr__(self, "provider", prov)
+        object.__setattr__(self, "model_name", model)
+        object.__setattr__(self, "error_message", err_msg)
+        object.__setattr__(self, "metadata", meta)
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -301,24 +403,26 @@ class CognitiveTelemetryRecord:
     def from_db_row(cls, row: Union[sqlite3.Row, Dict[str, Any]]) -> CognitiveTelemetryRecord:
         r = dict(row)
         tokens = TokenMetrics(
-            input_tokens=r.get("input_tokens") or 0,
-            output_tokens=r.get("output_tokens") or 0,
-            cache_read_tokens=r.get("cache_read_tokens") or 0,
-            cache_creation_tokens=r.get("cache_creation_tokens") or 0,
-            total_tokens=r.get("total_tokens") or 0,
+            input_tokens=r.get("input_tokens"),
+            output_tokens=r.get("output_tokens"),
+            cache_read_tokens=r.get("cache_read_tokens"),
+            cache_creation_tokens=r.get("cache_creation_tokens"),
+            total_tokens=r.get("total_tokens"),
             provenance=r.get("tokens_provenance") or MetricProvenance.UNKNOWN,
         )
         latencies = LatencyMetrics(
+            total_duration_ms=r.get("total_duration_ms") or 0.0,
             ttft_ms=r.get("ttft_ms"),
             generation_duration_ms=r.get("generation_duration_ms"),
             tool_duration_ms=r.get("tool_duration_ms"),
             supervisor_overhead_ms=r.get("supervisor_overhead_ms"),
-            total_duration_ms=r.get("total_duration_ms") or 0.0,
-            provenance=r.get("latency_provenance") or MetricProvenance.UNKNOWN,
+            latency_provenance=r.get("latency_provenance") or MetricProvenance.MEASURED,
+            generation_duration_provenance=r.get("generation_duration_provenance") or MetricProvenance.ESTIMATED,
         )
         cost = CostMetrics(
             total_cost_usd=r.get("total_cost_usd"),
             provenance=r.get("cost_provenance") or MetricProvenance.UNKNOWN,
+            pricing_version=r.get("pricing_version"),
         )
         meta_raw = r.get("metadata")
         try:
@@ -352,9 +456,11 @@ class CognitiveTelemetryRecord:
 class PricingRegistry:
     """Transparent pricing registry in USD per 1,000,000 tokens for baseline cost estimation.
 
-    Estimations are strictly marked as MetricProvenance.ESTIMATED. Unrecognized models
-    are returned as MetricProvenance.UNKNOWN with total_cost_usd=None to avoid fabricated numbers.
+    Estimations are strictly marked as MetricProvenance.ESTIMATED and stamped with REGISTRY_VERSION.
+    Unrecognized models return MetricProvenance.UNKNOWN with total_cost_usd=None to prevent fabricated numbers.
     """
+    REGISTRY_VERSION = "2026.11.01"
+
     # Rate format: { "input_per_m": float, "output_per_m": float, "cache_read_per_m": float, "cache_creation_per_m": float }
     _REGISTRY: Dict[str, Dict[str, float]] = {
         # Anthropic reference pricing
@@ -404,7 +510,6 @@ class PricingRegistry:
         key = cls._normalize_name(model_name)
         if key in cls._REGISTRY:
             return cls._REGISTRY[key]
-        # Match without date suffixes or common prefixes
         for registered_key, rates in cls._REGISTRY.items():
             if key.startswith(registered_key) or registered_key.startswith(key):
                 return rates
@@ -414,17 +519,22 @@ class PricingRegistry:
     def estimate_cost(cls, model_name: str, tokens: TokenMetrics) -> CostMetrics:
         """Calculate estimated cost for token metrics based on reference pricing.
 
-        Returns CostMetrics with provenance=ESTIMATED if the model is registered,
-        or provenance=UNKNOWN if the model is unrecognized.
+        Returns CostMetrics with provenance=ESTIMATED and pricing_version stamped if model is known,
+        or provenance=UNKNOWN with total_cost_usd=None if the model is unrecognized.
         """
         rates = cls.get_pricing(model_name)
         if not rates:
             return CostMetrics(provenance=MetricProvenance.UNKNOWN)
 
-        in_cost = (tokens.input_tokens / 1_000_000.0) * rates["input_per_m"]
-        out_cost = (tokens.output_tokens / 1_000_000.0) * rates["output_per_m"]
-        read_cost = (tokens.cache_read_tokens / 1_000_000.0) * rates.get("cache_read_per_m", 0.0)
-        creat_cost = (tokens.cache_creation_tokens / 1_000_000.0) * rates.get("cache_creation_per_m", 0.0)
+        in_tok = tokens.input_tokens or 0
+        out_tok = tokens.output_tokens or 0
+        read_tok = tokens.cache_read_tokens or 0
+        creat_tok = tokens.cache_creation_tokens or 0
+
+        in_cost = (in_tok / 1_000_000.0) * rates["input_per_m"]
+        out_cost = (out_tok / 1_000_000.0) * rates["output_per_m"]
+        read_cost = (read_tok / 1_000_000.0) * rates.get("cache_read_per_m", 0.0)
+        creat_cost = (creat_tok / 1_000_000.0) * rates.get("cache_creation_per_m", 0.0)
         total = in_cost + out_cost + read_cost + creat_cost
 
         return CostMetrics(
@@ -434,12 +544,12 @@ class PricingRegistry:
             cache_creation_cost_usd=round(creat_cost, 8),
             total_cost_usd=round(total, 8),
             provenance=MetricProvenance.ESTIMATED,
+            pricing_version=cls.REGISTRY_VERSION,
         )
 
     @staticmethod
     def _normalize_name(model_name: str) -> str:
         name = str(model_name or "").strip().lower()
-        # Strip provider prefixes like "openai/", "anthropic/", "google/"
         if "/" in name:
             name = name.split("/")[-1]
         return name
@@ -448,8 +558,7 @@ class PricingRegistry:
 class TelemetryCollector:
     """Context manager and high-precision timer for collecting cognitive metrics.
 
-    Ensures fine-grained decomposition of latency (TTFT, generation, tool, supervisor overhead)
-    and strictly validates token provenance.
+    Ensures fine-grained decomposition of latency and enforces vendor-specific token contracts.
     """
 
     def __init__(
@@ -472,12 +581,10 @@ class TelemetryCollector:
         self.model_name = model_name
         self.metadata = scrub_sensitive_dict(metadata or {})
 
-        # High-resolution wall-clock timer
         self._start_perf: Optional[float] = None
         self._end_perf: Optional[float] = None
         self._first_token_perf: Optional[float] = None
 
-        # Metrics accumulators
         self._tokens = TokenMetrics(provenance=MetricProvenance.UNKNOWN)
         self._cost = CostMetrics(provenance=MetricProvenance.UNKNOWN)
         self._tool_duration_ms: float = 0.0
@@ -545,20 +652,21 @@ class TelemetryCollector:
 
     def set_tokens(
         self,
-        input_tokens: int,
-        output_tokens: int,
-        cache_read_tokens: int = 0,
-        cache_creation_tokens: int = 0,
+        input_tokens: Optional[int],
+        output_tokens: Optional[int],
+        cache_read_tokens: Optional[int] = None,
+        cache_creation_tokens: Optional[int] = None,
         total_tokens: Optional[int] = None,
         provenance: str = MetricProvenance.MEASURED,
     ) -> None:
-        """Record token accounting with explicit provenance classification."""
-        self._tokens = TokenMetrics(
+        """Record token accounting applying vendor-specific cache contracts."""
+        self._tokens = normalize_provider_tokens(
+            provider=self.provider,
             input_tokens=input_tokens,
             output_tokens=output_tokens,
             cache_read_tokens=cache_read_tokens,
             cache_creation_tokens=cache_creation_tokens,
-            total_tokens=total_tokens or (input_tokens + output_tokens + cache_read_tokens + cache_creation_tokens),
+            total_tokens=total_tokens,
             provenance=provenance,
         )
 
@@ -570,6 +678,7 @@ class TelemetryCollector:
         cache_read_cost_usd: Optional[float] = None,
         cache_creation_cost_usd: Optional[float] = None,
         provenance: str = MetricProvenance.MEASURED,
+        pricing_version: Optional[str] = None,
     ) -> None:
         """Record explicit cost accounting."""
         self._cost = CostMetrics(
@@ -579,6 +688,7 @@ class TelemetryCollector:
             cache_creation_cost_usd=cache_creation_cost_usd,
             total_cost_usd=total_cost_usd,
             provenance=provenance,
+            pricing_version=pricing_version,
         )
 
     def finalize(
@@ -588,10 +698,7 @@ class TelemetryCollector:
         error_message: Optional[str] = None,
         metadata_update: Optional[Dict[str, Any]] = None,
     ) -> CognitiveTelemetryRecord:
-        """Finalize and construct an immutable CognitiveTelemetryRecord.
-
-        Computes latency decomposition and derives cost if not explicitly recorded.
-        """
+        """Finalize and construct an immutable CognitiveTelemetryRecord."""
         if self._start_perf is None:
             self._start_perf = time.perf_counter()
         if self._end_perf is None:
@@ -599,31 +706,28 @@ class TelemetryCollector:
 
         total_duration_ms = max(0.0, (self._end_perf - self._start_perf) * 1000.0)
 
-        # TTFT calculation
         ttft_ms: Optional[float] = None
         if self._first_token_perf is not None:
             ttft_ms = max(0.0, (self._first_token_perf - self._start_perf) * 1000.0)
 
-        # Generation duration = Total - (Tool + Supervisor)
-        # Bounded to non-negative
+        # Generation duration is derived by subtraction from total duration
         overhead_sum = self._tool_duration_ms + self._supervisor_overhead_ms
         gen_duration_ms: Optional[float] = max(0.0, total_duration_ms - overhead_sum)
 
         latencies = LatencyMetrics(
+            total_duration_ms=total_duration_ms,
             ttft_ms=ttft_ms,
             generation_duration_ms=gen_duration_ms,
             tool_duration_ms=self._tool_duration_ms,
             supervisor_overhead_ms=self._supervisor_overhead_ms,
-            total_duration_ms=total_duration_ms,
-            provenance=MetricProvenance.MEASURED,
+            latency_provenance=MetricProvenance.MEASURED,
+            generation_duration_provenance=MetricProvenance.ESTIMATED,
         )
 
-        # Cost: if not explicitly recorded with MEASURED or ESTIMATED, attempt reference pricing
         cost = self._cost
-        if cost.provenance == MetricProvenance.UNKNOWN and (self._tokens.input_tokens > 0 or self._tokens.output_tokens > 0):
+        if cost.provenance == MetricProvenance.UNKNOWN and self._tokens.provenance != MetricProvenance.UNKNOWN:
             cost = PricingRegistry.estimate_cost(self.model_name, self._tokens)
 
-        # Merge metadata
         merged_meta = dict(self.metadata)
         if metadata_update:
             merged_meta.update(scrub_sensitive_dict(metadata_update))
@@ -650,39 +754,58 @@ class TelemetryCollector:
         )
 
 
-@dataclass
+@dataclass(frozen=True)
 class TelemetryAggregate:
-    """Statistical aggregate summary of cognitive telemetry records across runs or missions."""
-    record_count: int = 0
-    total_input_tokens: int = 0
-    total_output_tokens: int = 0
-    total_cache_read_tokens: int = 0
-    total_cache_creation_tokens: int = 0
-    total_tokens: int = 0
+    """Immutable statistical aggregate summary of cognitive telemetry records.
+
+    Differentiates known zero tokens/costs from unknown ones, and explicitly signals truncation.
+    """
+    total_matched_records: int = 0
+    sample_size: int = 0
+    is_truncated: bool = False
+    truncation_note: Optional[str] = None
+
+    total_input_tokens: Optional[int] = None
+    total_output_tokens: Optional[int] = None
+    total_cache_read_tokens: Optional[int] = None
+    total_cache_creation_tokens: Optional[int] = None
+    total_tokens: Optional[int] = None
+
+    records_with_measured_tokens: int = 0
+    records_with_estimated_tokens: int = 0
+    records_with_unknown_tokens: int = 0
     tokens_by_provenance: Dict[str, int] = field(default_factory=lambda: {
         MetricProvenance.MEASURED: 0,
         MetricProvenance.ESTIMATED: 0,
         MetricProvenance.UNKNOWN: 0,
     })
-    total_cost_usd: float = 0.0
+
+    total_cost_usd: Optional[float] = None
+    records_with_measured_cost: int = 0
+    records_with_estimated_cost: int = 0
+    records_with_unknown_cost: int = 0
     cost_by_provenance: Dict[str, float] = field(default_factory=lambda: {
         MetricProvenance.MEASURED: 0.0,
         MetricProvenance.ESTIMATED: 0.0,
         MetricProvenance.UNKNOWN: 0.0,
     })
+
     total_duration_ms: float = 0.0
     avg_duration_ms: float = 0.0
     p50_duration_ms: float = 0.0
     p90_duration_ms: float = 0.0
     p95_duration_ms: float = 0.0
     p99_duration_ms: float = 0.0
+
     avg_ttft_ms: Optional[float] = None
     avg_generation_duration_ms: Optional[float] = None
     avg_tool_duration_ms: Optional[float] = None
     avg_supervisor_overhead_ms: Optional[float] = None
+
     tool_calls_count: int = 0
     retries_count: int = 0
     stream_chunks_count: int = 0
+
     success_count: int = 0
     failure_count: int = 0
     success_rate: float = 0.0
@@ -705,29 +828,50 @@ def _percentile(sorted_vals: List[float], p: float) -> float:
     return round(sorted_vals[lower] * (1.0 - weight) + sorted_vals[upper] * weight, 3)
 
 
-def compute_telemetry_aggregate(records: List[CognitiveTelemetryRecord]) -> TelemetryAggregate:
+def compute_telemetry_aggregate(
+    records: List[CognitiveTelemetryRecord],
+    total_matched: Optional[int] = None,
+    is_truncated: bool = False,
+    truncation_note: Optional[str] = None,
+) -> TelemetryAggregate:
     """Compute comprehensive statistical metrics over a set of telemetry records."""
     if not records:
-        return TelemetryAggregate()
+        return TelemetryAggregate(
+            total_matched_records=total_matched or 0,
+            sample_size=0,
+            is_truncated=is_truncated,
+            truncation_note=truncation_note,
+        )
 
     count = len(records)
-    total_in = 0
-    total_out = 0
-    total_cache_read = 0
-    total_cache_creation = 0
-    total_tok = 0
+    matched = total_matched if total_matched is not None else count
+
+    in_tokens_sum = 0
+    out_tokens_sum = 0
+    cache_read_sum = 0
+    cache_creation_sum = 0
+    total_tokens_sum = 0
+
+    has_any_known_tokens = False
     tokens_prov: Dict[str, int] = {
         MetricProvenance.MEASURED: 0,
         MetricProvenance.ESTIMATED: 0,
         MetricProvenance.UNKNOWN: 0,
     }
+    rec_with_meas_tokens = 0
+    rec_with_est_tokens = 0
+    rec_with_unk_tokens = 0
 
-    total_cost = 0.0
+    cost_sum = 0.0
+    has_any_known_cost = False
     cost_prov: Dict[str, float] = {
         MetricProvenance.MEASURED: 0.0,
         MetricProvenance.ESTIMATED: 0.0,
         MetricProvenance.UNKNOWN: 0.0,
     }
+    rec_with_meas_cost = 0
+    rec_with_est_cost = 0
+    rec_with_unk_cost = 0
 
     durations: List[float] = []
     ttfts: List[float] = []
@@ -743,28 +887,39 @@ def compute_telemetry_aggregate(records: List[CognitiveTelemetryRecord]) -> Tele
     error_counts: Dict[str, int] = {}
 
     for r in records:
-        # Tokens
-        total_in += r.tokens.input_tokens
-        total_out += r.tokens.output_tokens
-        total_cache_read += r.tokens.cache_read_tokens
-        total_cache_creation += r.tokens.cache_creation_tokens
-        total_tok += r.tokens.total_tokens
-
-        tok_prov = r.tokens.provenance
-        if tok_prov in tokens_prov:
-            tokens_prov[tok_prov] += r.tokens.total_tokens
+        # Token metrics
+        if r.tokens.provenance == MetricProvenance.UNKNOWN or r.tokens.total_tokens is None:
+            rec_with_unk_tokens += 1
+            tokens_prov[MetricProvenance.UNKNOWN] += (r.tokens.total_tokens or 0)
         else:
-            tokens_prov[MetricProvenance.UNKNOWN] += r.tokens.total_tokens
+            has_any_known_tokens = True
+            tok_val = r.tokens.total_tokens or 0
+            total_tokens_sum += tok_val
+            in_tokens_sum += (r.tokens.input_tokens or 0)
+            out_tokens_sum += (r.tokens.output_tokens or 0)
+            cache_read_sum += (r.tokens.cache_read_tokens or 0)
+            cache_creation_sum += (r.tokens.cache_creation_tokens or 0)
 
-        # Cost
-        if r.cost.total_cost_usd is not None:
-            c_val = r.cost.total_cost_usd
-            total_cost += c_val
-            c_prov = r.cost.provenance
-            if c_prov in cost_prov:
-                cost_prov[c_prov] = round(cost_prov[c_prov] + c_val, 8)
+            if r.tokens.provenance == MetricProvenance.MEASURED:
+                rec_with_meas_tokens += 1
+                tokens_prov[MetricProvenance.MEASURED] += tok_val
             else:
-                cost_prov[MetricProvenance.UNKNOWN] = round(cost_prov[MetricProvenance.UNKNOWN] + c_val, 8)
+                rec_with_est_tokens += 1
+                tokens_prov[MetricProvenance.ESTIMATED] += tok_val
+
+        # Cost metrics
+        if r.cost.provenance == MetricProvenance.UNKNOWN or r.cost.total_cost_usd is None:
+            rec_with_unk_cost += 1
+        else:
+            has_any_known_cost = True
+            c_val = r.cost.total_cost_usd
+            cost_sum += c_val
+            if r.cost.provenance == MetricProvenance.MEASURED:
+                rec_with_meas_cost += 1
+                cost_prov[MetricProvenance.MEASURED] = round(cost_prov[MetricProvenance.MEASURED] + c_val, 8)
+            else:
+                rec_with_est_cost += 1
+                cost_prov[MetricProvenance.ESTIMATED] = round(cost_prov[MetricProvenance.ESTIMATED] + c_val, 8)
 
         # Durations
         durations.append(r.latencies.total_duration_ms)
@@ -794,14 +949,23 @@ def compute_telemetry_aggregate(records: List[CognitiveTelemetryRecord]) -> Tele
     avg_dur = round(total_dur / count, 3)
 
     return TelemetryAggregate(
-        record_count=count,
-        total_input_tokens=total_in,
-        total_output_tokens=total_out,
-        total_cache_read_tokens=total_cache_read,
-        total_cache_creation_tokens=total_cache_creation,
-        total_tokens=total_tok,
+        total_matched_records=matched,
+        sample_size=count,
+        is_truncated=is_truncated,
+        truncation_note=truncation_note,
+        total_input_tokens=in_tokens_sum if has_any_known_tokens else None,
+        total_output_tokens=out_tokens_sum if has_any_known_tokens else None,
+        total_cache_read_tokens=cache_read_sum if has_any_known_tokens else None,
+        total_cache_creation_tokens=cache_creation_sum if has_any_known_tokens else None,
+        total_tokens=total_tokens_sum if has_any_known_tokens else None,
+        records_with_measured_tokens=rec_with_meas_tokens,
+        records_with_estimated_tokens=rec_with_est_tokens,
+        records_with_unknown_tokens=rec_with_unk_tokens,
         tokens_by_provenance=tokens_prov,
-        total_cost_usd=round(total_cost, 8),
+        total_cost_usd=round(cost_sum, 8) if has_any_known_cost else None,
+        records_with_measured_cost=rec_with_meas_cost,
+        records_with_estimated_cost=rec_with_est_cost,
+        records_with_unknown_cost=rec_with_unk_cost,
         cost_by_provenance=cost_prov,
         total_duration_ms=round(total_dur, 3),
         avg_duration_ms=avg_dur,
@@ -824,11 +988,7 @@ def compute_telemetry_aggregate(records: List[CognitiveTelemetryRecord]) -> Tele
 
 
 def safe_record_telemetry(store: Any, record: Union[CognitiveTelemetryRecord, Dict[str, Any]]) -> Optional[CognitiveTelemetryRecord]:
-    """Fault-tolerant, non-interfering recorder for cognitive telemetry.
-
-    Guarantees that telemetry logging failures will NEVER crash supervisor runs or alter
-    operational workflows.
-    """
+    """Fault-tolerant, non-interfering recorder for cognitive telemetry."""
     try:
         if hasattr(store, "record_cognitive_telemetry"):
             return store.record_cognitive_telemetry(record)

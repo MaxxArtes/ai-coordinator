@@ -199,6 +199,7 @@ from .telemetry import (
     TelemetryAggregate,
     compute_telemetry_aggregate,
     safe_record_telemetry,
+    normalize_provider_tokens,
 )
 
 __all__ = [
@@ -367,5 +368,6 @@ __all__ = [
     "TelemetryAggregate",
     "compute_telemetry_aggregate",
     "safe_record_telemetry",
+    "normalize_provider_tokens",
 ]
 __version__ = "0.5.1"

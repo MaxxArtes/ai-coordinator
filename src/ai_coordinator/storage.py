@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import contextlib
+import dataclasses
 import datetime as dt
 import hashlib
 import hmac
@@ -886,11 +887,11 @@ class Store:
             plan_revision INTEGER,
             provider TEXT NOT NULL,
             model_name TEXT NOT NULL,
-            input_tokens INTEGER DEFAULT 0,
-            output_tokens INTEGER DEFAULT 0,
-            cache_read_tokens INTEGER DEFAULT 0,
-            cache_creation_tokens INTEGER DEFAULT 0,
-            total_tokens INTEGER DEFAULT 0,
+            input_tokens INTEGER,
+            output_tokens INTEGER,
+            cache_read_tokens INTEGER,
+            cache_creation_tokens INTEGER,
+            total_tokens INTEGER,
             tokens_provenance TEXT NOT NULL,
             ttft_ms REAL,
             generation_duration_ms REAL,
@@ -898,8 +899,10 @@ class Store:
             supervisor_overhead_ms REAL,
             total_duration_ms REAL NOT NULL,
             latency_provenance TEXT NOT NULL,
+            generation_duration_provenance TEXT NOT NULL DEFAULT 'estimated',
             total_cost_usd REAL,
             cost_provenance TEXT NOT NULL,
+            pricing_version TEXT,
             tool_calls_count INTEGER DEFAULT 0,
             retries_count INTEGER DEFAULT 0,
             stream_chunks_count INTEGER DEFAULT 0,
@@ -914,6 +917,18 @@ class Store:
           CREATE INDEX IF NOT EXISTS idx_cognitive_telemetry_run ON cognitive_telemetry(run_id);
           CREATE INDEX IF NOT EXISTS idx_cognitive_telemetry_model ON cognitive_telemetry(model_name);
           CREATE INDEX IF NOT EXISTS idx_cognitive_telemetry_created ON cognitive_telemetry(created_at);
+
+          CREATE TRIGGER IF NOT EXISTS trg_cognitive_telemetry_no_update
+          BEFORE UPDATE ON cognitive_telemetry
+          BEGIN
+              SELECT RAISE(FAIL, 'cognitive_telemetry records are immutable and append-only');
+          END;
+
+          CREATE TRIGGER IF NOT EXISTS trg_cognitive_telemetry_no_delete
+          BEFORE DELETE ON cognitive_telemetry
+          BEGIN
+              SELECT RAISE(FAIL, 'cognitive_telemetry records are immutable and cannot be deleted');
+          END;
         """)
 
         # Dynamic migrations for any existing columns
@@ -961,6 +976,20 @@ class Store:
             except sqlite3.OperationalError as exc:
                 if "duplicate column" not in str(exc).lower():
                     raise
+        self.db.commit()
+
+        cog_columns = {r[1] for r in self.db.execute("PRAGMA table_info(cognitive_telemetry)")}
+        needed_cog_columns = {
+            "generation_duration_provenance": "TEXT NOT NULL DEFAULT 'estimated'",
+            "pricing_version": "TEXT",
+        }
+        for col, col_type in needed_cog_columns.items():
+            if col not in cog_columns:
+                try:
+                    self.db.execute(f"ALTER TABLE cognitive_telemetry ADD COLUMN {col} {col_type}")
+                except sqlite3.OperationalError as exc:
+                    if "duplicate column" not in str(exc).lower():
+                        raise
         self.db.commit()
 
     @contextlib.contextmanager
@@ -2857,11 +2886,11 @@ class Store:
                     input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens, total_tokens,
                     tokens_provenance,
                     ttft_ms, generation_duration_ms, tool_duration_ms, supervisor_overhead_ms,
-                    total_duration_ms, latency_provenance,
-                    total_cost_usd, cost_provenance,
+                    total_duration_ms, latency_provenance, generation_duration_provenance,
+                    total_cost_usd, cost_provenance, pricing_version,
                     tool_calls_count, retries_count, stream_chunks_count,
                     success, error_category, error_message, metadata, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     rec.task_id,
                     rec.run_id,
@@ -2881,9 +2910,11 @@ class Store:
                     rec.latencies.tool_duration_ms,
                     rec.latencies.supervisor_overhead_ms,
                     rec.latencies.total_duration_ms,
-                    rec.latencies.provenance,
+                    rec.latencies.latency_provenance,
+                    rec.latencies.generation_duration_provenance,
                     rec.cost.total_cost_usd,
                     rec.cost.provenance,
+                    rec.cost.pricing_version,
                     rec.tool_calls_count,
                     rec.retries_count,
                     rec.stream_chunks_count,
@@ -2894,8 +2925,8 @@ class Store:
                     rec.created_at,
                 ),
             )
-            rec.id = cur.lastrowid
-        return rec
+            saved_id = cur.lastrowid
+        return dataclasses.replace(rec, id=saved_id)
 
     def query_cognitive_telemetry(
         self,
@@ -2941,16 +2972,58 @@ class Store:
         run_id: Optional[str] = None,
         model_name: Optional[str] = None,
         provider: Optional[str] = None,
+        max_records: Optional[int] = None,
     ) -> TelemetryAggregate:
-        """Compute statistical aggregates of cognitive telemetry matching the given filters."""
-        records = self.query_cognitive_telemetry(
-            task_id=task_id,
-            run_id=run_id,
-            model_name=model_name,
-            provider=provider,
-            limit=10000,
-            offset=0,
+        """Compute statistical aggregates of cognitive telemetry matching the given filters.
+
+        If max_records is provided, records are sampled up to that limit, and TelemetryAggregate
+        will explicitly set is_truncated=True with the total matched count.
+        If max_records is None, all matching records are aggregated without truncation.
+        """
+        clauses = []
+        params: List[Any] = []
+
+        if task_id:
+            clauses.append("task_id = ?")
+            params.append(task_id)
+        if run_id:
+            clauses.append("run_id = ?")
+            params.append(run_id)
+        if model_name:
+            clauses.append("model_name = ?")
+            params.append(model_name)
+        if provider:
+            clauses.append("provider = ?")
+            params.append(provider.strip().lower())
+
+        where_stmt = f" WHERE {' AND '.join(clauses)}" if clauses else ""
+
+        with self._lock:
+            count_query = f"SELECT COUNT(*) FROM cognitive_telemetry{where_stmt}"
+            total_matched = self.db.execute(count_query, params).fetchone()[0]
+
+            if max_records is not None:
+                query = f"SELECT * FROM cognitive_telemetry{where_stmt} ORDER BY id DESC LIMIT ?"
+                fetch_params = list(params) + [max(1, int(max_records))]
+            else:
+                query = f"SELECT * FROM cognitive_telemetry{where_stmt} ORDER BY id DESC"
+                fetch_params = params
+
+            rows = self.db.execute(query, fetch_params).fetchall()
+
+        records = [CognitiveTelemetryRecord.from_db_row(r) for r in rows]
+        is_truncated = max_records is not None and total_matched > len(records)
+        note = (
+            f"Agregação truncada para os {len(records)} registros mais recentes de um total de {total_matched}"
+            if is_truncated
+            else None
         )
-        return compute_telemetry_aggregate(records)
+
+        return compute_telemetry_aggregate(
+            records=records,
+            total_matched=total_matched,
+            is_truncated=is_truncated,
+            truncation_note=note,
+        )
 
 
