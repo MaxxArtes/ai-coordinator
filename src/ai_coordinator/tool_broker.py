@@ -970,13 +970,54 @@ class ToolBroker:
             raise CallerIdentityMismatchError("Mailbox exige identificacao confiavel do worker supervisor (expected_worker_pid obrigatorio e positivo)")
 
         sbox = Path(sandbox_root).resolve()
-        req_dir = sbox / ".broker" / "requests"
-        res_dir = sbox / ".broker" / "responses"
+        if not sbox.exists() or not sbox.is_dir():
+            raise FileSandboxSecurityError(f"Raiz da sandbox invalida ou inexistente: {sandbox_root}")
+
+        broker_dir = sbox / ".broker"
+        req_dir = broker_dir / "requests"
+        res_dir = broker_dir / "responses"
+
+        # Anti-symlink/reparse defense on base hierarchy
+        if broker_dir.exists():
+            if is_reparse_point_or_symlink(broker_dir):
+                if raise_on_fatal:
+                    raise ReparseEscapeError(f"Diretorio base da mailbox (.broker) e um link simbolico ou reparse point: {broker_dir}")
+                return [{
+                    "status": "error",
+                    "error": "SymlinkSecurityViolation",
+                    "message": f"Diretorio base da mailbox (.broker) e um link simbolico ou reparse point: {broker_dir}",
+                }]
+            validate_contained_path(broker_dir, sbox)
 
         if not req_dir.exists():
             return []
 
-        res_dir.mkdir(parents=True, exist_ok=True)
+        if is_reparse_point_or_symlink(req_dir):
+            if raise_on_fatal:
+                raise ReparseEscapeError(f"Diretorio de requisicoes (.broker/requests) e um link simbolico ou reparse point: {req_dir}")
+            return [{
+                "status": "error",
+                "error": "SymlinkSecurityViolation",
+                "message": f"Diretorio de requisicoes (.broker/requests) e um link simbolico ou reparse point: {req_dir}",
+            }]
+        validate_contained_path(req_dir, sbox)
+
+        if res_dir.exists():
+            if is_reparse_point_or_symlink(res_dir):
+                if raise_on_fatal:
+                    raise ReparseEscapeError(f"Diretorio de respostas (.broker/responses) e um link simbolico ou reparse point: {res_dir}")
+                return [{
+                    "status": "error",
+                    "error": "SymlinkSecurityViolation",
+                    "message": f"Diretorio de respostas (.broker/responses) e um link simbolico ou reparse point: {res_dir}",
+                }]
+            validate_contained_path(res_dir, sbox)
+        else:
+            res_dir.mkdir(parents=True, exist_ok=True)
+            if is_reparse_point_or_symlink(res_dir):
+                raise ReparseEscapeError(f"Diretorio de respostas recem-criado e um link simbolico ou reparse point: {res_dir}")
+            validate_contained_path(res_dir, sbox)
+
         results = []
 
         for req_file in sorted(req_dir.glob("*.json")):
@@ -1000,6 +1041,7 @@ class ToolBroker:
                     continue
 
                 validate_contained_path(req_file, req_dir)
+                validate_contained_path(req_file, sbox)
 
                 raw = req_file.read_text(encoding="utf-8")
                 payload = json.loads(raw)
@@ -1052,9 +1094,16 @@ class ToolBroker:
                 # Recoverable operational errors (e.g. rate limit, tool not allowed, approval required, expired/revoked token, handler error)
                 status_obj = {"status": "error", "error": type(e).__name__, "message": str(e)}
 
-            res_file = res_dir / f"res_{req_file.stem}.json"
+            # TOCTOU & Containment check for responses directory and target file
             try:
+                if is_reparse_point_or_symlink(broker_dir) or is_reparse_point_or_symlink(res_dir):
+                    raise ReparseEscapeError("Hierarquia de respostas da mailbox foi substituida por symlink ou reparse point durante o ciclo")
+                validate_contained_path(res_dir, sbox)
+
+                res_file = res_dir / f"res_{req_file.stem}.json"
+                validate_contained_path(res_file, sbox)
                 validate_contained_path(res_file, res_dir)
+
                 if res_file.exists() and (res_file.is_symlink() or is_reparse_point_or_symlink(res_file)):
                     try:
                         res_file.unlink()
@@ -1062,7 +1111,41 @@ class ToolBroker:
                         pass
                     if raise_on_fatal:
                         raise ReparseEscapeError(f"Symlink detectado no caminho de resposta da mailbox: {res_file.name}")
-                res_file.write_text(json.dumps(status_obj, indent=2), encoding="utf-8")
+
+                # Atomic write via safe temporary file inside verified res_dir
+                payload_bytes = json.dumps(status_obj, indent=2).encode("utf-8")
+                tmp_res_file = res_dir / f".tmp_{uuid.uuid4().hex}_{res_file.name}"
+
+                if os.name != "nt":
+                    open_flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+                    if hasattr(os, "O_NOFOLLOW"):
+                        open_flags |= os.O_NOFOLLOW
+                    fd = os.open(str(tmp_res_file), open_flags, 0o600)
+                    try:
+                        with os.fdopen(fd, "wb") as f:
+                            f.write(payload_bytes)
+                            f.flush()
+                            os.fsync(f.fileno())
+                    except Exception:
+                        try:
+                            os.close(fd)
+                        except Exception:
+                            pass
+                        raise
+                else:
+                    with open(tmp_res_file, "wb") as f:
+                        f.write(payload_bytes)
+                        f.flush()
+                        os.fsync(f.fileno())
+
+                if is_reparse_point_or_symlink(tmp_res_file):
+                    try:
+                        tmp_res_file.unlink()
+                    except Exception:
+                        pass
+                    raise ReparseEscapeError(f"Arquivo temporario de resposta e um symlink/reparse point: {tmp_res_file.name}")
+
+                os.replace(tmp_res_file, res_file)
             except (ReparseEscapeError, FileSandboxSecurityError):
                 if raise_on_fatal:
                     raise

@@ -198,7 +198,7 @@ class WorkerAuditLogger:
         self.store.db.execute("CREATE INDEX IF NOT EXISTS idx_worker_audit_run ON worker_audit_log(run_id)")
         self.store.db.execute("CREATE INDEX IF NOT EXISTS idx_worker_audit_corr ON worker_audit_log(correlation_id)")
         self.store.db.execute("CREATE INDEX IF NOT EXISTS idx_worker_audit_type ON worker_audit_log(event_type)")
-        self.store.db.execute("CREATE INDEX IF NOT EXISTS idx_worker_audit_seq ON worker_audit_log(sequence_number)")
+        self.store.db.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_worker_audit_seq ON worker_audit_log(sequence_number)")
 
         # Strict SQL immutability triggers on worker_audit_log (block UPDATE and DELETE)
         self.store.db.execute("""
@@ -275,6 +275,23 @@ class WorkerAuditLogger:
 
         try:
             with self._lock:
+                # Acquire exclusive SQLite write lock immediately to serialize across stores/processes
+                # Retry briefly with exponential backoff if another process currently holds the lock
+                acquired = False
+                for attempt in range(10):
+                    try:
+                        if not self.store.db.in_transaction:
+                            self.store.db.execute("BEGIN IMMEDIATE")
+                        acquired = True
+                        break
+                    except sqlite3.OperationalError as op_err:
+                        if "locked" in str(op_err).lower() or "busy" in str(op_err).lower():
+                            time.sleep(0.02 * (1.5 ** attempt))
+                        else:
+                            raise
+                if not acquired and not self.store.db.in_transaction:
+                    self.store.db.execute("BEGIN IMMEDIATE")
+
                 # Query last sequence_number and chain_hash globally across the store
                 row = self.store.db.execute("""
                     SELECT sequence_number, chain_hash
@@ -362,11 +379,11 @@ class WorkerAuditLogger:
 
                 self.store.db.commit()
 
-                # Decoupled external anchor file persistence
+                # Decoupled external anchor file persistence with collision-proof unique tempfile
                 if self.anchor_file_path:
+                    tmp_anchor = self.anchor_file_path.with_name(f"{self.anchor_file_path.name}.tmp.{os.getpid()}.{uuid.uuid4().hex}")
                     try:
                         anchor_payload_line = f"ANCHOR_V1|{seq_num}|{chain_hash}|{created_at}|{anchor_sig}\n"
-                        tmp_anchor = self.anchor_file_path.with_suffix(".tmp")
                         with open(tmp_anchor, "w", encoding="utf-8") as f:
                             f.write(anchor_payload_line)
                             f.flush()
@@ -376,13 +393,30 @@ class WorkerAuditLogger:
                                 os.chmod(tmp_anchor, 0o600)
                             except Exception:
                                 pass
-                        tmp_anchor.replace(self.anchor_file_path)
+
+                        # Atomic replace with retry for Windows file lock contention
+                        replaced = False
+                        for rep_attempt in range(5):
+                            try:
+                                os.replace(tmp_anchor, self.anchor_file_path)
+                                replaced = True
+                                break
+                            except (OSError, PermissionError):
+                                time.sleep(0.01 * (1.5 ** rep_attempt))
+                        if not replaced:
+                            os.replace(tmp_anchor, self.anchor_file_path)
+
                         if os.name != "nt":
                             try:
                                 os.chmod(self.anchor_file_path, 0o600)
                             except Exception:
                                 pass
                     except Exception as ext_anc_err:
+                        try:
+                            if tmp_anchor.exists():
+                                tmp_anchor.unlink()
+                        except Exception:
+                            pass
                         raise WorkerAuditPersistenceError(f"Falha ao persistir ancora externa desacoplada: {ext_anc_err}") from ext_anc_err
 
             return WorkerAuditRecord(
@@ -406,6 +440,11 @@ class WorkerAuditLogger:
                 prev_hash=prev_hash,
             )
         except Exception as e:
+            try:
+                if hasattr(self.store, "db") and self.store.db and self.store.db.in_transaction:
+                    self.store.db.rollback()
+            except Exception:
+                pass
             # Fail-closed policy: audit persistence failures must abort privileged execution
             raise WorkerAuditPersistenceError(f"Falha ao persistir evento de auditoria '{evt_type_str}': {e}") from e
 
@@ -643,7 +682,7 @@ class WorkerAuditLogger:
                     return False
 
                 anchor_payload_line = f"ANCHOR_V1|{seq_num}|{chain_hash}|{created_at}|{sig}\n"
-                tmp_anchor = self.anchor_file_path.with_suffix(".tmp")
+                tmp_anchor = self.anchor_file_path.with_name(f"{self.anchor_file_path.name}.tmp.{os.getpid()}.{uuid.uuid4().hex}")
                 with open(tmp_anchor, "w", encoding="utf-8") as f:
                     f.write(anchor_payload_line)
                     f.flush()
@@ -653,7 +692,15 @@ class WorkerAuditLogger:
                         os.chmod(tmp_anchor, 0o600)
                     except Exception:
                         pass
-                tmp_anchor.replace(self.anchor_file_path)
+                for rep_attempt in range(5):
+                    try:
+                        os.replace(tmp_anchor, self.anchor_file_path)
+                        break
+                    except (OSError, PermissionError):
+                        time.sleep(0.01 * (1.5 ** rep_attempt))
+                else:
+                    os.replace(tmp_anchor, self.anchor_file_path)
+
                 if os.name != "nt":
                     try:
                         os.chmod(self.anchor_file_path, 0o600)

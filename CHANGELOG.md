@@ -7,6 +7,35 @@ e este projeto adere ao [Versionamento Semântico](https://semver.org/lang/pt-BR
 
 ---
 
+## [0.5.1] - 2026-11-03
+
+Release de segurança prioritária e endurecimento de isolamento (*Security Hardening*), corrigindo os achados de auditoria identificados na revisão do PR #2 do Codex.
+
+### Segurança e Correções
+
+#### P1 — Prevenção de Fuga da Sandbox e Sobrescrita Arbitrária via Mailbox (.broker)
+- **Validação Estrita da Hierarquia da Mailbox**: `ToolBroker.process_mailbox` agora inspeciona recursivamente toda a hierarquia `.broker`, `.broker/requests` e `.broker/responses` contra a raiz autorizada da sandbox (`sbox`), garantindo confinamento estrito.
+- **Bloqueio de Symlinks, Junções e Reparse Points**: Rejeição imediata (*fail-closed*) caso qualquer diretório ou componente intermediário da hierarquia seja link simbólico, junção NTFS ou reparse point, impedindo que workers não confiáveis redirecionem o diretório de respostas para fora da sandbox.
+- **Defesa contra TOCTOU e Escrita Atômica Segura**:
+  - Em ambientes POSIX, criação de arquivos temporários de resposta com flags `O_NOFOLLOW | O_CREAT | O_EXCL` via descritor de arquivo, garantindo que links criados concorrentemente sejam rejeitados pelo próprio kernel.
+  - No Windows, escrita em arquivo temporário com UUID exclusivo e substituição atômica (`os.replace`) após conferência estrita de ausência de reparse points, impedindo ataques de corrida em diretórios de resposta.
+
+#### P1 — Serialização de Concorrência e Resiliência na Trilha de Auditoria
+- **Serialização Cross-Store com `BEGIN IMMEDIATE`**: `WorkerAuditSubsystem.record_event` adquire transação exclusiva no SQLite (`BEGIN IMMEDIATE`) imediatamente antes da leitura do tail (`SELECT sequence_number, chain_hash`), eliminando condições de corrida entre instâncias separadas de `Store` ou múltiplos coordenadores compartilhando o mesmo banco de dados.
+- **Índice UNIQUE em Sequência de Auditoria**: Adicionada restrição `UNIQUE` ao índice `idx_worker_audit_seq`, garantindo integridade estrita e impossibilidade de sequências duplicadas no nível do banco.
+- **Eliminação de Colisões em Âncoras Desacopladas**: O arquivo temporário da âncora externa agora utiliza identificador exclusivo contendo PID e UUID (`audit.anchor.tmp.{pid}.{uuid}`), eliminando conflitos de acesso no Windows e em sistemas POSIX.
+- **Recuperação Atômica de Quedas**: Em caso de falha transitória ou descontinuidade da âncora externa, o método `reconcile_anchor` restaura o arquivo a partir do registro assinado e auditado na tabela `worker_audit_anchors`.
+
+#### P2 — Compatibilidade e Resolução Segura de Identidades Legadas (v0.4.0)
+- **Normalização de Identidades de Processo**: Introduzida a função `match_process_creation_time`, que discrimina a plataforma e o formato de persistência do `process_create_time`:
+  - Suporte ao formato legado da v0.4.0 no Windows (Win32 `FILETIME` bruto de 100ns desde 1601, na faixa `1.16e17` a `2.0e17`), convertendo deterministicamente para nanossegundos Unix.
+  - Suporte ao formato legado da v0.4.0 no Linux (clock ticks / jiffies desde boot, `< 10^11`), convertendo com base no `SC_CLK_TCK`.
+  - Suporte ao formato padrão da v0.5.x (nanossegundos Unix desde 1970).
+- **Política Fail-Closed Estrita**: Identidades com timestamps negativos, nulos, ambíguos ou fora de faixas válidas conhecidas são rejeitadas de forma conservadora, prevenindo falsos positivos e acidentes por reciclagem de PID.
+- **Preservação de Runs em Andamento**: O reconciliador de tarefas (`Store.reconcile`) e a finalização de processos (`safe_terminate_tree` e `WindowsProcessController.is_running`) agora reconhecem processos ativos legados sem interromper ou matar indevidamente runs em progresso.
+
+---
+
 ## [0.5.0] - 2026-10-29
 
 Esta versão consolida a conclusão da **Fase 4B (Human-AI Cognitive Workspace)**, introduzindo isolamento de processos e filesystem em nível de sistema operacional (OS-level sandboxing), governança e autorização segura de ferramentas via Tool Broker com tokens HMAC, trilha de auditoria criptográfica imutável com dupla ancoragem e integração ao ecossistema `ai-memory`.
