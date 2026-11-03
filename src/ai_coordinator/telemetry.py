@@ -75,36 +75,66 @@ def scrub_sensitive_text(text: Optional[str]) -> Optional[str]:
     return scrubbed
 
 
+def _disambiguate_key(key: str, existing_keys: Set[str]) -> str:
+    """Disambiguate key collisions during redaction deterministically."""
+    if key not in existing_keys:
+        return key
+    counter = 1
+    candidate = f"{key}_{counter}"
+    while candidate in existing_keys:
+        counter += 1
+        candidate = f"{key}_{counter}"
+    return candidate
+
+
 def scrub_sensitive_value(value: Any) -> Any:
-    """Recursively scrub sensitive text and data structures across any nesting depth."""
+    """Recursively scrub sensitive text and data structures across any nesting depth.
+
+    Normalizes all sequences (lists, tuples, sets) into standard JSON-compatible lists,
+    preventing serialization exceptions during database persistence.
+    """
     if value is None:
         return None
     if isinstance(value, str):
         return scrub_sensitive_text(value)
     if isinstance(value, dict):
         return scrub_sensitive_dict(value)
-    if isinstance(value, (list, tuple, set)):
-        scrubbed_items = [scrub_sensitive_value(x) for x in value]
-        if isinstance(value, list):
-            return scrubbed_items
-        elif isinstance(value, tuple):
-            return tuple(scrubbed_items)
+    if isinstance(value, (list, tuple, set, frozenset)):
+        if isinstance(value, (set, frozenset)):
+            try:
+                items = sorted(list(value), key=lambda x: str(x))
+            except Exception:
+                items = list(value)
         else:
-            return set(scrubbed_items)
-    return value
+            items = list(value)
+        return [scrub_sensitive_value(x) for x in items]
+    if isinstance(value, (int, bool)):
+        return value
+    if isinstance(value, float):
+        return None if (math.isnan(value) or math.isinf(value)) else value
+    if hasattr(value, "to_dict") and callable(value.to_dict):
+        return scrub_sensitive_dict(value.to_dict())
+    return scrub_sensitive_text(str(value))
 
 
 def scrub_sensitive_dict(data: Optional[Dict[str, Any]]) -> Dict[str, Any]:
-    """Recursively scrub sensitive keys and token values from telemetry metadata across all nested containers."""
+    """Recursively scrub sensitive keys and token values from telemetry metadata across all nested containers.
+
+    Sanitizes both keys and values, ensures safe collision resolution, and produces
+    100% JSON-compliant structures safe for database serialization.
+    """
     if not data or not isinstance(data, dict):
         return {}
     scrubbed: Dict[str, Any] = {}
     for k, v in data.items():
         k_str = str(k)
+        clean_k = scrub_sensitive_text(k_str) or "[REDACTED_SECRET]"
         if any(term in k_str.lower() for term in ("secret", "token", "password", "key", "auth", "credential", "api_key", "apikey")):
-            scrubbed[k_str] = "[REDACTED_SECRET]"
+            clean_v = "[REDACTED_SECRET]"
         else:
-            scrubbed[k_str] = scrub_sensitive_value(v)
+            clean_v = scrub_sensitive_value(v)
+        final_k = _disambiguate_key(clean_k, set(scrubbed.keys()))
+        scrubbed[final_k] = clean_v
     return scrubbed
 
 

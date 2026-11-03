@@ -204,6 +204,17 @@ from .telemetry import (
     scrub_sensitive_dict,
     scrub_sensitive_value,
 )
+from .synthetic_benchmark import (
+    DATASET_VERSION,
+    SyntheticTaskDefinition,
+    EvaluationOracleReport,
+    SyntheticDatasetGenerator,
+    FunctionalOracle,
+    EfficiencyOracle,
+    SecurityOracle,
+    SyntheticBenchmarkRunner,
+    canonical_json_hash,
+)
 
 __all__ = [
     "HumanWorkspace",
@@ -375,5 +386,14 @@ __all__ = [
     "scrub_sensitive_text",
     "scrub_sensitive_dict",
     "scrub_sensitive_value",
+    "DATASET_VERSION",
+    "SyntheticTaskDefinition",
+    "EvaluationOracleReport",
+    "SyntheticDatasetGenerator",
+    "FunctionalOracle",
+    "EfficiencyOracle",
+    "SecurityOracle",
+    "SyntheticBenchmarkRunner",
+    "canonical_json_hash",
 ]
 __version__ = "0.5.1"

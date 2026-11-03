@@ -113,6 +113,7 @@ from .telemetry import (
     CognitiveTelemetryRecord,
     TelemetryAggregate,
     compute_telemetry_aggregate,
+    scrub_sensitive_dict,
 )
 
 now = lambda: dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
@@ -2876,7 +2877,8 @@ class Store:
         else:
             raise TypeError(f"Esperado CognitiveTelemetryRecord ou dict, recebido {type(record)}")
 
-        meta_json = json.dumps(rec.metadata, ensure_ascii=False) if rec.metadata else "{}"
+        clean_metadata = scrub_sensitive_dict(rec.metadata) if rec.metadata else {}
+        meta_json = json.dumps(clean_metadata, ensure_ascii=False)
 
         with self.transaction():
             cur = self.db.execute(

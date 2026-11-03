@@ -275,6 +275,20 @@ class TestPhase4CCognitiveTelemetry(unittest.TestCase):
         tuple_elem = next(iter(clean_deep["tuples_in_set"]))
         self.assertEqual(tuple_elem[0], "bearer [REDACTED_SECRET]")
 
+        # Audit Finding P1 (Review 3): Credential as dictionary key
+        key_as_secret = {
+            "sk-proj-1234567890abcdef12345678": "value_under_secret_key",
+            "nested": {
+                "ghp_111122223333444455556666777788889999": "nested_value_under_secret_key"
+            },
+        }
+        clean_keys = scrub_sensitive_dict(key_as_secret)
+        self.assertNotIn("sk-proj-1234567890abcdef12345678", clean_keys)
+        self.assertIn("[REDACTED_SECRET]", clean_keys)
+        self.assertEqual(clean_keys["[REDACTED_SECRET]"], "value_under_secret_key")
+        self.assertNotIn("ghp_111122223333444455556666777788889999", clean_keys["nested"])
+        self.assertIn("[REDACTED_SECRET]", clean_keys["nested"])
+
         # Test scrub_sensitive_value directly on arbitrary types
         self.assertIsNone(scrub_sensitive_value(None))
         self.assertEqual(scrub_sensitive_value(42), 42)
@@ -528,6 +542,62 @@ class TestPhase4CCognitiveTelemetry(unittest.TestCase):
                 store2.db.execute("UPDATE cognitive_telemetry SET task_id='tampered' WHERE id=?", (saved.id,))
         finally:
             store2.db.close()
+
+    def test_15_metadata_key_scrubbing_collision_and_sqlite_persistence(self) -> None:
+        """Validate key sanitization, collision disambiguation, JSON compatibility for sets, and SQLite persistence."""
+        dirty_meta = {
+            "sk-proj-1234567890abcdef12345678": "secret_key_val",
+            "sk-proj-999999999999999999999999": "collision_val",
+            "normal_section": {
+                "ghp_111122223333444455556666777788889999": "nested_secret_key_val"
+            },
+            "tags_set": {"alpha", "beta", "sk-proj-333333333333333333333333"},
+            "coordinates_tuple": (10.5, 20.5),
+        }
+
+        rec = CognitiveTelemetryRecord(
+            task_id="task_meta_audit_01",
+            provider="openai",
+            model_name="gpt-4o",
+            metadata=dirty_meta,
+            success=True,
+        )
+
+        # 1. Record-level assertions
+        self.assertNotIn("sk-proj-1234567890abcdef12345678", rec.metadata)
+        self.assertNotIn("sk-proj-999999999999999999999999", rec.metadata)
+        self.assertIn("[REDACTED_SECRET]", rec.metadata)
+        self.assertIn("[REDACTED_SECRET]_1", rec.metadata)
+        self.assertEqual(rec.metadata["[REDACTED_SECRET]"], "secret_key_val")
+        self.assertEqual(rec.metadata["[REDACTED_SECRET]_1"], "collision_val")
+        self.assertIsInstance(rec.metadata["tags_set"], list)
+        self.assertIsInstance(rec.metadata["coordinates_tuple"], list)
+
+        # 2. SQLite Atomic Persistence and Raw String Verification
+        saved = self.store.record_cognitive_telemetry(rec)
+        self.assertIsNotNone(saved.id)
+
+        # Query raw metadata text directly from SQLite
+        cur = self.store.db.execute(
+            "SELECT metadata FROM cognitive_telemetry WHERE task_id = 'task_meta_audit_01'"
+        )
+        row = cur.fetchone()
+        self.assertIsNotNone(row)
+        raw_meta_text = row[0]
+
+        # Verify complete absence of any secret tokens in raw database text
+        self.assertNotIn("sk-proj-1234567890abcdef12345678", raw_meta_text)
+        self.assertNotIn("sk-proj-999999999999999999999999", raw_meta_text)
+        self.assertNotIn("sk-proj-333333333333333333333333", raw_meta_text)
+        self.assertNotIn("ghp_111122223333444455556666777788889999", raw_meta_text)
+
+        # Verify valid JSON parsing from database
+        parsed_db_meta = json.loads(raw_meta_text)
+        self.assertIn("[REDACTED_SECRET]", parsed_db_meta)
+        self.assertIn("[REDACTED_SECRET]_1", parsed_db_meta)
+        self.assertIn("[REDACTED_SECRET]", parsed_db_meta["normal_section"])
+        self.assertIn("[REDACTED_SECRET]", parsed_db_meta["tags_set"])
+        self.assertEqual(parsed_db_meta["coordinates_tuple"], [10.5, 20.5])
 
 
 if __name__ == "__main__":
