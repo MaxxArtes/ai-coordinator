@@ -13,7 +13,7 @@ A instrumentação da Fase 4C obedece rigorosamente aos seguintes princípios:
 3. **Imutabilidade Auditável em Dois Níveis:**
    - **Camada de Código:** Todas as estruturas de dados (`TokenMetrics`, `LatencyMetrics`, `CostMetrics`, `CognitiveTelemetryRecord`, `TelemetryAggregate`) são dataclasses congeladas (`frozen=True`), impedindo mutações pós-criação.
    - **Camada de Banco de Dados:** A tabela `cognitive_telemetry` possui triggers SQLite (`trg_cognitive_telemetry_no_update` e `trg_cognitive_telemetry_no_delete`) que rejeitam tentativas de `UPDATE` ou `DELETE` com `IntegrityError`, garantindo persistência estritamente append-only.
-4. **Sanitização Adversarial Obrigatória:** Credenciais e segredos (`sk-*`, `ghp_*`, `github_pat_*`, chaves Google `AIza*`, chaves AWS `AKIA*`, tokens Slack `xox*`, tokens bearer e pares chave/valor) são completamente expurgados (`[REDACTED_SECRET]`) em mensagens de texto, erros e em estruturas aninhadas (dicionários, listas, tuplas e conjuntos).
+4. **Sanitização Adversarial Recursiva Universal:** Credenciais e segredos (`sk-*`, `ghp_*`, `github_pat_*`, chaves Google `AIza*`, chaves AWS `AKIA*`, tokens Slack `xox*`, tokens bearer e pares chave/valor) são completamente expurgados (`[REDACTED_SECRET]`) por meio de `scrub_sensitive_value` e `scrub_sensitive_dict`, que descem recursivamente em qualquer profundidade e topologia de containers (dicionários, listas, tuplas, conjuntos e matrizes aninhadas).
 
 ---
 
@@ -69,7 +69,7 @@ Grandezas temporais são expressas em **milissegundos (ms)** com temporizador de
 - `generation_duration_ms`: Tempo de inferência do modelo. Quando derivado pela subtração $\text{total} - (\text{ferramentas} + \text{overhead})$, sua proveniência é explicitamente classificada como:
   $$\text{generation\_duration\_provenance} = \text{estimated}$$
 
-### 4.2 Custos Monetários e Versionamento (`PricingRegistry`)
+### 4.2 Custos Monetários, Semântica de Faturamento de Cache e Versionamento (`PricingRegistry`)
 Custos são expressos em USD por 1 milhão de tokens (1M tokens). O registro possui versionamento explícito (`REGISTRY_VERSION = "2026.11.01"`):
 
 | Modelo / Família | Input / 1M | Output / 1M | Cache Read / 1M | Cache Creation / 1M |
@@ -83,7 +83,22 @@ Custos são expressos em USD por 1 milhão de tokens (1M tokens). O registro pos
 | `gemini-1.5-pro` | $3.50 | $10.50 | $0.875 | $0.00 |
 | `gemini-1.5-flash` | $0.075 | $0.30 | $0.01875 | $0.00 |
 
-Se o modelo não constar na tabela de preços, `total_cost_usd` permanece `None`, `pricing_version` permanece `None` e a proveniência é `unknown`.
+#### Regras Contábeis de Faturamento por Provedor
+Para refletir o modelo financeiro real de cada provedor e evitar sobretarifação artificial:
+1. **OpenAI / Azure / Google Gemini:**
+   O campo de prompt já contém os tokens em cache. O faturamento calcula a parcela uncached deduzindo os tokens em cache:
+   $$\text{uncached\_in} = \max(0, \text{input\_tokens} - \text{cache\_read\_tokens})$$
+   $$\text{custo\_total} = (\text{uncached\_in} \times \text{tarifa\_in} + \text{cache\_read\_tokens} \times \text{tarifa\_cache} + \text{output\_tokens} \times \text{tarifa\_out}) / 10^6$$
+   *Exemplo canônico:* 1.000 tokens de entrada no `gpt-4o` (500 em cache) e 250 de saída:
+   - Entrada não-cacheada: $500 \times \$2.50 / 10^6 = \$0.001250$
+   - Leitura de cache: $500 \times \$1.25 / 10^6 = \$0.000625$
+   - Saída: $250 \times \$10.00 / 10^6 = \$0.002500$
+   - Custo exato: **US$ 0,004375** (evita a distorção anterior de US$ 0,005625).
+2. **Anthropic Claude:**
+   `input_tokens` já é estritamente não-cacheado, sendo faturado pela tarifa cheia e somado aos custos de leitura e criação de cache:
+   $$\text{custo\_total} = (\text{input\_tokens} \times \text{tarifa\_in} + \text{cache\_read} \times \text{tarifa\_read} + \text{cache\_creation} \times \text{tarifa\_creat} + \text{output\_tokens} \times \text{tarifa\_out}) / 10^6$$
+3. **Componentes Indispensáveis Ausentes:**
+   Se `input_tokens` ou `output_tokens` forem desconhecidos (`None`), ou se o modelo não constar na tabela de preços, `total_cost_usd` permanece rigorosamente `None`, `pricing_version` permanece `None` e a proveniência é `unknown` (nunca gerando números fabricados ou zeros artificiais).
 
 ---
 

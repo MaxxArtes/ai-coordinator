@@ -200,6 +200,9 @@ from .telemetry import (
     compute_telemetry_aggregate,
     safe_record_telemetry,
     normalize_provider_tokens,
+    scrub_sensitive_text,
+    scrub_sensitive_dict,
+    scrub_sensitive_value,
 )
 
 __all__ = [
@@ -369,5 +372,8 @@ __all__ = [
     "compute_telemetry_aggregate",
     "safe_record_telemetry",
     "normalize_provider_tokens",
+    "scrub_sensitive_text",
+    "scrub_sensitive_dict",
+    "scrub_sensitive_value",
 ]
 __version__ = "0.5.1"

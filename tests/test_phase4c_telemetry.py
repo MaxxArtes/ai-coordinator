@@ -30,6 +30,7 @@ from ai_coordinator import (
 from ai_coordinator.telemetry import (
     scrub_sensitive_text,
     scrub_sensitive_dict,
+    scrub_sensitive_value,
 )
 
 
@@ -146,7 +147,7 @@ class TestPhase4CCognitiveTelemetry(unittest.TestCase):
         self.assertEqual(restored, latencies)
 
     def test_05_pricing_registry_versioning_and_cost_estimation(self) -> None:
-        """Validate pricing registry calculation, version stamping, and unknown cost handling."""
+        """Validate pricing registry calculation, vendor cache deductions, version stamping, and unknown cost handling."""
         tokens = TokenMetrics(
             input_tokens=1_000_000,
             output_tokens=100_000,
@@ -155,8 +156,8 @@ class TestPhase4CCognitiveTelemetry(unittest.TestCase):
             provenance=MetricProvenance.MEASURED,
         )
 
-        # Known Anthropic model: claude-3-5-sonnet
-        cost = PricingRegistry.estimate_cost("claude-3-5-sonnet", tokens)
+        # Known Anthropic model: claude-3-5-sonnet (input_tokens is disjoint from cache)
+        cost = PricingRegistry.estimate_cost("claude-3-5-sonnet", tokens, provider="anthropic")
         self.assertEqual(cost.provenance, MetricProvenance.ESTIMATED)
         self.assertEqual(cost.pricing_version, PricingRegistry.REGISTRY_VERSION)
         self.assertAlmostEqual(cost.input_cost_usd or 0.0, 3.00, places=4)
@@ -165,6 +166,47 @@ class TestPhase4CCognitiveTelemetry(unittest.TestCase):
         self.assertAlmostEqual(cost.cache_creation_cost_usd or 0.0, 0.75, places=4)
         self.assertAlmostEqual(cost.total_cost_usd or 0.0, 5.40, places=4)
 
+        # Exact Auditor Scenario for OpenAI gpt-4o:
+        # 1,000 input prompt tokens (including 500 cached tokens) and 250 output tokens
+        # Uncached input = 1000 - 500 = 500 tokens ($0.00125)
+        # Cache read = 500 tokens ($0.000625)
+        # Output = 250 tokens ($0.002500)
+        # Expected total = US$ 0.004375 (NOT 0.005625)
+        openai_tokens = TokenMetrics(
+            input_tokens=1_000,
+            output_tokens=250,
+            cache_read_tokens=500,
+            provenance=MetricProvenance.MEASURED,
+        )
+        openai_cost = PricingRegistry.estimate_cost("gpt-4o", openai_tokens, provider="openai")
+        self.assertEqual(openai_cost.provenance, MetricProvenance.ESTIMATED)
+        self.assertEqual(openai_cost.pricing_version, PricingRegistry.REGISTRY_VERSION)
+        self.assertAlmostEqual(openai_cost.input_cost_usd or 0.0, 0.00125, places=6)
+        self.assertAlmostEqual(openai_cost.cache_read_cost_usd or 0.0, 0.000625, places=6)
+        self.assertAlmostEqual(openai_cost.output_cost_usd or 0.0, 0.0025, places=6)
+        self.assertEqual(openai_cost.total_cost_usd, 0.004375)
+
+        # Gemini Scenario with cache deduction: gemini-1.5-pro
+        gemini_tokens = TokenMetrics(
+            input_tokens=1_000,
+            output_tokens=100,
+            cache_read_tokens=400,
+            provenance=MetricProvenance.MEASURED,
+        )
+        gemini_cost = PricingRegistry.estimate_cost("gemini-1.5-pro", gemini_tokens, provider="google")
+        self.assertEqual(gemini_cost.provenance, MetricProvenance.ESTIMATED)
+        # uncached = 600 * 3.50 / 1e6 = 0.0021, read = 400 * 0.875 / 1e6 = 0.00035, out = 100 * 10.50 / 1e6 = 0.00105 -> 0.0035
+        self.assertAlmostEqual(gemini_cost.total_cost_usd or 0.0, 0.0035, places=6)
+
+        # Missing essential token metrics must return UNKNOWN with total_cost_usd=None
+        missing_in_cost = PricingRegistry.estimate_cost("gpt-4o", TokenMetrics(input_tokens=None, output_tokens=100))
+        self.assertEqual(missing_in_cost.provenance, MetricProvenance.UNKNOWN)
+        self.assertIsNone(missing_in_cost.total_cost_usd)
+
+        missing_out_cost = PricingRegistry.estimate_cost("gpt-4o", TokenMetrics(input_tokens=100, output_tokens=None))
+        self.assertEqual(missing_out_cost.provenance, MetricProvenance.UNKNOWN)
+        self.assertIsNone(missing_out_cost.total_cost_usd)
+
         # Unrecognized model: must return UNKNOWN and total_cost_usd=None (NEVER 0.0)
         unrecognized_cost = PricingRegistry.estimate_cost("unknown-local-llama-999b", tokens)
         self.assertEqual(unrecognized_cost.provenance, MetricProvenance.UNKNOWN)
@@ -172,7 +214,7 @@ class TestPhase4CCognitiveTelemetry(unittest.TestCase):
         self.assertIsNone(unrecognized_cost.pricing_version)
 
     def test_06_adversarial_secret_scrubbing(self) -> None:
-        """Validate complete redaction of all secrets across keys, values, and standalone text."""
+        """Validate complete redaction of all secrets across keys, values, and deep nested containers."""
         # Specific test cases from auditor's review
         auditor_cases = [
             ("failure sk-proj-1234567890abcdef12345678", "failure [REDACTED_SECRET]"),
@@ -218,6 +260,25 @@ class TestPhase4CCognitiveTelemetry(unittest.TestCase):
         self.assertEqual(clean_meta["normal_items"][2]["nested_credential"], "[REDACTED_SECRET]")
         self.assertEqual(clean_meta["normal_tuple"][0], "[REDACTED_SECRET]")
         self.assertEqual(clean_meta["normal_tuple"][1], "normal_data")
+
+        # Deeply nested lists (Audit Finding P1: list inside list)
+        deep_nested = {
+            "context": [
+                ["sk-proj-1234567890abcdef12345678"],
+                {"nested_matrix": [[["ghp_111122223333444455556666777788889999"]]]},
+            ],
+            "tuples_in_set": {("bearer 1234567890abcdef",)},
+        }
+        clean_deep = scrub_sensitive_dict(deep_nested)
+        self.assertEqual(clean_deep["context"][0][0], "[REDACTED_SECRET]")
+        self.assertEqual(clean_deep["context"][1]["nested_matrix"][0][0][0], "[REDACTED_SECRET]")
+        tuple_elem = next(iter(clean_deep["tuples_in_set"]))
+        self.assertEqual(tuple_elem[0], "bearer [REDACTED_SECRET]")
+
+        # Test scrub_sensitive_value directly on arbitrary types
+        self.assertIsNone(scrub_sensitive_value(None))
+        self.assertEqual(scrub_sensitive_value(42), 42)
+        self.assertEqual(scrub_sensitive_value([["AIzaSyD-1234567890abcdef1234567890abcde"]]), [["[REDACTED_SECRET]"]])
 
     def test_07_telemetry_collector_end_to_end(self) -> None:
         """Validate TelemetryCollector context manager, fine-grained timers, and finalization."""

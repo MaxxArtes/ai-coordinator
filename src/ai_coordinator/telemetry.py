@@ -75,33 +75,36 @@ def scrub_sensitive_text(text: Optional[str]) -> Optional[str]:
     return scrubbed
 
 
+def scrub_sensitive_value(value: Any) -> Any:
+    """Recursively scrub sensitive text and data structures across any nesting depth."""
+    if value is None:
+        return None
+    if isinstance(value, str):
+        return scrub_sensitive_text(value)
+    if isinstance(value, dict):
+        return scrub_sensitive_dict(value)
+    if isinstance(value, (list, tuple, set)):
+        scrubbed_items = [scrub_sensitive_value(x) for x in value]
+        if isinstance(value, list):
+            return scrubbed_items
+        elif isinstance(value, tuple):
+            return tuple(scrubbed_items)
+        else:
+            return set(scrubbed_items)
+    return value
+
+
 def scrub_sensitive_dict(data: Optional[Dict[str, Any]]) -> Dict[str, Any]:
-    """Recursively scrub sensitive keys and token values from telemetry metadata."""
-    if not data:
+    """Recursively scrub sensitive keys and token values from telemetry metadata across all nested containers."""
+    if not data or not isinstance(data, dict):
         return {}
     scrubbed: Dict[str, Any] = {}
     for k, v in data.items():
         k_str = str(k)
         if any(term in k_str.lower() for term in ("secret", "token", "password", "key", "auth", "credential", "api_key", "apikey")):
             scrubbed[k_str] = "[REDACTED_SECRET]"
-        elif isinstance(v, str):
-            scrubbed[k_str] = scrub_sensitive_text(v)
-        elif isinstance(v, dict):
-            scrubbed[k_str] = scrub_sensitive_dict(v)
-        elif isinstance(v, (list, tuple, set)):
-            scrubbed_items = [
-                scrub_sensitive_dict(item) if isinstance(item, dict)
-                else (scrub_sensitive_text(item) if isinstance(item, str) else item)
-                for item in v
-            ]
-            if isinstance(v, list):
-                scrubbed[k_str] = scrubbed_items
-            elif isinstance(v, tuple):
-                scrubbed[k_str] = tuple(scrubbed_items)
-            else:
-                scrubbed[k_str] = set(scrubbed_items)
         else:
-            scrubbed[k_str] = v
+            scrubbed[k_str] = scrub_sensitive_value(v)
     return scrubbed
 
 
@@ -516,22 +519,54 @@ class PricingRegistry:
         return None
 
     @classmethod
-    def estimate_cost(cls, model_name: str, tokens: TokenMetrics) -> CostMetrics:
-        """Calculate estimated cost for token metrics based on reference pricing.
+    def estimate_cost(
+        cls,
+        model_name: str,
+        tokens: TokenMetrics,
+        provider: Optional[str] = None,
+    ) -> CostMetrics:
+        """Calculate estimated cost for token metrics based on reference pricing and vendor contracts.
 
-        Returns CostMetrics with provenance=ESTIMATED and pricing_version stamped if model is known,
-        or provenance=UNKNOWN with total_cost_usd=None if the model is unrecognized.
+        Returns CostMetrics with provenance=ESTIMATED and pricing_version stamped if model is known
+        and essential token metrics are present. If the model is unrecognized or either input_tokens
+        or output_tokens is None (unknown), returns provenance=UNKNOWN with total_cost_usd=None to
+        prevent fabricated financial numbers.
+
+        Accounting Contract:
+        - OpenAI / Azure / Google Gemini: Reported prompt/input tokens already include cached tokens.
+          To prevent double charging, uncached input = max(0, input_tokens - cache_read_tokens).
+        - Anthropic: Reported input_tokens is disjoint from cached tokens, so uncached input = input_tokens.
         """
         rates = cls.get_pricing(model_name)
         if not rates:
             return CostMetrics(provenance=MetricProvenance.UNKNOWN)
 
-        in_tok = tokens.input_tokens or 0
-        out_tok = tokens.output_tokens or 0
+        if tokens.input_tokens is None or tokens.output_tokens is None:
+            return CostMetrics(provenance=MetricProvenance.UNKNOWN)
+
+        prov = str(provider or "").strip().lower()
+        if not prov or prov == "unknown":
+            norm_name = cls._normalize_name(model_name)
+            if any(k in norm_name for k in ("gpt-", "o1", "o3", "chatgpt")):
+                prov = "openai"
+            elif "claude" in norm_name:
+                prov = "anthropic"
+            elif "gemini" in norm_name:
+                prov = "google"
+
+        in_tok = tokens.input_tokens
+        out_tok = tokens.output_tokens
         read_tok = tokens.cache_read_tokens or 0
         creat_tok = tokens.cache_creation_tokens or 0
 
-        in_cost = (in_tok / 1_000_000.0) * rates["input_per_m"]
+        # OpenAI, Azure, and Google Gemini report prompt/input tokens inclusive of cached tokens.
+        # Deduct cache_read_tokens to compute the actual uncached input billed at full rate.
+        if prov in ("openai", "azure", "google", "gemini"):
+            uncached_in = max(0, in_tok - read_tok)
+        else:
+            uncached_in = in_tok
+
+        in_cost = (uncached_in / 1_000_000.0) * rates["input_per_m"]
         out_cost = (out_tok / 1_000_000.0) * rates["output_per_m"]
         read_cost = (read_tok / 1_000_000.0) * rates.get("cache_read_per_m", 0.0)
         creat_cost = (creat_tok / 1_000_000.0) * rates.get("cache_creation_per_m", 0.0)
@@ -726,7 +761,7 @@ class TelemetryCollector:
 
         cost = self._cost
         if cost.provenance == MetricProvenance.UNKNOWN and self._tokens.provenance != MetricProvenance.UNKNOWN:
-            cost = PricingRegistry.estimate_cost(self.model_name, self._tokens)
+            cost = PricingRegistry.estimate_cost(self.model_name, self._tokens, provider=self.provider)
 
         merged_meta = dict(self.metadata)
         if metadata_update:
