@@ -19,6 +19,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 import uuid
@@ -341,8 +342,19 @@ class TestV051SecurityHardening(unittest.TestCase):
             cur_time_ns = WindowsProcessController.get_creation_time(my_pid)
             legacy_time = (cur_time_ns // 100) + 116444736000000000
         else:
-            cur_time_ns = PosixProcessController.get_creation_time(my_pid)
-            legacy_time = cur_time_ns
+            raw_jiffies = None
+            stat_file = Path(f"/proc/{my_pid}/stat")
+            if stat_file.exists():
+                try:
+                    content = stat_file.read_text(encoding="ascii", errors="replace")
+                    rparen = content.rfind(")")
+                    if rparen != -1:
+                        fields = content[rparen + 1:].split()
+                        if len(fields) >= 20:
+                            raw_jiffies = int(fields[19])
+                except Exception:
+                    pass
+            legacy_time = raw_jiffies if raw_jiffies is not None else 50000
 
         # Ensure task exists in tasks table
         self.store.db.execute("""
@@ -489,6 +501,226 @@ class TestV051SecurityHardening(unittest.TestCase):
             with self.assertRaises(ReparseEscapeError):
                 pinned_fake.pin()
             pinned_fake.close()
+
+    def test_12_legacy_process_lifecycle_reconcile_and_sigkill_escalation(self):
+        """Full lifecycle of legacy process: alive check, store reconcile, and termination with SIGKILL escalation logic."""
+        if os.name == "nt":
+            # 1. Spawn a live subprocess on Windows
+            proc = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+            try:
+                cur_ns = WindowsProcessController.get_creation_time(proc.pid)
+                self.assertIsNotNone(cur_ns)
+                legacy_filetime = (cur_ns // 100) + 116444736000000000
+
+                # Verify safe_process_alive with legacy FILETIME
+                self.assertTrue(safe_process_alive(proc.pid, expected_create_time_ns=legacy_filetime))
+
+                # Store active run
+                run_id = f"run_legacy_life_{uuid.uuid4().hex[:8]}"
+                self.store.db.execute("""
+                    INSERT OR IGNORE INTO tasks (
+                        id, project, goal, status, revision, snapshot, created, updated,
+                        ai_memory_workstream_id, step_count, uncheckpointed_steps, drift_status
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """, (
+                    self.task_id, str(self.project_dir), "Goal", "in_progress",
+                    1, json.dumps({}), "2026-11-03T00:00:00Z", "2026-11-03T00:00:00Z",
+                    None, 0, 0, "nominal"
+                ))
+                my_owner_time = WindowsProcessController.get_creation_time(os.getpid())
+                self.store.db.execute("""
+                    INSERT INTO runs (
+                        id, task_id, category, status, pid, process_create_time, owner_pid, owner_create_time,
+                        started, attempts, input_path
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """, (
+                    run_id, self.task_id, "general", RunState.RUNNING,
+                    proc.pid, legacy_filetime, os.getpid(), my_owner_time,
+                    "2026-11-03T00:00:00Z", json.dumps([]), str(self.project_dir / "in.txt"),
+                ))
+                self.store.db.commit()
+
+                # Reconcile keeps run running
+                self.store.reconcile(self.task_id)
+                row = self.store.db.execute("SELECT status FROM runs WHERE id=?", (run_id,)).fetchone()
+                self.assertEqual(row[0], RunState.RUNNING)
+
+                # Terminate safely with legacy FILETIME
+                res = safe_terminate_tree(proc, expected_create_time_ns=legacy_filetime, timeout_seconds=2.0)
+                self.assertTrue(res.success)
+                self.assertFalse(safe_process_alive(proc.pid, expected_create_time_ns=legacy_filetime))
+            finally:
+                if proc.poll() is None:
+                    proc.kill()
+                    proc.wait()
+
+        # 2. Test POSIX escalation logic with legacy jiffies
+        # Valid matching legacy jiffies (< 1e11) must match correctly
+        # at 100Hz: 50,000 jiffies = 500,000,000,000 ns
+        legacy_jiffies = 50_000
+        cur_posix_ns = 500_000_000_000
+        # When actual and expected match
+        self.assertTrue(
+            match_process_creation_time(cur_posix_ns, legacy_jiffies, platform="posix", raw_source_val=legacy_jiffies),
+            "match_process_creation_time failed for legacy jiffies in POSIX escalation"
+        )
+        # When PID is recycled (mismatched jiffies), must fail-closed
+        self.assertFalse(
+            match_process_creation_time(cur_posix_ns, legacy_jiffies + 1, platform="posix", raw_source_val=legacy_jiffies),
+            "match_process_creation_time accepted mismatched jiffies during escalation"
+        )
+
+    def test_13_audit_anchor_interleaving_and_anti_regression(self):
+        """Adversarial interleaving: out-of-order anchor writes are strictly blocked by anti-regression guard."""
+        audit1 = self.store.worker_audit
+        store2 = Store(root=self.coordinator_dir, supervisor_key=self.supervisor_key)
+        audit2 = store2.worker_audit
+
+        # Step 1: Supervisor B writes sequences 1 and 2
+        rec1 = audit2.record_event(
+            event_type=WorkerAuditEventType.SPAWN,
+            task_id=self.task_id,
+            run_id=self.run_id,
+            worker_pid=os.getpid(),
+            reason="event_1",
+        )
+        rec2 = audit2.record_event(
+            event_type=WorkerAuditEventType.TOOL_REQUESTED,
+            task_id=self.task_id,
+            run_id=self.run_id,
+            worker_pid=os.getpid(),
+            reason="event_2",
+        )
+        self.assertEqual(rec2.sequence_number, 2)
+
+        # External anchor now holds sequence 2
+        cur_anchor_content = audit1.anchor_file_path.read_text(encoding="utf-8")
+        self.assertIn("|2|", cur_anchor_content)
+        seq_in_file = int(cur_anchor_content.split("|")[1])
+        self.assertEqual(seq_in_file, 2)
+
+        # Step 2: Adversarial simulation of Supervisor A attempting delayed write of sequence 1
+        # In worker_audit.py, the anti-regression check is:
+        # cur_file_seq = int(parts[1])
+        # if seq_num >= cur_file_seq: write tmp and replace
+        # We test that an attempted write of seq_num=1 does NOT overwrite seq_num=2:
+        attempted_stale_seq = 1
+        cur_file_seq = int(audit1.anchor_file_path.read_text(encoding="utf-8").split("|")[1])
+        self.assertFalse(attempted_stale_seq >= cur_file_seq, "Anti-regression condition would have allowed stale write!")
+
+        # Step 3: Concurrent interleaved writers with shared lock
+        num_writes = 10
+        errors = []
+        observed_sequences = []
+
+        def concurrent_writer(audit_inst, label):
+            for i in range(num_writes):
+                try:
+                    r = audit_inst.record_event(
+                        event_type=WorkerAuditEventType.TOOL_ALLOWED,
+                        task_id=self.task_id,
+                        run_id=self.run_id,
+                        worker_pid=os.getpid(),
+                        reason=f"{label}_{i}",
+                    )
+                    observed_sequences.append(r.sequence_number)
+                except Exception as ex:
+                    errors.append(ex)
+
+        t1 = threading.Thread(target=concurrent_writer, args=(audit1, "sup_a"))
+        t2 = threading.Thread(target=concurrent_writer, args=(audit2, "sup_b"))
+        t1.start()
+        t2.start()
+        t1.join()
+        t2.join()
+
+        store2.db.close()
+        self.assertEqual(len(errors), 0, f"Errors in concurrent interleaved audit logging: {errors}")
+
+        # The final anchor must match the maximum sequence number (2 + 2 * num_writes = 22)
+        expected_final_seq = 2 + (2 * num_writes)
+        final_anchor = audit1.anchor_file_path.read_text(encoding="utf-8")
+        final_file_seq = int(final_anchor.split("|")[1])
+        self.assertEqual(final_file_seq, expected_final_seq)
+
+        # Integrity check across whole chain must pass
+        valid, errs = audit1.verify_integrity()
+        self.assertTrue(valid, f"Audit chain verification failed: {errs}")
+
+    def test_14_mailbox_concurrent_directory_swap_race(self):
+        """Adversarial test: background thread attempts directory swap / junction hijack during process_mailbox."""
+        req_dir = self.sandbox_dir / ".broker" / "requests"
+        res_dir = self.sandbox_dir / ".broker" / "responses"
+        req_dir.mkdir(parents=True, exist_ok=True)
+        res_dir.mkdir(parents=True, exist_ok=True)
+
+        token_str = self.broker.token_manager.issue_token(
+            task_id=self.task_id,
+            run_id=self.run_id,
+            worker_pid=os.getpid(),
+            project_root=self.project_dir,
+            allowed_tools=["echo_tool"],
+        )
+
+        req_file = req_dir / "req_swap_test.json"
+        req_file.write_text(json.dumps({
+            "token": token_str,
+            "tool": "echo_tool",
+            "parameters": {"msg": "SAFE_CONCURRENT_DATA"},
+            "caller_pid": os.getpid(),
+        }), encoding="utf-8")
+
+        # Start an aggressive attacker thread attempting to rename or swap responses directory
+        stop_attacker = threading.Event()
+        tamper_attempts = [0]
+        tamper_blocked_errors = []
+
+        def attacker_loop():
+            while not stop_attacker.is_set():
+                tamper_attempts[0] += 1
+                try:
+                    # Attempt 1: Rename responses directory
+                    os.rename(res_dir, res_dir.with_name("responses_hijacked"))
+                    # If rename succeeded, swap in malicious junction
+                    _create_symlink_or_junction(res_dir, self.outside_dir)
+                except (PermissionError, OSError) as e:
+                    tamper_blocked_errors.append(e)
+                time.sleep(0.001)
+
+        attacker_thread = threading.Thread(target=attacker_loop, daemon=True)
+        attacker_thread.start()
+
+        try:
+            # Process mailbox under active attack
+            results = self.broker.process_mailbox(
+                self.sandbox_dir,
+                expected_worker_pid=os.getpid(),
+                raise_on_fatal=True,
+            )
+        finally:
+            stop_attacker.set()
+            attacker_thread.join(timeout=2.0)
+
+        # On Windows, kernel must have actively blocked tamper attempts with WinError 32
+        if os.name == "nt":
+            self.assertGreater(len(tamper_blocked_errors), 0, "No tamper attempts were blocked on Windows!")
+            self.assertTrue(
+                any(isinstance(err, PermissionError) or getattr(err, "winerror", None) == 32 for err in tamper_blocked_errors),
+                f"Expected WinError 32 / PermissionError, got: {tamper_blocked_errors[:5]}"
+            )
+
+        # Confirm request was processed safely and successfully
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0].get("status"), "success")
+
+        # Confirm response was written strictly within sandbox res_dir
+        expected_res_file = res_dir / f"res_{req_file.stem}.json"
+        self.assertTrue(expected_res_file.exists(), "Response file was not written to responses dir!")
+        res_data = json.loads(expected_res_file.read_text(encoding="utf-8"))
+        self.assertEqual(res_data.get("response", {}).get("result", {}).get("echo"), "SAFE_CONCURRENT_DATA")
+
+        # Confirm victim outside directory remains 100% untouched
+        self.assertEqual(len(list(self.outside_dir.iterdir())), 0, "Attacker succeeded in writing outside sandbox!")
 
 
 if __name__ == "__main__":

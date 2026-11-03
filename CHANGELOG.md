@@ -34,7 +34,7 @@ Release de segurança prioritária e endurecimento de isolamento (*Security Hard
   - Suporte ao formato legado da v0.4.0 no Linux (clock ticks / jiffies desde boot, `< 10^11`), validado estritamente em POSIX via igualdade exata com base no `SC_CLK_TCK`.
   - Rejeição cruzada fail-closed entre plataformas (FILETIME em POSIX e jiffies em Windows são rejeitados imediatamente).
 - **Política Fail-Closed Estrita**: Identidades com timestamps negativos, nulos, ambíguos ou fora de faixas válidas conhecidas são rejeitadas de forma conservadora, prevenindo falsos positivos e acidentes por reciclagem de PID.
-- **Preservação de Runs em Andamento**: O reconciliador de tarefas (`Store.reconcile`) e a finalização de processos (`safe_terminate_tree` e `WindowsProcessController.is_running`) continuam reconhecendo processos ativos legados sem interromper ou matar indevidamente runs em progresso.
+- **Preservação de Runs em Andamento e Escalonamento Seguro**: O reconciliador de tarefas (`Store.reconcile`) e a finalização de processos (`safe_terminate_tree`, `WindowsProcessController.is_running` e `PosixProcessController.terminate_process`) continuam reconhecendo processos ativos legados sem interromper indevidamente runs em progresso, garantindo que a validação de identidades legadas seja mantida durante a etapa de escalonamento destrutivo para `SIGKILL`.
 
 ---
 

@@ -835,7 +835,19 @@ class PosixProcessController:
                         duration_seconds=time.monotonic() - start,
                         detail=f"PID {pid} identity cannot be re-verified before SIGKILL; aborting destructive escalation",
                     )
-                if cur_time != expected_create_time_ns:
+                raw_jiffies = None
+                stat_file = Path(f"/proc/{pid}/stat")
+                if stat_file.exists():
+                    try:
+                        content = stat_file.read_text(encoding="ascii", errors="replace")
+                        rparen = content.rfind(")")
+                        if rparen != -1:
+                            fields = content[rparen + 1:].split()
+                            if len(fields) >= 20:
+                                raw_jiffies = int(fields[19])
+                    except Exception:
+                        pass
+                if not match_process_creation_time(cur_time, expected_create_time_ns, platform="posix", raw_source_val=raw_jiffies):
                     return TerminationResult(
                         success=False,
                         exit_code=None,
