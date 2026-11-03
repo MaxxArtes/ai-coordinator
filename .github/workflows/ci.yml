@@ -63,6 +63,10 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: "22.22.2"
+      - name: Extract package version
+        run: |
+          VERSION=$(python -c "import tomllib; print(tomllib.loads(open('pyproject.toml').read())['project']['version'])")
+          echo "VERSION=$VERSION" >> $GITHUB_ENV
       - name: Install packaging dependencies
         run: |
           python -m pip install --upgrade pip
@@ -75,7 +79,7 @@ jobs:
         run: python scripts/verify_clean_install_and_migration.py
       - name: Compute SHA-256 checksums and export to Step Summary
         run: |
-          echo "### Release Candidate Artifacts (v0.5.0)" >> $GITHUB_STEP_SUMMARY
+          echo "### Release Candidate Artifacts (v${VERSION})" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "| Artifact | SHA-256 Checksum | Size (bytes) |" >> $GITHUB_STEP_SUMMARY
           echo "|---|---|---|" >> $GITHUB_STEP_SUMMARY
@@ -91,7 +95,7 @@ jobs:
       - name: Upload release candidate artifacts for independent audit
         uses: actions/upload-artifact@v4
         with:
-          name: release-artifacts-v0.5.0
+          name: release-artifacts-v${{ env.VERSION }}
           path: |
             dist/*
             checksums.sha256

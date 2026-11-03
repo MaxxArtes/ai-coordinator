@@ -7,6 +7,37 @@ e este projeto adere ao [Versionamento Semântico](https://semver.org/lang/pt-BR
 
 ---
 
+## [0.5.1] - 2026-11-03
+
+Release de segurança prioritária e endurecimento de isolamento (*Security Hardening*), corrigindo os achados de auditoria identificados na revisão do PR #2 do Codex.
+
+### Segurança e Correções
+
+#### P1 — Prevenção de Fuga da Sandbox e Sobrescrita Arbitrária via Mailbox (.broker)
+- **Validação Estrita da Hierarquia da Mailbox**: `ToolBroker.process_mailbox` agora inspeciona recursivamente toda a hierarquia `.broker`, `.broker/requests` e `.broker/responses` contra a raiz autorizada da sandbox (`sbox`), garantindo confinamento estrito.
+- **Bloqueio de Symlinks, Junções e Reparse Points**: Rejeição imediata (*fail-closed*) caso qualquer diretório ou componente intermediário da hierarquia seja link simbólico, junção NTFS ou reparse point, impedindo que workers não confiáveis redirecionem o diretório de respostas para fora da sandbox.
+- **Fixação de Diretórios e Prevenção de TOCTOU (Directory Swap)**:
+  - No Windows, introduzido o mecanismo de fixação `_PinnedDirectory`, mantendo handles abertos nos diretórios com `FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT` sem o compartilhamento `FILE_SHARE_DELETE`. Qualquer tentativa por processos concorrentes de renomear, excluir ou substituir `.broker` ou `.broker/responses` por junções é rejeitada diretamente pelo kernel do Windows NT (`WinError 32 / sharing violation`).
+  - Em ambientes POSIX, os diretórios são abertos por descida estritamente relativa a partir da raiz confiável (`sbox_fd` -> `.broker` via `dir_fd=sbox_fd` -> `requests`/`responses` via `dir_fd=broker_fd`) com flags `O_DIRECTORY | O_NOFOLLOW`, impedindo desvios por links simbólicos em qualquer diretório intermediário ou ancestral. Todas as operações de leitura, stat, remoção e gravação de requisições e respostas operam exclusivamente através de descritores fixados (`dir_fd=req_fd`, `dir_fd=res_fd`), com substituição atômica via `src_dir_fd`/`dst_dir_fd` e política estrita de falha fechada (*fail-closed*), eliminando janelas de corrida TOCTOU e swaps de diretórios ancestrais.
+
+#### P1 — Serialização de Concorrência e Resiliência na Trilha de Auditoria
+- **Lock Cross-Process Exclusivo (`auth/audit.lock`)**: Introduzido o context manager `_acquire_audit_lock` utilizando locks de arquivo exclusivos no nível do sistema operacional (`msvcrt.locking` no Windows e `fcntl.flock` no POSIX), serializando a transação do SQLite (`BEGIN IMMEDIATE` até `commit()`) e a escrita atômica no arquivo desacoplado `audit.anchor` sob o mesmo lock mútuo entre processos e instâncias de `Store`.
+- **Serialização Estrita e Prevenção de Regressão na Âncora Externa**: A ordem de gravação garante que a transação SQLite seja consolidada primeiro (`commit()`) para que eventuais falhas deixem a âncora externa apenas atrasada (recuperável via `reconcile_anchor()`), nunca adiantada. Adicionada conferência de número de sequência que impede que processos atrasados sobrescrevam o arquivo com sequências inferiores.
+- **Índice UNIQUE em Sequência de Auditoria**: Adicionada restrição `UNIQUE` ao índice `idx_worker_audit_seq`, garantindo integridade estrita e impossibilidade de sequências duplicadas no nível do banco.
+- **Eliminação de Colisões em Âncoras Desacopladas**: O arquivo temporário da âncora externa agora utiliza identificador exclusivo contendo PID e UUID (`audit.anchor.tmp.{pid}.{uuid}`), eliminando conflitos de acesso no Windows e em sistemas POSIX.
+- **Recuperação Atômica de Quedas**: Em caso de falha transitória ou descontinuidade da âncora externa, o método `reconcile_anchor` restaura o arquivo a partir do registro assinado e auditado na tabela `worker_audit_anchors` sob o lock exclusivo cross-process.
+
+#### P2 — Correspondência Exata de Identidade e Tolerância Zero (PID Recycling)
+- **Correspondência Estrita Sem Tolerância (`diff == 0`)**: A função `match_process_creation_time` opera com tolerância temporal zero, eliminando janelas heurísticas (`tolerance_ns`) para impedir que a reutilização rápida de PID pelo sistema operacional engane o supervisor.
+- **Normalização Segura de Identidades de Processo**:
+  - Suporte ao formato legado da v0.4.0 no Windows (Win32 `FILETIME` bruto de 100ns desde 1601, na faixa `1.16e17` a `2.0e17`), validado estritamente em ambiente Windows via igualdade determinística exata.
+  - Suporte ao formato legado da v0.4.0 no Linux (clock ticks / jiffies desde boot, `< 10^11`), validado estritamente em POSIX via igualdade exata com base no `SC_CLK_TCK`.
+  - Rejeição cruzada fail-closed entre plataformas (FILETIME em POSIX e jiffies em Windows são rejeitados imediatamente).
+- **Política Fail-Closed Estrita**: Identidades com timestamps negativos, nulos, ambíguos ou fora de faixas válidas conhecidas são rejeitadas de forma conservadora, prevenindo falsos positivos e acidentes por reciclagem de PID.
+- **Preservação de Runs em Andamento e Escalonamento Seguro**: O reconciliador de tarefas (`Store.reconcile`) e a finalização de processos (`safe_terminate_tree`, `WindowsProcessController.is_running` e `PosixProcessController.terminate_process`) continuam reconhecendo processos ativos legados sem interromper indevidamente runs em progresso, garantindo que a validação de identidades legadas seja mantida durante a etapa de escalonamento destrutivo para `SIGKILL`.
+
+---
+
 ## [0.5.0] - 2026-10-29
 
 Esta versão consolida a conclusão da **Fase 4B (Human-AI Cognitive Workspace)**, introduzindo isolamento de processos e filesystem em nível de sistema operacional (OS-level sandboxing), governança e autorização segura de ferramentas via Tool Broker com tokens HMAC, trilha de auditoria criptográfica imutável com dupla ancoragem e integração ao ecossistema `ai-memory`.

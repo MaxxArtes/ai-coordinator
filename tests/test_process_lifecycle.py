@@ -88,13 +88,19 @@ sys.exit(0)
             # Run supervisor as separate process
             sup_proc = subprocess.Popen([sys.executable, str(sup_script)])
             # Wait for supervisor to write worker pid
-            for _ in range(30):
+            worker_pid = None
+            for _ in range(50):
                 if pid_file.exists():
-                    break
+                    try:
+                        content = pid_file.read_text(encoding="ascii").strip()
+                        if content and content.isdigit():
+                            worker_pid = int(content)
+                            break
+                    except Exception:
+                        pass
                 time.sleep(0.1)
 
-            self.assertTrue(pid_file.exists(), "Supervisor did not write worker PID")
-            worker_pid = int(pid_file.read_text(encoding="ascii").strip())
+            self.assertIsNotNone(worker_pid, "Supervisor did not write worker PID")
 
             # Worker should be alive while supervisor is running
             self.assertTrue(safe_process_alive(worker_pid))

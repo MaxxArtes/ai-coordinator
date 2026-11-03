@@ -253,6 +253,71 @@ class TerminationResult:
 
 
 # ---------------------------------------------------------------------------
+# Process Identity and Time Normalization
+# ---------------------------------------------------------------------------
+
+def match_process_creation_time(
+    actual_time_ns: int,
+    expected_time: Optional[int],
+    platform: str = "nt" if os.name == "nt" else "posix",
+    raw_source_val: Optional[int] = None,
+) -> bool:
+    """Safely match process creation time across v0.4.0 legacy and v0.5.x formats with exact fail-closed semantics.
+
+    Strict zero-tolerance matching (diff == 0) ensures that rapid PID recycling
+    cannot trick the supervisor into adopting or terminating an unrelated process.
+
+    Supported formats:
+    1. Exact nanosecond match (actual_time_ns == expected_time).
+    2. Raw kernel source value exact match (raw Windows FILETIME or Linux jiffies).
+    3. Windows v0.4.0 legacy FILETIME (100ns intervals since 1601-01-01, ~1.16e17 to 2.0e17):
+       Matched strictly on Windows: raw_source_val == expected_time OR
+       (expected_time - 116444736000000000) * 100 == actual_time_ns.
+    4. Linux v0.4.0 legacy clock ticks / jiffies (< 10^11):
+       Matched strictly on POSIX/Linux: raw_source_val == expected_time OR
+       expected_time * (1_000_000_000 // clk_tck) == actual_time_ns.
+    5. All other values, cross-platform mismatches, negative values, and non-exact differences
+       are rejected fail-closed.
+    """
+    if expected_time is None:
+        return True
+    if expected_time <= 0 or actual_time_ns <= 0:
+        return False
+
+    # 1. Exact nanosecond match (v0.5.x standard)
+    if actual_time_ns == expected_time:
+        return True
+
+    # 2. Raw kernel source value exact match
+    if raw_source_val is not None and raw_source_val == expected_time:
+        return True
+
+    # 3. Windows legacy FILETIME (100ns intervals since 1601-01-01)
+    # Valid only if platform is Windows ("nt")
+    if 116444736000000000 <= expected_time <= 200000000000000000:
+        if platform != "nt":
+            return False
+        converted_unix_ns = (expected_time - 116444736000000000) * 100
+        return actual_time_ns == converted_unix_ns
+
+    # 4. Linux legacy jiffies / clock ticks (< 10^11)
+    # Valid only if platform is POSIX / Linux
+    if expected_time < 100_000_000_000:
+        if platform == "nt":
+            return False
+        clk_tck = 100
+        try:
+            clk_tck = os.sysconf("SC_CLK_TCK")
+        except Exception:
+            pass
+        expected_boot_ns = expected_time * (1_000_000_000 // clk_tck)
+        return actual_time_ns == expected_boot_ns
+
+    # Fail-closed for all unknown, out-of-range, ambiguous, or mismatched values
+    return False
+
+
+# ---------------------------------------------------------------------------
 # Windows Process Controller
 # ---------------------------------------------------------------------------
 
@@ -298,7 +363,7 @@ class WindowsProcessController:
                 if kernel32.GetProcessTimes(h, ctypes.byref(ct), ctypes.byref(et), ctypes.byref(kt), ctypes.byref(ut)):
                     filetime_100ns = (ct.dwHighDateTime << 32) + ct.dwLowDateTime
                     actual_ns = (filetime_100ns - 116444736000000000) * 100
-                    if actual_ns != expected_create_time_ns:
+                    if not match_process_creation_time(actual_ns, expected_create_time_ns, platform="nt", raw_source_val=filetime_100ns):
                         return False
                 else:
                     return False
@@ -437,7 +502,7 @@ class WindowsProcessController:
             if kernel32.GetProcessTimes(h_proc, ctypes.byref(ct), ctypes.byref(et), ctypes.byref(kt), ctypes.byref(ut)):
                 filetime_100ns = (ct.dwHighDateTime << 32) + ct.dwLowDateTime
                 current_create_time = (filetime_100ns - 116444736000000000) * 100
-                if expected_create_time_ns is not None and current_create_time != expected_create_time_ns:
+                if expected_create_time_ns is not None and not match_process_creation_time(current_create_time, expected_create_time_ns, platform="nt", raw_source_val=filetime_100ns):
                     return TerminationResult(
                         success=False,
                         exit_code=None,
@@ -544,7 +609,21 @@ class PosixProcessController:
             # Process exists but owned by someone else
             if expected_create_time_ns is not None:
                 cur_time = cls.get_creation_time(pid)
-                return cur_time == expected_create_time_ns
+                if cur_time is None:
+                    return False
+                raw_jiffies = None
+                stat_file = Path(f"/proc/{pid}/stat")
+                if stat_file.exists():
+                    try:
+                        content = stat_file.read_text(encoding="ascii", errors="replace")
+                        rparen = content.rfind(")")
+                        if rparen != -1:
+                            fields = content[rparen + 1:].split()
+                            if len(fields) >= 20:
+                                raw_jiffies = int(fields[19])
+                    except Exception:
+                        pass
+                return match_process_creation_time(cur_time, expected_create_time_ns, platform="posix", raw_source_val=raw_jiffies)
             return True
 
         # Non-destructive zombie/defunct check on Linux (/proc) and macOS/BSD (ps)
@@ -574,7 +653,21 @@ class PosixProcessController:
 
         if expected_create_time_ns is not None:
             cur_time = cls.get_creation_time(pid)
-            if cur_time is not None and cur_time != expected_create_time_ns:
+            if cur_time is None:
+                return False
+            raw_jiffies = None
+            stat_file = Path(f"/proc/{pid}/stat")
+            if stat_file.exists():
+                try:
+                    content = stat_file.read_text(encoding="ascii", errors="replace")
+                    rparen = content.rfind(")")
+                    if rparen != -1:
+                        fields = content[rparen + 1:].split()
+                        if len(fields) >= 20:
+                            raw_jiffies = int(fields[19])
+                except Exception:
+                    pass
+            if not match_process_creation_time(cur_time, expected_create_time_ns, platform="posix", raw_source_val=raw_jiffies):
                 return False
         return True
 
@@ -651,7 +744,19 @@ class PosixProcessController:
                     duration_seconds=time.monotonic() - start,
                     detail=f"PID {pid} creation time cannot be verified; refusing destructive termination",
                 )
-            if cur_time != expected_create_time_ns:
+            raw_jiffies = None
+            stat_file = Path(f"/proc/{pid}/stat")
+            if stat_file.exists():
+                try:
+                    content = stat_file.read_text(encoding="ascii", errors="replace")
+                    rparen = content.rfind(")")
+                    if rparen != -1:
+                        fields = content[rparen + 1:].split()
+                        if len(fields) >= 20:
+                            raw_jiffies = int(fields[19])
+                except Exception:
+                    pass
+            if not match_process_creation_time(cur_time, expected_create_time_ns, platform="posix", raw_source_val=raw_jiffies):
                 return TerminationResult(
                     success=False,
                     exit_code=None,
@@ -700,7 +805,11 @@ class PosixProcessController:
                     wpid, status = os.waitpid(pid, os.WNOHANG)
                     if wpid == pid:
                         exit_code = os.waitstatus_to_exitcode(status) if hasattr(os, "waitstatus_to_exitcode") else (status >> 8)
-                        return TerminationResult(True, exit_code, "terminated", time.monotonic() - start, "Terminated gracefully with SIGTERM")
+                        detail = "Terminated gracefully with SIGTERM"
+                        if hasattr(os, "WIFSIGNALED") and os.WIFSIGNALED(status):
+                            if hasattr(os, "WTERMSIG") and os.WTERMSIG(status) == signal.SIGKILL:
+                                detail = "Terminated forcefully with SIGKILL"
+                        return TerminationResult(True, exit_code, "terminated", time.monotonic() - start, detail)
                 except (ChildProcessError, OSError):
                     pass
 
@@ -730,7 +839,19 @@ class PosixProcessController:
                         duration_seconds=time.monotonic() - start,
                         detail=f"PID {pid} identity cannot be re-verified before SIGKILL; aborting destructive escalation",
                     )
-                if cur_time != expected_create_time_ns:
+                raw_jiffies = None
+                stat_file = Path(f"/proc/{pid}/stat")
+                if stat_file.exists():
+                    try:
+                        content = stat_file.read_text(encoding="ascii", errors="replace")
+                        rparen = content.rfind(")")
+                        if rparen != -1:
+                            fields = content[rparen + 1:].split()
+                            if len(fields) >= 20:
+                                raw_jiffies = int(fields[19])
+                    except Exception:
+                        pass
+                if not match_process_creation_time(cur_time, expected_create_time_ns, platform="posix", raw_source_val=raw_jiffies):
                     return TerminationResult(
                         success=False,
                         exit_code=None,
@@ -953,7 +1074,7 @@ def safe_terminate_tree(
                     duration_seconds=time.monotonic() - start_time,
                     detail=f"PID {pid} creation time cannot be verified; refusing destructive termination",
                 )
-            if cur_time != expected_create_time_ns:
+            if not match_process_creation_time(cur_time, expected_create_time_ns, platform="nt"):
                 return TerminationResult(
                     success=False,
                     exit_code=None,
@@ -1000,7 +1121,19 @@ def safe_terminate_tree(
                     duration_seconds=time.monotonic() - start_time,
                     detail=f"PID {pid} creation time cannot be verified; refusing destructive termination",
                 )
-            if cur_time != expected_create_time_ns:
+            raw_jiffies = None
+            stat_file = Path(f"/proc/{pid}/stat")
+            if stat_file.exists():
+                try:
+                    content = stat_file.read_text(encoding="ascii", errors="replace")
+                    rparen = content.rfind(")")
+                    if rparen != -1:
+                        fields = content[rparen + 1:].split()
+                        if len(fields) >= 20:
+                            raw_jiffies = int(fields[19])
+                except Exception:
+                    pass
+            if not match_process_creation_time(cur_time, expected_create_time_ns, platform="posix", raw_source_val=raw_jiffies):
                 return TerminationResult(
                     success=False,
                     exit_code=None,

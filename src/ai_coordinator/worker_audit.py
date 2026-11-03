@@ -6,6 +6,7 @@ of all worker lifecycle events and tool authorizations.
 
 from __future__ import annotations
 
+import contextlib
 from dataclasses import dataclass, asdict
 from enum import Enum
 import hashlib
@@ -13,10 +14,16 @@ import hmac
 import json
 import os
 from pathlib import Path
+import sqlite3
 import threading
 import time
 from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 import uuid
+
+if os.name == "nt":
+    import msvcrt
+else:
+    import fcntl
 
 
 class WorkerAuditEventType(str, Enum):
@@ -140,6 +147,7 @@ class WorkerAuditLogger:
 
         self._lock = getattr(store, "_lock", None) or threading.RLock()
         self.anchor_file_path: Optional[Path] = None
+        self.lock_file_path: Optional[Path] = None
         if hasattr(self.store, "root") and self.store.root:
             auth_dir = Path(self.store.root) / "auth"
             try:
@@ -150,10 +158,66 @@ class WorkerAuditLogger:
                     except Exception:
                         pass
                 self.anchor_file_path = auth_dir / "audit.anchor"
+                self.lock_file_path = auth_dir / "audit.lock"
             except Exception:
                 self.anchor_file_path = None
+                self.lock_file_path = None
 
         self._init_table()
+
+    @contextlib.contextmanager
+    def _acquire_audit_lock(self, timeout_seconds: float = 15.0):
+        """Cross-process exclusive file lock on auth/audit.lock to serialize DB transactions and external anchor writes."""
+        if not self.lock_file_path:
+            yield
+            return
+
+        try:
+            self.lock_file_path.parent.mkdir(parents=True, exist_ok=True)
+        except Exception:
+            pass
+
+        lock_file = None
+        try:
+            lock_file = open(self.lock_file_path, "a+b")
+        except Exception as e:
+            raise WorkerAuditPersistenceError(f"Falha ao abrir arquivo de lock cross-process '{self.lock_file_path}': {e}") from e
+
+        acquired = False
+        deadline = time.monotonic() + timeout_seconds
+        try:
+            while time.monotonic() < deadline:
+                try:
+                    if os.name == "nt":
+                        lock_file.seek(0)
+                        msvcrt.locking(lock_file.fileno(), msvcrt.LK_NBLCK, 1)
+                    else:
+                        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    acquired = True
+                    break
+                except (OSError, IOError, PermissionError):
+                    time.sleep(0.015)
+
+            if not acquired:
+                raise WorkerAuditPersistenceError(
+                    f"Timeout ({timeout_seconds}s) ao aguardar lock exclusivo de auditoria cross-process em '{self.lock_file_path}'"
+                )
+            yield
+        finally:
+            if acquired:
+                try:
+                    if os.name == "nt":
+                        lock_file.seek(0)
+                        msvcrt.locking(lock_file.fileno(), msvcrt.LK_UNLCK, 1)
+                    else:
+                        fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+                except Exception:
+                    pass
+            if lock_file is not None:
+                try:
+                    lock_file.close()
+                except Exception:
+                    pass
 
     def _init_table(self) -> None:
         """Create append-only worker_audit_log and immutable triggers in SQLite."""
@@ -198,7 +262,7 @@ class WorkerAuditLogger:
         self.store.db.execute("CREATE INDEX IF NOT EXISTS idx_worker_audit_run ON worker_audit_log(run_id)")
         self.store.db.execute("CREATE INDEX IF NOT EXISTS idx_worker_audit_corr ON worker_audit_log(correlation_id)")
         self.store.db.execute("CREATE INDEX IF NOT EXISTS idx_worker_audit_type ON worker_audit_log(event_type)")
-        self.store.db.execute("CREATE INDEX IF NOT EXISTS idx_worker_audit_seq ON worker_audit_log(sequence_number)")
+        self.store.db.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_worker_audit_seq ON worker_audit_log(sequence_number)")
 
         # Strict SQL immutability triggers on worker_audit_log (block UPDATE and DELETE)
         self.store.db.execute("""
@@ -275,115 +339,116 @@ class WorkerAuditLogger:
 
         try:
             with self._lock:
-                # Query last sequence_number and chain_hash globally across the store
-                row = self.store.db.execute("""
-                    SELECT sequence_number, chain_hash
-                    FROM worker_audit_log
-                    ORDER BY sequence_number DESC, id DESC LIMIT 1
-                """).fetchone()
+                with self._acquire_audit_lock():
+                    # Acquire exclusive SQLite write lock immediately to serialize across stores/processes
+                    # Retry briefly with exponential backoff if another process currently holds the lock
+                    acquired = False
+                    for attempt in range(10):
+                        try:
+                            if not self.store.db.in_transaction:
+                                self.store.db.execute("BEGIN IMMEDIATE")
+                            acquired = True
+                            break
+                        except sqlite3.OperationalError as op_err:
+                            if "locked" in str(op_err).lower() or "busy" in str(op_err).lower():
+                                time.sleep(0.02 * (1.5 ** attempt))
+                            else:
+                                raise
+                    if not acquired and not self.store.db.in_transaction:
+                        self.store.db.execute("BEGIN IMMEDIATE")
 
-                if row:
-                    prev_seq, prev_hash = row[0], row[1]
-                    seq_num = prev_seq + 1
-                else:
-                    prev_hash = GENESIS_HASH
-                    seq_num = 1
+                    # Query last sequence_number and chain_hash globally across the store
+                    row = self.store.db.execute("""
+                        SELECT sequence_number, chain_hash
+                        FROM worker_audit_log
+                        ORDER BY sequence_number DESC, id DESC LIMIT 1
+                    """).fetchone()
 
-                ident_json = json.dumps(clean_ident, sort_keys=True, separators=(",", ":")) if clean_ident else None
-                limits_json = json.dumps(clean_limits, sort_keys=True, separators=(",", ":")) if clean_limits else None
-                usage_json = json.dumps(clean_usage, sort_keys=True, separators=(",", ":")) if clean_usage else None
-                details_json = json.dumps(clean_details, sort_keys=True, separators=(",", ":")) if clean_details else None
+                    if row:
+                        prev_seq, prev_hash = row[0], row[1]
+                        seq_num = prev_seq + 1
+                    else:
+                        prev_hash = GENESIS_HASH
+                        seq_num = 1
 
-                # Canonical deterministic hash chaining over ALL 15 fields
-                chain_hash = compute_canonical_record_hash(
-                    prev_hash=prev_hash,
-                    sequence_number=seq_num,
-                    task_id=str(task_id),
-                    run_id=str(run_id),
-                    worker_pid=int(worker_pid) if worker_pid is not None else None,
-                    process_identity_json=ident_json,
-                    event_type=evt_type_str,
-                    correlation_id=corr_id,
-                    operational_revision=int(operational_revision),
-                    limits_json=limits_json,
-                    resource_usage_json=usage_json,
-                    reason=reason,
-                    error=error,
-                    details_json=details_json,
-                    created_at=created_at,
-                )
+                    ident_json = json.dumps(clean_ident, sort_keys=True, separators=(",", ":")) if clean_ident else None
+                    limits_json = json.dumps(clean_limits, sort_keys=True, separators=(",", ":")) if clean_limits else None
+                    usage_json = json.dumps(clean_usage, sort_keys=True, separators=(",", ":")) if clean_usage else None
+                    details_json = json.dumps(clean_details, sort_keys=True, separators=(",", ":")) if clean_details else None
 
-                # Record HMAC signature
-                sig = hmac.new(self.supervisor_secret, chain_hash.encode("ascii"), hashlib.sha256).hexdigest()
+                    # Canonical deterministic hash chaining over ALL 15 fields
+                    chain_hash = compute_canonical_record_hash(
+                        prev_hash=prev_hash,
+                        sequence_number=seq_num,
+                        task_id=str(task_id),
+                        run_id=str(run_id),
+                        worker_pid=int(worker_pid) if worker_pid is not None else None,
+                        process_identity_json=ident_json,
+                        event_type=evt_type_str,
+                        correlation_id=corr_id,
+                        operational_revision=int(operational_revision),
+                        limits_json=limits_json,
+                        resource_usage_json=usage_json,
+                        reason=reason,
+                        error=error,
+                        details_json=details_json,
+                        created_at=created_at,
+                    )
 
-                # Record tail-anchoring entry
-                anchor_payload = f"ANCHOR:{seq_num}:{chain_hash}:{created_at}"
-                anchor_sig = hmac.new(self.supervisor_secret, anchor_payload.encode("ascii"), hashlib.sha256).hexdigest()
+                    # Record HMAC signature
+                    sig = hmac.new(self.supervisor_secret, chain_hash.encode("ascii"), hashlib.sha256).hexdigest()
 
-                self.store.db.execute("""
-                    INSERT INTO worker_audit_log (
-                        event_id, sequence_number, task_id, run_id, worker_pid,
-                        process_identity, event_type, correlation_id,
-                        operational_revision, limits_json, resource_usage_json,
-                        reason, error, details_json, chain_hash, record_signature,
-                        created_at, prev_hash
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """, (
-                    event_id,
-                    seq_num,
-                    str(task_id),
-                    str(run_id),
-                    int(worker_pid) if worker_pid is not None else None,
-                    ident_json,
-                    evt_type_str,
-                    corr_id,
-                    int(operational_revision),
-                    limits_json,
-                    usage_json,
-                    reason,
-                    error,
-                    details_json,
-                    chain_hash,
-                    sig,
-                    created_at,
-                    prev_hash,
-                ))
+                    # Record tail-anchoring entry
+                    anchor_payload = f"ANCHOR:{seq_num}:{chain_hash}:{created_at}"
+                    anchor_sig = hmac.new(self.supervisor_secret, anchor_payload.encode("ascii"), hashlib.sha256).hexdigest()
 
-                self.store.db.execute("""
-                    INSERT INTO worker_audit_anchors (
-                        last_sequence_number, last_chain_hash, anchor_signature, anchored_at
-                    ) VALUES (?, ?, ?, ?)
-                """, (
-                    seq_num,
-                    chain_hash,
-                    anchor_sig,
-                    created_at,
-                ))
+                    self.store.db.execute("""
+                        INSERT INTO worker_audit_log (
+                            event_id, sequence_number, task_id, run_id, worker_pid,
+                            process_identity, event_type, correlation_id,
+                            operational_revision, limits_json, resource_usage_json,
+                            reason, error, details_json, chain_hash, record_signature,
+                            created_at, prev_hash
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """, (
+                        event_id,
+                        seq_num,
+                        str(task_id),
+                        str(run_id),
+                        int(worker_pid) if worker_pid is not None else None,
+                        ident_json,
+                        evt_type_str,
+                        corr_id,
+                        int(operational_revision),
+                        limits_json,
+                        usage_json,
+                        reason,
+                        error,
+                        details_json,
+                        chain_hash,
+                        sig,
+                        created_at,
+                        prev_hash,
+                    ))
 
-                self.store.db.commit()
+                    self.store.db.execute("""
+                        INSERT INTO worker_audit_anchors (
+                            last_sequence_number, last_chain_hash, anchor_signature, anchored_at
+                        ) VALUES (?, ?, ?, ?)
+                    """, (
+                        seq_num,
+                        chain_hash,
+                        anchor_sig,
+                        created_at,
+                    ))
 
-                # Decoupled external anchor file persistence
-                if self.anchor_file_path:
-                    try:
-                        anchor_payload_line = f"ANCHOR_V1|{seq_num}|{chain_hash}|{created_at}|{anchor_sig}\n"
-                        tmp_anchor = self.anchor_file_path.with_suffix(".tmp")
-                        with open(tmp_anchor, "w", encoding="utf-8") as f:
-                            f.write(anchor_payload_line)
-                            f.flush()
-                            os.fsync(f.fileno())
-                        if os.name != "nt":
-                            try:
-                                os.chmod(tmp_anchor, 0o600)
-                            except Exception:
-                                pass
-                        tmp_anchor.replace(self.anchor_file_path)
-                        if os.name != "nt":
-                            try:
-                                os.chmod(self.anchor_file_path, 0o600)
-                            except Exception:
-                                pass
-                    except Exception as ext_anc_err:
-                        raise WorkerAuditPersistenceError(f"Falha ao persistir ancora externa desacoplada: {ext_anc_err}") from ext_anc_err
+                    # Strict serialization: commit SQLite first so that any failure leaves the external
+                    # anchor lagging (recoverable via reconcile_anchor), never ahead or inconsistent.
+                    self.store.db.commit()
+
+                    # Decoupled external anchor file persistence with collision-proof unique tempfile and anti-regression check
+                    if self.anchor_file_path:
+                        self._persist_external_anchor(seq_num, chain_hash, created_at, anchor_sig)
 
             return WorkerAuditRecord(
                 event_id=event_id,
@@ -406,6 +471,11 @@ class WorkerAuditLogger:
                 prev_hash=prev_hash,
             )
         except Exception as e:
+            try:
+                if hasattr(self.store, "db") and self.store.db and self.store.db.in_transaction:
+                    self.store.db.rollback()
+            except Exception:
+                pass
             # Fail-closed policy: audit persistence failures must abort privileged execution
             raise WorkerAuditPersistenceError(f"Falha ao persistir evento de auditoria '{evt_type_str}': {e}") from e
 
@@ -622,43 +692,94 @@ class WorkerAuditLogger:
             ))
         return records
 
+    def _persist_external_anchor(
+        self,
+        seq_num: int,
+        chain_hash: str,
+        created_at: str,
+        anchor_sig: str,
+        force: bool = False,
+    ) -> bool:
+        """Persists the external anchor file with collision-proof unique tempfile and anti-regression guard.
+
+        Returns True if the anchor was written, False if blocked by anti-regression guard (seq_num < cur_file_seq).
+        """
+        if not self.anchor_file_path:
+            return False
+
+        cur_file_seq = 0
+        if self.anchor_file_path.exists():
+            try:
+                existing_content = self.anchor_file_path.read_text(encoding="utf-8").strip()
+                parts = existing_content.split("|")
+                if len(parts) >= 2 and parts[1].isdigit():
+                    cur_file_seq = int(parts[1])
+            except Exception:
+                pass
+
+        if not force and seq_num < cur_file_seq:
+            return False
+
+        tmp_anchor = self.anchor_file_path.with_name(f"{self.anchor_file_path.name}.tmp.{os.getpid()}.{uuid.uuid4().hex}")
+        try:
+            anchor_payload_line = f"ANCHOR_V1|{seq_num}|{chain_hash}|{created_at}|{anchor_sig}\n"
+            with open(tmp_anchor, "w", encoding="utf-8") as f:
+                f.write(anchor_payload_line)
+                f.flush()
+                os.fsync(f.fileno())
+            if os.name != "nt":
+                try:
+                    os.chmod(tmp_anchor, 0o600)
+                except Exception:
+                    pass
+
+            # Atomic replace with retry for Windows file lock contention
+            replaced = False
+            for rep_attempt in range(5):
+                try:
+                    os.replace(tmp_anchor, self.anchor_file_path)
+                    replaced = True
+                    break
+                except (OSError, PermissionError):
+                    time.sleep(0.01 * (1.5 ** rep_attempt))
+            if not replaced:
+                os.replace(tmp_anchor, self.anchor_file_path)
+
+            if os.name != "nt":
+                try:
+                    os.chmod(self.anchor_file_path, 0o600)
+                except Exception:
+                    pass
+            return True
+        except Exception as ext_anc_err:
+            try:
+                if tmp_anchor.exists():
+                    tmp_anchor.unlink()
+            except Exception:
+                pass
+            raise WorkerAuditPersistenceError(f"Falha ao persistir ancora externa desacoplada: {ext_anc_err}") from ext_anc_err
+
     def reconcile_anchor(self) -> bool:
         """Reconcile external anchor file from verified SQLite anchor record if desynchronized after unexpected shutdown."""
         if not self.anchor_file_path or not hasattr(self.store, "db") or not self.store.db:
             return False
         with self._lock:
-            try:
-                row = self.store.db.execute("""
-                    SELECT last_sequence_number, last_chain_hash, anchor_signature, anchored_at
-                    FROM worker_audit_anchors
-                    ORDER BY id DESC LIMIT 1
-                """).fetchone()
-                if not row:
-                    return False
-                seq_num, chain_hash, sig, created_at = row
-                # Verify that SQLite anchor record is authentic before rewriting external anchor
-                expected_payload = f"ANCHOR:{seq_num}:{chain_hash}:{created_at}"
-                expected_sig = hmac.new(self.supervisor_secret, expected_payload.encode("ascii"), hashlib.sha256).hexdigest()
-                if not hmac.compare_digest(sig, expected_sig):
-                    return False
+            with self._acquire_audit_lock():
+                try:
+                    row = self.store.db.execute("""
+                        SELECT last_sequence_number, last_chain_hash, anchor_signature, anchored_at
+                        FROM worker_audit_anchors
+                        ORDER BY id DESC LIMIT 1
+                    """).fetchone()
+                    if not row:
+                        return False
+                    seq_num, chain_hash, sig, created_at = row
+                    # Verify that SQLite anchor record is authentic before rewriting external anchor
+                    expected_payload = f"ANCHOR:{seq_num}:{chain_hash}:{created_at}"
+                    expected_sig = hmac.new(self.supervisor_secret, expected_payload.encode("ascii"), hashlib.sha256).hexdigest()
+                    if not hmac.compare_digest(sig, expected_sig):
+                        return False
 
-                anchor_payload_line = f"ANCHOR_V1|{seq_num}|{chain_hash}|{created_at}|{sig}\n"
-                tmp_anchor = self.anchor_file_path.with_suffix(".tmp")
-                with open(tmp_anchor, "w", encoding="utf-8") as f:
-                    f.write(anchor_payload_line)
-                    f.flush()
-                    os.fsync(f.fileno())
-                if os.name != "nt":
-                    try:
-                        os.chmod(tmp_anchor, 0o600)
-                    except Exception:
-                        pass
-                tmp_anchor.replace(self.anchor_file_path)
-                if os.name != "nt":
-                    try:
-                        os.chmod(self.anchor_file_path, 0o600)
-                    except Exception:
-                        pass
-                return True
-            except Exception:
-                return False
+                    return self._persist_external_anchor(seq_num, chain_hash, created_at, sig, force=True)
+                except Exception:
+                    return False
