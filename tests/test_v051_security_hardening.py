@@ -557,11 +557,18 @@ class TestV051SecurityHardening(unittest.TestCase):
                     proc.wait()
         elif sys.platform.startswith("linux"):
             # 1. Spawn a live subprocess on Linux that ignores SIGTERM to force SIGKILL escalation
-            proc = subprocess.Popen([
-                sys.executable,
-                "-c",
-                "import signal, time; signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(30)"
-            ])
+            proc = subprocess.Popen(
+                [
+                    sys.executable,
+                    "-c",
+                    "import signal, sys, time; signal.signal(signal.SIGTERM, signal.SIG_IGN); sys.stdout.write('READY\\n'); sys.stdout.flush(); time.sleep(30)"
+                ],
+                stdout=subprocess.PIPE,
+                start_new_session=True,
+            )
+            # Ensure process has started and actively installed SIG_IGN before proceeding
+            ready_line = proc.stdout.readline()
+            self.assertEqual(ready_line.strip(), b"READY")
             try:
                 cur_ns = PosixProcessController.get_creation_time(proc.pid)
                 self.assertIsNotNone(cur_ns)
