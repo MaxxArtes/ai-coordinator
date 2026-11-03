@@ -33,6 +33,7 @@ from ai_coordinator.tool_broker import (
     ToolPolicyMode,
     ToolAccessDeniedError,
     CallerIdentityMismatchError,
+    _PinnedDirectory,
 )
 from ai_coordinator.fs_sandbox import (
     FileSandboxSecurityError,
@@ -54,6 +55,7 @@ from ai_coordinator.process import (
     WindowsProcessController,
     PosixProcessController,
     ProcessSupervisor,
+    match_process_creation_time,
 )
 
 
@@ -382,6 +384,111 @@ class TestV051SecurityHardening(unittest.TestCase):
         # Active run must NOT have been interrupted or marked unknown
         row = self.store.db.execute("SELECT status FROM runs WHERE id=?", (run_id,)).fetchone()
         self.assertEqual(row[0], RunState.RUNNING, "Store.reconcile interrupted active run with legacy create_time!")
+
+    def test_09_pid_recycling_exact_matching_zero_tolerance(self):
+        """Zero tolerance in process identity matching: any non-zero diff is rejected to prevent PID recycling adoption."""
+        my_pid = os.getpid()
+
+        if os.name == "nt":
+            cur_time_ns = WindowsProcessController.get_creation_time(my_pid)
+            self.assertIsNotNone(cur_time_ns)
+
+            # Exact match passes
+            self.assertTrue(safe_process_alive(my_pid, expected_create_time_ns=cur_time_ns))
+
+            # 1 nanosecond difference MUST be rejected (PID recycling simulation)
+            self.assertFalse(safe_process_alive(my_pid, expected_create_time_ns=cur_time_ns + 1))
+            self.assertFalse(safe_process_alive(my_pid, expected_create_time_ns=cur_time_ns - 1))
+            self.assertFalse(safe_process_alive(my_pid, expected_create_time_ns=cur_time_ns + 100))
+
+            # Legacy Windows FILETIME exact conversion passes
+            legacy_filetime = (cur_time_ns // 100) + 116444736000000000
+            self.assertTrue(safe_process_alive(my_pid, expected_create_time_ns=legacy_filetime))
+
+            # Legacy Windows FILETIME with 1 interval difference MUST be rejected
+            self.assertFalse(safe_process_alive(my_pid, expected_create_time_ns=legacy_filetime + 1))
+            self.assertFalse(safe_process_alive(my_pid, expected_create_time_ns=legacy_filetime - 1))
+
+            # Cross-platform fail-closed: Linux jiffies on Windows MUST be rejected
+            self.assertFalse(match_process_creation_time(cur_time_ns, 50_000, platform="nt"))
+
+        # POSIX tests via match_process_creation_time
+        # 500s at 100Hz = 50,000 jiffies = 500_000_000_000 ns
+        self.assertTrue(match_process_creation_time(500_000_000_000, 50_000, platform="posix"))
+        # 1 jiffy difference MUST be rejected
+        self.assertFalse(match_process_creation_time(500_000_000_000, 50_001, platform="posix"))
+        self.assertFalse(match_process_creation_time(500_000_000_000, 49_999, platform="posix"))
+        # Cross-platform fail-closed: Windows FILETIME on POSIX MUST be rejected
+        self.assertFalse(match_process_creation_time(500_000_000_000, 133500000000000000, platform="posix"))
+
+    def test_10_external_anchor_cross_process_lock_and_anti_regression(self):
+        """Cross-process audit lock and anti-regression guarantee on external anchor."""
+        audit = self.store.worker_audit
+
+        # Record events 1 and 2
+        rec1 = audit.record_event(
+            event_type=WorkerAuditEventType.SPAWN,
+            task_id=self.task_id,
+            run_id=self.run_id,
+            worker_pid=os.getpid(),
+        )
+        rec2 = audit.record_event(
+            event_type=WorkerAuditEventType.TOOL_REQUESTED,
+            task_id=self.task_id,
+            run_id=self.run_id,
+            worker_pid=os.getpid(),
+        )
+
+        self.assertEqual(rec2.sequence_number, 2)
+        self.assertTrue(audit.anchor_file_path.exists())
+        content = audit.anchor_file_path.read_text(encoding="utf-8")
+        self.assertIn("|2|", content)
+
+        # Test cross-process lock exclusivity: when held, lock file exists and is active
+        with audit._acquire_audit_lock():
+            self.assertTrue(audit.lock_file_path.exists())
+
+        # Test anti-regression: verify current file sequence is 2
+        cur_file_seq = int(audit.anchor_file_path.read_text(encoding="utf-8").split("|")[1])
+        self.assertEqual(cur_file_seq, 2)
+
+        # Reconcile anchor also works with cross-process lock
+        reconciled = audit.reconcile_anchor()
+        self.assertTrue(reconciled)
+        valid, errs = audit.verify_integrity()
+        self.assertTrue(valid, f"Verification failed after reconciliation: {errs}")
+
+    def test_11_mailbox_directory_swap_pinned_handle_blocks_tampering(self):
+        """Pinned directory handles block deletion, renaming, and junction substitution during mailbox processing."""
+        broker_dir = self.sandbox_dir / ".broker"
+        res_dir = broker_dir / "responses"
+        req_dir = broker_dir / "requests"
+        res_dir.mkdir(parents=True, exist_ok=True)
+        req_dir.mkdir(parents=True, exist_ok=True)
+
+        # Test _PinnedDirectory
+        pinned = _PinnedDirectory(res_dir, self.sandbox_dir, raise_on_fatal=True)
+        pinned.pin()
+
+        try:
+            if os.name == "nt":
+                # On Windows, holding the handle without FILE_SHARE_DELETE MUST block rmdir and rename
+                with self.assertRaises(PermissionError):
+                    os.rmdir(res_dir)
+
+                with self.assertRaises(PermissionError):
+                    os.rename(res_dir, res_dir.with_name("responses_moved"))
+        finally:
+            pinned.close()
+
+        # Recreate directory for junction test
+        fake_res_dir = self.sandbox_dir / ".broker" / "responses_junction"
+        created = _create_symlink_or_junction(fake_res_dir, self.outside_dir)
+        if created:
+            pinned_fake = _PinnedDirectory(fake_res_dir, self.sandbox_dir, raise_on_fatal=True)
+            with self.assertRaises(ReparseEscapeError):
+                pinned_fake.pin()
+            pinned_fake.close()
 
 
 if __name__ == "__main__":

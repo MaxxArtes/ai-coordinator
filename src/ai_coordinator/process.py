@@ -259,60 +259,61 @@ class TerminationResult:
 def match_process_creation_time(
     actual_time_ns: int,
     expected_time: Optional[int],
-    platform: str = "nt",
+    platform: str = "nt" if os.name == "nt" else "posix",
     raw_source_val: Optional[int] = None,
-    tolerance_ns: int = 100_000_000,
 ) -> bool:
-    """Safely match process creation time across v0.4.0 legacy and v0.5.x formats with fail-closed semantics.
+    """Safely match process creation time across v0.4.0 legacy and v0.5.x formats with exact fail-closed semantics.
 
-    Supports:
-    1. Exact match (actual_time_ns == expected_time).
+    Strict zero-tolerance matching (diff == 0) ensures that rapid PID recycling
+    cannot trick the supervisor into adopting or terminating an unrelated process.
+
+    Supported formats:
+    1. Exact nanosecond match (actual_time_ns == expected_time).
     2. Raw kernel source value exact match (raw Windows FILETIME or Linux jiffies).
-    3. Windows v0.4.0 legacy FILETIME (100ns intervals since 1601-01-01, ~1.16e17 to 2.0e17).
-    4. Linux v0.4.0 legacy clock ticks / jiffies (< 10^11).
-    5. Standard Unix nanoseconds with tolerance (v0.5.x, ~9.0e17 to 5.0e18).
-    6. Unix seconds representation (1.0e9 to 3.0e9).
-    7. Fail-closed for all unknown, negative, or ambiguous values.
+    3. Windows v0.4.0 legacy FILETIME (100ns intervals since 1601-01-01, ~1.16e17 to 2.0e17):
+       Matched strictly on Windows: raw_source_val == expected_time OR
+       (expected_time - 116444736000000000) * 100 == actual_time_ns.
+    4. Linux v0.4.0 legacy clock ticks / jiffies (< 10^11):
+       Matched strictly on POSIX/Linux: raw_source_val == expected_time OR
+       expected_time * (1_000_000_000 // clk_tck) == actual_time_ns.
+    5. All other values, cross-platform mismatches, negative values, and non-exact differences
+       are rejected fail-closed.
     """
     if expected_time is None:
         return True
     if expected_time <= 0 or actual_time_ns <= 0:
         return False
 
-    # 1. Exact match
+    # 1. Exact nanosecond match (v0.5.x standard)
     if actual_time_ns == expected_time:
         return True
 
-    # 2. Raw source value exact match
+    # 2. Raw kernel source value exact match
     if raw_source_val is not None and raw_source_val == expected_time:
         return True
 
     # 3. Windows legacy FILETIME (100ns intervals since 1601-01-01)
+    # Valid only if platform is Windows ("nt")
     if 116444736000000000 <= expected_time <= 200000000000000000:
+        if platform != "nt":
+            return False
         converted_unix_ns = (expected_time - 116444736000000000) * 100
-        return abs(actual_time_ns - converted_unix_ns) <= tolerance_ns
+        return actual_time_ns == converted_unix_ns
 
     # 4. Linux legacy jiffies / clock ticks (< 10^11)
+    # Valid only if platform is POSIX / Linux
     if expected_time < 100_000_000_000:
+        if platform == "nt":
+            return False
         clk_tck = 100
-        if platform != "nt":
-            try:
-                clk_tck = os.sysconf("SC_CLK_TCK")
-            except Exception:
-                pass
+        try:
+            clk_tck = os.sysconf("SC_CLK_TCK")
+        except Exception:
+            pass
         expected_boot_ns = expected_time * (1_000_000_000 // clk_tck)
-        if abs(actual_time_ns - expected_boot_ns) <= tolerance_ns:
-            return True
+        return actual_time_ns == expected_boot_ns
 
-    # 5. Standard Unix nanoseconds with tolerance (v0.5.0)
-    if 900_000_000_000_000_000 <= expected_time <= 5_000_000_000_000_000_000:
-        return abs(actual_time_ns - expected_time) <= tolerance_ns
-
-    # 6. Unix seconds (1.0e9 to 3.0e9)
-    if 1_000_000_000 <= expected_time <= 3_000_000_000:
-        return abs(actual_time_ns - (expected_time * 1_000_000_000)) <= tolerance_ns
-
-    # Fail-closed for all unknown, out-of-range, or ambiguous values
+    # Fail-closed for all unknown, out-of-range, ambiguous, or mismatched values
     return False
 
 
