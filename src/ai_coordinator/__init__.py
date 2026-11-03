@@ -188,6 +188,18 @@ from .human_workspace import (
     HumanWorkspaceConflict,
     HumanWorkspaceNotFoundError,
 )
+from .telemetry import (
+    MetricProvenance,
+    TokenMetrics,
+    LatencyMetrics,
+    CostMetrics,
+    CognitiveTelemetryRecord,
+    TelemetryCollector,
+    PricingRegistry,
+    TelemetryAggregate,
+    compute_telemetry_aggregate,
+    safe_record_telemetry,
+)
 
 __all__ = [
     "HumanWorkspace",
@@ -345,5 +357,15 @@ __all__ = [
     "PathTraversalError",
     "ReparseEscapeError",
     "validate_contained_path",
+    "MetricProvenance",
+    "TokenMetrics",
+    "LatencyMetrics",
+    "CostMetrics",
+    "CognitiveTelemetryRecord",
+    "TelemetryCollector",
+    "PricingRegistry",
+    "TelemetryAggregate",
+    "compute_telemetry_aggregate",
+    "safe_record_telemetry",
 ]
 __version__ = "0.5.1"

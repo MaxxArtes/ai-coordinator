@@ -104,6 +104,15 @@ from .reconstruction import (
     calculate_upstream_prerequisites,
     splice_alternative_route,
 )
+from .telemetry import (
+    MetricProvenance,
+    TokenMetrics,
+    LatencyMetrics,
+    CostMetrics,
+    CognitiveTelemetryRecord,
+    TelemetryAggregate,
+    compute_telemetry_aggregate,
+)
 
 now = lambda: dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
 
@@ -867,6 +876,44 @@ class Store:
           CREATE INDEX IF NOT EXISTS idx_experience_visibility ON experience_records(visibility);
           CREATE INDEX IF NOT EXISTS idx_insights_project ON insights(project_id, status);
           CREATE INDEX IF NOT EXISTS idx_insights_visibility ON insights(visibility);
+
+          CREATE TABLE IF NOT EXISTS cognitive_telemetry (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            task_id TEXT NOT NULL,
+            run_id TEXT,
+            worker_identity TEXT,
+            worker_pid INTEGER,
+            plan_revision INTEGER,
+            provider TEXT NOT NULL,
+            model_name TEXT NOT NULL,
+            input_tokens INTEGER DEFAULT 0,
+            output_tokens INTEGER DEFAULT 0,
+            cache_read_tokens INTEGER DEFAULT 0,
+            cache_creation_tokens INTEGER DEFAULT 0,
+            total_tokens INTEGER DEFAULT 0,
+            tokens_provenance TEXT NOT NULL,
+            ttft_ms REAL,
+            generation_duration_ms REAL,
+            tool_duration_ms REAL,
+            supervisor_overhead_ms REAL,
+            total_duration_ms REAL NOT NULL,
+            latency_provenance TEXT NOT NULL,
+            total_cost_usd REAL,
+            cost_provenance TEXT NOT NULL,
+            tool_calls_count INTEGER DEFAULT 0,
+            retries_count INTEGER DEFAULT 0,
+            stream_chunks_count INTEGER DEFAULT 0,
+            success INTEGER NOT NULL DEFAULT 1,
+            error_category TEXT,
+            error_message TEXT,
+            metadata TEXT DEFAULT '{}',
+            created_at TEXT NOT NULL
+          );
+
+          CREATE INDEX IF NOT EXISTS idx_cognitive_telemetry_task ON cognitive_telemetry(task_id);
+          CREATE INDEX IF NOT EXISTS idx_cognitive_telemetry_run ON cognitive_telemetry(run_id);
+          CREATE INDEX IF NOT EXISTS idx_cognitive_telemetry_model ON cognitive_telemetry(model_name);
+          CREATE INDEX IF NOT EXISTS idx_cognitive_telemetry_created ON cognitive_telemetry(created_at);
         """)
 
         # Dynamic migrations for any existing columns
@@ -919,26 +966,27 @@ class Store:
     @contextlib.contextmanager
     def transaction(self):
         """Context manager executing BEGIN IMMEDIATE for atomic, isolated writes (re-entrant)."""
-        is_outer = not self.db.in_transaction
-        if not is_outer:
-            yield
-        else:
-            self._post_commit_scopes = [[]]
-            self.db.execute("BEGIN IMMEDIATE")
-            try:
+        with self._lock:
+            is_outer = not self.db.in_transaction
+            if not is_outer:
                 yield
-                self.db.commit()
-            except BaseException:
-                self.db.rollback()
-                self._post_commit_scopes.clear()
-                raise
             else:
-                actions = []
-                for s in self._post_commit_scopes:
-                    actions.extend(s)
-                self._post_commit_scopes.clear()
-                for act in actions:
-                    act()
+                self._post_commit_scopes = [[]]
+                self.db.execute("BEGIN IMMEDIATE")
+                try:
+                    yield
+                    self.db.commit()
+                except BaseException:
+                    self.db.rollback()
+                    self._post_commit_scopes.clear()
+                    raise
+                else:
+                    actions = []
+                    for s in self._post_commit_scopes:
+                        actions.extend(s)
+                    self._post_commit_scopes.clear()
+                    for act in actions:
+                        act()
 
     def _record_event(
         self,
@@ -2787,4 +2835,122 @@ class Store:
             diff_summary=diff_summary,
             metadata=metadata,
         )
+
+    def record_cognitive_telemetry(
+        self, record: Union[CognitiveTelemetryRecord, Dict[str, Any]]
+    ) -> CognitiveTelemetryRecord:
+        """Atomically persist an observational cognitive telemetry record."""
+        if isinstance(record, dict):
+            rec = CognitiveTelemetryRecord.from_dict(record)
+        elif isinstance(record, CognitiveTelemetryRecord):
+            rec = record
+        else:
+            raise TypeError(f"Esperado CognitiveTelemetryRecord ou dict, recebido {type(record)}")
+
+        meta_json = json.dumps(rec.metadata, ensure_ascii=False) if rec.metadata else "{}"
+
+        with self.transaction():
+            cur = self.db.execute(
+                """INSERT INTO cognitive_telemetry (
+                    task_id, run_id, worker_identity, worker_pid, plan_revision,
+                    provider, model_name,
+                    input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens, total_tokens,
+                    tokens_provenance,
+                    ttft_ms, generation_duration_ms, tool_duration_ms, supervisor_overhead_ms,
+                    total_duration_ms, latency_provenance,
+                    total_cost_usd, cost_provenance,
+                    tool_calls_count, retries_count, stream_chunks_count,
+                    success, error_category, error_message, metadata, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    rec.task_id,
+                    rec.run_id,
+                    rec.worker_identity,
+                    rec.worker_pid,
+                    rec.plan_revision,
+                    rec.provider,
+                    rec.model_name,
+                    rec.tokens.input_tokens,
+                    rec.tokens.output_tokens,
+                    rec.tokens.cache_read_tokens,
+                    rec.tokens.cache_creation_tokens,
+                    rec.tokens.total_tokens,
+                    rec.tokens.provenance,
+                    rec.latencies.ttft_ms,
+                    rec.latencies.generation_duration_ms,
+                    rec.latencies.tool_duration_ms,
+                    rec.latencies.supervisor_overhead_ms,
+                    rec.latencies.total_duration_ms,
+                    rec.latencies.provenance,
+                    rec.cost.total_cost_usd,
+                    rec.cost.provenance,
+                    rec.tool_calls_count,
+                    rec.retries_count,
+                    rec.stream_chunks_count,
+                    1 if rec.success else 0,
+                    rec.error_category,
+                    rec.error_message,
+                    meta_json,
+                    rec.created_at,
+                ),
+            )
+            rec.id = cur.lastrowid
+        return rec
+
+    def query_cognitive_telemetry(
+        self,
+        task_id: Optional[str] = None,
+        run_id: Optional[str] = None,
+        model_name: Optional[str] = None,
+        provider: Optional[str] = None,
+        success: Optional[bool] = None,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> List[CognitiveTelemetryRecord]:
+        """Query stored cognitive telemetry records with filtering and pagination."""
+        clauses = []
+        params: List[Any] = []
+
+        if task_id:
+            clauses.append("task_id = ?")
+            params.append(task_id)
+        if run_id:
+            clauses.append("run_id = ?")
+            params.append(run_id)
+        if model_name:
+            clauses.append("model_name = ?")
+            params.append(model_name)
+        if provider:
+            clauses.append("provider = ?")
+            params.append(provider.strip().lower())
+        if success is not None:
+            clauses.append("success = ?")
+            params.append(1 if success else 0)
+
+        where_stmt = f" WHERE {' AND '.join(clauses)}" if clauses else ""
+        query = f"SELECT * FROM cognitive_telemetry{where_stmt} ORDER BY id DESC LIMIT ? OFFSET ?"
+        params.extend([max(1, int(limit)), max(0, int(offset))])
+
+        with self._lock:
+            rows = self.db.execute(query, params).fetchall()
+        return [CognitiveTelemetryRecord.from_db_row(r) for r in rows]
+
+    def aggregate_cognitive_telemetry(
+        self,
+        task_id: Optional[str] = None,
+        run_id: Optional[str] = None,
+        model_name: Optional[str] = None,
+        provider: Optional[str] = None,
+    ) -> TelemetryAggregate:
+        """Compute statistical aggregates of cognitive telemetry matching the given filters."""
+        records = self.query_cognitive_telemetry(
+            task_id=task_id,
+            run_id=run_id,
+            model_name=model_name,
+            provider=provider,
+            limit=10000,
+            offset=0,
+        )
+        return compute_telemetry_aggregate(records)
+
 
