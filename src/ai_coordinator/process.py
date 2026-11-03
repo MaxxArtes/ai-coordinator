@@ -805,7 +805,11 @@ class PosixProcessController:
                     wpid, status = os.waitpid(pid, os.WNOHANG)
                     if wpid == pid:
                         exit_code = os.waitstatus_to_exitcode(status) if hasattr(os, "waitstatus_to_exitcode") else (status >> 8)
-                        return TerminationResult(True, exit_code, "terminated", time.monotonic() - start, "Terminated gracefully with SIGTERM")
+                        detail = "Terminated gracefully with SIGTERM"
+                        if hasattr(os, "WIFSIGNALED") and os.WIFSIGNALED(status):
+                            if hasattr(os, "WTERMSIG") and os.WTERMSIG(status) == signal.SIGKILL:
+                                detail = "Terminated forcefully with SIGKILL"
+                        return TerminationResult(True, exit_code, "terminated", time.monotonic() - start, detail)
                 except (ChildProcessError, OSError):
                     pass
 

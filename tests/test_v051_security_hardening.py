@@ -564,7 +564,6 @@ class TestV051SecurityHardening(unittest.TestCase):
                     "import signal, sys, time; signal.signal(signal.SIGTERM, signal.SIG_IGN); sys.stdout.write('READY\\n'); sys.stdout.flush(); time.sleep(30)"
                 ],
                 stdout=subprocess.PIPE,
-                start_new_session=True,
             )
             # Ensure process has started and actively installed SIG_IGN before proceeding
             ready_line = proc.stdout.readline()
@@ -618,7 +617,7 @@ class TestV051SecurityHardening(unittest.TestCase):
                 self.assertEqual(row[0], RunState.RUNNING)
 
                 # Timeout of 0.3s will expire SIGTERM wait, triggering raw_jiffies re-verification and SIGKILL escalation
-                res = safe_terminate_tree(proc, expected_create_time_ns=legacy_time, timeout_seconds=0.3)
+                res = PosixProcessController.terminate_process(proc.pid, expected_create_time_ns=legacy_time, timeout_seconds=0.3)
                 self.assertTrue(res.success)
                 self.assertEqual(res.reason, "terminated")
                 self.assertIn("SIGKILL", res.detail)
