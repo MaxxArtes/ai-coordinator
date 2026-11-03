@@ -24,6 +24,7 @@ import os
 from pathlib import Path
 import sqlite3
 import stat
+import subprocess
 import threading
 import time
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple, Union
@@ -53,22 +54,37 @@ class _PinnedDirectory:
 
     On Windows: Opens and holds an OS handle with FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT
                 without FILE_SHARE_DELETE, preventing deletion, renaming, or junction swap by other processes.
-    On POSIX: Opens and holds a directory file descriptor with O_RDONLY | O_DIRECTORY | O_NOFOLLOW,
-              and provides dir_fd for atomic relative file operations.
+    On POSIX: Opens and holds a directory file descriptor with O_RDONLY | O_DIRECTORY | O_NOFOLLOW.
+              When parent_fd and component_name are provided, descends strictly relative to parent_fd
+              using a single component name without slashes, ensuring O_NOFOLLOW blocks intermediate symlinks.
     """
-    def __init__(self, dir_path: Union[str, Path], sbox: Union[str, Path], raise_on_fatal: bool = False):
+    def __init__(
+        self,
+        dir_path: Union[str, Path],
+        sbox: Union[str, Path],
+        parent_fd: Optional[int] = None,
+        component_name: Optional[str] = None,
+        raise_on_fatal: bool = False,
+    ):
         self.raw_path = Path(dir_path)
         self.sbox = Path(sbox).resolve()
+        self.parent_fd = parent_fd
+        self.component_name = component_name
         self.raise_on_fatal = raise_on_fatal
         self.handle: Optional[int] = None
         self.dir_fd: Optional[int] = None
 
+    def is_pinned(self) -> bool:
+        if os.name == "nt":
+            return self.handle is not None and self.handle != INVALID_HANDLE_VALUE
+        return self.dir_fd is not None
+
     def pin(self) -> None:
-        if not self.raw_path.exists() and not self.raw_path.is_symlink():
+        if self.parent_fd is None and not self.raw_path.exists() and not self.raw_path.is_symlink():
             return
 
-        # 1. Direct symlink / reparse check on unresolved raw path
-        if self.raw_path.is_symlink() or is_reparse_point_or_symlink(self.raw_path):
+        # 1. Direct symlink / reparse check on unresolved raw path (when no parent_fd)
+        if self.parent_fd is None and (self.raw_path.is_symlink() or is_reparse_point_or_symlink(self.raw_path)):
             if self.raise_on_fatal:
                 raise ReparseEscapeError(f"Diretorio protegido e um link simbolico ou reparse point: {self.raw_path}")
             raise FileSandboxSecurityError(f"Link simbolico detectado no diretorio: {self.raw_path}")
@@ -123,11 +139,18 @@ class _PinnedDirectory:
             if hasattr(os, "O_NOFOLLOW"):
                 flags |= os.O_NOFOLLOW
             try:
-                self.dir_fd = os.open(str(self.raw_path), flags)
+                if self.parent_fd is not None and self.component_name:
+                    self.dir_fd = os.open(self.component_name, flags, dir_fd=self.parent_fd)
+                else:
+                    self.dir_fd = os.open(str(self.raw_path), flags)
             except OSError as e:
-                if e.errno == errno.ELOOP or self.raise_on_fatal:
-                    raise ReparseEscapeError(f"Falha ao abrir descritor seguro do diretorio '{self.raw_path}': {e}") from e
-                raise FileSandboxSecurityError(f"Erro ao abrir descritor de diretorio: {e}") from e
+                if e.errno == errno.ENOENT:
+                    self.dir_fd = None
+                    return
+                target_name = self.component_name or str(self.raw_path)
+                if e.errno in (errno.ELOOP, errno.EACCES) or self.raise_on_fatal:
+                    raise ReparseEscapeError(f"Falha ao abrir descritor seguro do diretorio '{target_name}': {e}") from e
+                raise FileSandboxSecurityError(f"Erro ao abrir descritor de diretorio '{target_name}': {e}") from e
 
             st = os.fstat(self.dir_fd)
             if not stat.S_ISDIR(st.st_mode):
@@ -1096,82 +1119,168 @@ class ToolBroker:
         res_dir = broker_dir / "responses"
 
         # Anti-symlink/reparse defense on base hierarchy
-        if broker_dir.exists():
-            if is_reparse_point_or_symlink(broker_dir):
-                if raise_on_fatal:
-                    raise ReparseEscapeError(f"Diretorio base da mailbox (.broker) e um link simbolico ou reparse point: {broker_dir}")
-                return [{
-                    "status": "error",
-                    "error": "SymlinkSecurityViolation",
-                    "message": f"Diretorio base da mailbox (.broker) e um link simbolico ou reparse point: {broker_dir}",
-                }]
-            validate_contained_path(broker_dir, sbox)
-
-        if not req_dir.exists():
-            return []
-
-        if is_reparse_point_or_symlink(req_dir):
-            if raise_on_fatal:
-                raise ReparseEscapeError(f"Diretorio de requisicoes (.broker/requests) e um link simbolico ou reparse point: {req_dir}")
-            return [{
-                "status": "error",
-                "error": "SymlinkSecurityViolation",
-                "message": f"Diretorio de requisicoes (.broker/requests) e um link simbolico ou reparse point: {req_dir}",
-            }]
-        validate_contained_path(req_dir, sbox)
-
-        if res_dir.exists():
-            if is_reparse_point_or_symlink(res_dir):
-                if raise_on_fatal:
-                    raise ReparseEscapeError(f"Diretorio de respostas (.broker/responses) e um link simbolico ou reparse point: {res_dir}")
-                return [{
-                    "status": "error",
-                    "error": "SymlinkSecurityViolation",
-                    "message": f"Diretorio de respostas (.broker/responses) e um link simbolico ou reparse point: {res_dir}",
-                }]
-            validate_contained_path(res_dir, sbox)
-        else:
-            res_dir.mkdir(parents=True, exist_ok=True)
-            if is_reparse_point_or_symlink(res_dir):
-                raise ReparseEscapeError(f"Diretorio de respostas recem-criado e um link simbolico ou reparse point: {res_dir}")
-            validate_contained_path(res_dir, sbox)
-
-        # Pin broker hierarchy against concurrent directory swapping (TOCTOU directory replacement)
-        pinned_broker = _PinnedDirectory(broker_dir, sbox, raise_on_fatal=raise_on_fatal)
-        pinned_req = _PinnedDirectory(req_dir, sbox, raise_on_fatal=raise_on_fatal)
-        pinned_res = _PinnedDirectory(res_dir, sbox, raise_on_fatal=raise_on_fatal)
+        pinned_sbox = _PinnedDirectory(sbox, sbox, raise_on_fatal=raise_on_fatal)
+        pinned_broker: Optional[_PinnedDirectory] = None
+        pinned_req: Optional[_PinnedDirectory] = None
+        pinned_res: Optional[_PinnedDirectory] = None
 
         try:
-            pinned_broker.pin()
-            pinned_req.pin()
-            pinned_res.pin()
+            pinned_sbox.pin()
+
+            if os.name == "nt":
+                if not broker_dir.exists():
+                    return []
+                if is_reparse_point_or_symlink(broker_dir):
+                    if raise_on_fatal:
+                        raise ReparseEscapeError(f"Diretorio base da mailbox (.broker) e um link simbolico ou reparse point: {broker_dir}")
+                    return [{
+                        "status": "error",
+                        "error": "SymlinkSecurityViolation",
+                        "message": f"Diretorio base da mailbox (.broker) e um link simbolico ou reparse point: {broker_dir}",
+                    }]
+                validate_contained_path(broker_dir, sbox)
+                pinned_broker = _PinnedDirectory(broker_dir, sbox, raise_on_fatal=raise_on_fatal)
+                pinned_broker.pin()
+
+                if not req_dir.exists():
+                    return []
+                if is_reparse_point_or_symlink(req_dir):
+                    if raise_on_fatal:
+                        raise ReparseEscapeError(f"Diretorio de requisicoes (.broker/requests) e um link simbolico ou reparse point: {req_dir}")
+                    return [{
+                        "status": "error",
+                        "error": "SymlinkSecurityViolation",
+                        "message": f"Diretorio de requisicoes (.broker/requests) e um link simbolico ou reparse point: {req_dir}",
+                    }]
+                validate_contained_path(req_dir, sbox)
+                pinned_req = _PinnedDirectory(req_dir, sbox, raise_on_fatal=raise_on_fatal)
+                pinned_req.pin()
+
+                if res_dir.exists():
+                    if is_reparse_point_or_symlink(res_dir):
+                        if raise_on_fatal:
+                            raise ReparseEscapeError(f"Diretorio de respostas (.broker/responses) e um link simbolico ou reparse point: {res_dir}")
+                        return [{
+                            "status": "error",
+                            "error": "SymlinkSecurityViolation",
+                            "message": f"Diretorio de respostas (.broker/responses) e um link simbolico ou reparse point: {res_dir}",
+                        }]
+                    validate_contained_path(res_dir, sbox)
+                else:
+                    res_dir.mkdir(parents=True, exist_ok=True)
+                    if is_reparse_point_or_symlink(res_dir):
+                        raise ReparseEscapeError(f"Diretorio de respostas recem-criado e um link simbolico ou reparse point: {res_dir}")
+                    validate_contained_path(res_dir, sbox)
+                pinned_res = _PinnedDirectory(res_dir, sbox, raise_on_fatal=raise_on_fatal)
+                pinned_res.pin()
+            else:
+                # POSIX: strict relative descriptor descent from pinned_sbox.dir_fd
+                if pinned_sbox.dir_fd is None:
+                    raise FileSandboxSecurityError("Descritor seguro da raiz da sandbox indisponivel no ambiente POSIX")
+
+                pinned_broker = _PinnedDirectory(
+                    broker_dir, sbox, parent_fd=pinned_sbox.dir_fd, component_name=".broker", raise_on_fatal=raise_on_fatal
+                )
+                pinned_broker.pin()
+                if not pinned_broker.is_pinned():
+                    return []
+
+                pinned_req = _PinnedDirectory(
+                    req_dir, sbox, parent_fd=pinned_broker.dir_fd, component_name="requests", raise_on_fatal=raise_on_fatal
+                )
+                pinned_req.pin()
+                if not pinned_req.is_pinned():
+                    return []
+
+                # Ensure responses directory exists relative to broker_fd
+                try:
+                    os.mkdir("responses", 0o700, dir_fd=pinned_broker.dir_fd)
+                except FileExistsError:
+                    pass
+                except OSError as mk_err:
+                    if raise_on_fatal:
+                        raise ReparseEscapeError(f"Falha ao criar responses via descritor de broker: {mk_err}") from mk_err
+
+                pinned_res = _PinnedDirectory(
+                    res_dir, sbox, parent_fd=pinned_broker.dir_fd, component_name="responses", raise_on_fatal=raise_on_fatal
+                )
+                pinned_res.pin()
+                if not pinned_res.is_pinned():
+                    raise FileSandboxSecurityError("Descritor seguro de responses indisponivel no ambiente POSIX")
 
             results = []
 
-            for req_file in sorted(req_dir.glob("*.json")):
+            # Determine request items
+            if os.name != "nt":
+                if pinned_req.dir_fd is None or pinned_res.dir_fd is None:
+                    raise FileSandboxSecurityError("Descritores de requisicoes/respostas indisponiveis no ambiente POSIX")
+                req_names = sorted([f for f in os.listdir(pinned_req.dir_fd) if f.endswith(".json")])
+            else:
+                req_names = sorted([f.name for f in req_dir.glob("*.json")])
+
+            for req_name in req_names:
                 try:
-                    # Anti-symlink and path containment protection
-                    if req_file.is_symlink() or is_reparse_point_or_symlink(req_file):
-                        try:
-                            req_file.unlink()
-                        except Exception:
-                            pass
-                        if raise_on_fatal:
-                            raise ReparseEscapeError(
-                                f"Link simbolico ou reparse point detectado em arquivo de requisicao: {req_file.name}"
-                            )
-                        status_obj = {
-                            "status": "error",
-                            "error": "SymlinkSecurityViolation",
-                            "message": f"Link simbolico ou reparse point detectado em arquivo de requisicao: {req_file.name}",
-                        }
-                        results.append(status_obj)
+                    if "/" in req_name or "\\" in req_name or req_name in (".", ".."):
                         continue
 
-                    validate_contained_path(req_file, req_dir)
-                    validate_contained_path(req_file, sbox)
+                    # Read & stat request safely
+                    if os.name != "nt":
+                        st = os.stat(req_name, dir_fd=pinned_req.dir_fd, follow_symlinks=False)
+                        if stat.S_ISLNK(st.st_mode):
+                            try:
+                                os.unlink(req_name, dir_fd=pinned_req.dir_fd)
+                            except Exception:
+                                pass
+                            if raise_on_fatal:
+                                raise ReparseEscapeError(
+                                    f"Link simbolico detectado em arquivo de requisicao: {req_name}"
+                                )
+                            status_obj = {
+                                "status": "error",
+                                "error": "SymlinkSecurityViolation",
+                                "message": f"Link simbolico detectado em arquivo de requisicao: {req_name}",
+                            }
+                            results.append(status_obj)
+                            continue
+                        if not stat.S_ISREG(st.st_mode):
+                            continue
 
-                    raw = req_file.read_text(encoding="utf-8")
+                        req_open_flags = os.O_RDONLY
+                        if hasattr(os, "O_NOFOLLOW"):
+                            req_open_flags |= os.O_NOFOLLOW
+                        r_fd = os.open(req_name, req_open_flags, dir_fd=pinned_req.dir_fd)
+                        try:
+                            with os.fdopen(r_fd, "rb") as rf:
+                                raw = rf.read().decode("utf-8")
+                        except Exception:
+                            try:
+                                os.close(r_fd)
+                            except Exception:
+                                pass
+                            raise
+                    else:
+                        req_file = req_dir / req_name
+                        if req_file.is_symlink() or is_reparse_point_or_symlink(req_file):
+                            try:
+                                req_file.unlink()
+                            except Exception:
+                                pass
+                            if raise_on_fatal:
+                                raise ReparseEscapeError(
+                                    f"Link simbolico ou reparse point detectado em arquivo de requisicao: {req_file.name}"
+                                )
+                            status_obj = {
+                                "status": "error",
+                                "error": "SymlinkSecurityViolation",
+                                "message": f"Link simbolico ou reparse point detectado em arquivo de requisicao: {req_file.name}",
+                            }
+                            results.append(status_obj)
+                            continue
+
+                        validate_contained_path(req_file, req_dir)
+                        validate_contained_path(req_file, sbox)
+                        raw = req_file.read_text(encoding="utf-8")
+
                     payload = json.loads(raw)
                     token_str = payload.get("token")
                     tool_name = payload.get("tool")
@@ -1213,59 +1322,57 @@ class ToolBroker:
                     FileSandboxSecurityError,
                     ToolAuditPersistenceError,
                 ) as fatal_sec_err:
-                    # Critical security & integrity violations classified as fatal:
-                    # If raise_on_fatal=True (e.g. inside supervisor streaming loop), propagate directly to terminate worker!
                     if raise_on_fatal:
                         raise
                     status_obj = {"status": "error", "error": type(fatal_sec_err).__name__, "message": str(fatal_sec_err)}
                 except Exception as e:
-                    # Recoverable operational errors (e.g. rate limit, tool not allowed, approval required, expired/revoked token, handler error)
                     status_obj = {"status": "error", "error": type(e).__name__, "message": str(e)}
 
-                # TOCTOU & Containment check for responses directory and target file
+                # Deposit response
                 try:
-                    if is_reparse_point_or_symlink(broker_dir) or is_reparse_point_or_symlink(res_dir):
-                        raise ReparseEscapeError("Hierarquia de respostas da mailbox foi substituida por symlink ou reparse point durante o ciclo")
-                    validate_contained_path(res_dir, sbox)
-
-                    res_file = res_dir / f"res_{req_file.stem}.json"
-                    validate_contained_path(res_file, sbox)
-                    validate_contained_path(res_file, res_dir)
-
-                    if res_file.exists() and (res_file.is_symlink() or is_reparse_point_or_symlink(res_file)):
-                        try:
-                            res_file.unlink()
-                        except Exception:
-                            pass
-                        if raise_on_fatal:
-                            raise ReparseEscapeError(f"Symlink detectado no caminho de resposta da mailbox: {res_file.name}")
-
-                    # Atomic write via safe temporary file inside pinned res_dir
+                    res_filename = f"res_{Path(req_name).stem}.json"
+                    tmp_res_filename = f".tmp_{uuid.uuid4().hex}_{res_filename}"
                     payload_bytes = json.dumps(status_obj, indent=2).encode("utf-8")
-                    tmp_res_name = f".tmp_{uuid.uuid4().hex}_{res_file.name}"
-                    tmp_res_file = res_dir / tmp_res_name
 
-                    if os.name != "nt" and pinned_res.dir_fd is not None:
+                    if os.name != "nt":
                         open_flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
                         if hasattr(os, "O_NOFOLLOW"):
                             open_flags |= os.O_NOFOLLOW
-                        fd = os.open(tmp_res_name, open_flags, 0o600, dir_fd=pinned_res.dir_fd)
+                        w_fd = os.open(tmp_res_filename, open_flags, 0o600, dir_fd=pinned_res.dir_fd)
                         try:
-                            with os.fdopen(fd, "wb") as f:
-                                f.write(payload_bytes)
-                                f.flush()
-                                os.fsync(f.fileno())
+                            with os.fdopen(w_fd, "wb") as wf:
+                                wf.write(payload_bytes)
+                                wf.flush()
+                                os.fsync(wf.fileno())
                         except Exception:
                             try:
-                                os.close(fd)
+                                os.close(w_fd)
                             except Exception:
                                 pass
                             raise
+
                         try:
-                            os.replace(tmp_res_name, res_file.name, src_dir_fd=pinned_res.dir_fd, dst_dir_fd=pinned_res.dir_fd)
-                        except TypeError:
-                            os.replace(tmp_res_file, res_file)
+                            os.replace(tmp_res_filename, res_filename, src_dir_fd=pinned_res.dir_fd, dst_dir_fd=pinned_res.dir_fd)
+                        except TypeError as te:
+                            raise FileSandboxSecurityError(f"os.replace com dir_fd nao suportado: {te}") from te
                     else:
+                        if is_reparse_point_or_symlink(broker_dir) or is_reparse_point_or_symlink(res_dir):
+                            raise ReparseEscapeError("Hierarquia de respostas da mailbox foi substituida por symlink ou reparse point durante o ciclo")
+                        validate_contained_path(res_dir, sbox)
+
+                        res_file = res_dir / res_filename
+                        validate_contained_path(res_file, sbox)
+                        validate_contained_path(res_file, res_dir)
+
+                        if res_file.exists() and (res_file.is_symlink() or is_reparse_point_or_symlink(res_file)):
+                            try:
+                                res_file.unlink()
+                            except Exception:
+                                pass
+                            if raise_on_fatal:
+                                raise ReparseEscapeError(f"Symlink detectado no caminho de resposta da mailbox: {res_file.name}")
+
+                        tmp_res_file = res_dir / tmp_res_filename
                         with open(tmp_res_file, "wb") as f:
                             f.write(payload_bytes)
                             f.flush()
@@ -1283,20 +1390,31 @@ class ToolBroker:
                     if raise_on_fatal:
                         raise
                 except Exception as res_err:
-                    raise OSError(f"Falha de seguranca ao gravar resposta da mailbox ({res_file.name}): {res_err}") from res_err
+                    raise OSError(f"Falha de seguranca ao gravar resposta da mailbox ({res_filename}): {res_err}") from res_err
 
+                # Unlink processed request
                 try:
-                    if req_file.exists():
-                        req_file.unlink()
+                    if os.name != "nt":
+                        os.unlink(req_name, dir_fd=pinned_req.dir_fd)
+                    else:
+                        req_file = req_dir / req_name
+                        if req_file.exists():
+                            req_file.unlink()
                 except Exception as unlink_err:
-                    raise OSError(f"Falha de seguranca ao remover requisicao processada da mailbox ({req_file.name}): {unlink_err}") from unlink_err
+                    raise OSError(f"Falha de seguranca ao remover requisicao processada da mailbox ({req_name}): {unlink_err}") from unlink_err
+
                 results.append(status_obj)
 
             return results
         finally:
-            pinned_res.close()
-            pinned_req.close()
-            pinned_broker.close()
+            if pinned_res:
+                pinned_res.close()
+            if pinned_req:
+                pinned_req.close()
+            if pinned_broker:
+                pinned_broker.close()
+            if pinned_sbox:
+                pinned_sbox.close()
 
     def _record_audit(
         self,

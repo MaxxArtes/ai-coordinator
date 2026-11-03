@@ -556,8 +556,12 @@ class TestV051SecurityHardening(unittest.TestCase):
                     proc.kill()
                     proc.wait()
         elif sys.platform.startswith("linux"):
-            # 1. Spawn a live subprocess on Linux
-            proc = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+            # 1. Spawn a live subprocess on Linux that ignores SIGTERM to force SIGKILL escalation
+            proc = subprocess.Popen([
+                sys.executable,
+                "-c",
+                "import signal, time; signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(30)"
+            ])
             try:
                 cur_ns = PosixProcessController.get_creation_time(proc.pid)
                 self.assertIsNotNone(cur_ns)
@@ -606,8 +610,11 @@ class TestV051SecurityHardening(unittest.TestCase):
                 row = self.store.db.execute("SELECT status FROM runs WHERE id=?", (run_id,)).fetchone()
                 self.assertEqual(row[0], RunState.RUNNING)
 
-                res = safe_terminate_tree(proc, expected_create_time_ns=legacy_time, timeout_seconds=2.0)
+                # Timeout of 0.3s will expire SIGTERM wait, triggering raw_jiffies re-verification and SIGKILL escalation
+                res = safe_terminate_tree(proc, expected_create_time_ns=legacy_time, timeout_seconds=0.3)
                 self.assertTrue(res.success)
+                self.assertEqual(res.reason, "terminated")
+                self.assertIn("SIGKILL", res.detail)
                 self.assertFalse(safe_process_alive(proc.pid, expected_create_time_ns=legacy_time))
             finally:
                 if proc.poll() is None:
@@ -660,13 +667,23 @@ class TestV051SecurityHardening(unittest.TestCase):
         self.assertEqual(seq_in_file, 2)
 
         # Step 2: Adversarial simulation of Supervisor A attempting delayed write of sequence 1
-        # In worker_audit.py, the anti-regression check is:
-        # cur_file_seq = int(parts[1])
-        # if seq_num >= cur_file_seq: write tmp and replace
-        # We test that an attempted write of seq_num=1 does NOT overwrite seq_num=2:
+        # In worker_audit.py, _persist_external_anchor enforces seq_num >= cur_file_seq:
         attempted_stale_seq = 1
         cur_file_seq = int(audit1.anchor_file_path.read_text(encoding="utf-8").split("|")[1])
         self.assertFalse(attempted_stale_seq >= cur_file_seq, "Anti-regression condition would have allowed stale write!")
+
+        # Directly attempt stale write via _persist_external_anchor: must return False and NOT overwrite
+        stale_write_result = audit1._persist_external_anchor(
+            seq_num=1,
+            chain_hash="stale_fake_chain_hash_1",
+            created_at="2026-11-03T00:00:00Z",
+            anchor_sig="stale_fake_sig_1",
+            force=False,
+        )
+        self.assertFalse(stale_write_result, "_persist_external_anchor accepted stale sequence 1 when file is at sequence 2!")
+        anchor_after_stale = audit1.anchor_file_path.read_text(encoding="utf-8")
+        self.assertIn("|2|", anchor_after_stale, "Anchor was overwritten by stale write!")
+        self.assertNotIn("stale_fake_chain_hash_1", anchor_after_stale)
 
         # Step 3: Concurrent interleaved writers with shared lock
         num_writes = 10
@@ -793,6 +810,93 @@ class TestV051SecurityHardening(unittest.TestCase):
 
         # Confirm victim outside directory remains 100% untouched
         self.assertEqual(len(list(self.outside_dir.iterdir())), 0, "Attacker succeeded in writing outside sandbox!")
+
+    def test_15_posix_ancestor_symlink_swap_blocked_fail_closed(self):
+        """Adversarial test on POSIX: swapping ancestor .broker or child responses to symlink fails closed with ReparseEscapeError and touches no outside files."""
+        if os.name == "nt":
+            self.skipTest("POSIX ancestor symlink swap test is specific to Linux/macOS environments")
+
+        posix_sbox = self.sandbox_dir / "sbox_posix"
+        posix_outside = self.sandbox_dir.parent / "outside_posix"
+        posix_sbox.mkdir(parents=True, exist_ok=True)
+        posix_outside.mkdir(parents=True, exist_ok=True)
+
+        sbox_broker = posix_sbox / ".broker"
+        sbox_req = sbox_broker / "requests"
+        sbox_res = sbox_broker / "responses"
+        sbox_req.mkdir(parents=True, exist_ok=True)
+        sbox_res.mkdir(parents=True, exist_ok=True)
+
+        outside_req = posix_outside / "requests"
+        outside_res = posix_outside / "responses"
+        outside_req.mkdir(parents=True, exist_ok=True)
+        outside_res.mkdir(parents=True, exist_ok=True)
+
+        victim_file = outside_res / "victim.txt"
+        victim_file.write_text("ORIGINAL_UNTOUCHED_VICTIM_CONTENT", encoding="utf-8")
+
+        outside_req_file = outside_req / "req_malicious.json"
+        outside_req_file.write_text(json.dumps({"test": "malicious"}), encoding="utf-8")
+
+        # Scenario 1: Worker swaps ancestor .broker to symlink pointing to outside
+        sbox_broker.rename(posix_sbox / "broker_backup")
+        os.symlink(str(posix_outside), str(sbox_broker), target_is_directory=True)
+
+        try:
+            with self.assertRaises((ReparseEscapeError, FileSandboxSecurityError)):
+                self.broker.process_mailbox(
+                    posix_sbox,
+                    expected_worker_pid=os.getpid(),
+                    raise_on_fatal=True,
+                )
+        finally:
+            if sbox_broker.is_symlink():
+                sbox_broker.unlink()
+            (posix_sbox / "broker_backup").rename(sbox_broker)
+
+        # Confirm fail-closed properties for Scenario 1:
+        self.assertEqual(victim_file.read_text(encoding="utf-8"), "ORIGINAL_UNTOUCHED_VICTIM_CONTENT")
+        self.assertEqual(len(list(outside_res.glob("res_*.json"))), 0)
+        self.assertTrue(outside_req_file.exists())
+
+        # Scenario 2: Worker swaps child responses to symlink pointing to outside/responses
+        sbox_res.rename(sbox_broker / "responses_backup")
+        os.symlink(str(outside_res), str(sbox_res), target_is_directory=True)
+
+        try:
+            with self.assertRaises((ReparseEscapeError, FileSandboxSecurityError)):
+                self.broker.process_mailbox(
+                    posix_sbox,
+                    expected_worker_pid=os.getpid(),
+                    raise_on_fatal=True,
+                )
+        finally:
+            if sbox_res.is_symlink():
+                sbox_res.unlink()
+            (sbox_broker / "responses_backup").rename(sbox_res)
+
+        # Confirm fail-closed properties for Scenario 2:
+        self.assertEqual(victim_file.read_text(encoding="utf-8"), "ORIGINAL_UNTOUCHED_VICTIM_CONTENT")
+        self.assertEqual(len(list(outside_res.glob("res_*.json"))), 0)
+
+        # Scenario 3: Worker swaps requests to symlink pointing to outside/requests
+        sbox_req.rename(sbox_broker / "requests_backup")
+        os.symlink(str(outside_req), str(sbox_req), target_is_directory=True)
+
+        try:
+            with self.assertRaises((ReparseEscapeError, FileSandboxSecurityError)):
+                self.broker.process_mailbox(
+                    posix_sbox,
+                    expected_worker_pid=os.getpid(),
+                    raise_on_fatal=True,
+                )
+        finally:
+            if sbox_req.is_symlink():
+                sbox_req.unlink()
+            (sbox_broker / "requests_backup").rename(sbox_req)
+
+        # Confirm outside request was NEVER read or unlinked
+        self.assertTrue(outside_req_file.exists())
 
 
 if __name__ == "__main__":

@@ -448,54 +448,7 @@ class WorkerAuditLogger:
 
                     # Decoupled external anchor file persistence with collision-proof unique tempfile and anti-regression check
                     if self.anchor_file_path:
-                        cur_file_seq = 0
-                        if self.anchor_file_path.exists():
-                            try:
-                                existing_content = self.anchor_file_path.read_text(encoding="utf-8").strip()
-                                parts = existing_content.split("|")
-                                if len(parts) >= 2 and parts[1].isdigit():
-                                    cur_file_seq = int(parts[1])
-                            except Exception:
-                                pass
-
-                        if seq_num >= cur_file_seq:
-                            tmp_anchor = self.anchor_file_path.with_name(f"{self.anchor_file_path.name}.tmp.{os.getpid()}.{uuid.uuid4().hex}")
-                            try:
-                                anchor_payload_line = f"ANCHOR_V1|{seq_num}|{chain_hash}|{created_at}|{anchor_sig}\n"
-                                with open(tmp_anchor, "w", encoding="utf-8") as f:
-                                    f.write(anchor_payload_line)
-                                    f.flush()
-                                    os.fsync(f.fileno())
-                                if os.name != "nt":
-                                    try:
-                                        os.chmod(tmp_anchor, 0o600)
-                                    except Exception:
-                                        pass
-
-                                # Atomic replace with retry for Windows file lock contention
-                                replaced = False
-                                for rep_attempt in range(5):
-                                    try:
-                                        os.replace(tmp_anchor, self.anchor_file_path)
-                                        replaced = True
-                                        break
-                                    except (OSError, PermissionError):
-                                        time.sleep(0.01 * (1.5 ** rep_attempt))
-                                if not replaced:
-                                    os.replace(tmp_anchor, self.anchor_file_path)
-
-                                if os.name != "nt":
-                                    try:
-                                        os.chmod(self.anchor_file_path, 0o600)
-                                    except Exception:
-                                        pass
-                            except Exception as ext_anc_err:
-                                try:
-                                    if tmp_anchor.exists():
-                                        tmp_anchor.unlink()
-                                except Exception:
-                                    pass
-                                raise WorkerAuditPersistenceError(f"Falha ao persistir ancora externa desacoplada: {ext_anc_err}") from ext_anc_err
+                        self._persist_external_anchor(seq_num, chain_hash, created_at, anchor_sig)
 
             return WorkerAuditRecord(
                 event_id=event_id,
@@ -739,6 +692,73 @@ class WorkerAuditLogger:
             ))
         return records
 
+    def _persist_external_anchor(
+        self,
+        seq_num: int,
+        chain_hash: str,
+        created_at: str,
+        anchor_sig: str,
+        force: bool = False,
+    ) -> bool:
+        """Persists the external anchor file with collision-proof unique tempfile and anti-regression guard.
+
+        Returns True if the anchor was written, False if blocked by anti-regression guard (seq_num < cur_file_seq).
+        """
+        if not self.anchor_file_path:
+            return False
+
+        cur_file_seq = 0
+        if self.anchor_file_path.exists():
+            try:
+                existing_content = self.anchor_file_path.read_text(encoding="utf-8").strip()
+                parts = existing_content.split("|")
+                if len(parts) >= 2 and parts[1].isdigit():
+                    cur_file_seq = int(parts[1])
+            except Exception:
+                pass
+
+        if not force and seq_num < cur_file_seq:
+            return False
+
+        tmp_anchor = self.anchor_file_path.with_name(f"{self.anchor_file_path.name}.tmp.{os.getpid()}.{uuid.uuid4().hex}")
+        try:
+            anchor_payload_line = f"ANCHOR_V1|{seq_num}|{chain_hash}|{created_at}|{anchor_sig}\n"
+            with open(tmp_anchor, "w", encoding="utf-8") as f:
+                f.write(anchor_payload_line)
+                f.flush()
+                os.fsync(f.fileno())
+            if os.name != "nt":
+                try:
+                    os.chmod(tmp_anchor, 0o600)
+                except Exception:
+                    pass
+
+            # Atomic replace with retry for Windows file lock contention
+            replaced = False
+            for rep_attempt in range(5):
+                try:
+                    os.replace(tmp_anchor, self.anchor_file_path)
+                    replaced = True
+                    break
+                except (OSError, PermissionError):
+                    time.sleep(0.01 * (1.5 ** rep_attempt))
+            if not replaced:
+                os.replace(tmp_anchor, self.anchor_file_path)
+
+            if os.name != "nt":
+                try:
+                    os.chmod(self.anchor_file_path, 0o600)
+                except Exception:
+                    pass
+            return True
+        except Exception as ext_anc_err:
+            try:
+                if tmp_anchor.exists():
+                    tmp_anchor.unlink()
+            except Exception:
+                pass
+            raise WorkerAuditPersistenceError(f"Falha ao persistir ancora externa desacoplada: {ext_anc_err}") from ext_anc_err
+
     def reconcile_anchor(self) -> bool:
         """Reconcile external anchor file from verified SQLite anchor record if desynchronized after unexpected shutdown."""
         if not self.anchor_file_path or not hasattr(self.store, "db") or not self.store.db:
@@ -760,31 +780,6 @@ class WorkerAuditLogger:
                     if not hmac.compare_digest(sig, expected_sig):
                         return False
 
-                    anchor_payload_line = f"ANCHOR_V1|{seq_num}|{chain_hash}|{created_at}|{sig}\n"
-                    tmp_anchor = self.anchor_file_path.with_name(f"{self.anchor_file_path.name}.tmp.{os.getpid()}.{uuid.uuid4().hex}")
-                    with open(tmp_anchor, "w", encoding="utf-8") as f:
-                        f.write(anchor_payload_line)
-                        f.flush()
-                        os.fsync(f.fileno())
-                    if os.name != "nt":
-                        try:
-                            os.chmod(tmp_anchor, 0o600)
-                        except Exception:
-                            pass
-                    for rep_attempt in range(5):
-                        try:
-                            os.replace(tmp_anchor, self.anchor_file_path)
-                            break
-                        except (OSError, PermissionError):
-                            time.sleep(0.01 * (1.5 ** rep_attempt))
-                    else:
-                        os.replace(tmp_anchor, self.anchor_file_path)
-
-                    if os.name != "nt":
-                        try:
-                            os.chmod(self.anchor_file_path, 0o600)
-                        except Exception:
-                            pass
-                    return True
+                    return self._persist_external_anchor(seq_num, chain_hash, created_at, sig, force=True)
                 except Exception:
                     return False
