@@ -16,6 +16,7 @@ from __future__ import annotations
 import base64
 from dataclasses import asdict, dataclass, field
 from enum import Enum
+import errno
 import hashlib
 import hmac
 import json
@@ -55,25 +56,32 @@ class _PinnedDirectory:
     On POSIX: Opens and holds a directory file descriptor with O_RDONLY | O_DIRECTORY | O_NOFOLLOW,
               and provides dir_fd for atomic relative file operations.
     """
-    def __init__(self, dir_path: Path, sbox: Path, raise_on_fatal: bool = False):
-        self.dir_path = Path(dir_path).resolve()
+    def __init__(self, dir_path: Union[str, Path], sbox: Union[str, Path], raise_on_fatal: bool = False):
+        self.raw_path = Path(dir_path)
         self.sbox = Path(sbox).resolve()
         self.raise_on_fatal = raise_on_fatal
         self.handle: Optional[int] = None
         self.dir_fd: Optional[int] = None
 
     def pin(self) -> None:
-        if not self.dir_path.exists():
+        if not self.raw_path.exists() and not self.raw_path.is_symlink():
             return
+
+        # 1. Direct symlink / reparse check on unresolved raw path
+        if self.raw_path.is_symlink() or is_reparse_point_or_symlink(self.raw_path):
+            if self.raise_on_fatal:
+                raise ReparseEscapeError(f"Diretorio protegido e um link simbolico ou reparse point: {self.raw_path}")
+            raise FileSandboxSecurityError(f"Link simbolico detectado no diretorio: {self.raw_path}")
+
         if os.name == "nt":
-            attrs = kernel32.GetFileAttributesW(str(self.dir_path))
+            attrs = kernel32.GetFileAttributesW(str(self.raw_path))
             if attrs != 0xFFFFFFFF and (attrs & FILE_ATTRIBUTE_REPARSE_POINT):
                 if self.raise_on_fatal:
-                    raise ReparseEscapeError(f"Diretorio protegido e um reparse point / junction: {self.dir_path}")
-                raise FileSandboxSecurityError(f"Reparse point detectado no diretorio: {self.dir_path}")
+                    raise ReparseEscapeError(f"Diretorio protegido e um reparse point / junction: {self.raw_path}")
+                raise FileSandboxSecurityError(f"Reparse point detectado no diretorio: {self.raw_path}")
 
             h = kernel32.CreateFileW(
-                str(self.dir_path),
+                str(self.raw_path),
                 FILE_LIST_DIRECTORY | SYNCHRONIZE,
                 FILE_SHARE_READ | FILE_SHARE_WRITE,  # NOTE: NO FILE_SHARE_DELETE
                 None,
@@ -84,17 +92,17 @@ class _PinnedDirectory:
             if not h or h == INVALID_HANDLE_VALUE:
                 err = ctypes.get_last_error()
                 if self.raise_on_fatal:
-                    raise ReparseEscapeError(f"Falha ao fixar diretorio '{self.dir_path}' (WinError {err})")
-                raise FileSandboxSecurityError(f"Falha ao fixar diretorio '{self.dir_path}': WinError {err}")
+                    raise ReparseEscapeError(f"Falha ao fixar diretorio '{self.raw_path}' (WinError {err})")
+                raise FileSandboxSecurityError(f"Falha ao fixar diretorio '{self.raw_path}': WinError {err}")
             self.handle = h
 
             # Re-verify through opened handle
-            attrs_after = kernel32.GetFileAttributesW(str(self.dir_path))
+            attrs_after = kernel32.GetFileAttributesW(str(self.raw_path))
             if attrs_after != 0xFFFFFFFF and (attrs_after & FILE_ATTRIBUTE_REPARSE_POINT):
                 self.close()
                 if self.raise_on_fatal:
-                    raise ReparseEscapeError(f"Diretorio protegido e um reparse point: {self.dir_path}")
-                raise FileSandboxSecurityError(f"Reparse point detectado: {self.dir_path}")
+                    raise ReparseEscapeError(f"Diretorio protegido e um reparse point: {self.raw_path}")
+                raise FileSandboxSecurityError(f"Reparse point detectado: {self.raw_path}")
 
             buf = ctypes.create_unicode_buffer(1024)
             res = kernel32.GetFinalPathNameByHandleW(self.handle, buf, 1024, 0)
@@ -107,7 +115,7 @@ class _PinnedDirectory:
                     final_path.relative_to(self.sbox)
                 except ValueError:
                     self.close()
-                    raise ReparseEscapeError(f"Diretorio fixado '{self.dir_path}' escapa da sandbox: '{final_path}'")
+                    raise ReparseEscapeError(f"Diretorio fixado '{self.raw_path}' escapa da sandbox: '{final_path}'")
         else:
             flags = os.O_RDONLY
             if hasattr(os, "O_DIRECTORY"):
@@ -115,16 +123,16 @@ class _PinnedDirectory:
             if hasattr(os, "O_NOFOLLOW"):
                 flags |= os.O_NOFOLLOW
             try:
-                self.dir_fd = os.open(str(self.dir_path), flags)
+                self.dir_fd = os.open(str(self.raw_path), flags)
             except OSError as e:
-                if self.raise_on_fatal:
-                    raise ReparseEscapeError(f"Falha ao abrir descritor seguro do diretorio '{self.dir_path}': {e}") from e
+                if e.errno == errno.ELOOP or self.raise_on_fatal:
+                    raise ReparseEscapeError(f"Falha ao abrir descritor seguro do diretorio '{self.raw_path}': {e}") from e
                 raise FileSandboxSecurityError(f"Erro ao abrir descritor de diretorio: {e}") from e
 
             st = os.fstat(self.dir_fd)
             if not stat.S_ISDIR(st.st_mode):
                 self.close()
-                raise FileSandboxSecurityError(f"Caminho '{self.dir_path}' nao e diretorio regular")
+                raise FileSandboxSecurityError(f"Caminho '{self.raw_path}' nao e diretorio regular")
 
     def close(self) -> None:
         if os.name == "nt" and self.handle is not None and self.handle != INVALID_HANDLE_VALUE:
