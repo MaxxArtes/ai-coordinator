@@ -341,7 +341,7 @@ class TestV051SecurityHardening(unittest.TestCase):
         if os.name == "nt":
             cur_time_ns = WindowsProcessController.get_creation_time(my_pid)
             legacy_time = (cur_time_ns // 100) + 116444736000000000
-        else:
+        elif sys.platform.startswith("linux"):
             raw_jiffies = None
             stat_file = Path(f"/proc/{my_pid}/stat")
             if stat_file.exists():
@@ -355,6 +355,8 @@ class TestV051SecurityHardening(unittest.TestCase):
                 except Exception:
                     pass
             legacy_time = raw_jiffies if raw_jiffies is not None else 50000
+        else:
+            legacy_time = PosixProcessController.get_creation_time(my_pid)
 
         # Ensure task exists in tasks table
         self.store.db.execute("""
@@ -553,8 +555,8 @@ class TestV051SecurityHardening(unittest.TestCase):
                 if proc.poll() is None:
                     proc.kill()
                     proc.wait()
-        else:
-            # 1. Spawn a live subprocess on POSIX
+        elif sys.platform.startswith("linux"):
+            # 1. Spawn a live subprocess on Linux
             proc = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
             try:
                 cur_ns = PosixProcessController.get_creation_time(proc.pid)
@@ -729,7 +731,16 @@ class TestV051SecurityHardening(unittest.TestCase):
         }), encoding="utf-8")
 
         if os.name == "nt":
-            # Start an aggressive attacker thread attempting to rename or swap responses directory
+            # 1. Deterministic kernel check: pinned handle without FILE_SHARE_DELETE blocks rename
+            pinned_check = _PinnedDirectory(res_dir, self.sandbox_dir, raise_on_fatal=True)
+            pinned_check.pin()
+            try:
+                with self.assertRaises(PermissionError):
+                    os.rename(res_dir, res_dir.with_name("responses_hijacked"))
+            finally:
+                pinned_check.close()
+
+            # 2. Concurrency check: background attacker thread attempts directory swap during mailbox processing
             stop_attacker = threading.Event()
             tamper_attempts = [0]
             tamper_blocked_errors = []
@@ -738,9 +749,7 @@ class TestV051SecurityHardening(unittest.TestCase):
                 while not stop_attacker.is_set():
                     tamper_attempts[0] += 1
                     try:
-                        # Attempt 1: Rename responses directory
                         os.rename(res_dir, res_dir.with_name("responses_hijacked"))
-                        # If rename succeeded, swap in malicious junction
                         _create_symlink_or_junction(res_dir, self.outside_dir)
                     except (PermissionError, OSError) as e:
                         tamper_blocked_errors.append(e)
@@ -750,7 +759,6 @@ class TestV051SecurityHardening(unittest.TestCase):
             attacker_thread.start()
 
             try:
-                # Process mailbox under active attack
                 results = self.broker.process_mailbox(
                     self.sandbox_dir,
                     expected_worker_pid=os.getpid(),
@@ -760,12 +768,11 @@ class TestV051SecurityHardening(unittest.TestCase):
                 stop_attacker.set()
                 attacker_thread.join(timeout=2.0)
 
-            # On Windows, kernel must have actively blocked tamper attempts with WinError 32
-            self.assertGreater(len(tamper_blocked_errors), 0, "No tamper attempts were blocked on Windows!")
-            self.assertTrue(
-                any(isinstance(err, PermissionError) or getattr(err, "winerror", None) == 32 for err in tamper_blocked_errors),
-                f"Expected WinError 32 / PermissionError, got: {tamper_blocked_errors[:5]}"
-            )
+            if tamper_blocked_errors:
+                self.assertTrue(
+                    all(isinstance(err, PermissionError) or getattr(err, "winerror", None) == 32 for err in tamper_blocked_errors),
+                    f"Unexpected error in tamper attempts: {tamper_blocked_errors[:5]}"
+                )
         else:
             # On POSIX: Pinned dir_fd with O_DIRECTORY | O_NOFOLLOW guarantees confinement
             results = self.broker.process_mailbox(
