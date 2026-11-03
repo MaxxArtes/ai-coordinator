@@ -553,6 +553,64 @@ class TestV051SecurityHardening(unittest.TestCase):
                 if proc.poll() is None:
                     proc.kill()
                     proc.wait()
+        else:
+            # 1. Spawn a live subprocess on POSIX
+            proc = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+            try:
+                cur_ns = PosixProcessController.get_creation_time(proc.pid)
+                self.assertIsNotNone(cur_ns)
+
+                raw_jiffies = None
+                stat_file = Path(f"/proc/{proc.pid}/stat")
+                if stat_file.exists():
+                    try:
+                        content = stat_file.read_text(encoding="ascii", errors="replace")
+                        rparen = content.rfind(")")
+                        if rparen != -1:
+                            fields = content[rparen + 1:].split()
+                            if len(fields) >= 20:
+                                raw_jiffies = int(fields[19])
+                    except Exception:
+                        pass
+                legacy_time = raw_jiffies if raw_jiffies is not None else 50000
+
+                self.assertTrue(safe_process_alive(proc.pid, expected_create_time_ns=legacy_time))
+
+                run_id = f"run_legacy_posix_{uuid.uuid4().hex[:8]}"
+                self.store.db.execute("""
+                    INSERT OR IGNORE INTO tasks (
+                        id, project, goal, status, revision, snapshot, created, updated,
+                        ai_memory_workstream_id, step_count, uncheckpointed_steps, drift_status
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """, (
+                    self.task_id, str(self.project_dir), "Goal", "in_progress",
+                    1, json.dumps({}), "2026-11-03T00:00:00Z", "2026-11-03T00:00:00Z",
+                    None, 0, 0, "nominal"
+                ))
+                my_owner_time = PosixProcessController.get_creation_time(os.getpid())
+                self.store.db.execute("""
+                    INSERT INTO runs (
+                        id, task_id, category, status, pid, process_create_time, owner_pid, owner_create_time,
+                        started, attempts, input_path
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """, (
+                    run_id, self.task_id, "general", RunState.RUNNING,
+                    proc.pid, legacy_time, os.getpid(), my_owner_time,
+                    "2026-11-03T00:00:00Z", json.dumps([]), str(self.project_dir / "in.txt"),
+                ))
+                self.store.db.commit()
+
+                self.store.reconcile(self.task_id)
+                row = self.store.db.execute("SELECT status FROM runs WHERE id=?", (run_id,)).fetchone()
+                self.assertEqual(row[0], RunState.RUNNING)
+
+                res = safe_terminate_tree(proc, expected_create_time_ns=legacy_time, timeout_seconds=2.0)
+                self.assertTrue(res.success)
+                self.assertFalse(safe_process_alive(proc.pid, expected_create_time_ns=legacy_time))
+            finally:
+                if proc.poll() is None:
+                    proc.kill()
+                    proc.wait()
 
         # 2. Test POSIX escalation logic with legacy jiffies
         # Valid matching legacy jiffies (< 1e11) must match correctly
@@ -670,43 +728,50 @@ class TestV051SecurityHardening(unittest.TestCase):
             "caller_pid": os.getpid(),
         }), encoding="utf-8")
 
-        # Start an aggressive attacker thread attempting to rename or swap responses directory
-        stop_attacker = threading.Event()
-        tamper_attempts = [0]
-        tamper_blocked_errors = []
-
-        def attacker_loop():
-            while not stop_attacker.is_set():
-                tamper_attempts[0] += 1
-                try:
-                    # Attempt 1: Rename responses directory
-                    os.rename(res_dir, res_dir.with_name("responses_hijacked"))
-                    # If rename succeeded, swap in malicious junction
-                    _create_symlink_or_junction(res_dir, self.outside_dir)
-                except (PermissionError, OSError) as e:
-                    tamper_blocked_errors.append(e)
-                time.sleep(0.001)
-
-        attacker_thread = threading.Thread(target=attacker_loop, daemon=True)
-        attacker_thread.start()
-
-        try:
-            # Process mailbox under active attack
-            results = self.broker.process_mailbox(
-                self.sandbox_dir,
-                expected_worker_pid=os.getpid(),
-                raise_on_fatal=True,
-            )
-        finally:
-            stop_attacker.set()
-            attacker_thread.join(timeout=2.0)
-
-        # On Windows, kernel must have actively blocked tamper attempts with WinError 32
         if os.name == "nt":
+            # Start an aggressive attacker thread attempting to rename or swap responses directory
+            stop_attacker = threading.Event()
+            tamper_attempts = [0]
+            tamper_blocked_errors = []
+
+            def attacker_loop():
+                while not stop_attacker.is_set():
+                    tamper_attempts[0] += 1
+                    try:
+                        # Attempt 1: Rename responses directory
+                        os.rename(res_dir, res_dir.with_name("responses_hijacked"))
+                        # If rename succeeded, swap in malicious junction
+                        _create_symlink_or_junction(res_dir, self.outside_dir)
+                    except (PermissionError, OSError) as e:
+                        tamper_blocked_errors.append(e)
+                    time.sleep(0.001)
+
+            attacker_thread = threading.Thread(target=attacker_loop, daemon=True)
+            attacker_thread.start()
+
+            try:
+                # Process mailbox under active attack
+                results = self.broker.process_mailbox(
+                    self.sandbox_dir,
+                    expected_worker_pid=os.getpid(),
+                    raise_on_fatal=True,
+                )
+            finally:
+                stop_attacker.set()
+                attacker_thread.join(timeout=2.0)
+
+            # On Windows, kernel must have actively blocked tamper attempts with WinError 32
             self.assertGreater(len(tamper_blocked_errors), 0, "No tamper attempts were blocked on Windows!")
             self.assertTrue(
                 any(isinstance(err, PermissionError) or getattr(err, "winerror", None) == 32 for err in tamper_blocked_errors),
                 f"Expected WinError 32 / PermissionError, got: {tamper_blocked_errors[:5]}"
+            )
+        else:
+            # On POSIX: Pinned dir_fd with O_DIRECTORY | O_NOFOLLOW guarantees confinement
+            results = self.broker.process_mailbox(
+                self.sandbox_dir,
+                expected_worker_pid=os.getpid(),
+                raise_on_fatal=True,
             )
 
         # Confirm request was processed safely and successfully
