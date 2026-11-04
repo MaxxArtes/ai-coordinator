@@ -111,7 +111,26 @@ O módulo de testes [`tests/test_phase4c_stress_and_concurrency.py`](file:///D:/
 
 O módulo [`src/ai_coordinator/baseline_runner.py`](file:///D:/ai-coordinator/src/ai_coordinator/baseline_runner.py) estabelece o ponto de referência estrito (*zero-point baseline*):
 - **Solvers de Referência Independentes (`CanonicalSolverRegistry`):** Executam o domínio algorítmico real (ETL, reconciliação contábil, ordenação topológica, particionamento fork-join) tomando unicamente o `input_payload`, sem consultar ou referenciar `expected_output`.
-- **Segregação Rigorosa de Fases Temporais:** Registra separadamente o tempo de execução da tarefa (`task_execution_ms`), overhead da instrumentação observacional (`telemetry_overhead_ms`) e tempo dos oráculos (`validation_ms`).
-- **Distribuições Estatísticas e Percentis (`MetricDistribution`):** Cálculo automatizado de média, desvio padrão, mediana (p50), p95, p99, valores mínimo e máximo.
-- **Metadados de Ambiente e Rastreabilidade:** Captura hash SHA do commit Git, versão do runtime Python, sistema operacional, arquitetura, versão do pacote e versão do dataset.
-- **Manifesto Canônico Assinado da Baseline:** Exportação estruturada e validação criptográfica (SHA-256 e HMAC-SHA256) do agregado consolidado.
+- **Cobertura Experimental Abrangente:** Executa todas as 9 tarefas das Suítes A (3), B (3) e C (3) por iteração, incluindo explicitamente tarefas adversariais e de contenção de orçamento.
+- **Segregação Rigorosa de Fases Temporais (`TaskTimingBreakdown`):** Registra separadamente o tempo de execução da tarefa (`task_execution_ms`), overhead da instrumentação observacional (`telemetry_overhead_ms`) e tempo dos oráculos (`validation_ms`).
+- **Distribuições Estatísticas e Percentis (`MetricDistribution`):** Cálculo automatizado de média, desvio-padrão amostral imparcial com correção de Bessel ($ddof=1$, `sample_std_dev`), desvio populacional ($ddof=0$, `population_std_dev`), mediana (p50), p95, p99, valores mínimo e máximo.
+- **Metadados de Ambiente e Rastreabilidade Total (`BaselineEnvironmentMetadata`):** Captura hash SHA do commit Git, branch, status sujo do repositório (`git_dirty`), sementes de cada suíte (`seeds`), hashes de inputs dos datasets (`dataset_hashes`), ordem determinística de execução, versão do runtime Python, sistema operacional, arquitetura, versão do pacote, versão da tabela de precificação e versão do dataset.
+- **Manifesto Canônico Assinado da Baseline:** O manifesto canônico autenticado (`compute_canonical_manifest`) engloba o objeto completo `environment.to_dict()` (incluindo seeds, hashes, branch e estado git), o digest SHA-256 de todas as tarefas individuais (`task_results_digest`), distribuições de latência, momentos de tokens e custos, e taxas de sucesso. Qualquer alteração em sementes, estado de repositório ou métricas invalida imediatamente a integridade e a assinatura.
+- **Verificação Profunda de Integridade em Modo Duplo (`verify_full_report_integrity`):**
+  - **Modo 1 — Integridade por Hash (`hmac_key is None`):** Valida matematicamente o hash SHA-256 da raiz, a concordância exata do `task_results_digest` contra cada uma das execuções em `task_execution_results` e os hashes individuais de integridade de cada tarefa.
+  - **Modo 2 — Autenticação Criptográfica HMAC (`hmac_key` fornecida):** Exige obrigatoriamente a presença e a validade da assinatura principal (`oracle_signature`) e das assinaturas individuais de cada tarefa. Relatórios com assinaturas ausentes, removidas ou forjadas são imediatamente e categoricamente rejeitados, impedindo qualquer degradação silenciosa.
+
+---
+
+## 7. Contrato Operacional de Orçamento Compartilhado (`SharedFlightBudgetFence`)
+
+O controle de recursos entre múltiplos agentes operando concorrentemente segue uma arquitetura em duas camadas:
+
+1. **Controle Preventivo Mandatório (`reserve`):**
+   - Antes de iniciar qualquer tarefa ou despachar requisições a provedores externos de LLM, o worker deve estimar sua cota de tokens e custo monetário e solicitar a reserva atômica via `reserve()`.
+   - Se a projeção exceder `max_tokens` ou `max_cost_usd`, a requisição é bloqueada preventivamente com `SharedBudgetExceededError`, impedindo vazamento de consumo.
+2. **Reconciliação e Revalidação no Término (`commit`):**
+   - Ao término do ciclo, o worker submete seu consumo efetivo através do `commit()`.
+   - Se o consumo real for inferior à reserva, a folga não utilizada é imediatamente devolvida ao saldo compartilhado.
+   - Se o consumo real superar a reserva prévia, o método `commit()` projeta atomicamente a nova demanda acumulada de todos os workers ativos. Se o teto global for ultrapassado, o commit é rejeitado com `SharedBudgetExceededError`.
+   - **Nota de Governança:** A revalidação no `commit()` constitui uma salvaguarda contra variações estocásticas, mas **não substitui** o controle preventivo. Em integrações com provedores reais, qualquer expansão de escopo deve ser previamente autorizada e reservada.

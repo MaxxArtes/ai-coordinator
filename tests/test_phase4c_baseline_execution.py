@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import dataclasses
+import hashlib
+import hmac
 import json
 import sqlite3
 import tempfile
@@ -20,6 +22,7 @@ from ai_coordinator import (
     BaselineEnvironmentMetadata,
     canonical_json_hash,
 )
+from ai_coordinator.synthetic_benchmark import _normalize_json_structure
 
 
 class TestPhase4CBaselineExecution(unittest.TestCase):
@@ -188,6 +191,97 @@ class TestPhase4CBaselineExecution(unittest.TestCase):
         )
         self.assertFalse(tampered_env.verify_integrity())
         self.assertFalse(tampered_env.verify_signature(self.hmac_secret))
+
+        # Tamper 4: Modify seeds in environment
+        tampered_seeds = dataclasses.replace(
+            report,
+            environment=dataclasses.replace(report.environment, seeds={"suite_a": 99999}),
+        )
+        self.assertFalse(tampered_seeds.verify_integrity(), "Adulteração de seeds deve invalidar verify_integrity()")
+        self.assertFalse(tampered_seeds.verify_signature(self.hmac_secret), "Adulteração de seeds deve invalidar verify_signature()")
+        self.assertFalse(tampered_seeds.verify_full_report_integrity(self.hmac_secret))
+
+        # Tamper 5: Modify dataset_hashes in environment
+        tampered_hashes = dataclasses.replace(
+            report,
+            environment=dataclasses.replace(report.environment, dataset_hashes={"suite_a": "forged_dataset_hash"}),
+        )
+        self.assertFalse(tampered_hashes.verify_integrity(), "Adulteração de dataset_hashes deve invalidar verify_integrity()")
+        self.assertFalse(tampered_hashes.verify_signature(self.hmac_secret), "Adulteração de dataset_hashes deve invalidar verify_signature()")
+        self.assertFalse(tampered_hashes.verify_full_report_integrity(self.hmac_secret))
+
+        # Tamper 6: Modify git_branch in environment
+        tampered_branch = dataclasses.replace(
+            report,
+            environment=dataclasses.replace(report.environment, git_branch="forged_branch_name"),
+        )
+        self.assertFalse(tampered_branch.verify_integrity(), "Adulteração de git_branch deve invalidar verify_integrity()")
+        self.assertFalse(tampered_branch.verify_signature(self.hmac_secret), "Adulteração de git_branch deve invalidar verify_signature()")
+
+        # Tamper 7: Modify git_dirty in environment
+        tampered_dirty = dataclasses.replace(
+            report,
+            environment=dataclasses.replace(report.environment, git_dirty=not report.environment.git_dirty),
+        )
+        self.assertFalse(tampered_dirty.verify_integrity(), "Adulteração de git_dirty deve invalidar verify_integrity()")
+        self.assertFalse(tampered_dirty.verify_signature(self.hmac_secret), "Adulteração de git_dirty deve invalidar verify_signature()")
+
+        # Tamper 8: Modify pricing_registry_version in environment
+        tampered_pricing = dataclasses.replace(
+            report,
+            environment=dataclasses.replace(report.environment, pricing_registry_version="9999.99.99"),
+        )
+        self.assertFalse(tampered_pricing.verify_integrity(), "Adulteração de pricing_registry_version deve invalidar verify_integrity()")
+        self.assertFalse(tampered_pricing.verify_signature(self.hmac_secret), "Adulteração de pricing_registry_version deve invalidar verify_signature()")
+
+        # Tamper 9: Modify task_execution_order in environment
+        tampered_order = dataclasses.replace(
+            report,
+            environment=dataclasses.replace(report.environment, task_execution_order=["forged_task_order"]),
+        )
+        self.assertFalse(tampered_order.verify_integrity(), "Adulteração de task_execution_order deve invalidar verify_integrity()")
+        self.assertFalse(tampered_order.verify_signature(self.hmac_secret), "Adulteração de task_execution_order deve invalidar verify_signature()")
+
+        # Tamper 10: Modify pricing_model in environment
+        tampered_pmodel = dataclasses.replace(
+            report,
+            environment=dataclasses.replace(report.environment, pricing_model="forged_pricing_model"),
+        )
+        self.assertFalse(tampered_pmodel.verify_integrity(), "Adulteração de pricing_model deve invalidar verify_integrity()")
+        self.assertFalse(tampered_pmodel.verify_signature(self.hmac_secret), "Adulteração de pricing_model deve invalidar verify_signature()")
+
+        # Tamper 11: Missing/stripped root oracle_signature under authenticated verification
+        tampered_root_sig = dataclasses.replace(report, oracle_signature=None)
+        self.assertFalse(
+            tampered_root_sig.verify_full_report_integrity(self.hmac_secret),
+            "Ausência de assinatura raiz deve reprovar verify_full_report_integrity no modo autenticado",
+        )
+        # However, in unauthenticated hash integrity mode (hmac_key=None), unsigned report passes hash verification
+        self.assertTrue(
+            tampered_root_sig.verify_full_report_integrity(None),
+            "Modo de integridade por hash (sem chave) deve aceitar relatório sem assinatura desde que íntegro",
+        )
+
+        # Tamper 12: Missing/stripped oracle_signature on an individual task under authenticated verification
+        tampered_tasks_no_sig = list(report.task_execution_results)
+        tampered_tasks_no_sig[0] = dataclasses.replace(
+            tampered_tasks_no_sig[0],
+            oracle_report=dataclasses.replace(tampered_tasks_no_sig[0].oracle_report, oracle_signature=None),
+        )
+        raw_rep_no_task_sig = dataclasses.replace(report, task_execution_results=tampered_tasks_no_sig)
+        new_digest = raw_rep_no_task_sig.compute_task_results_digest()
+        rep_no_task_sig = dataclasses.replace(raw_rep_no_task_sig, task_results_digest=new_digest)
+        # Re-sign root with updated digest to strictly isolate individual task signature failure
+        manifest = rep_no_task_sig.compute_canonical_manifest()
+        m_bytes = json.dumps(_normalize_json_structure(manifest), sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode("utf-8")
+        h_val = hashlib.sha256(m_bytes).hexdigest()
+        s_val = hmac.new(self.hmac_secret.encode("utf-8"), m_bytes, hashlib.sha256).hexdigest()
+        rep_no_task_sig = dataclasses.replace(rep_no_task_sig, integrity_hash=h_val, oracle_signature=s_val)
+
+        self.assertFalse(
+            rep_no_task_sig.verify_full_report_integrity(self.hmac_secret),
+            "Ausência de assinatura em tarefa individual deve reprovar verify_full_report_integrity no modo autenticado",
+        )
 
     def test_06_baseline_reproducibility_across_identical_seeds(self) -> None:
         """Validate that repeated runs with identical seeds produce identical task sets and aggregates."""

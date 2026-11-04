@@ -886,6 +886,13 @@ class SharedFlightBudgetFence:
     - Atomicity: Concurrent workers reserve budget under synchronization; total active allocations never exceed limits.
     - Pre-consumption Rejection: If remaining tokens or cost are insufficient, the reservation is rejected BEFORE consumption.
     - Safe Release / Commit: Workers commit actual usage or release reservations upon cancellation/failure.
+
+    IMPORTANT ARCHITECTURAL & OPERATIONAL CONTRACT:
+    The post-execution headroom check in commit() acts as a safety backstop against accidental overruns,
+    but it DOES NOT replace preventive pre-consumption fencing. In production agentic workflows and
+    real external LLM/API integrations, any anticipated budget expansion MUST be reserved in advance
+    via reserve() BEFORE executing work or dispatching API calls, ensuring active allocations strictly
+    remain within the shared flight limits.
     """
 
     def __init__(self, max_tokens: int, max_cost_usd: float):
@@ -974,6 +981,10 @@ class SharedFlightBudgetFence:
         atomically re-validated against remaining shared headroom.
         Raises SharedBudgetExceededError if the commit would cause shared limits to be breached.
         Raises KeyError if the reservation_id is unknown or already finalized.
+
+        NOTE ON PREVENTIVE CONTROL:
+        This post-consumption re-validation does not substitute preventive pre-reservation.
+        Production workers must always pre-allocate headroom with reserve() prior to invoking services.
         """
         act_tok = max(0, int(actual_tokens))
         act_cost = max(0.0, float(actual_cost_usd))

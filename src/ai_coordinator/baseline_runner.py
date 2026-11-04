@@ -484,16 +484,17 @@ class BaselineExecutionReport:
         return hashlib.sha256(canonical_bytes).hexdigest()
 
     def compute_canonical_manifest(self) -> Dict[str, Any]:
-        """Generate structured canonical manifest of the aggregated baseline for cryptographic signing."""
+        """Generate structured canonical manifest of the aggregated baseline for cryptographic signing.
+
+        Authenticates the entire experimental configuration environment (including seeds,
+        dataset hashes, git commit, git branch, git dirty flag, platform, python version,
+        pricing versions, task execution order, and metric provenance) along with task results digest,
+        success rates, latency distributions, token aggregates, and cost aggregates.
+        """
         return {
             "run_id": self.run_id,
             "created_at": self.created_at,
-            "dataset_version": self.environment.dataset_version,
-            "git_commit": self.environment.git_commit,
-            "python_version": self.environment.python_version,
-            "platform": f"{self.environment.platform_system}_{self.environment.platform_machine}",
-            "is_reference_baseline": self.environment.is_reference_baseline,
-            "adaptive_heuristics_active": self.environment.adaptive_heuristics_active,
+            "environment": self.environment.to_dict(),
             "total_tasks_executed": self.total_tasks_executed,
             "iterations": self.iterations,
             "task_results_digest": self.compute_task_results_digest(),
@@ -520,19 +521,47 @@ class BaselineExecutionReport:
         return hmac.compare_digest(self.oracle_signature, expected)
 
     def verify_full_report_integrity(self, hmac_key: Optional[str] = None) -> bool:
-        """Performs deep cryptographic verification of the root manifest and every individual task result."""
+        """Performs deep cryptographic verification of the root manifest and every individual task result.
+
+        Mode 1: SHA-256 Hash Integrity Mode (hmac_key is None)
+          - Verifies root manifest integrity_hash against canonical serialization.
+          - Verifies task_results_digest matches all task_execution_results.
+          - Verifies individual task integrity_hash for every task in task_execution_results.
+
+        Mode 2: Authenticated HMAC Mode (hmac_key is provided)
+          - Performs all Mode 1 checks.
+          - REQUIRES root oracle_signature to be present and strictly matching hmac_key.
+          - REQUIRES every individual task oracle_signature to be present and strictly matching hmac_key.
+          - Any missing, stripped, or forged signature immediately fails verification.
+        """
+        # 1. Root manifest hash integrity
         if not self.verify_integrity():
             return False
-        if hmac_key and self.oracle_signature and not self.verify_signature(hmac_key):
+
+        # 2. Task collection digest match
+        if not self.task_results_digest:
             return False
-        if self.task_results_digest and not hmac.compare_digest(self.task_results_digest, self.compute_task_results_digest()):
+        if not hmac.compare_digest(self.task_results_digest, self.compute_task_results_digest()):
             return False
+
+        # 3. Root signature verification (mandatory in authenticated mode)
+        if hmac_key is not None:
+            if not self.oracle_signature or not self.verify_signature(hmac_key):
+                return False
+
+        # 4. Deep verification of every individual task result
         for res in self.task_execution_results:
+            # Individual report hash integrity
             if not res.oracle_report.verify_integrity():
                 return False
-            if hmac_key and res.oracle_report.oracle_signature:
+
+            # Individual report HMAC signature (mandatory in authenticated mode)
+            if hmac_key is not None:
+                if not res.oracle_report.oracle_signature:
+                    return False
                 if not res.oracle_report.verify_signature(hmac_key):
                     return False
+
         return True
 
     def to_dict(self) -> Dict[str, Any]:
