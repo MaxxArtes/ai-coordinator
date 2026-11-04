@@ -41,6 +41,7 @@ from .synthetic_benchmark import (
     FunctionalOracle,
     EfficiencyOracle,
     SecurityOracle,
+    SecurityVerdict,
     canonical_json_hash,
     _normalize_json_structure,
 )
@@ -293,7 +294,9 @@ class MetricDistribution:
     """Statistical moments and percentiles for a metric series."""
     count: int
     mean: float
-    std_dev: float
+    std_dev: float  # Sample standard deviation (Bessel's correction ddof=1)
+    sample_std_dev: float  # Explicit sample standard deviation (ddof=1)
+    population_std_dev: float  # Explicit population standard deviation (ddof=0)
     p50: float
     p95: float
     p99: float
@@ -304,12 +307,18 @@ class MetricDistribution:
     @classmethod
     def compute(cls, values: List[float], provenance: str = MetricProvenance.MEASURED) -> MetricDistribution:
         if not values:
-            return cls(0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, provenance)
+            return cls(0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, provenance)
         sorted_vals = sorted(values)
         n = len(sorted_vals)
         mean_val = sum(sorted_vals) / n
-        variance = sum((x - mean_val) ** 2 for x in sorted_vals) / n if n > 1 else 0.0
-        std_val = math.sqrt(variance)
+
+        # Sample standard deviation with Bessel's correction (ddof=1)
+        sample_var = sum((x - mean_val) ** 2 for x in sorted_vals) / (n - 1) if n > 1 else 0.0
+        sample_std = math.sqrt(sample_var)
+
+        # Population standard deviation (ddof=0)
+        pop_var = sum((x - mean_val) ** 2 for x in sorted_vals) / n if n > 0 else 0.0
+        pop_std = math.sqrt(pop_var)
 
         def percentile(p: float) -> float:
             idx = int(n * p)
@@ -318,7 +327,9 @@ class MetricDistribution:
         return cls(
             count=n,
             mean=round(mean_val, 4),
-            std_dev=round(std_val, 4),
+            std_dev=round(sample_std, 4),
+            sample_std_dev=round(sample_std, 4),
+            population_std_dev=round(pop_std, 4),
             p50=round(percentile(0.50), 4),
             p95=round(percentile(0.95), 4),
             p99=round(percentile(0.99), 4),
@@ -333,7 +344,7 @@ class MetricDistribution:
 
 @dataclass(frozen=True)
 class BaselineEnvironmentMetadata:
-    """Environment, git, runtime, and configuration provenance."""
+    """Environment, git, runtime, and experimental configuration provenance."""
     git_commit: str
     python_version: str
     platform_system: str
@@ -344,11 +355,28 @@ class BaselineEnvironmentMetadata:
     pricing_registry_version: str
     is_reference_baseline: bool = True
     adaptive_heuristics_active: bool = False
+    git_branch: str = "unknown"
+    git_dirty: bool = False
+    iterations: int = 1
+    total_tasks_per_iteration: int = 9
+    seeds: Dict[str, int] = field(default_factory=dict)
+    dataset_hashes: Dict[str, str] = field(default_factory=dict)
+    task_execution_order: List[str] = field(default_factory=list)
+    pricing_model: str = "synthetic-reference"
+    metric_provenance_summary: Dict[str, str] = field(default_factory=dict)
     timestamp: str = field(default_factory=lambda: dt.datetime.now(dt.timezone.utc).isoformat())
 
     @classmethod
-    def capture(cls) -> BaselineEnvironmentMetadata:
+    def capture(
+        cls,
+        seeds: Optional[Dict[str, int]] = None,
+        dataset_hashes: Optional[Dict[str, str]] = None,
+        task_execution_order: Optional[List[str]] = None,
+        iterations: int = 1,
+    ) -> BaselineEnvironmentMetadata:
         git_sha = "unknown"
+        git_branch = "unknown"
+        git_dirty = False
         try:
             res = subprocess.run(
                 ["git", "rev-parse", "HEAD"],
@@ -358,11 +386,37 @@ class BaselineEnvironmentMetadata:
             )
             if res.returncode == 0:
                 git_sha = res.stdout.strip()
+            res_branch = subprocess.run(
+                ["git", "branch", "--show-current"],
+                capture_output=True,
+                text=True,
+                timeout=3.0,
+            )
+            if res_branch.returncode == 0:
+                git_branch = res_branch.stdout.strip()
+            res_status = subprocess.run(
+                ["git", "status", "--porcelain"],
+                capture_output=True,
+                text=True,
+                timeout=3.0,
+            )
+            if res_status.returncode == 0:
+                git_dirty = len(res_status.stdout.strip()) > 0
         except Exception:
             pass
 
+        prov_summary = {
+            "tokens": MetricProvenance.ESTIMATED,
+            "costs": MetricProvenance.ESTIMATED,
+            "latencies": MetricProvenance.MEASURED,
+            "external_api_calls": "ZERO_OFFLINE",
+        }
+
+        order = task_execution_order or []
         return cls(
             git_commit=git_sha,
+            git_branch=git_branch,
+            git_dirty=git_dirty,
             python_version=platform.python_version(),
             platform_system=platform.system(),
             platform_release=platform.release(),
@@ -372,6 +426,13 @@ class BaselineEnvironmentMetadata:
             pricing_registry_version=PricingRegistry.REGISTRY_VERSION,
             is_reference_baseline=True,
             adaptive_heuristics_active=False,
+            iterations=iterations,
+            total_tasks_per_iteration=len(order) if order else 9,
+            seeds=seeds or {},
+            dataset_hashes=dataset_hashes or {},
+            task_execution_order=order,
+            pricing_model="synthetic-reference",
+            metric_provenance_summary=prov_summary,
         )
 
     def to_dict(self) -> Dict[str, Any]:
@@ -392,7 +453,35 @@ class BaselineExecutionReport:
     success_rates: Dict[str, float]
     integrity_hash: str = ""
     oracle_signature: Optional[str] = None
+    task_results_digest: str = ""
     created_at: str = field(default_factory=lambda: dt.datetime.now(dt.timezone.utc).isoformat())
+
+    def compute_task_results_digest(self) -> str:
+        """Compute deterministic SHA-256 digest of the entire collection of task execution results.
+
+        Each individual task execution result contributes its task_id, suite, iteration,
+        input_payload_hash, canonical_output_hash, timing breakdown, oracle report integrity hash,
+        oracle_signature, and security verdict. Any alteration of an individual result is immediately detected.
+        """
+        entries = []
+        for res in self.task_execution_results:
+            entries.append({
+                "task_id": res.task_id,
+                "suite": res.suite,
+                "task_type": res.task_type,
+                "iteration": res.iteration,
+                "timing_breakdown": res.timing_breakdown.to_dict(),
+                "oracle_integrity_hash": res.oracle_report.integrity_hash,
+                "oracle_signature": res.oracle_report.oracle_signature,
+                "input_payload_hash": res.oracle_report.input_payload_hash,
+                "canonical_output_hash": res.oracle_report.canonical_output_hash,
+                "functional_success": res.oracle_report.functional_success,
+                "efficiency_success": res.oracle_report.efficiency_success,
+                "security_success": res.oracle_report.security_success,
+                "security_verdict": res.oracle_report.security_verdict,
+            })
+        canonical_bytes = json.dumps(_normalize_json_structure(entries), sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode("utf-8")
+        return hashlib.sha256(canonical_bytes).hexdigest()
 
     def compute_canonical_manifest(self) -> Dict[str, Any]:
         """Generate structured canonical manifest of the aggregated baseline for cryptographic signing."""
@@ -407,6 +496,7 @@ class BaselineExecutionReport:
             "adaptive_heuristics_active": self.environment.adaptive_heuristics_active,
             "total_tasks_executed": self.total_tasks_executed,
             "iterations": self.iterations,
+            "task_results_digest": self.compute_task_results_digest(),
             "success_rates": self.success_rates,
             "latency_distributions": {k: v.to_dict() for k, v in sorted(self.latency_distributions.items())},
             "token_aggregates": self.token_aggregates,
@@ -429,6 +519,22 @@ class BaselineExecutionReport:
         expected = hmac.new(hmac_key.encode("utf-8"), canonical_bytes, hashlib.sha256).hexdigest()
         return hmac.compare_digest(self.oracle_signature, expected)
 
+    def verify_full_report_integrity(self, hmac_key: Optional[str] = None) -> bool:
+        """Performs deep cryptographic verification of the root manifest and every individual task result."""
+        if not self.verify_integrity():
+            return False
+        if hmac_key and self.oracle_signature and not self.verify_signature(hmac_key):
+            return False
+        if self.task_results_digest and not hmac.compare_digest(self.task_results_digest, self.compute_task_results_digest()):
+            return False
+        for res in self.task_execution_results:
+            if not res.oracle_report.verify_integrity():
+                return False
+            if hmac_key and res.oracle_report.oracle_signature:
+                if not res.oracle_report.verify_signature(hmac_key):
+                    return False
+        return True
+
     def to_dict(self) -> Dict[str, Any]:
         return {
             "run_id": self.run_id,
@@ -436,6 +542,7 @@ class BaselineExecutionReport:
             "environment": self.environment.to_dict(),
             "total_tasks_executed": self.total_tasks_executed,
             "iterations": self.iterations,
+            "task_results_digest": self.task_results_digest,
             "success_rates": self.success_rates,
             "latency_distributions": {k: v.to_dict() for k, v in self.latency_distributions.items()},
             "token_aggregates": self.token_aggregates,
@@ -464,11 +571,21 @@ class BaselineRunner:
         run_id = f"baseline_run_{int(time.time())}"
         env = BaselineEnvironmentMetadata.capture()
 
-        # Generate standard tasks
+        # Generate standard tasks across all 3 suites
         tasks_a = SyntheticDatasetGenerator.generate_suite_a(seed=seed_suite_a, count=3)
         tasks_b = SyntheticDatasetGenerator.generate_suite_b(seed=seed_suite_b, count=3)
-        tasks_c = SyntheticDatasetGenerator.generate_suite_c(seed=seed_suite_c, count=2)
+        tasks_c = SyntheticDatasetGenerator.generate_suite_c(seed=seed_suite_c, count=3)
         all_tasks = tasks_a + tasks_b + tasks_c
+
+        task_order = [t.task_id for t in all_tasks]
+        dataset_hashes = {t.task_id: canonical_json_hash(t.input_payload) for t in all_tasks}
+        seeds = {"suite_a": seed_suite_a, "suite_b": seed_suite_b, "suite_c": seed_suite_c}
+        env = BaselineEnvironmentMetadata.capture(
+            seeds=seeds,
+            dataset_hashes=dataset_hashes,
+            task_execution_order=task_order,
+            iterations=iterations,
+        )
 
         execution_results: List[BaselineTaskExecutionResult] = []
         task_durations: List[float] = []
@@ -482,7 +599,9 @@ class BaselineRunner:
         passed_all_count = 0
         functional_success_count = 0
         efficiency_success_count = 0
-        security_success_count = 0
+        security_pass_count = 0
+        security_unverified_count = 0
+        security_fail_count = 0
 
         for it in range(iterations):
             for task in all_tasks:
@@ -614,8 +733,12 @@ class BaselineRunner:
                     functional_success_count += 1
                 if eff_ok:
                     efficiency_success_count += 1
-                if sec_ok:
-                    security_success_count += 1
+                if final_oracle_rep.security_verdict == SecurityVerdict.PASS:
+                    security_pass_count += 1
+                elif final_oracle_rep.security_verdict == SecurityVerdict.PARTIAL_UNVERIFIED:
+                    security_unverified_count += 1
+                elif final_oracle_rep.security_verdict == SecurityVerdict.FAIL:
+                    security_fail_count += 1
 
         total_runs = len(execution_results)
         latency_dists = {
@@ -644,7 +767,9 @@ class BaselineRunner:
             "passed_all_rate": round(passed_all_count / total_runs, 4) if total_runs else 0.0,
             "functional_success_rate": round(functional_success_count / total_runs, 4) if total_runs else 0.0,
             "efficiency_success_rate": round(efficiency_success_count / total_runs, 4) if total_runs else 0.0,
-            "security_success_rate": round(security_success_count / total_runs, 4) if total_runs else 0.0,
+            "security_pass_rate": round(security_pass_count / total_runs, 4) if total_runs else 0.0,
+            "security_unverified_rate": round(security_unverified_count / total_runs, 4) if total_runs else 0.0,
+            "security_fail_rate": round(security_fail_count / total_runs, 4) if total_runs else 0.0,
         }
 
         report = BaselineExecutionReport(
@@ -657,9 +782,12 @@ class BaselineRunner:
             token_aggregates=token_aggs,
             cost_aggregates=cost_aggs,
             success_rates=success_rates,
+            task_results_digest="",
         )
+        task_digest = report.compute_task_results_digest()
+        report = dataclasses.replace(report, task_results_digest=task_digest)
 
-        # Authenticate the aggregated baseline manifest
+        # Authenticate the aggregated baseline manifest (including task_results_digest)
         manifest = report.compute_canonical_manifest()
         manifest_bytes = json.dumps(_normalize_json_structure(manifest), sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode("utf-8")
         integrity_hash = hashlib.sha256(manifest_bytes).hexdigest()

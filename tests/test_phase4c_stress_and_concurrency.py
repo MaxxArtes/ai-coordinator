@@ -46,6 +46,7 @@ from ai_coordinator.synthetic_benchmark import (
     EvaluationOracleReport,
     FunctionalOracle,
     SecurityOracle,
+    SecurityVerdict,
     SyntheticBenchmarkRunner,
     SyntheticDatasetGenerator,
     SyntheticTaskDefinition,
@@ -755,6 +756,10 @@ os._exit(87)
             dataclasses.replace(original_report, sqlite_immutable=False),
             "sqlite_immutable",
         )
+        assert_tampered(
+            dataclasses.replace(original_report, security_verdict=SecurityVerdict.UNKNOWN),
+            "security_verdict",
+        )
 
         # Version parameter alteration
         self.assertFalse(original_report.verify_integrity(benchmark_version="1999.01.01"))
@@ -806,6 +811,91 @@ os._exit(87)
         self.assertFalse(res.efficiency_success)
         self.assertFalse(res.budget_latency_compliant)
         self.assertTrue(any("Métrica de latência/duração ausente ou desconhecida" in v for v in res.violations))
+
+    def test_11_shared_fence_commit_overrun_rejected(self) -> None:
+        """Validate that commit revalidates headroom when actual consumption exceeds reserve and rejects overruns."""
+        fence = SharedFlightBudgetFence(max_tokens=1000, max_cost_usd=0.010)
+
+        res_id = fence.reserve("worker_1", estimated_tokens=100, estimated_cost_usd=0.0010)
+        self.assertEqual(fence.reserved_tokens, 100)
+        self.assertEqual(fence.committed_tokens, 0)
+
+        # Worker attempts to commit 1500 tokens (exceeds max_tokens of 1000)
+        with self.assertRaises(SharedBudgetExceededError) as ctx:
+            fence.commit(res_id, actual_tokens=1500, actual_cost_usd=0.0010)
+        self.assertIn("Consumo efetivo no commit excedeu o orçamento compartilhado", str(ctx.exception))
+
+        # Ensure committed state was not breached and rejected count incremented
+        self.assertEqual(fence.committed_tokens, 0)
+        self.assertEqual(fence.rejected_count, 1)
+
+        # Worker attempts to commit with cost exceeding max_cost_usd (0.010)
+        with self.assertRaises(SharedBudgetExceededError):
+            fence.commit(res_id, actual_tokens=100, actual_cost_usd=0.025)
+        self.assertEqual(fence.committed_cost_usd, 0.0)
+        self.assertEqual(fence.rejected_count, 2)
+
+        # Compliant commit succeeds
+        fence.commit(res_id, actual_tokens=200, actual_cost_usd=0.0020)
+        self.assertEqual(fence.committed_tokens, 200)
+        self.assertEqual(fence.committed_cost_usd, 0.0020)
+        self.assertEqual(fence.reserved_tokens, 0)
+        self.assertEqual(fence.remaining_tokens, 800)
+
+    def test_12_shared_fence_commit_race_condition(self) -> None:
+        """Validate concurrent commits exceeding individual reservations compete safely without exceeding total budget."""
+        fence = SharedFlightBudgetFence(max_tokens=1000, max_cost_usd=0.010)
+        worker_count = 10
+        # Each worker reserves 50 tokens (total reserved = 500 <= 1000)
+        res_ids = [fence.reserve(f"w_{i}", estimated_tokens=50, estimated_cost_usd=0.0005) for i in range(worker_count)]
+        self.assertEqual(fence.reserved_tokens, 500)
+
+        # Now each worker tries to commit 200 tokens (total requested = 2000 > 1000 max_tokens)
+        committed_workers: List[str] = []
+        rejected_workers: List[str] = []
+        lock = threading.Lock()
+
+        def do_commit(r_id: str) -> None:
+            try:
+                fence.commit(r_id, actual_tokens=200, actual_cost_usd=0.0020)
+                with lock:
+                    committed_workers.append(r_id)
+            except SharedBudgetExceededError:
+                with lock:
+                    rejected_workers.append(r_id)
+
+        threads = [threading.Thread(target=do_commit, args=(r_id,)) for r_id in res_ids]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=10.0)
+
+        # Total committed tokens must strictly be <= 1000 and total committed cost <= 0.010
+        self.assertLessEqual(fence.committed_tokens, 1000)
+        self.assertLessEqual(fence.committed_cost_usd, 0.010)
+        self.assertGreater(len(committed_workers), 0)
+        self.assertGreater(len(rejected_workers), 0)
+        self.assertEqual(len(committed_workers) + len(rejected_workers), worker_count)
+
+    def test_13_shared_fence_unknown_or_duplicate_commit_rejected(self) -> None:
+        """Validate that commit raises KeyError for unknown, duplicate, or released reservations."""
+        fence = SharedFlightBudgetFence(max_tokens=1000, max_cost_usd=0.010)
+
+        # Unknown reservation
+        with self.assertRaises(KeyError):
+            fence.commit("non_existent_res_id", actual_tokens=50, actual_cost_usd=0.0005)
+
+        # Duplicate commit
+        res_id = fence.reserve("worker_dup", estimated_tokens=50, estimated_cost_usd=0.0005)
+        fence.commit(res_id, actual_tokens=50, actual_cost_usd=0.0005)
+        with self.assertRaises(KeyError):
+            fence.commit(res_id, actual_tokens=50, actual_cost_usd=0.0005)
+
+        # Commit after release
+        res_id_rel = fence.reserve("worker_rel", estimated_tokens=50, estimated_cost_usd=0.0005)
+        fence.release(res_id_rel)
+        with self.assertRaises(KeyError):
+            fence.commit(res_id_rel, actual_tokens=50, actual_cost_usd=0.0005)
 
 
 if __name__ == "__main__":

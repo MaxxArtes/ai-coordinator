@@ -99,12 +99,30 @@ class TestPhase4CBaselineExecution(unittest.TestCase):
         self.assertEqual(dist.p50, 30.0)
         self.assertEqual(dist.min_val, 10.0)
         self.assertEqual(dist.max_val, 50.0)
-        self.assertAlmostEqual(dist.std_dev, 14.1421, places=3)
+        # Sample standard deviation with Bessel's correction (ddof=1)
+        self.assertAlmostEqual(dist.std_dev, 15.8114, places=3)
+        self.assertAlmostEqual(dist.sample_std_dev, 15.8114, places=3)
+        # Population standard deviation (ddof=0)
+        self.assertAlmostEqual(dist.population_std_dev, 14.1421, places=3)
 
     def test_04_baseline_environment_metadata_and_provenance(self) -> None:
         """Validate that baseline captures environment, git commit, python runtime, and dataset version."""
-        env = BaselineEnvironmentMetadata.capture()
+        env = BaselineEnvironmentMetadata.capture(
+            seeds={"suite_a": 42, "suite_b": 43, "suite_c": 44},
+            dataset_hashes={"suite_a": "hash_a", "suite_b": "hash_b", "suite_c": "hash_c"},
+            task_execution_order=["task_1", "task_2"],
+            iterations=1,
+        )
         self.assertIsNotNone(env.git_commit)
+        self.assertIsNotNone(env.git_branch)
+        self.assertIsInstance(env.git_dirty, bool)
+        self.assertEqual(env.iterations, 1)
+        self.assertEqual(env.total_tasks_per_iteration, len(env.task_execution_order))
+        self.assertEqual(env.seeds["suite_a"], 42)
+        self.assertEqual(env.dataset_hashes["suite_a"], "hash_a")
+        self.assertEqual(env.task_execution_order, ["task_1", "task_2"])
+        self.assertEqual(env.pricing_model, "synthetic-reference")
+        self.assertIn("tokens", env.metric_provenance_summary)
         self.assertIsNotNone(env.python_version)
         self.assertIsNotNone(env.platform_system)
         self.assertEqual(env.dataset_version, DATASET_VERSION)
@@ -116,10 +134,36 @@ class TestPhase4CBaselineExecution(unittest.TestCase):
         runner = BaselineRunner(store=self.store, hmac_key=self.hmac_secret)
         report = runner.run_baseline(iterations=1)
 
-        # Baseline: untampered report passes both checks
+        # Baseline: untampered report passes both checks and full deep integrity
         self.assertTrue(report.verify_integrity())
         self.assertTrue(report.verify_signature(self.hmac_secret))
+        self.assertTrue(report.verify_full_report_integrity(self.hmac_secret))
         self.assertFalse(report.verify_signature("wrong_key_12345"))
+        self.assertFalse(report.verify_full_report_integrity("wrong_key_12345"))
+
+        # Tamper 0: Modify individual task result (e.g. alter canonical_output_hash) without modifying summary aggregates
+        tampered_tasks = list(report.task_execution_results)
+        bad_oracle_rep = dataclasses.replace(
+            tampered_tasks[0].oracle_report,
+            canonical_output_hash="tampered_task_hash_9999",
+        )
+        tampered_tasks[0] = dataclasses.replace(tampered_tasks[0], oracle_report=bad_oracle_rep)
+        tampered_individual_rep = dataclasses.replace(
+            report,
+            task_execution_results=tampered_tasks,
+        )
+        self.assertFalse(
+            tampered_individual_rep.verify_integrity(),
+            "Adulteração individual de tarefa deve invalidar verify_integrity() via task_results_digest",
+        )
+        self.assertFalse(
+            tampered_individual_rep.verify_signature(self.hmac_secret),
+            "Adulteração individual de tarefa deve invalidar verify_signature() via task_results_digest",
+        )
+        self.assertFalse(
+            tampered_individual_rep.verify_full_report_integrity(self.hmac_secret),
+            "Adulteração individual de tarefa deve invalidar verify_full_report_integrity()",
+        )
 
         # Tamper 1: Modify success rate
         tampered_success = dataclasses.replace(
@@ -153,11 +197,17 @@ class TestPhase4CBaselineExecution(unittest.TestCase):
         rep1 = runner1.run_baseline(iterations=1, seed_suite_a=4242, seed_suite_b=8484, seed_suite_c=1212)
         rep2 = runner2.run_baseline(iterations=1, seed_suite_a=4242, seed_suite_b=8484, seed_suite_c=1212)
 
+        self.assertEqual(rep1.total_tasks_executed, 9)
+        self.assertEqual(rep2.total_tasks_executed, 9)
         self.assertEqual(rep1.total_tasks_executed, rep2.total_tasks_executed)
         self.assertEqual(rep1.token_aggregates["total_tokens"], rep2.token_aggregates["total_tokens"])
         self.assertEqual(rep1.cost_aggregates["total_cost_usd"], rep2.cost_aggregates["total_cost_usd"])
         self.assertEqual(rep1.success_rates, rep2.success_rates)
         self.assertEqual(rep1.success_rates["functional_success_rate"], 1.0)
+        self.assertEqual(rep1.success_rates["efficiency_success_rate"], 1.0)
+        self.assertEqual(rep1.success_rates["security_pass_rate"], 1.0)
+        self.assertEqual(rep1.success_rates["security_unverified_rate"], 0.0)
+        self.assertEqual(rep1.success_rates["security_fail_rate"], 0.0)
         self.assertEqual(rep1.success_rates["passed_all_rate"], 1.0)
 
 

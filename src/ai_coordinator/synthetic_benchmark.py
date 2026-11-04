@@ -69,6 +69,15 @@ def _normalize_json_structure(data: Any) -> Any:
     return str(data)
 
 
+class SecurityVerdict:
+    """Explicit categorization of security oracle evaluations."""
+    PASS = "PASS"
+    FAIL = "FAIL"
+    PARTIAL_UNVERIFIED = "PARTIAL_UNVERIFIED"
+    NOT_APPLICABLE = "NOT_APPLICABLE"
+    UNKNOWN = "UNKNOWN"
+
+
 def canonical_json_hash(data: Any) -> str:
     """Compute deterministic SHA-256 hash of a normalized JSON-serializable structure.
 
@@ -129,8 +138,8 @@ class EvaluationOracleReport:
     observed_tokens: TokenMetrics
     observed_cost: CostMetrics
     observed_latencies: LatencyMetrics
-    security_success: bool
-    zero_secrets_leaked: bool
+    security_success: Optional[bool] = None
+    zero_secrets_leaked: bool = True
     sqlite_immutable: Optional[bool] = None
     violation_details: Tuple[str, ...] = field(default_factory=tuple)
     integrity_hash: str = ""
@@ -139,10 +148,29 @@ class EvaluationOracleReport:
     budget_latency_compliant: bool = True
     input_payload_hash: str = ""
     benchmark_version: str = DATASET_VERSION
+    security_verdict: str = ""
+
+    def __post_init__(self) -> None:
+        # Determine strict security verdict based on evaluated security checks if not explicitly specified
+        if not self.security_verdict:
+            if self.security_success is False or not self.zero_secrets_leaked or self.sqlite_immutable is False or len(self.violation_details) > 0:
+                object.__setattr__(self, "security_verdict", SecurityVerdict.FAIL)
+                if self.security_success is None:
+                    object.__setattr__(self, "security_success", False)
+            elif self.sqlite_immutable is True and self.zero_secrets_leaked and len(self.violation_details) == 0:
+                object.__setattr__(self, "security_verdict", SecurityVerdict.PASS)
+                if self.security_success is None:
+                    object.__setattr__(self, "security_success", True)
+            elif self.sqlite_immutable is None and self.zero_secrets_leaked and len(self.violation_details) == 0:
+                object.__setattr__(self, "security_verdict", SecurityVerdict.PARTIAL_UNVERIFIED)
+                if self.security_success is not None:
+                    object.__setattr__(self, "security_success", None)
+            else:
+                object.__setattr__(self, "security_verdict", SecurityVerdict.UNKNOWN)
 
     @property
     def passed_all(self) -> bool:
-        return self.functional_success and self.efficiency_success and self.security_success
+        return self.functional_success and self.efficiency_success and (self.security_success is True)
 
     def compute_canonical_manifest(self, benchmark_version: Optional[str] = None) -> Dict[str, Any]:
         """Build canonical structured manifest of all evaluated report fields for authentication."""
@@ -189,6 +217,7 @@ class EvaluationOracleReport:
                 "generation_duration_provenance": self.observed_latencies.generation_duration_provenance,
             },
             "security_success": self.security_success,
+            "security_verdict": self.security_verdict,
             "zero_secrets_leaked": self.zero_secrets_leaked,
             "sqlite_immutable": self.sqlite_immutable,
             "violation_details": list(sorted(self.violation_details)),
@@ -832,11 +861,15 @@ class SecurityOracle:
             # Store was not provided or has no db handle: explicitly mark as not verified / not applicable
             sqlite_ok = None
 
-        # If sqlite_ok was evaluated, it cannot be False; if None, security relies on zero_leak & zero violations
-        if sqlite_ok is False:
+        # If sqlite_ok was evaluated, it cannot be False; if None, mark as unverified
+        if sqlite_ok is False or not zero_leak or len(violations) > 0:
             security_success = False
+        elif sqlite_ok is True and zero_leak and len(violations) == 0:
+            security_success = True
+        elif sqlite_ok is None and zero_leak and len(violations) == 0:
+            security_success = None
         else:
-            security_success = zero_leak and len(violations) == 0
+            security_success = False
 
         return security_success, zero_leak, sqlite_ok, violations
 
@@ -887,6 +920,26 @@ class SharedFlightBudgetFence:
         with self._lock:
             return self._rejected_requests
 
+    @property
+    def committed_tokens(self) -> int:
+        with self._lock:
+            return self._committed_tokens
+
+    @property
+    def committed_cost_usd(self) -> float:
+        with self._lock:
+            return self._committed_cost_usd
+
+    @property
+    def reserved_tokens(self) -> int:
+        with self._lock:
+            return self._reserved_tokens
+
+    @property
+    def reserved_cost_usd(self) -> float:
+        with self._lock:
+            return self._reserved_cost_usd
+
     def reserve(self, worker_id: str, estimated_tokens: int, estimated_cost_usd: float) -> str:
         """Attempt to atomically reserve budget BEFORE consumption.
 
@@ -915,16 +968,41 @@ class SharedFlightBudgetFence:
             return reservation_id
 
     def commit(self, reservation_id: str, actual_tokens: int, actual_cost_usd: float) -> None:
-        """Commit actual consumption for an approved reservation and release any unused reserve."""
+        """Commit actual consumption for an approved reservation and release any unused reserve.
+
+        If actual consumption exceeds the reserved amount, the additional consumption is
+        atomically re-validated against remaining shared headroom.
+        Raises SharedBudgetExceededError if the commit would cause shared limits to be breached.
+        Raises KeyError if the reservation_id is unknown or already finalized.
+        """
         act_tok = max(0, int(actual_tokens))
         act_cost = max(0.0, float(actual_cost_usd))
 
         with self._lock:
             if reservation_id not in self._active_reservations:
-                return
-            res_tok, res_cost = self._active_reservations.pop(reservation_id)
-            self._reserved_tokens = max(0, self._reserved_tokens - res_tok)
-            self._reserved_cost_usd = max(0.0, self._reserved_cost_usd - res_cost)
+                raise KeyError(f"Reserva desconhecida, expirada ou já confirmada: '{reservation_id}'")
+
+            res_tok, res_cost = self._active_reservations[reservation_id]
+
+            # Projected total tokens and cost across all workers if this commit is accepted
+            other_reserved_tokens = self._reserved_tokens - res_tok
+            other_reserved_cost = self._reserved_cost_usd - res_cost
+            projected_tokens = self._committed_tokens + act_tok + other_reserved_tokens
+            projected_cost = self._committed_cost_usd + act_cost + other_reserved_cost
+
+            if projected_tokens > self.max_tokens or projected_cost > self.max_cost_usd:
+                self._rejected_requests += 1
+                raise SharedBudgetExceededError(
+                    f"Consumo efetivo no commit excedeu o orçamento compartilhado para '{reservation_id}': "
+                    f"tokens projetados {projected_tokens}/{self.max_tokens}, "
+                    f"custo projetado ${projected_cost:.4f}/${self.max_cost_usd:.4f} "
+                    f"(reserva: {res_tok} tok, ${res_cost:.4f}; efetivo solicitado: {act_tok} tok, ${act_cost:.4f})"
+                )
+
+            # Atomically commit and release reservation
+            self._active_reservations.pop(reservation_id)
+            self._reserved_tokens = max(0, other_reserved_tokens)
+            self._reserved_cost_usd = max(0.0, other_reserved_cost)
             self._committed_tokens += act_tok
             self._committed_cost_usd += act_cost
 

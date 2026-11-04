@@ -21,6 +21,7 @@ from ai_coordinator import (
     FunctionalOracle,
     EfficiencyOracle,
     SecurityOracle,
+    SecurityVerdict,
     SyntheticBenchmarkRunner,
     canonical_json_hash,
 )
@@ -368,7 +369,7 @@ class TestPhase4CSyntheticBenchmark(unittest.TestCase):
         self.assertIsNone(report.oracle_signature)
 
     def test_12_security_oracle_returns_none_when_store_not_provided(self) -> None:
-        """Validate that SecurityOracle does not claim SQLite immutability is approved when store is None."""
+        """Validate that SecurityOracle returns None and PARTIAL_UNVERIFIED when store is None."""
         telemetry = CognitiveTelemetryRecord(
             task_id="no_store_task",
             metadata={"phase": "test"},
@@ -379,10 +380,30 @@ class TestPhase4CSyntheticBenchmark(unittest.TestCase):
             telemetry=telemetry,
             store=None,
         )
-        self.assertTrue(sec_ok)
+        self.assertIsNone(sec_ok, "security_success deve ser None (não completamente verificado) quando store for None")
         self.assertTrue(zero_leak)
         self.assertIsNone(sqlite_ok, "sqlite_ok deve ser None (não avaliado) quando store for None")
         self.assertEqual(len(violations), 0)
+
+        # Ensure EvaluationOracleReport assigns PARTIAL_UNVERIFIED and passed_all is False
+        report = EvaluationOracleReport(
+            task_id="no_store_task",
+            suite="suite_a_data_engineering",
+            functional_success=True,
+            correctness_score=1.0,
+            canonical_output_hash="abc",
+            expected_output_hash="abc",
+            efficiency_success=True,
+            budget_tokens_compliant=True,
+            budget_cost_compliant=True,
+            observed_tokens=telemetry.tokens,
+            observed_cost=telemetry.cost,
+            observed_latencies=telemetry.latencies,
+            security_success=sec_ok,
+            sqlite_immutable=sqlite_ok,
+        )
+        self.assertEqual(report.security_verdict, SecurityVerdict.PARTIAL_UNVERIFIED)
+        self.assertFalse(report.passed_all, "passed_all deve ser False quando security_success for None")
 
 
 if __name__ == "__main__":
