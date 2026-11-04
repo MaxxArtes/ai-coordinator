@@ -73,18 +73,33 @@ O sistema avalia cada execução de forma automatizada e independente do agente 
    - Atribui nota 1.0 para correspondência exata ou score ponderado de schema em caso de discrepância.
 2. **`EfficiencyOracle`:**
    - Valida limites de tokens e custos configurados na tarefa (`budget_limit_tokens`, `budget_limit_cost_usd`).
-   - Rejeita execuções com métricas desconhecidas (`total_tokens is None` ou `total_cost_usd is None`), impedindo falsas aprovações por conversão indevida para zero.
+   - Valida o cumprimento do teto temporal (`max_duration_ms`) medido por relógio estritamente monotônico (`time.perf_counter`), impedindo aprovações de tarefas lentas.
+   - Rejeita execuções com métricas desconhecidas (`total_tokens is None`, `total_cost_usd is None` ou latência com proveniência `unknown`), impedindo falsas aprovações por conversão indevida para zero.
    - Verifica classificação correta de proveniência (`measured`, `estimated`, `unknown`).
    - Audita a aplicação de desconto de cache por provedor, impedindo sobretaxação.
 3. **`SecurityOracle`:**
    - Examina a saída original bruta do candidato (`actual_output`) **antes de qualquer transformação ou sanitização**, detectando imediatamente qualquer vazamento de credenciais.
    - Varre logs, erros e metadados procurando credenciais de alta entropia.
-   - Testa a imutabilidade do banco SQLite de forma estritamente não-destrutiva, utilizando `SAVEPOINT` com `ROLLBACK` mandatório e exigindo especificamente `sqlite3.IntegrityError` decorrente do trigger `immutable and append-only` (rejeitando erros operacionais espúrios).
+   - Testa a imutabilidade do banco SQLite de forma estritamente isolada e não-perturbadora, utilizando um banco descartável em memória (`:memory:`) replicado da definição do schema (com `store._lock`). Esse método elimina colisões de transações, `SAVEPOINT` ou contenção de lock na conexão compartilhada operacional.
 
 ---
 
 ## 4. Orquestrador Local (`SyntheticBenchmarkRunner`)
 
 O `SyntheticBenchmarkRunner` provê um harness de teste unificado que executa tarefas sintéticas, registra telemetria observacional e consolida relatórios imutáveis (`EvaluationOracleReport`):
+- **Temporização Monotônica:** Início e término medidos exclusivamente com `time.perf_counter()`, imunes a saltos de relógio de sistema ou correções NTP.
 - **Proveniência Rigorosa:** Contagens de tokens estimadas deterministicamente por contagem de caracteres são registradas obrigatoriamente como `MetricProvenance.ESTIMATED` (jamais `MEASURED`).
-- **Identificador de Integridade vs Assinatura Autenticada:** O relatório expõe separadamente o `integrity_hash` (digest SHA-256 determinístico dos resultados) e a `oracle_signature` (assinatura criptograficamente autenticada via HMAC-SHA256 quando fornecida chave secreta `hmac_key`).
+- **Autenticação Abrangente por HMAC:** O manifesto canônico autenticado cobre integralmente todos os campos de resultado, métricas de tokens/custo/latência, violações detalhadas, versão do benchmark e hashes de saída. Adulterações em qualquer desses campos invalidam a assinatura HMAC e o `integrity_hash`.
+- **Verificação Independente:** Métodos `report.verify_integrity()` e `report.verify_signature(hmac_key)` permitem que auditores e sistemas externos atestem matematicamente a autenticidade e a ausência de adulteração pós-execução.
+
+---
+
+## 5. Testes de Carga, Concorrência e Estresse (Subetapa 4C.0.3)
+
+O módulo de testes [`tests/test_phase4c_stress_and_concurrency.py`](file:///D:/ai-coordinator/tests/test_phase4c_stress_and_concurrency.py) submete a infraestrutura a condições extremas:
+- **Throughput e Concorrência WAL:** Gravação paralela multi-thread sem deadlocks (`database is locked`), medindo latências p50/p95/p99.
+- **Leituras e Escritas Concorrentes Intercaladas:** Agregações estatísticas e consultas simultâneas operando sem interferência.
+- **Fencing Atômico de Orçamento:** Contenção de missões concorrentes sem corridas TOCTOU.
+- **Injeção Massiva de Segredos:** Varredura em rajadas de credenciais de alta entropia, com prova SQL direta no banco físico.
+- **Tolerância a Falhas e Recuperação WAL:** Integridade de recuperação após simulação de abortamento brusco de conexão.
+- **Sobrecarga Mínima:** Overhead de telemetria estritamente inferior a 25 ms por ciclo completo e crescimento de memória controlado.

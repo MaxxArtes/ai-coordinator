@@ -6,6 +6,7 @@ cognitive baseline experimentation without external API costs or credential expo
 """
 from __future__ import annotations
 
+import contextlib
 import dataclasses
 from dataclasses import dataclass, field
 import datetime as dt
@@ -16,6 +17,7 @@ import math
 import random
 import re
 import sqlite3
+import time
 from typing import Any, Dict, List, Optional, Set, Tuple, Union
 
 from .telemetry import (
@@ -119,10 +121,62 @@ class EvaluationOracleReport:
     integrity_hash: str = ""
     oracle_signature: Optional[str] = None
     timestamp: str = field(default_factory=lambda: dt.datetime.now(dt.timezone.utc).isoformat())
+    budget_latency_compliant: bool = True
 
     @property
     def passed_all(self) -> bool:
         return self.functional_success and self.efficiency_success and self.security_success
+
+    def compute_canonical_manifest(self, benchmark_version: str = DATASET_VERSION) -> Dict[str, Any]:
+        """Build canonical structured manifest of all evaluated report fields for authentication."""
+        return {
+            "version": benchmark_version,
+            "task_id": self.task_id,
+            "suite": self.suite,
+            "passed_all": self.passed_all,
+            "functional_success": self.functional_success,
+            "correctness_score": round(self.correctness_score, 4),
+            "canonical_output_hash": self.canonical_output_hash,
+            "expected_output_hash": self.expected_output_hash,
+            "efficiency_success": self.efficiency_success,
+            "budget_tokens_compliant": self.budget_tokens_compliant,
+            "budget_cost_compliant": self.budget_cost_compliant,
+            "budget_latency_compliant": self.budget_latency_compliant,
+            "observed_tokens": {
+                "input_tokens": self.observed_tokens.input_tokens,
+                "output_tokens": self.observed_tokens.output_tokens,
+                "total_tokens": self.observed_tokens.total_tokens,
+                "provenance": self.observed_tokens.provenance,
+            },
+            "observed_cost": {
+                "total_cost_usd": self.observed_cost.total_cost_usd,
+                "provenance": self.observed_cost.provenance,
+            },
+            "observed_latencies": {
+                "total_duration_ms": round(self.observed_latencies.total_duration_ms, 4),
+                "latency_provenance": self.observed_latencies.latency_provenance,
+            },
+            "security_success": self.security_success,
+            "zero_secrets_leaked": self.zero_secrets_leaked,
+            "sqlite_immutable": self.sqlite_immutable,
+            "violation_details": list(sorted(self.violation_details)),
+        }
+
+    def verify_integrity(self, benchmark_version: str = DATASET_VERSION) -> bool:
+        """Verify that integrity_hash strictly matches the canonical digest of all manifest fields."""
+        manifest = self.compute_canonical_manifest(benchmark_version)
+        canonical_bytes = json.dumps(_normalize_json_structure(manifest), sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode("utf-8")
+        expected_hash = hashlib.sha256(canonical_bytes).hexdigest()
+        return hmac.compare_digest(self.integrity_hash, expected_hash)
+
+    def verify_signature(self, hmac_key: str, benchmark_version: str = DATASET_VERSION) -> bool:
+        """Verify that oracle_signature is authentic for all report fields under the provided secret key."""
+        if not self.oracle_signature or not hmac_key:
+            return False
+        manifest = self.compute_canonical_manifest(benchmark_version)
+        canonical_bytes = json.dumps(_normalize_json_structure(manifest), sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode("utf-8")
+        expected_sig = hmac.new(hmac_key.encode("utf-8"), canonical_bytes, hashlib.sha256).hexdigest()
+        return hmac.compare_digest(self.oracle_signature, expected_sig)
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -136,6 +190,7 @@ class EvaluationOracleReport:
             "efficiency_success": self.efficiency_success,
             "budget_tokens_compliant": self.budget_tokens_compliant,
             "budget_cost_compliant": self.budget_cost_compliant,
+            "budget_latency_compliant": self.budget_latency_compliant,
             "observed_tokens": self.observed_tokens.to_dict(),
             "observed_cost": self.observed_cost.to_dict(),
             "observed_latencies": self.observed_latencies.to_dict(),
@@ -513,22 +568,41 @@ class FunctionalOracle:
         return False, 0.0, actual_hash
 
 
+class EfficiencyEvaluationResult(tuple):
+    """Result tuple supporting both 4-tuple backward compatibility and named attributes."""
+    efficiency_success: bool
+    budget_tokens_compliant: bool
+    budget_cost_compliant: bool
+    budget_latency_compliant: bool
+    violations: List[str]
+
+    def __new__(cls, efficiency_success: bool, tokens_ok: bool, cost_ok: bool, violations: List[str], duration_ok: bool = True):
+        inst = super().__new__(cls, (efficiency_success, tokens_ok, cost_ok, violations))
+        inst.efficiency_success = efficiency_success
+        inst.budget_tokens_compliant = tokens_ok
+        inst.budget_cost_compliant = cost_ok
+        inst.budget_latency_compliant = duration_ok
+        inst.violations = violations
+        return inst
+
+
 class EfficiencyOracle:
-    """Oracle auditing budget limits, vendor cache accounting, and provenance classification."""
+    """Oracle auditing budget limits, vendor cache accounting, latency, and provenance classification."""
 
     @classmethod
     def evaluate(
         cls,
         telemetry: CognitiveTelemetryRecord,
         expected_task: SyntheticTaskDefinition,
-    ) -> Tuple[bool, bool, bool, List[str]]:
-        """Evaluate resource and telemetry compliance.
+    ) -> EfficiencyEvaluationResult:
+        """Evaluate resource, cost, latency, and telemetry compliance.
 
-        Returns (efficiency_success, budget_tokens_compliant, budget_cost_compliant, violations).
+        Returns EfficiencyEvaluationResult (unpacks as 4-tuple: efficiency_success, budget_tokens_compliant, budget_cost_compliant, violations).
         """
         violations: List[str] = []
         tok = telemetry.tokens
         cost = telemetry.cost
+        lat = telemetry.latencies
 
         # 1. Budget compliance - Unknown or missing metrics must NOT be approved as compliant
         tok_count = tok.total_tokens
@@ -553,14 +627,29 @@ class EfficiencyOracle:
                     f"Limite de custo excedido: observado ${cost_val:.6f} > orçado ${expected_task.budget_limit_cost_usd:.6f}"
                 )
 
-        # 2. Strict provenance validation
+        # 2. Strict latency and duration compliance (using monotonic clock verification)
+        duration_val = lat.total_duration_ms
+        if duration_val is None or lat.latency_provenance == MetricProvenance.UNKNOWN:
+            duration_ok = False
+            violations.append("Métrica de latência/duração ausente ou desconhecida: impossível validar conformidade temporal")
+        else:
+            duration_ok = duration_val <= expected_task.max_duration_ms
+            if not duration_ok:
+                violations.append(
+                    f"Limite de duração excedido: observado {duration_val:.2f} ms > máximo permitido {expected_task.max_duration_ms:.2f} ms"
+                )
+
+        # 3. Strict provenance validation
         if tok.provenance not in MetricProvenance.ALL:
             violations.append(f"Proveniência de tokens inválida: '{tok.provenance}'")
 
         if cost.provenance not in MetricProvenance.ALL:
             violations.append(f"Proveniência de custo inválida: '{cost.provenance}'")
 
-        # 3. Cache discount validation (no double-billing for OpenAI/Gemini)
+        if lat.latency_provenance not in MetricProvenance.ALL:
+            violations.append(f"Proveniência de latência inválida: '{lat.latency_provenance}'")
+
+        # 4. Cache discount validation (no double-billing for OpenAI/Gemini)
         prov = telemetry.provider.lower()
         if prov in ("openai", "azure", "google", "gemini") and tok.cache_read_tokens and tok.input_tokens:
             if cost.input_cost_usd is not None and cost.cache_read_cost_usd is not None:
@@ -573,8 +662,8 @@ class EfficiencyOracle:
                             f"Sobretarifação de cache detectada: entrada faturou {cost.input_cost_usd} em vez de {expected_in_cost}"
                         )
 
-        efficiency_success = tokens_ok and cost_ok and len(violations) == 0
-        return efficiency_success, tokens_ok, cost_ok, violations
+        efficiency_success = tokens_ok and cost_ok and duration_ok and len(violations) == 0
+        return EfficiencyEvaluationResult(efficiency_success, tokens_ok, cost_ok, violations, duration_ok)
 
 
 class SecurityOracle:
@@ -629,34 +718,82 @@ class SecurityOracle:
                 violations.append("Credencial em texto não sanitizado vazada no payload de metadata")
                 break
 
-        # 4. Test SQLite immutability triggers safely without modifying the evaluated database
-        if store is not None and telemetry.id is not None:
-            # Execute within an isolated savepoint with mandatory rollback to preserve database integrity
+        # 4. Test SQLite immutability triggers safely using an isolated disposable in-memory database
+        # This completely eliminates concurrent SAVEPOINT/ROLLBACK interference on the shared connection
+        if store is not None and hasattr(store, "db"):
             try:
-                store.db.execute("SAVEPOINT sec_oracle_immutability_test")
+                # Thread-safe read of schema definitions from store.db
+                lock = getattr(store, "_lock", None)
+                lock_ctx = lock if lock is not None else contextlib.nullcontext()
+                with lock_ctx:
+                    schema_rows = store.db.execute(
+                        "SELECT type, name, sql FROM sqlite_master WHERE tbl_name = 'cognitive_telemetry' AND sql IS NOT NULL"
+                    ).fetchall()
+                    sample_row = None
+                    col_count = 0
+                    if telemetry.id is not None:
+                        cur = store.db.execute("SELECT * FROM cognitive_telemetry WHERE id = ?", (telemetry.id,))
+                        sample_row = cur.fetchone()
+                        col_count = len(cur.description) if cur.description else 0
+
+                # Recreate schema in a dedicated disposable in-memory database
+                disposable_db = sqlite3.connect(":memory:")
                 try:
-                    store.db.execute(
-                        "UPDATE cognitive_telemetry SET task_id = 'tampered' WHERE id = ?",
-                        (telemetry.id,),
-                    )
-                    # If this succeeds, the trigger is MISSING!
-                    sqlite_ok = False
-                    violations.append("Violação de segurança: UPDATE na tabela cognitive_telemetry não foi rejeitado pelo trigger!")
-                except sqlite3.IntegrityError as err:
-                    if "immutable and append-only" in str(err):
-                        sqlite_ok = True
+                    tables_sql = [r[2] for r in schema_rows if r[0] == "table"]
+                    triggers_sql = [r[2] for r in schema_rows if r[0] == "trigger"]
+
+                    for t_sql in tables_sql:
+                        disposable_db.execute(t_sql)
+                    for trg_sql in triggers_sql:
+                        disposable_db.execute(trg_sql)
+
+                    # Insert probe row into disposable database
+                    probe_id = telemetry.id if telemetry.id is not None else 1
+                    if sample_row is not None and col_count > 0:
+                        placeholders = ",".join(["?"] * col_count)
+                        disposable_db.execute(f"INSERT INTO cognitive_telemetry VALUES ({placeholders})", tuple(sample_row))
                     else:
+                        disposable_db.execute(
+                            "INSERT INTO cognitive_telemetry (id, task_id, provider, model_name, tokens_provenance, total_duration_ms, latency_provenance, cost_provenance) "
+                            "VALUES (?, 'probe_task', 'probe_prov', 'probe_mod', 'estimated', 1.0, 'measured', 'estimated')",
+                            (probe_id,),
+                        )
+
+                    # Test UPDATE rejection on the disposable database
+                    try:
+                        disposable_db.execute(
+                            "UPDATE cognitive_telemetry SET task_id = 'tampered' WHERE id = ?",
+                            (probe_id,),
+                        )
                         sqlite_ok = False
-                        violations.append(f"IntegrityError inesperado na verificação de integridade: {err}")
-                except Exception as err:
-                    sqlite_ok = False
-                    violations.append(f"Erro operacional inesperado ao verificar trigger de imutabilidade: {err}")
+                        violations.append("Violação de segurança: UPDATE na tabela cognitive_telemetry não foi rejeitado pelo trigger!")
+                    except sqlite3.IntegrityError as err:
+                        if "immutable and append-only" in str(err):
+                            sqlite_ok = True
+                        else:
+                            sqlite_ok = False
+                            violations.append(f"IntegrityError inesperado na verificação de integridade: {err}")
+
+                    # If UPDATE was rejected, also test DELETE rejection
+                    if sqlite_ok:
+                        try:
+                            disposable_db.execute(
+                                "DELETE FROM cognitive_telemetry WHERE id = ?",
+                                (probe_id,),
+                            )
+                            sqlite_ok = False
+                            violations.append("Violação de segurança: DELETE na tabela cognitive_telemetry não foi rejeitado pelo trigger!")
+                        except sqlite3.IntegrityError as del_err:
+                            if "immutable and cannot be deleted" in str(del_err):
+                                sqlite_ok = True
+                            else:
+                                sqlite_ok = False
+                                violations.append(f"IntegrityError inesperado na exclusão: {del_err}")
                 finally:
-                    store.db.execute("ROLLBACK TO sec_oracle_immutability_test")
-                    store.db.execute("RELEASE sec_oracle_immutability_test")
+                    disposable_db.close()
             except Exception as outer_err:
                 sqlite_ok = False
-                violations.append(f"Falha ao executar teste de savepoint de imutabilidade: {outer_err}")
+                violations.append(f"Falha ao executar teste de imutabilidade em banco descartável: {outer_err}")
 
         security_success = zero_leak and sqlite_ok and len(violations) == 0
         return security_success, zero_leak, sqlite_ok, violations
@@ -669,6 +806,20 @@ class SyntheticBenchmarkRunner:
         self.store = store
         self.hmac_key = hmac_key
 
+    @classmethod
+    def verify_report(
+        cls,
+        report: EvaluationOracleReport,
+        hmac_key: Optional[str] = None,
+        benchmark_version: str = DATASET_VERSION,
+    ) -> bool:
+        """Verify comprehensive integrity and HMAC authentication of an oracle report."""
+        if not report.verify_integrity(benchmark_version):
+            return False
+        if hmac_key is not None:
+            return report.verify_signature(hmac_key, benchmark_version)
+        return True
+
     def run_task(
         self,
         task: SyntheticTaskDefinition,
@@ -679,7 +830,7 @@ class SyntheticBenchmarkRunner:
     ) -> EvaluationOracleReport:
         """Execute a synthetic task, collect fine-grained telemetry, and evaluate with all oracles."""
         t0 = dt.datetime.now(dt.timezone.utc)
-        start_perf = dt.datetime.now().timestamp()
+        start_perf = time.perf_counter()
 
         # Execute candidate solver under test
         actual_output = None
@@ -691,7 +842,7 @@ class SyntheticBenchmarkRunner:
             success = False
             error_msg = str(exc)
 
-        end_perf = dt.datetime.now().timestamp()
+        end_perf = time.perf_counter()
         duration_ms = max(0.0, (end_perf - start_perf) * 1000.0)
 
         # Build telemetry record - tokens estimated by character count are strictly marked ESTIMATED
@@ -732,8 +883,10 @@ class SyntheticBenchmarkRunner:
         # 1. Functional Oracle (compares actual output against expected output)
         func_ok, correctness, actual_hash = FunctionalOracle.evaluate(actual_output, task)
 
-        # 2. Efficiency Oracle (audits budget limits, provenance, and cache discounts)
-        eff_ok, tok_ok, cost_ok, eff_violations = EfficiencyOracle.evaluate(telemetry, task)
+        # 2. Efficiency Oracle (audits budget limits, duration limit, provenance, and cache discounts)
+        eff_res = EfficiencyOracle.evaluate(telemetry, task)
+        eff_ok, tok_ok, cost_ok, eff_violations = eff_res
+        duration_ok = getattr(eff_res, "budget_latency_compliant", True)
 
         # 3. Security Oracle (evaluates candidate's actual output directly before any redaction)
         sec_ok, zero_leak, sqlite_ok, sec_violations = SecurityOracle.evaluate(
@@ -744,17 +897,8 @@ class SyntheticBenchmarkRunner:
 
         all_violations = tuple(eff_violations + sec_violations)
 
-        # Compute deterministic integrity hash (full SHA-256)
-        integrity_payload = f"{task.task_id}:{actual_hash}:{func_ok}:{eff_ok}:{sec_ok}:{tok_ok}:{cost_ok}:{zero_leak}:{sqlite_ok}"
-        integrity_hash = hashlib.sha256(integrity_payload.encode("utf-8")).hexdigest()
-
-        # Compute authenticated HMAC signature if a secret key is configured
-        active_hmac_key = hmac_key or self.hmac_key
-        oracle_sig: Optional[str] = None
-        if active_hmac_key:
-            oracle_sig = hmac.new(active_hmac_key.encode("utf-8"), integrity_payload.encode("utf-8"), hashlib.sha256).hexdigest()
-
-        return EvaluationOracleReport(
+        # Build preliminary report to generate canonical manifest
+        preliminary_report = EvaluationOracleReport(
             task_id=task.task_id,
             suite=task.suite,
             functional_success=func_ok,
@@ -764,6 +908,7 @@ class SyntheticBenchmarkRunner:
             efficiency_success=eff_ok,
             budget_tokens_compliant=tok_ok,
             budget_cost_compliant=cost_ok,
+            budget_latency_compliant=duration_ok,
             observed_tokens=tokens,
             observed_cost=cost,
             observed_latencies=latencies,
@@ -771,6 +916,21 @@ class SyntheticBenchmarkRunner:
             zero_secrets_leaked=zero_leak,
             sqlite_immutable=sqlite_ok,
             violation_details=all_violations,
+        )
+
+        # Compute comprehensive canonical integrity hash covering ALL metrics, violations, and results
+        manifest = preliminary_report.compute_canonical_manifest(benchmark_version=task.version)
+        canonical_bytes = json.dumps(_normalize_json_structure(manifest), sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode("utf-8")
+        integrity_hash = hashlib.sha256(canonical_bytes).hexdigest()
+
+        # Compute authenticated HMAC signature over the comprehensive canonical manifest
+        active_hmac_key = hmac_key or self.hmac_key
+        oracle_sig: Optional[str] = None
+        if active_hmac_key:
+            oracle_sig = hmac.new(active_hmac_key.encode("utf-8"), canonical_bytes, hashlib.sha256).hexdigest()
+
+        return dataclasses.replace(
+            preliminary_report,
             integrity_hash=integrity_hash,
             oracle_signature=oracle_sig,
         )
