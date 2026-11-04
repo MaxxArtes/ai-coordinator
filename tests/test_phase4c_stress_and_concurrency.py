@@ -20,6 +20,8 @@ import json
 import os
 import shutil
 import sqlite3
+import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -48,6 +50,8 @@ from ai_coordinator.synthetic_benchmark import (
     SyntheticDatasetGenerator,
     SyntheticTaskDefinition,
     canonical_json_hash,
+    SharedBudgetExceededError,
+    SharedFlightBudgetFence,
 )
 
 
@@ -306,7 +310,62 @@ class TestPhase4CStressAndConcurrency(unittest.TestCase):
             self.assertTrue(r[1].startswith("immutable_target_"))
 
     def test_04_concurrent_flight_budget_fencing(self) -> None:
-        """Validate that budget fencing operates atomically under concurrent task execution."""
+        """Validate genuine shared budget contention across workers with atomic reservations and pre-consumption rejection."""
+        # 1. Test SharedFlightBudgetFence with real atomic reservations across concurrent workers
+        shared_fence = SharedFlightBudgetFence(max_tokens=1000, max_cost_usd=0.010)
+        worker_count = 20
+        tokens_per_worker = 150
+        cost_per_worker = 0.0015
+
+        successful_workers: List[str] = []
+        rejected_workers: List[str] = []
+        lock = threading.Lock()
+
+        def competing_worker(worker_idx: int) -> None:
+            w_id = f"worker_{worker_idx:02d}"
+            try:
+                # Pre-consumption reservation: must raise SharedBudgetExceededError before consumption
+                res_id = shared_fence.reserve(
+                    worker_id=w_id,
+                    estimated_tokens=tokens_per_worker,
+                    estimated_cost_usd=cost_per_worker,
+                )
+                # Worker executes work safely within reserved quota
+                time.sleep(0.005)
+                # Worker commits actual usage
+                shared_fence.commit(res_id, actual_tokens=tokens_per_worker, actual_cost_usd=cost_per_worker)
+                with lock:
+                    successful_workers.append(w_id)
+            except SharedBudgetExceededError:
+                # Rejection happened BEFORE consumption; zero tokens or cost leaked
+                with lock:
+                    rejected_workers.append(w_id)
+
+        threads = [threading.Thread(target=competing_worker, args=(i,)) for i in range(worker_count)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=10.0)
+
+        # 1000 total tokens // 150 per worker = exactly 6 workers admitted
+        self.assertEqual(len(successful_workers), 6, f"Esperado exatamente 6 workers admitidos, obtido: {len(successful_workers)}")
+        self.assertEqual(len(rejected_workers), 14, f"Esperado exatamente 14 workers rejeitados, obtido: {len(rejected_workers)}")
+        self.assertEqual(shared_fence.approved_count, 6)
+        self.assertEqual(shared_fence.rejected_count, 14)
+        self.assertEqual(shared_fence.remaining_tokens, 100)  # 1000 - (6 * 150) = 100
+        self.assertAlmostEqual(shared_fence.remaining_cost_usd, 0.0010, places=4)
+
+        # Dynamic release test: Releasing an active reservation allows a pending worker to succeed
+        extra_res_id = shared_fence.reserve("temporary_holder", estimated_tokens=100, estimated_cost_usd=0.0010)
+        self.assertEqual(shared_fence.remaining_tokens, 0)
+        # Any further request is rejected
+        with self.assertRaises(SharedBudgetExceededError):
+            shared_fence.reserve("denied_worker", 50, 0.0005)
+        # Release the reservation
+        shared_fence.release(extra_res_id)
+        self.assertEqual(shared_fence.remaining_tokens, 100)
+
+        # 2. Verify that EfficiencyOracle also evaluates individual task budgets correctly
         task = SyntheticTaskDefinition(
             task_id="budget_fencing_concurrent",
             suite="suite_c_adversarial",
@@ -323,8 +382,6 @@ class TestPhase4CStressAndConcurrency(unittest.TestCase):
         )
 
         fenced_outcomes: List[bool] = []
-        lock = threading.Lock()
-
         def task_evaluator(tokens_spent: int) -> None:
             telemetry = CognitiveTelemetryRecord(
                 task_id=task.task_id,
@@ -337,20 +394,17 @@ class TestPhase4CStressAndConcurrency(unittest.TestCase):
             with lock:
                 fenced_outcomes.append(eff_res.efficiency_success)
 
-        # Run 5 tasks that stay within budget and 5 that exceed budget simultaneously
-        threads = [
+        oracle_threads = [
             threading.Thread(target=task_evaluator, args=(200 if i % 2 == 0 else 800,))
             for i in range(10)
         ]
-        for t in threads:
+        for t in oracle_threads:
             t.start()
-        for t in threads:
+        for t in oracle_threads:
             t.join(timeout=10.0)
 
-        compliant_count = sum(1 for res in fenced_outcomes if res is True)
-        fenced_count = sum(1 for res in fenced_outcomes if res is False)
-        self.assertEqual(compliant_count, 5)
-        self.assertEqual(fenced_count, 5)
+        self.assertEqual(sum(1 for res in fenced_outcomes if res is True), 5)
+        self.assertEqual(sum(1 for res in fenced_outcomes if res is False), 5)
 
     def test_05_high_volume_credential_injection_and_sanitization(self) -> None:
         """Validate zero-leak guarantee under a massive burst of nested adversarial credentials."""
@@ -397,7 +451,7 @@ class TestPhase4CStressAndConcurrency(unittest.TestCase):
             self.assertIn("[REDACTED_SECRET]", raw_text)
 
     def test_06_crash_recovery_and_partial_write_isolation(self) -> None:
-        """Validate database recovery and state preservation following simulated abrupt termination."""
+        """Validate database recovery and state preservation following real abrupt subprocess termination."""
         # Write initial committed records
         for i in range(10):
             rec = CognitiveTelemetryRecord(
@@ -408,33 +462,59 @@ class TestPhase4CStressAndConcurrency(unittest.TestCase):
             )
             self.store.record_cognitive_telemetry(rec)
 
-        # Force a connection with an uncommitted transaction simulating an aborted process
-        raw_conn = sqlite3.connect(self.temp_dir + "/coordination.sqlite", timeout=5.0)
-        try:
-            raw_conn.execute("PRAGMA journal_mode=WAL")
-            raw_conn.execute("BEGIN IMMEDIATE")
-            # Uncommitted insert with a synthetic raw probe
-            raw_conn.execute(
-                "INSERT INTO cognitive_telemetry (task_id, provider, model_name, tokens_provenance, total_duration_ms, latency_provenance, cost_provenance, created_at) "
-                "VALUES ('uncommitted_phantom', 'crash_bench', 'crash-model', 'estimated', 10.0, 'measured', 'estimated', '2026-11-04T12:00:00Z')"
-            )
-            # Abort transaction (simulating crash before commit)
-            raw_conn.rollback()
-        finally:
-            raw_conn.close()
-
-        # Close active store connection to simulate full process termination
+        # Close store connection before spawning subprocess to avoid file locking contention on Windows
         self.store.db.close()
+
+        # Execute genuine separate Python subprocess that begins an uncommitted transaction and crashes via os._exit()
+        db_file = os.path.abspath(os.path.join(self.temp_dir, "coordination.sqlite")).replace("\\", "/")
+        subprocess_code = f"""
+import os, sys, sqlite3
+
+conn = sqlite3.connect(r"{db_file}", timeout=10.0)
+conn.execute("PRAGMA journal_mode=WAL")
+conn.execute("BEGIN IMMEDIATE")
+conn.execute(
+    "INSERT INTO cognitive_telemetry (task_id, provider, model_name, tokens_provenance, total_duration_ms, latency_provenance, cost_provenance, created_at) "
+    "VALUES ('uncommitted_subprocess_phantom', 'crash_bench', 'crash-model', 'estimated', 10.0, 'measured', 'estimated', '2026-11-04T12:00:00Z')"
+)
+sys.stdout.write("SUBPROCESS_DIRTY_READY\\n")
+sys.stdout.flush()
+
+# Abrupt termination bypassing Python clean up, SQLite rollback, and connection close
+os._exit(87)
+"""
+        proc = subprocess.Popen(
+            [sys.executable, "-c", subprocess_code],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        stdout, stderr = proc.communicate(timeout=10.0)
+        self.assertEqual(proc.returncode, 87, f"Subprocesso deve abortar com código 87. Erro: {stderr}")
+        self.assertIn("SUBPROCESS_DIRTY_READY", stdout)
 
         # Reopen with a brand new Store instance and verify WAL recovery
         new_store = Store(root=self.temp_dir)
         try:
             records = new_store.query_cognitive_telemetry(provider="crash_bench", limit=50)
             task_ids = {r.task_id for r in records}
+            # All 10 pre-crash committed records must be intact
             self.assertEqual(len(task_ids), 10)
-            self.assertNotIn("uncommitted_phantom", task_ids)
             for i in range(10):
                 self.assertIn(f"pre_crash_{i}", task_ids)
+            # The uncommitted phantom record from the crashed process must be discarded by WAL recovery
+            self.assertNotIn("uncommitted_subprocess_phantom", task_ids)
+
+            # Subsequent write must succeed normally proving the WAL lock was cleared
+            post_rec = CognitiveTelemetryRecord(
+                task_id="post_recovery_01",
+                provider="crash_bench",
+                model_name="crash-model",
+                success=True,
+            )
+            new_store.record_cognitive_telemetry(post_rec)
+            post_ids = {r.task_id for r in new_store.query_cognitive_telemetry(provider="crash_bench", limit=50)}
+            self.assertIn("post_recovery_01", post_ids)
         finally:
             new_store.db.close()
             # Restore store handle for tearDown clean up
@@ -512,46 +592,173 @@ class TestPhase4CStressAndConcurrency(unittest.TestCase):
         # Rejection on wrong secret key
         self.assertFalse(original_report.verify_signature("wrong_secret_key_12345", benchmark_version=task.version))
 
-        # Tamper Test 1: Tampered token metrics
-        tampered_tokens = dataclasses.replace(
-            original_report,
-            observed_tokens=TokenMetrics(input_tokens=1, output_tokens=1, provenance=MetricProvenance.MEASURED),
-        )
-        self.assertFalse(tampered_tokens.verify_integrity(task.version))
-        self.assertFalse(tampered_tokens.verify_signature(self.hmac_secret, task.version))
+        # Helper to assert both integrity_hash and oracle_signature are invalidated
+        def assert_tampered(report_variant: EvaluationOracleReport, field_name: str) -> None:
+            self.assertFalse(
+                report_variant.verify_integrity(task.version),
+                f"Adulteração em '{field_name}' deveria ter invalidado verify_integrity()",
+            )
+            self.assertFalse(
+                report_variant.verify_signature(self.hmac_secret, task.version),
+                f"Adulteração em '{field_name}' deveria ter invalidado verify_signature()",
+            )
 
-        # Tamper Test 2: Tampered cost metrics
-        tampered_cost = dataclasses.replace(
-            original_report,
-            observed_cost=CostMetrics(total_cost_usd=0.000001, provenance=MetricProvenance.MEASURED),
+        # 1. Token Metrics Tampering (including cache_read_tokens with unchanged total)
+        orig_tokens = original_report.observed_tokens
+        assert_tampered(
+            dataclasses.replace(original_report, observed_tokens=dataclasses.replace(orig_tokens, cache_read_tokens=99)),
+            "tokens.cache_read_tokens",
         )
-        self.assertFalse(tampered_cost.verify_integrity(task.version))
-        self.assertFalse(tampered_cost.verify_signature(self.hmac_secret, task.version))
-
-        # Tamper Test 3: Tampered latencies
-        tampered_latencies = dataclasses.replace(
-            original_report,
-            observed_latencies=LatencyMetrics(total_duration_ms=0.01, latency_provenance=MetricProvenance.MEASURED),
+        assert_tampered(
+            dataclasses.replace(original_report, observed_tokens=dataclasses.replace(orig_tokens, cache_creation_tokens=50)),
+            "tokens.cache_creation_tokens",
         )
-        self.assertFalse(tampered_latencies.verify_integrity(task.version))
-        self.assertFalse(tampered_latencies.verify_signature(self.hmac_secret, task.version))
-
-        # Tamper Test 4: Tampered violations
-        tampered_violations = dataclasses.replace(
-            original_report,
-            violation_details=("Violação forjada inserida post-hoc",),
+        assert_tampered(
+            dataclasses.replace(original_report, observed_tokens=dataclasses.replace(orig_tokens, input_tokens=1)),
+            "tokens.input_tokens",
         )
-        self.assertFalse(tampered_violations.verify_integrity(task.version))
-        self.assertFalse(tampered_violations.verify_signature(self.hmac_secret, task.version))
+        assert_tampered(
+            dataclasses.replace(original_report, observed_tokens=dataclasses.replace(orig_tokens, output_tokens=999)),
+            "tokens.output_tokens",
+        )
+        assert_tampered(
+            dataclasses.replace(original_report, observed_tokens=dataclasses.replace(orig_tokens, total_tokens=12345)),
+            "tokens.total_tokens",
+        )
+        assert_tampered(
+            dataclasses.replace(original_report, observed_tokens=dataclasses.replace(orig_tokens, provenance=MetricProvenance.MEASURED)),
+            "tokens.provenance",
+        )
 
-        # Tamper Test 5: Tampered version
+        # 2. Cost Metrics Tampering (individual components, total, pricing_version, provenance)
+        orig_cost = original_report.observed_cost
+        assert_tampered(
+            dataclasses.replace(original_report, observed_cost=dataclasses.replace(orig_cost, input_cost_usd=0.05)),
+            "cost.input_cost_usd",
+        )
+        assert_tampered(
+            dataclasses.replace(original_report, observed_cost=dataclasses.replace(orig_cost, output_cost_usd=0.08)),
+            "cost.output_cost_usd",
+        )
+        assert_tampered(
+            dataclasses.replace(original_report, observed_cost=dataclasses.replace(orig_cost, cache_read_cost_usd=0.01)),
+            "cost.cache_read_cost_usd",
+        )
+        assert_tampered(
+            dataclasses.replace(original_report, observed_cost=dataclasses.replace(orig_cost, cache_creation_cost_usd=0.02)),
+            "cost.cache_creation_cost_usd",
+        )
+        assert_tampered(
+            dataclasses.replace(original_report, observed_cost=dataclasses.replace(orig_cost, total_cost_usd=0.99)),
+            "cost.total_cost_usd",
+        )
+        assert_tampered(
+            dataclasses.replace(original_report, observed_cost=dataclasses.replace(orig_cost, pricing_version="1999.01")),
+            "cost.pricing_version",
+        )
+        assert_tampered(
+            dataclasses.replace(original_report, observed_cost=dataclasses.replace(orig_cost, provenance=MetricProvenance.UNKNOWN)),
+            "cost.provenance",
+        )
+
+        # 3. Latency Metrics Tampering (total, ttft, tool, supervisor, provenances)
+        orig_lat = original_report.observed_latencies
+        assert_tampered(
+            dataclasses.replace(original_report, observed_latencies=dataclasses.replace(orig_lat, total_duration_ms=0.01)),
+            "latencies.total_duration_ms",
+        )
+        assert_tampered(
+            dataclasses.replace(original_report, observed_latencies=dataclasses.replace(orig_lat, ttft_ms=50.0)),
+            "latencies.ttft_ms",
+        )
+        assert_tampered(
+            dataclasses.replace(original_report, observed_latencies=dataclasses.replace(orig_lat, generation_duration_ms=100.0)),
+            "latencies.generation_duration_ms",
+        )
+        assert_tampered(
+            dataclasses.replace(original_report, observed_latencies=dataclasses.replace(orig_lat, tool_duration_ms=25.0)),
+            "latencies.tool_duration_ms",
+        )
+        assert_tampered(
+            dataclasses.replace(original_report, observed_latencies=dataclasses.replace(orig_lat, supervisor_overhead_ms=5.0)),
+            "latencies.supervisor_overhead_ms",
+        )
+        assert_tampered(
+            dataclasses.replace(original_report, observed_latencies=dataclasses.replace(orig_lat, latency_provenance=MetricProvenance.ESTIMATED)),
+            "latencies.latency_provenance",
+        )
+
+        # 4. Metadata, Timestamp, and Cryptographic Hashes
+        assert_tampered(
+            dataclasses.replace(original_report, timestamp="1970-01-01T00:00:00Z"),
+            "timestamp",
+        )
+        assert_tampered(
+            dataclasses.replace(original_report, input_payload_hash="forged_input_hash_1234"),
+            "input_payload_hash",
+        )
+        assert_tampered(
+            dataclasses.replace(original_report, expected_output_hash="forged_expected_hash_5678"),
+            "expected_output_hash",
+        )
+        assert_tampered(
+            dataclasses.replace(original_report, canonical_output_hash="forged_output_hash_9012"),
+            "canonical_output_hash",
+        )
+        assert_tampered(
+            dataclasses.replace(original_report, task_id="forged_task_id"),
+            "task_id",
+        )
+        assert_tampered(
+            dataclasses.replace(original_report, suite="forged_suite"),
+            "suite",
+        )
+
+        # 5. Correctness Score, Violations, Version, and Booleans
+        assert_tampered(
+            dataclasses.replace(original_report, correctness_score=0.5),
+            "correctness_score",
+        )
+        assert_tampered(
+            dataclasses.replace(original_report, violation_details=("Violação forjada inserida post-hoc",)),
+            "violation_details",
+        )
+        assert_tampered(
+            dataclasses.replace(original_report, functional_success=False),
+            "functional_success",
+        )
+        assert_tampered(
+            dataclasses.replace(original_report, efficiency_success=False),
+            "efficiency_success",
+        )
+        assert_tampered(
+            dataclasses.replace(original_report, security_success=False),
+            "security_success",
+        )
+        assert_tampered(
+            dataclasses.replace(original_report, budget_tokens_compliant=False),
+            "budget_tokens_compliant",
+        )
+        assert_tampered(
+            dataclasses.replace(original_report, budget_cost_compliant=False),
+            "budget_cost_compliant",
+        )
+        assert_tampered(
+            dataclasses.replace(original_report, budget_latency_compliant=False),
+            "budget_latency_compliant",
+        )
+        assert_tampered(
+            dataclasses.replace(original_report, zero_secrets_leaked=False),
+            "zero_secrets_leaked",
+        )
+        assert_tampered(
+            dataclasses.replace(original_report, sqlite_immutable=False),
+            "sqlite_immutable",
+        )
+
+        # Version parameter alteration
         self.assertFalse(original_report.verify_integrity(benchmark_version="1999.01.01"))
         self.assertFalse(original_report.verify_signature(self.hmac_secret, benchmark_version="1999.01.01"))
-
-        # Tamper Test 6: Tampered correctness score
-        tampered_score = dataclasses.replace(original_report, correctness_score=0.5)
-        self.assertFalse(tampered_score.verify_integrity(task.version))
-        self.assertFalse(tampered_score.verify_signature(self.hmac_secret, task.version))
 
     def test_10_monotonic_clock_and_duration_budget_enforcement(self) -> None:
         """Validate monotonic clock usage (time.perf_counter) and max_duration_ms budget enforcement."""

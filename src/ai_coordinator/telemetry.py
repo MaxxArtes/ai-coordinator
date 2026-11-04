@@ -253,7 +253,10 @@ class LatencyMetrics:
     provenance: Optional[str] = None
 
     def __post_init__(self) -> None:
-        lat_prov = self.provenance if self.provenance is not None else self.latency_provenance
+        if self.provenance is not None and self.latency_provenance == MetricProvenance.MEASURED and self.provenance != MetricProvenance.MEASURED:
+            lat_prov = self.provenance
+        else:
+            lat_prov = self.latency_provenance
         MetricProvenance.validate(lat_prov)
         MetricProvenance.validate(self.generation_duration_provenance)
         tot = max(0.0, float(self.total_duration_ms))

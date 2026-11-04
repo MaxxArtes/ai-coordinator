@@ -367,6 +367,23 @@ class TestPhase4CSyntheticBenchmark(unittest.TestCase):
         self.assertEqual(len(report.integrity_hash), 64)
         self.assertIsNone(report.oracle_signature)
 
+    def test_12_security_oracle_returns_none_when_store_not_provided(self) -> None:
+        """Validate that SecurityOracle does not claim SQLite immutability is approved when store is None."""
+        telemetry = CognitiveTelemetryRecord(
+            task_id="no_store_task",
+            metadata={"phase": "test"},
+            success=True,
+        )
+        sec_ok, zero_leak, sqlite_ok, violations = SecurityOracle.evaluate(
+            actual_output={"clean": True},
+            telemetry=telemetry,
+            store=None,
+        )
+        self.assertTrue(sec_ok)
+        self.assertTrue(zero_leak)
+        self.assertIsNone(sqlite_ok, "sqlite_ok deve ser None (não avaliado) quando store for None")
+        self.assertEqual(len(violations), 0)
+
 
 if __name__ == "__main__":
     unittest.main()

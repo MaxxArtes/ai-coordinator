@@ -214,6 +214,17 @@ from .synthetic_benchmark import (
     SecurityOracle,
     SyntheticBenchmarkRunner,
     canonical_json_hash,
+    SharedBudgetExceededError,
+    SharedFlightBudgetFence,
+)
+from .baseline_runner import (
+    BaselineRunner,
+    CanonicalSolverRegistry,
+    BaselineExecutionReport,
+    BaselineTaskExecutionResult,
+    TaskTimingBreakdown,
+    MetricDistribution,
+    BaselineEnvironmentMetadata,
 )
 
 __all__ = [
@@ -395,5 +406,14 @@ __all__ = [
     "SecurityOracle",
     "SyntheticBenchmarkRunner",
     "canonical_json_hash",
+    "SharedBudgetExceededError",
+    "SharedFlightBudgetFence",
+    "BaselineRunner",
+    "CanonicalSolverRegistry",
+    "BaselineExecutionReport",
+    "BaselineTaskExecutionResult",
+    "TaskTimingBreakdown",
+    "MetricDistribution",
+    "BaselineEnvironmentMetadata",
 ]
 __version__ = "0.5.1"

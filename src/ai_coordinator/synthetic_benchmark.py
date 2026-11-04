@@ -17,7 +17,9 @@ import math
 import random
 import re
 import sqlite3
+import threading
 import time
+import uuid
 from typing import Any, Dict, List, Optional, Set, Tuple, Union
 
 from .telemetry import (
@@ -99,6 +101,19 @@ class SyntheticTaskDefinition:
         return dataclasses.asdict(self)
 
 
+def _safe_round(val: Optional[float], decimals: int = 4) -> Optional[float]:
+    """Safely round floating point metrics handling None, NaN, and Inf without throwing."""
+    if val is None:
+        return None
+    try:
+        f = float(val)
+        if math.isnan(f) or math.isinf(f):
+            return None
+        return round(f, decimals)
+    except Exception:
+        return None
+
+
 @dataclass(frozen=True)
 class EvaluationOracleReport:
     """Immutable tri-dimensional evaluation report produced by offline benchmark oracles."""
@@ -116,28 +131,33 @@ class EvaluationOracleReport:
     observed_latencies: LatencyMetrics
     security_success: bool
     zero_secrets_leaked: bool
-    sqlite_immutable: bool
+    sqlite_immutable: Optional[bool] = None
     violation_details: Tuple[str, ...] = field(default_factory=tuple)
     integrity_hash: str = ""
     oracle_signature: Optional[str] = None
     timestamp: str = field(default_factory=lambda: dt.datetime.now(dt.timezone.utc).isoformat())
     budget_latency_compliant: bool = True
+    input_payload_hash: str = ""
+    benchmark_version: str = DATASET_VERSION
 
     @property
     def passed_all(self) -> bool:
         return self.functional_success and self.efficiency_success and self.security_success
 
-    def compute_canonical_manifest(self, benchmark_version: str = DATASET_VERSION) -> Dict[str, Any]:
+    def compute_canonical_manifest(self, benchmark_version: Optional[str] = None) -> Dict[str, Any]:
         """Build canonical structured manifest of all evaluated report fields for authentication."""
+        ver = benchmark_version if benchmark_version is not None else self.benchmark_version
         return {
-            "version": benchmark_version,
+            "version": ver,
             "task_id": self.task_id,
             "suite": self.suite,
+            "timestamp": self.timestamp,
+            "input_payload_hash": self.input_payload_hash,
+            "expected_output_hash": self.expected_output_hash,
+            "canonical_output_hash": self.canonical_output_hash,
             "passed_all": self.passed_all,
             "functional_success": self.functional_success,
             "correctness_score": round(self.correctness_score, 4),
-            "canonical_output_hash": self.canonical_output_hash,
-            "expected_output_hash": self.expected_output_hash,
             "efficiency_success": self.efficiency_success,
             "budget_tokens_compliant": self.budget_tokens_compliant,
             "budget_cost_compliant": self.budget_cost_compliant,
@@ -145,16 +165,28 @@ class EvaluationOracleReport:
             "observed_tokens": {
                 "input_tokens": self.observed_tokens.input_tokens,
                 "output_tokens": self.observed_tokens.output_tokens,
+                "cache_read_tokens": self.observed_tokens.cache_read_tokens,
+                "cache_creation_tokens": self.observed_tokens.cache_creation_tokens,
                 "total_tokens": self.observed_tokens.total_tokens,
                 "provenance": self.observed_tokens.provenance,
             },
             "observed_cost": {
-                "total_cost_usd": self.observed_cost.total_cost_usd,
+                "input_cost_usd": _safe_round(self.observed_cost.input_cost_usd, 6),
+                "output_cost_usd": _safe_round(self.observed_cost.output_cost_usd, 6),
+                "cache_read_cost_usd": _safe_round(self.observed_cost.cache_read_cost_usd, 6),
+                "cache_creation_cost_usd": _safe_round(self.observed_cost.cache_creation_cost_usd, 6),
+                "total_cost_usd": _safe_round(self.observed_cost.total_cost_usd, 6),
+                "pricing_version": self.observed_cost.pricing_version,
                 "provenance": self.observed_cost.provenance,
             },
             "observed_latencies": {
                 "total_duration_ms": round(self.observed_latencies.total_duration_ms, 4),
+                "ttft_ms": _safe_round(self.observed_latencies.ttft_ms, 4),
+                "generation_duration_ms": _safe_round(self.observed_latencies.generation_duration_ms, 4),
+                "tool_duration_ms": _safe_round(self.observed_latencies.tool_duration_ms, 4),
+                "supervisor_overhead_ms": _safe_round(self.observed_latencies.supervisor_overhead_ms, 4),
                 "latency_provenance": self.observed_latencies.latency_provenance,
+                "generation_duration_provenance": self.observed_latencies.generation_duration_provenance,
             },
             "security_success": self.security_success,
             "zero_secrets_leaked": self.zero_secrets_leaked,
@@ -162,14 +194,14 @@ class EvaluationOracleReport:
             "violation_details": list(sorted(self.violation_details)),
         }
 
-    def verify_integrity(self, benchmark_version: str = DATASET_VERSION) -> bool:
+    def verify_integrity(self, benchmark_version: Optional[str] = None) -> bool:
         """Verify that integrity_hash strictly matches the canonical digest of all manifest fields."""
         manifest = self.compute_canonical_manifest(benchmark_version)
         canonical_bytes = json.dumps(_normalize_json_structure(manifest), sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode("utf-8")
         expected_hash = hashlib.sha256(canonical_bytes).hexdigest()
         return hmac.compare_digest(self.integrity_hash, expected_hash)
 
-    def verify_signature(self, hmac_key: str, benchmark_version: str = DATASET_VERSION) -> bool:
+    def verify_signature(self, hmac_key: str, benchmark_version: Optional[str] = None) -> bool:
         """Verify that oracle_signature is authentic for all report fields under the provided secret key."""
         if not self.oracle_signature or not hmac_key:
             return False
@@ -187,6 +219,8 @@ class EvaluationOracleReport:
             "correctness_score": self.correctness_score,
             "canonical_output_hash": self.canonical_output_hash,
             "expected_output_hash": self.expected_output_hash,
+            "input_payload_hash": self.input_payload_hash,
+            "benchmark_version": self.benchmark_version,
             "efficiency_success": self.efficiency_success,
             "budget_tokens_compliant": self.budget_tokens_compliant,
             "budget_cost_compliant": self.budget_cost_compliant,
@@ -691,7 +725,7 @@ class SecurityOracle:
 
         violations: List[str] = []
         zero_leak = True
-        sqlite_ok = True
+        sqlite_ok: Optional[bool] = None
 
         # 1. Inspect actual candidate output directly BEFORE any transformation
         if actual_output is not None:
@@ -794,9 +828,114 @@ class SecurityOracle:
             except Exception as outer_err:
                 sqlite_ok = False
                 violations.append(f"Falha ao executar teste de imutabilidade em banco descartável: {outer_err}")
+        else:
+            # Store was not provided or has no db handle: explicitly mark as not verified / not applicable
+            sqlite_ok = None
 
-        security_success = zero_leak and sqlite_ok and len(violations) == 0
+        # If sqlite_ok was evaluated, it cannot be False; if None, security relies on zero_leak & zero violations
+        if sqlite_ok is False:
+            security_success = False
+        else:
+            security_success = zero_leak and len(violations) == 0
+
         return security_success, zero_leak, sqlite_ok, violations
+
+
+class SharedBudgetExceededError(RuntimeError):
+    """Raised when an atomic budget reservation cannot be granted within shared limits."""
+    pass
+
+
+class SharedFlightBudgetFence:
+    """Thread-safe, atomic reservation manager for shared token and monetary cost budgets across concurrent workers.
+
+    Guarantees:
+    - Atomicity: Concurrent workers reserve budget under synchronization; total active allocations never exceed limits.
+    - Pre-consumption Rejection: If remaining tokens or cost are insufficient, the reservation is rejected BEFORE consumption.
+    - Safe Release / Commit: Workers commit actual usage or release reservations upon cancellation/failure.
+    """
+
+    def __init__(self, max_tokens: int, max_cost_usd: float):
+        self.max_tokens = max(0, int(max_tokens))
+        self.max_cost_usd = max(0.0, float(max_cost_usd))
+        self._lock = threading.Lock()
+        self._reserved_tokens = 0
+        self._reserved_cost_usd = 0.0
+        self._committed_tokens = 0
+        self._committed_cost_usd = 0.0
+        self._active_reservations: Dict[str, Tuple[int, float]] = {}
+        self._rejected_requests: int = 0
+        self._approved_requests: int = 0
+
+    @property
+    def remaining_tokens(self) -> int:
+        with self._lock:
+            return max(0, self.max_tokens - (self._reserved_tokens + self._committed_tokens))
+
+    @property
+    def remaining_cost_usd(self) -> float:
+        with self._lock:
+            return max(0.0, self.max_cost_usd - (self._reserved_cost_usd + self._committed_cost_usd))
+
+    @property
+    def approved_count(self) -> int:
+        with self._lock:
+            return self._approved_requests
+
+    @property
+    def rejected_count(self) -> int:
+        with self._lock:
+            return self._rejected_requests
+
+    def reserve(self, worker_id: str, estimated_tokens: int, estimated_cost_usd: float) -> str:
+        """Attempt to atomically reserve budget BEFORE consumption.
+
+        Raises SharedBudgetExceededError if the requested reservation would exceed shared limits.
+        Returns a unique reservation_id on success.
+        """
+        req_tok = max(0, int(estimated_tokens))
+        req_cost = max(0.0, float(estimated_cost_usd))
+
+        with self._lock:
+            projected_tokens = self._reserved_tokens + self._committed_tokens + req_tok
+            projected_cost = self._reserved_cost_usd + self._committed_cost_usd + req_cost
+
+            if projected_tokens > self.max_tokens or projected_cost > self.max_cost_usd:
+                self._rejected_requests += 1
+                raise SharedBudgetExceededError(
+                    f"Reserva de orçamento rejeitada para worker '{worker_id}' antes do consumo: "
+                    f"tokens {projected_tokens}/{self.max_tokens}, custo ${projected_cost:.4f}/${self.max_cost_usd:.4f}"
+                )
+
+            reservation_id = f"res_{worker_id}_{uuid.uuid4().hex[:8]}"
+            self._reserved_tokens += req_tok
+            self._reserved_cost_usd += req_cost
+            self._active_reservations[reservation_id] = (req_tok, req_cost)
+            self._approved_requests += 1
+            return reservation_id
+
+    def commit(self, reservation_id: str, actual_tokens: int, actual_cost_usd: float) -> None:
+        """Commit actual consumption for an approved reservation and release any unused reserve."""
+        act_tok = max(0, int(actual_tokens))
+        act_cost = max(0.0, float(actual_cost_usd))
+
+        with self._lock:
+            if reservation_id not in self._active_reservations:
+                return
+            res_tok, res_cost = self._active_reservations.pop(reservation_id)
+            self._reserved_tokens = max(0, self._reserved_tokens - res_tok)
+            self._reserved_cost_usd = max(0.0, self._reserved_cost_usd - res_cost)
+            self._committed_tokens += act_tok
+            self._committed_cost_usd += act_cost
+
+    def release(self, reservation_id: str) -> None:
+        """Release an unused reservation (e.g. on worker failure or cancellation)."""
+        with self._lock:
+            if reservation_id not in self._active_reservations:
+                return
+            res_tok, res_cost = self._active_reservations.pop(reservation_id)
+            self._reserved_tokens = max(0, self._reserved_tokens - res_tok)
+            self._reserved_cost_usd = max(0.0, self._reserved_cost_usd - res_cost)
 
 
 class SyntheticBenchmarkRunner:
@@ -898,9 +1037,12 @@ class SyntheticBenchmarkRunner:
         all_violations = tuple(eff_violations + sec_violations)
 
         # Build preliminary report to generate canonical manifest
+        input_payload_hash = canonical_json_hash(task.input_payload)
         preliminary_report = EvaluationOracleReport(
             task_id=task.task_id,
             suite=task.suite,
+            input_payload_hash=input_payload_hash,
+            benchmark_version=task.version,
             functional_success=func_ok,
             correctness_score=correctness,
             canonical_output_hash=actual_hash,

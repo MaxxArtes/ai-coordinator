@@ -98,8 +98,20 @@ O `SyntheticBenchmarkRunner` provê um harness de teste unificado que executa ta
 
 O módulo de testes [`tests/test_phase4c_stress_and_concurrency.py`](file:///D:/ai-coordinator/tests/test_phase4c_stress_and_concurrency.py) submete a infraestrutura a condições extremas:
 - **Throughput e Concorrência WAL:** Gravação paralela multi-thread sem deadlocks (`database is locked`), medindo latências p50/p95/p99.
-- **Leituras e Escritas Concorrentes Intercaladas:** Agregações estatísticas e consultas simultâneas operando sem interferência.
-- **Fencing Atômico de Orçamento:** Contenção de missões concorrentes sem corridas TOCTOU.
-- **Injeção Massiva de Segredos:** Varredura em rajadas de credenciais de alta entropia, com prova SQL direta no banco físico.
-- **Tolerância a Falhas e Recuperação WAL:** Integridade de recuperação após simulação de abortamento brusco de conexão.
-- **Sobrecarga Mínima:** Overhead de telemetria estritamente inferior a 25 ms por ciclo completo e crescimento de memória controlado.
+- **Leituras e Escritas Concorrentes Intercaladas:** Agregações estatísticas e consultas simultâneas operando sem interferência, com prova de monotonicidade por leitor.
+- **Fencing Atômico de Orçamento Compartilhado (`SharedFlightBudgetFence`):** Reserva atômica sob sincronização entre múltiplos workers concorrentes, rejeição prévia (`SharedBudgetExceededError`) antes de qualquer consumo e devolução segura de cotas.
+- **Injeção Massiva de Segredos:** Varredura em rajadas de 200 payloads com credenciais de alta entropia, comprovando zero vazamento via consulta SQL física direta no SQLite.
+- **Recuperação de Queda Abrupta via Subprocesso OS:** Teste com encerramento real de processo Python via `os._exit(87)` no meio de transação não confirmada, validando recuperação limpa do log WAL sem registros fantasmas.
+- **Detecção Abrangente de Adulteração HMAC:** Testes adversariais cobrindo todos os 35 campos do manifesto (tokens de cache, frações de custo, TTFT, latências, duração de ferramentas, timestamp, hash de input e hashes de output).
+- **Sobrecarga Mínima:** Overhead de telemetria estritamente inferior a 75 ms por ciclo completo e auditoria de vazamento de memória via `tracemalloc`.
+
+---
+
+## 6. Executor de Baseline Científica sem Otimizações (Fase 4C.0.4)
+
+O módulo [`src/ai_coordinator/baseline_runner.py`](file:///D:/ai-coordinator/src/ai_coordinator/baseline_runner.py) estabelece o ponto de referência estrito (*zero-point baseline*):
+- **Solvers de Referência Independentes (`CanonicalSolverRegistry`):** Executam o domínio algorítmico real (ETL, reconciliação contábil, ordenação topológica, particionamento fork-join) tomando unicamente o `input_payload`, sem consultar ou referenciar `expected_output`.
+- **Segregação Rigorosa de Fases Temporais:** Registra separadamente o tempo de execução da tarefa (`task_execution_ms`), overhead da instrumentação observacional (`telemetry_overhead_ms`) e tempo dos oráculos (`validation_ms`).
+- **Distribuições Estatísticas e Percentis (`MetricDistribution`):** Cálculo automatizado de média, desvio padrão, mediana (p50), p95, p99, valores mínimo e máximo.
+- **Metadados de Ambiente e Rastreabilidade:** Captura hash SHA do commit Git, versão do runtime Python, sistema operacional, arquitetura, versão do pacote e versão do dataset.
+- **Manifesto Canônico Assinado da Baseline:** Exportação estruturada e validação criptográfica (SHA-256 e HMAC-SHA256) do agregado consolidado.
