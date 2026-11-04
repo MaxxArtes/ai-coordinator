@@ -266,6 +266,63 @@ class EvaluationOracleReport:
             "timestamp": self.timestamp,
         }
 
+    @classmethod
+    def from_dict(cls, d: Dict[str, Any]) -> EvaluationOracleReport:
+        tok_d = d.get("observed_tokens", {})
+        cost_d = d.get("observed_cost", {})
+        lat_d = d.get("observed_latencies", {})
+        tokens = TokenMetrics(
+            input_tokens=tok_d.get("input_tokens", 0),
+            output_tokens=tok_d.get("output_tokens", 0),
+            cache_read_tokens=tok_d.get("cache_read_tokens", 0),
+            cache_creation_tokens=tok_d.get("cache_creation_tokens", 0),
+            total_tokens=tok_d.get("total_tokens", 0),
+            provenance=tok_d.get("provenance", "unknown"),
+        )
+        cost = CostMetrics(
+            input_cost_usd=cost_d.get("input_cost_usd", 0.0),
+            output_cost_usd=cost_d.get("output_cost_usd", 0.0),
+            cache_read_cost_usd=cost_d.get("cache_read_cost_usd", 0.0),
+            cache_creation_cost_usd=cost_d.get("cache_creation_cost_usd", 0.0),
+            total_cost_usd=cost_d.get("total_cost_usd", 0.0),
+            pricing_version=cost_d.get("pricing_version", "2026.04.1"),
+            provenance=cost_d.get("provenance", "unknown"),
+        )
+        latencies = LatencyMetrics(
+            total_duration_ms=lat_d.get("total_duration_ms", 0.0),
+            ttft_ms=lat_d.get("ttft_ms"),
+            generation_duration_ms=lat_d.get("generation_duration_ms"),
+            tool_duration_ms=lat_d.get("tool_duration_ms"),
+            supervisor_overhead_ms=lat_d.get("supervisor_overhead_ms"),
+            latency_provenance=lat_d.get("latency_provenance", "unknown"),
+            generation_duration_provenance=lat_d.get("generation_duration_provenance", "unknown"),
+        )
+        return cls(
+            task_id=d["task_id"],
+            suite=d["suite"],
+            functional_success=d["functional_success"],
+            correctness_score=d["correctness_score"],
+            canonical_output_hash=d["canonical_output_hash"],
+            expected_output_hash=d["expected_output_hash"],
+            efficiency_success=d["efficiency_success"],
+            budget_tokens_compliant=d["budget_tokens_compliant"],
+            budget_cost_compliant=d["budget_cost_compliant"],
+            observed_tokens=tokens,
+            observed_cost=cost,
+            observed_latencies=latencies,
+            security_success=d.get("security_success"),
+            zero_secrets_leaked=d.get("zero_secrets_leaked", True),
+            sqlite_immutable=d.get("sqlite_immutable"),
+            violation_details=tuple(d.get("violation_details", ())),
+            integrity_hash=d.get("integrity_hash", ""),
+            oracle_signature=d.get("oracle_signature"),
+            timestamp=d.get("timestamp", ""),
+            budget_latency_compliant=d.get("budget_latency_compliant", True),
+            input_payload_hash=d.get("input_payload_hash", ""),
+            benchmark_version=d.get("benchmark_version", DATASET_VERSION),
+            security_verdict=d.get("security_verdict", ""),
+        )
+
 
 class SyntheticDatasetGenerator:
     """Deterministic procedural generator for cognitive benchmark suites (A, B, and C).

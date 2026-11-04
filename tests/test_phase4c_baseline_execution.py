@@ -5,7 +5,10 @@ import dataclasses
 import hashlib
 import hmac
 import json
+import os
 import sqlite3
+import subprocess
+import sys
 import tempfile
 import unittest
 
@@ -303,6 +306,53 @@ class TestPhase4CBaselineExecution(unittest.TestCase):
         self.assertEqual(rep1.success_rates["security_unverified_rate"], 0.0)
         self.assertEqual(rep1.success_rates["security_fail_rate"], 0.0)
         self.assertEqual(rep1.success_rates["passed_all_rate"], 1.0)
+
+    def test_07_baseline_serialization_deserialization_and_cli_verifier(self) -> None:
+        """Validate lossless round-trip serialization and standalone CLI verifier execution."""
+        runner = BaselineRunner(store=self.store, hmac_key=self.hmac_secret)
+        original_report = runner.run_baseline(iterations=1)
+
+        # 1. Round-trip dictionary serialization
+        report_dict = original_report.to_dict()
+        reconstructed_report = BaselineExecutionReport.from_dict(report_dict)
+
+        self.assertEqual(reconstructed_report.run_id, original_report.run_id)
+        self.assertEqual(reconstructed_report.integrity_hash, original_report.integrity_hash)
+        self.assertEqual(reconstructed_report.oracle_signature, original_report.oracle_signature)
+        self.assertEqual(reconstructed_report.task_results_digest, original_report.task_results_digest)
+        self.assertTrue(reconstructed_report.verify_integrity())
+        self.assertTrue(reconstructed_report.verify_signature(self.hmac_secret))
+        self.assertTrue(reconstructed_report.verify_full_report_integrity(self.hmac_secret))
+
+        # 2. Test standalone CLI verifier script
+        report_path = os.path.join(self.test_dir, "test_baseline_verify.json")
+        with open(report_path, "w", encoding="utf-8") as f:
+            json.dump(report_dict, f, indent=2)
+
+        script_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "scripts", "verify_baseline_integrity.py"))
+
+        # Case A: Compliant report passes verification
+        res_ok = subprocess.run(
+            [sys.executable, script_path, "--report", report_path, "--hmac-key", self.hmac_secret],
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(res_ok.returncode, 0)
+        self.assertIn("100% íntegro e autêntico", res_ok.stdout)
+
+        # Case B: Tampered report is rejected with non-zero exit code
+        tampered_dict = dict(report_dict)
+        tampered_dict["token_aggregates"] = {"total_tokens": 999999}
+        with open(report_path, "w", encoding="utf-8") as f:
+            json.dump(tampered_dict, f, indent=2)
+
+        res_bad = subprocess.run(
+            [sys.executable, script_path, "--report", report_path, "--hmac-key", self.hmac_secret],
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(res_bad.returncode, 1)
+        self.assertIn("REPROVADO", res_bad.stderr)
 
 
 if __name__ == "__main__":

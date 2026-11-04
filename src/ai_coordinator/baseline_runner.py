@@ -581,6 +581,38 @@ class BaselineExecutionReport:
             "task_execution_results": [r.to_dict() for r in self.task_execution_results],
         }
 
+    @classmethod
+    def from_dict(cls, d: Dict[str, Any]) -> BaselineExecutionReport:
+        env = BaselineEnvironmentMetadata(**d["environment"])
+        task_results = []
+        for t in d.get("task_execution_results", []):
+            timing = TaskTimingBreakdown(**t["timing_breakdown"])
+            oracle = EvaluationOracleReport.from_dict(t["oracle_report"])
+            task_results.append(BaselineTaskExecutionResult(
+                task_id=t["task_id"],
+                suite=t["suite"],
+                task_type=t["task_type"],
+                iteration=t["iteration"],
+                oracle_report=oracle,
+                timing_breakdown=timing,
+            ))
+        lat_dists = {k: MetricDistribution(**v) for k, v in d.get("latency_distributions", {}).items()}
+        return cls(
+            run_id=d["run_id"],
+            environment=env,
+            total_tasks_executed=d["total_tasks_executed"],
+            iterations=d["iterations"],
+            task_execution_results=task_results,
+            latency_distributions=lat_dists,
+            token_aggregates=d["token_aggregates"],
+            cost_aggregates=d["cost_aggregates"],
+            success_rates=d["success_rates"],
+            integrity_hash=d.get("integrity_hash", ""),
+            oracle_signature=d.get("oracle_signature"),
+            task_results_digest=d.get("task_results_digest", ""),
+            created_at=d.get("created_at", ""),
+        )
+
 
 class BaselineRunner:
     """Scientific benchmark runner for offline baseline execution without optimizations."""
