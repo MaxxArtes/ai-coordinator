@@ -216,7 +216,7 @@ class TestPhase4CSyntheticBenchmark(unittest.TestCase):
 
     def test_07_synthetic_benchmark_runner_offline_end_to_end(self) -> None:
         """Validate SyntheticBenchmarkRunner offline execution, mock solvers, and report generation."""
-        runner = SyntheticBenchmarkRunner(store=self.store)
+        runner = SyntheticBenchmarkRunner(store=self.store, hmac_key="test-oracle-hmac-key")
         tasks = SyntheticDatasetGenerator.generate_suite_a(seed=4242, count=1)
         task = tasks[0]
 
@@ -233,15 +233,139 @@ class TestPhase4CSyntheticBenchmark(unittest.TestCase):
         self.assertTrue(report.efficiency_success)
         self.assertTrue(report.security_success)
         self.assertTrue(report.passed_all)
+        self.assertEqual(report.observed_tokens.provenance, MetricProvenance.ESTIMATED)
+        self.assertIsNotNone(report.integrity_hash)
+        self.assertEqual(len(report.integrity_hash), 64)
         self.assertIsNotNone(report.oracle_signature)
-        self.assertGreater(len(report.oracle_signature), 0)
+        self.assertEqual(len(report.oracle_signature), 64)
 
         # Verify serialization of report
         rep_dict = report.to_dict()
         self.assertEqual(rep_dict["task_id"], task.task_id)
         self.assertTrue(rep_dict["passed_all"])
+        self.assertEqual(rep_dict["integrity_hash"], report.integrity_hash)
+        self.assertEqual(rep_dict["oracle_signature"], report.oracle_signature)
         dumped = json.dumps(rep_dict)
         self.assertIn(task.task_id, dumped)
+
+    def test_08_adversarial_candidate_leaking_secrets_rejected_by_both_oracles(self) -> None:
+        """Validate that a candidate returning raw credentials fails FunctionalOracle AND SecurityOracle."""
+        tasks = SyntheticDatasetGenerator.generate_suite_c(seed=1212)
+        task_c1 = tasks[0]  # suite_c_01_adversarial_secret_injection
+
+        # Malicious / naive candidate returning raw unredacted input payload with secrets
+        leaky_output = dict(task_c1.input_payload)
+
+        # 1. FunctionalOracle must reject because actual output has literal secret instead of [REDACTED_SECRET]
+        func_ok, correctness, actual_hash = FunctionalOracle.evaluate(leaky_output, task_c1)
+        self.assertFalse(func_ok)
+        self.assertNotEqual(actual_hash, task_c1.expected_hash)
+        self.assertLess(correctness, 1.0)
+
+        # 2. SecurityOracle must scan actual_output directly and flag the leak
+        telemetry = CognitiveTelemetryRecord(
+            task_id=task_c1.task_id,
+            metadata={"phase": "test"},
+            success=True,
+        )
+        sec_ok, zero_leak, sqlite_ok, violations = SecurityOracle.evaluate(
+            actual_output=leaky_output,
+            telemetry=telemetry,
+            store=self.store,
+        )
+        self.assertFalse(sec_ok)
+        self.assertFalse(zero_leak)
+        self.assertTrue(any("saída (actual_output) do candidato" in v for v in violations))
+
+    def test_09_efficiency_oracle_rejects_unknown_and_missing_metrics(self) -> None:
+        """Validate that missing or UNKNOWN metrics produce budget rejection instead of false approval."""
+        tasks = SyntheticDatasetGenerator.generate_suite_a(seed=4242)
+        task = tasks[0]
+
+        # Case A: Unknown token count
+        telemetry_unknown_tok = CognitiveTelemetryRecord(
+            task_id=task.task_id,
+            tokens=TokenMetrics(input_tokens=None, output_tokens=None, provenance=MetricProvenance.UNKNOWN),
+            cost=CostMetrics(total_cost_usd=0.001, provenance=MetricProvenance.ESTIMATED),
+            success=True,
+        )
+        eff_a, tok_a, cost_a, violations_a = EfficiencyOracle.evaluate(telemetry_unknown_tok, task)
+        self.assertFalse(eff_a)
+        self.assertFalse(tok_a)
+        self.assertTrue(cost_a)
+        self.assertTrue(any("tokens ausente ou desconhecida" in v for v in violations_a))
+
+        # Case B: Unknown cost
+        telemetry_unknown_cost = CognitiveTelemetryRecord(
+            task_id=task.task_id,
+            tokens=TokenMetrics(input_tokens=100, output_tokens=50, provenance=MetricProvenance.MEASURED),
+            cost=CostMetrics(total_cost_usd=None, provenance=MetricProvenance.UNKNOWN),
+            success=True,
+        )
+        eff_b, tok_b, cost_b, violations_b = EfficiencyOracle.evaluate(telemetry_unknown_cost, task)
+        self.assertFalse(eff_b)
+        self.assertTrue(tok_b)
+        self.assertFalse(cost_b)
+        self.assertTrue(any("custo ausente ou desconhecida" in v for v in violations_b))
+
+    def test_10_security_oracle_catches_missing_or_bypassed_database_triggers(self) -> None:
+        """Validate that SecurityOracle detects when SQLite immutability triggers are missing."""
+        # Create a temporary standalone SQLite database WITHOUT triggers
+        raw_db_dir = tempfile.mkdtemp(prefix="test_no_triggers_")
+        raw_db_path = f"{raw_db_dir}/unprotected.db"
+        conn = sqlite3.connect(raw_db_path)
+        try:
+            conn.execute(
+                """CREATE TABLE cognitive_telemetry (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    task_id TEXT,
+                    metadata TEXT,
+                    created_at TEXT
+                )"""
+            )
+            cur = conn.execute("INSERT INTO cognitive_telemetry (task_id, metadata, created_at) VALUES ('orig_task', '{}', 'now')")
+            row_id = cur.lastrowid
+            conn.commit()
+
+            class FakeStore:
+                def __init__(self, db):
+                    self.db = db
+
+            fake_store = FakeStore(conn)
+            telemetry = CognitiveTelemetryRecord(
+                id=row_id,
+                task_id="orig_task",
+                success=True,
+            )
+
+            # SecurityOracle must detect that UPDATE succeeded without trigger rejection
+            sec_ok, zero_leak, sqlite_ok, violations = SecurityOracle.evaluate(
+                actual_output={"clean": True},
+                telemetry=telemetry,
+                store=fake_store,
+            )
+            self.assertFalse(sec_ok)
+            self.assertTrue(zero_leak)
+            self.assertFalse(sqlite_ok)
+            self.assertTrue(any("não foi rejeitado pelo trigger" in v for v in violations))
+
+            # Verify that savepoint rollback protected the row from permanent tampering
+            check_row = conn.execute("SELECT task_id FROM cognitive_telemetry WHERE id = ?", (row_id,)).fetchone()
+            self.assertEqual(check_row[0], "orig_task")
+        finally:
+            conn.close()
+
+    def test_11_runner_heuristic_provenance_and_unauthenticated_distinction(self) -> None:
+        """Validate that unkeyed runners produce integrity_hash but oracle_signature is None."""
+        unkeyed_runner = SyntheticBenchmarkRunner(store=self.store, hmac_key=None)
+        tasks = SyntheticDatasetGenerator.generate_suite_a(seed=4242, count=1)
+        task = tasks[0]
+
+        report = unkeyed_runner.run_task(task, lambda payload: task.expected_output)
+        self.assertEqual(report.observed_tokens.provenance, MetricProvenance.ESTIMATED)
+        self.assertIsNotNone(report.integrity_hash)
+        self.assertEqual(len(report.integrity_hash), 64)
+        self.assertIsNone(report.oracle_signature)
 
 
 if __name__ == "__main__":

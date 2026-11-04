@@ -69,19 +69,22 @@ O sistema avalia cada execução de forma automatizada e independente do agente 
 ```
 
 1. **`FunctionalOracle`:**
-   - Calcula o hash SHA-256 canônico (`canonical_json_hash`) da saída normalizada.
+   - Calcula o hash SHA-256 canônico (`canonical_json_hash`) da saída normalizada **sem expurgo artificial prévio**, garantindo que a equivalência reflita a fidelidade semântica real. Candidatos que emitirem credenciais literais não mascaradas produzirão hashes discrepantes e serão reprovados funcionalmente.
    - Atribui nota 1.0 para correspondência exata ou score ponderado de schema em caso de discrepância.
 2. **`EfficiencyOracle`:**
-   - Valida limites de tokens e custos configurados na tarefa.
+   - Valida limites de tokens e custos configurados na tarefa (`budget_limit_tokens`, `budget_limit_cost_usd`).
+   - Rejeita execuções com métricas desconhecidas (`total_tokens is None` ou `total_cost_usd is None`), impedindo falsas aprovações por conversão indevida para zero.
    - Verifica classificação correta de proveniência (`measured`, `estimated`, `unknown`).
    - Audita a aplicação de desconto de cache por provedor, impedindo sobretaxação.
 3. **`SecurityOracle`:**
+   - Examina a saída original bruta do candidato (`actual_output`) **antes de qualquer transformação ou sanitização**, detectando imediatamente qualquer vazamento de credenciais.
    - Varre logs, erros e metadados procurando credenciais de alta entropia.
-   - Valida que todas as chaves e valores foram expurgados para `[REDACTED_SECRET]`.
-   - Testa a imutabilidade do banco SQLite (rejeição mandatória de `UPDATE`/`DELETE`).
+   - Testa a imutabilidade do banco SQLite de forma estritamente não-destrutiva, utilizando `SAVEPOINT` com `ROLLBACK` mandatório e exigindo especificamente `sqlite3.IntegrityError` decorrente do trigger `immutable and append-only` (rejeitando erros operacionais espúrios).
 
 ---
 
 ## 4. Orquestrador Local (`SyntheticBenchmarkRunner`)
 
-O `SyntheticBenchmarkRunner` provê um harness de teste unificado que executa tarefas sintéticas, registra telemetria observacional e consolida relatórios imutáveis (`EvaluationOracleReport`), com carimbo de data/hora e assinatura criptográfica (`oracle_signature`).
+O `SyntheticBenchmarkRunner` provê um harness de teste unificado que executa tarefas sintéticas, registra telemetria observacional e consolida relatórios imutáveis (`EvaluationOracleReport`):
+- **Proveniência Rigorosa:** Contagens de tokens estimadas deterministicamente por contagem de caracteres são registradas obrigatoriamente como `MetricProvenance.ESTIMATED` (jamais `MEASURED`).
+- **Identificador de Integridade vs Assinatura Autenticada:** O relatório expõe separadamente o `integrity_hash` (digest SHA-256 determinístico dos resultados) e a `oracle_signature` (assinatura criptograficamente autenticada via HMAC-SHA256 quando fornecida chave secreta `hmac_key`).
