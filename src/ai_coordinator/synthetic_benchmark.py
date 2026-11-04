@@ -258,6 +258,7 @@ class EvaluationOracleReport:
             "observed_cost": self.observed_cost.to_dict(),
             "observed_latencies": self.observed_latencies.to_dict(),
             "security_success": self.security_success,
+            "security_verdict": self.security_verdict,
             "zero_secrets_leaked": self.zero_secrets_leaked,
             "sqlite_immutable": self.sqlite_immutable,
             "violation_details": list(self.violation_details),

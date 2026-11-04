@@ -24,8 +24,9 @@ from ai_coordinator import (
     TaskTimingBreakdown,
     BaselineEnvironmentMetadata,
     canonical_json_hash,
+    SecurityVerdict,
 )
-from ai_coordinator.synthetic_benchmark import _normalize_json_structure
+from ai_coordinator.synthetic_benchmark import _normalize_json_structure, EvaluationOracleReport
 
 
 class TestPhase4CBaselineExecution(unittest.TestCase):
@@ -308,12 +309,27 @@ class TestPhase4CBaselineExecution(unittest.TestCase):
         self.assertEqual(rep1.success_rates["passed_all_rate"], 1.0)
 
     def test_07_baseline_serialization_deserialization_and_cli_verifier(self) -> None:
-        """Validate lossless round-trip serialization and standalone CLI verifier execution."""
+        """Validate lossless round-trip serialization, security_verdict preservation, and secure standalone CLI verifier."""
         runner = BaselineRunner(store=self.store, hmac_key=self.hmac_secret)
         original_report = runner.run_baseline(iterations=1)
 
-        # 1. Round-trip dictionary serialization
+        # 1. Round-trip dictionary serialization and explicit security_verdict preservation
         report_dict = original_report.to_dict()
+        first_oracle_dict = report_dict["task_execution_results"][0]["oracle_report"]
+        self.assertIn("security_verdict", first_oracle_dict, "EvaluationOracleReport.to_dict deve exportar explicitamente security_verdict")
+        self.assertEqual(first_oracle_dict["security_verdict"], SecurityVerdict.PASS)
+
+        # Adversarial round-trip verification across all SecurityVerdict taxonomy values
+        for verdict in [SecurityVerdict.PASS, SecurityVerdict.FAIL, SecurityVerdict.PARTIAL_UNVERIFIED, SecurityVerdict.UNKNOWN]:
+            test_oracle_dict = dict(first_oracle_dict)
+            test_oracle_dict["security_verdict"] = verdict
+            reconstructed_oracle = EvaluationOracleReport.from_dict(test_oracle_dict)
+            self.assertEqual(
+                reconstructed_oracle.security_verdict,
+                verdict,
+                f"from_dict deve preservar fielmente o veredito '{verdict}' sem mutação silenciosa",
+            )
+
         reconstructed_report = BaselineExecutionReport.from_dict(report_dict)
 
         self.assertEqual(reconstructed_report.run_id, original_report.run_id)
@@ -324,35 +340,98 @@ class TestPhase4CBaselineExecution(unittest.TestCase):
         self.assertTrue(reconstructed_report.verify_signature(self.hmac_secret))
         self.assertTrue(reconstructed_report.verify_full_report_integrity(self.hmac_secret))
 
-        # 2. Test standalone CLI verifier script
+        # 2. Test standalone CLI verifier script (scripts/verify_baseline_integrity.py)
         report_path = os.path.join(self.test_dir, "test_baseline_verify.json")
+        key_file_path = os.path.join(self.test_dir, "test_hmac_key.secret")
+
         with open(report_path, "w", encoding="utf-8") as f:
             json.dump(report_dict, f, indent=2)
 
+        with open(key_file_path, "w", encoding="utf-8") as f:
+            f.write(self.hmac_secret)
+
         script_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "scripts", "verify_baseline_integrity.py"))
 
-        # Case A: Compliant report passes verification
-        res_ok = subprocess.run(
-            [sys.executable, script_path, "--report", report_path, "--hmac-key", self.hmac_secret],
+        # Case A: Secure authentication via environment variable (--key-env)
+        env_copy = os.environ.copy()
+        env_copy["TEST_AUDIT_HMAC_KEY"] = self.hmac_secret
+        res_env = subprocess.run(
+            [sys.executable, script_path, "--report", report_path, "--key-env", "TEST_AUDIT_HMAC_KEY"],
+            capture_output=True,
+            text=True,
+            env=env_copy,
+        )
+        self.assertEqual(res_env.returncode, 0)
+        self.assertIn("Integridade estrutural e autenticidade criptográfica confirmadas", res_env.stdout)
+
+        # Case B: Secure authentication via protected file (--key-file) with cross-check
+        res_file = subprocess.run(
+            [sys.executable, script_path, "--report", report_path, "--key-file", key_file_path, "--cross-check"],
             capture_output=True,
             text=True,
         )
-        self.assertEqual(res_ok.returncode, 0)
-        self.assertIn("100% íntegro e autêntico", res_ok.stdout)
+        self.assertEqual(res_file.returncode, 0)
+        self.assertIn("Integridade estrutural e autenticidade criptográfica confirmadas", res_file.stdout)
+        self.assertIn("[CROSS-CHECK] Validador Interno:       [OK] CONCORDANTE", res_file.stdout)
 
-        # Case B: Tampered report is rejected with non-zero exit code
-        tampered_dict = dict(report_dict)
-        tampered_dict["token_aggregates"] = {"total_tokens": 999999}
+        # Case C: Secure authentication via standard input pipe (--key-stdin)
+        res_stdin = subprocess.run(
+            [sys.executable, script_path, "--report", report_path, "--key-stdin"],
+            input=self.hmac_secret,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(res_stdin.returncode, 0)
+        self.assertIn("Integridade estrutural e autenticidade criptográfica confirmadas", res_stdin.stdout)
+
+        # Case D: Structural integrity mode without key (must NOT claim authenticity)
+        res_no_key = subprocess.run(
+            [sys.executable, script_path, "--report", report_path],
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(res_no_key.returncode, 0)
+        self.assertIn("Integridade estrutural confirmada (SHA-256)", res_no_key.stdout)
+        self.assertIn("AVISO: Autenticidade NÃO verificada (nenhuma chave HMAC fornecida)", res_no_key.stdout)
+        self.assertNotIn("100% íntegro e autêntico", res_no_key.stdout)
+
+        # Case E: Isolated alteration of security_verdict is detected and rejected
+        tampered_verdict_dict = json.loads(json.dumps(report_dict))
+        tampered_verdict_dict["task_execution_results"][0]["oracle_report"]["security_verdict"] = SecurityVerdict.UNKNOWN
         with open(report_path, "w", encoding="utf-8") as f:
-            json.dump(tampered_dict, f, indent=2)
-
-        res_bad = subprocess.run(
-            [sys.executable, script_path, "--report", report_path, "--hmac-key", self.hmac_secret],
+            json.dump(tampered_verdict_dict, f, indent=2)
+        res_verdict = subprocess.run(
+            [sys.executable, script_path, "--report", report_path, "--key-file", key_file_path],
             capture_output=True,
             text=True,
         )
-        self.assertEqual(res_bad.returncode, 1)
-        self.assertIn("REPROVADO", res_bad.stderr)
+        self.assertEqual(res_verdict.returncode, 1)
+        self.assertIn("REPROVADO", res_verdict.stderr)
+
+        # Case F: Stripped oracle signature under authenticated mode is rejected
+        tampered_sig_dict = json.loads(json.dumps(report_dict))
+        tampered_sig_dict["oracle_signature"] = None
+        with open(report_path, "w", encoding="utf-8") as f:
+            json.dump(tampered_sig_dict, f, indent=2)
+        res_sig = subprocess.run(
+            [sys.executable, script_path, "--report", report_path, "--key-file", key_file_path],
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(res_sig.returncode, 1)
+        self.assertIn("REPROVADO", res_sig.stderr)
+        self.assertIn("oracle_signature da raiz está ausente", res_sig.stderr)
+
+        # Case G: Malformed / incomplete report is rejected
+        with open(report_path, "w", encoding="utf-8") as f:
+            json.dump({"run_id": "malformed_missing_results"}, f)
+        res_empty = subprocess.run(
+            [sys.executable, script_path, "--report", report_path],
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(res_empty.returncode, 1)
+        self.assertIn("REPROVADO", res_empty.stderr)
 
 
 if __name__ == "__main__":
