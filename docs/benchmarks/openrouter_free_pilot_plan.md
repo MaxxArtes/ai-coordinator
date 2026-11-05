@@ -1,6 +1,6 @@
 # Plano Experimental de Campanha Piloto — OpenRouter Free (Fase 4C.1)
 
-> **Status:** Homologação Técnica da Infraestrutura Experimental — Revisão 6 (Final)
+> **Status:** Homologação Técnica Concluída — Revisão 7 (Origem HTTPS Autenticada e Proteção de Cabeçalhos)
 > **Branch:** `feature/phase4c-1-openrouter-free`  
 > **Política Financeira:** **Strict Zero-Cost Fail-Closed** (Custo Máximo Permitido: US$ 0.000000)
 
@@ -103,9 +103,9 @@ Quando autorizado pelo usuário, o procedimento operacional consistirá em uma *
 - Confirmar que a chave de API fornecida via `$env:OPENROUTER_API_KEY` possui permissão exclusiva de inferência, sem métodos de faturamento associados.
 
 ### Passo 2: Inicialização com Origem HTTPS Autenticada
-- Instanciar `OfficialOpenRouterCatalogClient` para obter `AuthenticatedCatalogSnapshot` assinado diretamente de `https://openrouter.ai/api/v1/models`.
+- Instanciar `OfficialOpenRouterCatalogClient` para obter `AuthenticatedCatalogSnapshot` assinado e atestado diretamente de `https://openrouter.ai/api/v1/models` (com validação estrita de URL, redirecionamentos e esquema HTTPS).
 - Carregar o snapshot no `FreeModelRegistry(require_trusted_source=True)` via `load_authenticated_snapshot()`.
-- Validar `registry.is_authenticated_origin == True`.
+- Validar `registry.is_authenticated_origin == True` (objetos fabricados localmente são terminantemente rejeitados).
 
 ### Passo 3: Verificação de Elegibilidade Estrita do Modelo Alvo
 - Confirmar que o modelo escolhido é `meta-llama/llama-3.2-3b-instruct:free` (ou `google/gemini-2.0-flash-exp:free`).
@@ -119,7 +119,7 @@ Quando autorizado pelo usuário, o procedimento operacional consistirá em uma *
 ### Passo 5: Execução da Chamada Única Controlada ($N=1$, Sequencial)
 - Modalidade: Estritamente **TEXT** (outras modalidades bloqueadas por `PILOT_SCOPE_RESTRICTION`).
 - Payload: Prompt sintético padrão determinístico da Suíte A (`"Classify sentiment: This product exceeded all my expectations."`).
-- Egress Gate: O `OpenRouterHttpTransport.dispatch()` inspeciona recursivamente o payload antes do envio, reserva 1 unidade de quota no SQLite, registra a intenção pré-flight, despacha a requisição HTTPS e grava o desfecho pós-flight.
+- Egress Gate: O `OpenRouterHttpTransport.dispatch()` inspeciona recursivamente o payload antes do envio (Gate 1), valida integridade de cabeçalhos proibindo sobrescrita de `Authorization`, `Content-Type` e `Host` (Gate 1b), reserva 1 unidade de quota no SQLite, registra a intenção pré-flight, despacha a requisição HTTPS e grava o desfecho pós-flight.
 
 ### Passo 6: Auditoria Pós-Execução e Classificação Científica
 - Verificar status HTTP (esperado 200).

@@ -112,8 +112,8 @@ class OpenRouterHttpTransport:
             from .registry import UntrustedCatalogSourceError
             raise UntrustedCatalogSourceError(
                 "[FAIL-CLOSED] Modo live exige catálogo com origem oficial HTTPS comprovada "
-                "(AuthenticatedCatalogSnapshot). Dicionários locais, dados estáticos ou catálogos fabricados "
-                "são terminantemente proibidos em chamadas reais."
+                "(OfficialOpenRouterCatalogClient). Dicionários locais, dados estáticos ou snapshots fabricados via "
+                "AuthenticatedCatalogSnapshot.create() são terminantemente proibidos em chamadas reais."
             )
 
     def get_endpoint_for_modality(self, modality_str: str) -> str:
@@ -151,6 +151,16 @@ class OpenRouterHttpTransport:
         # Import lazily to avoid circular imports
         from .adapters import inspect_payload_privacy_strictly
         inspect_payload_privacy_strictly(payload)
+
+        # Gate 1b: Reserved Headers Protection (Authorization, Content-Type, Host)
+        RESERVED_HEADERS = {"authorization", "content-type", "host"}
+        if custom_headers:
+            for k in custom_headers:
+                if str(k).strip().lower() in RESERVED_HEADERS:
+                    raise TransportError(
+                        f"[FAIL-CLOSED] Cabeçalho reservado '{k}' não pode ser sobrescrito via custom_headers. "
+                        "Substituição de identidade ou cabeçalhos de controle é terminantemente proibida."
+                    )
 
         # Gate 2: Endpoint validation
         url = self.get_endpoint_for_modality(modality_str)

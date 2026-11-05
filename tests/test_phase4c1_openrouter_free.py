@@ -72,12 +72,15 @@ from ai_coordinator.openrouter import (
     SlidingWindowRateLimiter,
     SpeechModelAdapter,
     StaleCatalogError,
+    StrictOpenRouterRedirectHandler,
     TextModelAdapter,
+    TransportError,
     UnauthorizedModelError,
     UntrustedCatalogSourceError,
     parse_float_cost,
     scrub_outbound_payload,
 )
+from ai_coordinator.openrouter.registry import _PROCESS_CATALOG_SECRET
 
 
 def _mp_quota_worker(db_path: str, account_id: str, max_per_minute: int, max_per_day: int, out_queue: Any) -> None:
@@ -220,9 +223,19 @@ class TestPhase4C1OpenRouterFree(unittest.TestCase):
         self.ledger = AvailabilityLedger()
 
     def _create_authenticated_guard(self) -> FreeCostGuard:
+        mock_http_response = MagicMock()
+        mock_http_response.getcode.return_value = 200
+        mock_http_response.geturl.return_value = "https://openrouter.ai/api/v1/models"
+        mock_http_response.headers = {"Content-Type": "application/json"}
+        mock_http_response.read.return_value = json.dumps(self.raw_catalog).encode("utf-8")
+        mock_ctx = MagicMock()
+        mock_ctx.__enter__.return_value = mock_http_response
+
+        with patch("urllib.request.urlopen", return_value=mock_ctx):
+            client = OfficialOpenRouterCatalogClient()
+            snapshot = client.fetch_catalog()
+
         reg = FreeModelRegistry(max_age_seconds=3600.0, require_trusted_source=True)
-        raw_bytes = json.dumps(self.raw_catalog).encode("utf-8")
-        snapshot = AuthenticatedCatalogSnapshot.create(raw_bytes)
         reg.load_authenticated_snapshot(snapshot)
         return FreeCostGuard(reg)
 
@@ -695,6 +708,8 @@ class TestPhase4C1OpenRouterFree(unittest.TestCase):
         # 1. Official client queries fixed HTTPS endpoint and returns AuthenticatedCatalogSnapshot
         mock_http_response = MagicMock()
         mock_http_response.getcode.return_value = 200
+        mock_http_response.geturl.return_value = "https://openrouter.ai/api/v1/models"
+        mock_http_response.headers = {"Content-Type": "application/json"}
         mock_http_response.read.return_value = json.dumps(build_synthetic_openrouter_catalog()).encode("utf-8")
         mock_ctx = MagicMock()
         mock_ctx.__enter__.return_value = mock_http_response
@@ -704,6 +719,8 @@ class TestPhase4C1OpenRouterFree(unittest.TestCase):
             snapshot = client.fetch_catalog()
             self.assertIsInstance(snapshot, AuthenticatedCatalogSnapshot)
             self.assertEqual(snapshot.endpoint_url, "https://openrouter.ai/api/v1/models")
+            self.assertTrue(snapshot.is_official_https_origin)
+            self.assertIsNotNone(snapshot.origin_attestation)
 
         # 2. Tampering with endpoint URL or forging an unverified snapshot fails closed
         with self.assertRaises(UntrustedCatalogSourceError):
@@ -1015,6 +1032,174 @@ class TestPhase4C1OpenRouterFree(unittest.TestCase):
         self.assertIn("ttft_ms", res_dict)
         self.assertIsNone(res_dict["ttft_ms"])
         self.assertEqual(res_dict["ttft_provenance"], "UNKNOWN")
+
+    def test_31_adversarial_locally_created_snapshot_fails_live_authorization(self) -> None:
+        """Auditoria Revisão 6: Comprovar que AuthenticatedCatalogSnapshot.create() não autoriza chamadas reais."""
+        synthetic_catalog = build_synthetic_openrouter_catalog()
+        raw_bytes = json.dumps(synthetic_catalog).encode("utf-8")
+
+        # 1. Snapshot created locally via create() has is_official_https_origin = False
+        local_snapshot = AuthenticatedCatalogSnapshot.create(raw_bytes)
+        self.assertFalse(local_snapshot.is_official_https_origin)
+        self.assertIsNone(local_snapshot.origin_attestation)
+
+        # 2. Registry with require_trusted_source=True rejects it fail-closed
+        strict_registry = FreeModelRegistry(require_trusted_source=True)
+        with self.assertRaises(UntrustedCatalogSourceError) as ctx:
+            strict_registry.load_authenticated_snapshot(local_snapshot)
+        self.assertIn("snapshot fornecido foi fabricado localmente", str(ctx.exception))
+
+        # 3. Registry with require_trusted_source=False accepts for offline testing,
+        # but keeps is_authenticated_origin = False
+        offline_registry = FreeModelRegistry(require_trusted_source=False)
+        offline_registry.load_authenticated_snapshot(local_snapshot)
+        self.assertFalse(offline_registry.is_authenticated_origin)
+
+        # 4. OpenRouterHttpTransport in live mode strictly rejects it fail-closed
+        guard = FreeCostGuard(offline_registry)
+        with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as tf, \
+             tempfile.NamedTemporaryFile(suffix=".jsonl", delete=False) as lf:
+            db_path = tf.name
+            log_path = lf.name
+        try:
+            limiter = SlidingWindowRateLimiter(sqlite_path=db_path)
+            ledger = AvailabilityLedger(storage_path=log_path, require_durable=True)
+            with self.assertRaises(UntrustedCatalogSourceError) as ctx_transport:
+                OpenRouterHttpTransport(
+                    cost_guard=guard,
+                    rate_limiter=limiter,
+                    ledger=ledger,
+                    live_network_enabled=True,
+                    api_key="sk-or-v1-dummy-key-for-test",
+                )
+            self.assertIn("Modo live exige catálogo com origem oficial HTTPS comprovada", str(ctx_transport.exception))
+        finally:
+            for p in (db_path, log_path):
+                if os.path.exists(p):
+                    os.unlink(p)
+
+    def test_32_catalog_client_https_redirect_and_destination_validation(self) -> None:
+        """Auditoria Revisão 6: Validação de destino oficial, política de redirecionamentos e origem efetiva."""
+        client = OfficialOpenRouterCatalogClient()
+
+        # 1. Insecure HTTP redirect/response is rejected
+        mock_resp_http = MagicMock()
+        mock_resp_http.getcode.return_value = 200
+        mock_resp_http.geturl.return_value = "http://openrouter.ai/api/v1/models"
+        mock_resp_http.headers = {"Content-Type": "application/json"}
+        mock_resp_http.read.return_value = b'{"data": []}'
+        mock_ctx_http = MagicMock()
+        mock_ctx_http.__enter__.return_value = mock_resp_http
+        with patch("urllib.request.urlopen", return_value=mock_ctx_http):
+            with self.assertRaises(UntrustedCatalogSourceError) as ctx:
+                client.fetch_catalog()
+            self.assertIn("esquema", str(ctx.exception).lower())
+
+        # 2. Redirect to foreign host is rejected
+        mock_resp_foreign = MagicMock()
+        mock_resp_foreign.getcode.return_value = 200
+        mock_resp_foreign.geturl.return_value = "https://evil-unauthorized-server.com/api/v1/models"
+        mock_resp_foreign.headers = {"Content-Type": "application/json"}
+        mock_resp_foreign.read.return_value = b'{"data": []}'
+        mock_ctx_foreign = MagicMock()
+        mock_ctx_foreign.__enter__.return_value = mock_resp_foreign
+        with patch("urllib.request.urlopen", return_value=mock_ctx_foreign):
+            with self.assertRaises(UntrustedCatalogSourceError) as ctx:
+                client.fetch_catalog()
+            self.assertIn("host", str(ctx.exception).lower())
+
+        # 3. Wrong path is rejected
+        mock_resp_path = MagicMock()
+        mock_resp_path.getcode.return_value = 200
+        mock_resp_path.geturl.return_value = "https://openrouter.ai/api/v1/other_endpoint"
+        mock_resp_path.headers = {"Content-Type": "application/json"}
+        mock_resp_path.read.return_value = b'{"data": []}'
+        mock_ctx_path = MagicMock()
+        mock_ctx_path.__enter__.return_value = mock_resp_path
+        with patch("urllib.request.urlopen", return_value=mock_ctx_path):
+            with self.assertRaises(UntrustedCatalogSourceError) as ctx:
+                client.fetch_catalog()
+            self.assertIn("caminho", str(ctx.exception).lower())
+
+        # 4. Non-JSON Content-Type is rejected
+        mock_resp_ct = MagicMock()
+        mock_resp_ct.getcode.return_value = 200
+        mock_resp_ct.geturl.return_value = "https://openrouter.ai/api/v1/models"
+        mock_resp_ct.headers = {"Content-Type": "text/html"}
+        mock_resp_ct.read.return_value = b'<html><body>Not JSON</body></html>'
+        mock_ctx_ct = MagicMock()
+        mock_ctx_ct.__enter__.return_value = mock_resp_ct
+        with patch("urllib.request.urlopen", return_value=mock_ctx_ct):
+            with self.assertRaises(UntrustedCatalogSourceError) as ctx:
+                client.fetch_catalog()
+            self.assertIn("content-type", str(ctx.exception).lower())
+
+    def test_33_custom_headers_cannot_overwrite_reserved_headers(self) -> None:
+        """Auditoria Revisão 6: Impedir que custom_headers sobrescreva Authorization ou cabeçalhos reservados."""
+        auth_guard = self._create_authenticated_guard()
+        with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as tf, \
+             tempfile.NamedTemporaryFile(suffix=".jsonl", delete=False) as lf:
+            db_path = tf.name
+            log_path = lf.name
+        try:
+            limiter = SlidingWindowRateLimiter(sqlite_path=db_path)
+            ledger = AvailabilityLedger(storage_path=log_path, require_durable=True)
+            transport = OpenRouterHttpTransport(
+                cost_guard=auth_guard,
+                rate_limiter=limiter,
+                ledger=ledger,
+                live_network_enabled=True,
+                api_key="sk-or-v1-legitimate-pilot-key",
+            )
+            payload = {
+                "model": "meta-llama/llama-3.2-3b-instruct:free",
+                "messages": [{"role": "user", "content": "hello"}],
+            }
+            # Attempt to overwrite Authorization
+            with self.assertRaises(TransportError) as ctx_auth:
+                transport.dispatch("text", payload, custom_headers={"Authorization": "Bearer evil-swapped-key"})
+            self.assertIn("reservado", str(ctx_auth.exception).lower())
+            self.assertIn("authorization", str(ctx_auth.exception).lower())
+
+            # Attempt to overwrite authorization (case-insensitive)
+            with self.assertRaises(TransportError) as ctx_auth_lower:
+                transport.dispatch("text", payload, custom_headers={"authorization": "Bearer evil-swapped-key"})
+            self.assertIn("reservado", str(ctx_auth_lower.exception).lower())
+
+            # Attempt to overwrite Content-Type
+            with self.assertRaises(TransportError) as ctx_ct:
+                transport.dispatch("text", payload, custom_headers={"Content-Type": "text/plain"})
+            self.assertIn("reservado", str(ctx_ct.exception).lower())
+
+            # Attempt to overwrite Host
+            with self.assertRaises(TransportError) as ctx_host:
+                transport.dispatch("text", payload, custom_headers={"Host": "attacker.com"})
+            self.assertIn("reservado", str(ctx_host.exception).lower())
+        finally:
+            for p in (db_path, log_path):
+                if os.path.exists(p):
+                    os.unlink(p)
+
+    def test_34_forged_origin_attestation_seal_strictly_rejected(self) -> None:
+        """Auditoria Revisão 6: Atestação forjada com is_official_https_origin=True é rejeitada fail-closed."""
+        import hashlib
+        import hmac
+
+        synthetic_catalog = build_synthetic_openrouter_catalog()
+        raw_bytes = json.dumps(synthetic_catalog).encode("utf-8")
+
+        # Tampered attestation signature
+        tampered_snapshot = AuthenticatedCatalogSnapshot(
+            raw_bytes=raw_bytes,
+            endpoint_url="https://openrouter.ai/api/v1/models",
+            fetched_at_epoch=time.time(),
+            hmac_signature=hmac.new(_PROCESS_CATALOG_SECRET, raw_bytes, hashlib.sha256).hexdigest(),
+            is_official_https_origin=True,
+            origin_attestation="forged_attestation_signature_hex",
+        )
+        with self.assertRaises(UntrustedCatalogSourceError) as ctx:
+            tampered_snapshot.verify_authenticity()
+        self.assertIn("inválida ou forjada", str(ctx.exception))
 
 
 if __name__ == "__main__":

@@ -10,6 +10,7 @@ from .registry import (
     UntrustedCatalogSourceError,
     OfficialOpenRouterCatalogClient,
     AuthenticatedCatalogSnapshot,
+    StrictOpenRouterRedirectHandler,
     parse_float_cost,
 )
 from .cost_guard import (
@@ -71,6 +72,7 @@ __all__ = [
     "UntrustedCatalogSourceError",
     "OfficialOpenRouterCatalogClient",
     "AuthenticatedCatalogSnapshot",
+    "StrictOpenRouterRedirectHandler",
     "parse_float_cost",
     "FreeCostGuard",
     "CostGuardError",
