@@ -1,6 +1,6 @@
 # Plano Experimental de Campanha Piloto — OpenRouter Free (Fase 4C.1)
 
-> **Status:** Proposta de Piloto Experimental — Atualizado após Auditoria Independente (Revisão 4)  
+> **Status:** Proposta de Piloto Experimental — Atualizado após Auditoria Independente (Revisão 5)
 > **Branch:** `feature/phase4c-1-openrouter-free`  
 > **Política Financeira:** **Strict Zero-Cost Fail-Closed** (Custo Máximo Permitido: US$ 0.000000)
 
@@ -58,6 +58,17 @@ Para contas gratuitas padrão da OpenRouter, a documentação oficial estabelece
 - **Intervalo Mínimo entre Requisições:** 3.0 segundos (máximo 20 req/min).
 - **Circuit Breaker:** Trip após 3 falhas consecutivas, com tempo de recuperação de 30 segundos.
 - **Retry Policy:** Máximo de 2 tentativas por tarefa para erros 429 e 503, com backoff exponencial e respeito a `Retry-After`.
+
+### 4.1. Proteções da Conta, Chaves de API e Reconhecimento Explícito de Volatilidade de Preços
+
+Em atendimento estrito à determinação 8 da Auditoria Independente:
+
+1. **Spend Cap no Painel OpenRouter:** A conta de serviço configurada para o experimento deve manter limite de gastos (*credit limit / spend cap*) configurado explicitamente em **US$ 0.00**. Nenhuma recarga automática, cartão de crédito ou método de faturamento deve estar ativo.
+2. **Escopo e Permissões da Chave de API:** A chave de API criada no portal da OpenRouter deve possuir permissão exclusiva de inferência (`completions`, `embeddings`), sem privilégios administrativos de consulta de faturamento ou mutação de limites.
+3. **Reconhecimento Formal de Volatilidade:** Reconhece-se taxativamente que **uma consulta de preços com valor US$ 0.00 não garante gratuidade perpétua nem estabilidade futura de preços**. O catálogo gratuito de provedores na OpenRouter é dinâmico e pode ser alterado a qualquer momento sem aviso prévio. Por esta razão:
+   - A obtenção do catálogo em modo operacional é feita exclusivamente via HTTPS oficial autenticado (`OfficialOpenRouterCatalogClient`) com verificação TLS e validação de schema.
+   - O `FreeCostGuard` aplica controle de frescor temporal (`max_age_seconds`) e revalidação no próprio ponto indivisível de saída HTTP (`OpenRouterHttpTransport.dispatch`).
+   - Se um modelo previamente gratuito passar a ter custo não-nulo em qualquer dimensão (prompt, completion, image ou request), a tentativa de disparo é interceptada e abortada com `UnauthorizedModelError`, registrando o evento `PRICE_CHANGED_BLOCKED` no `AvailabilityLedger` durável.
 
 ---
 

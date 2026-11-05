@@ -105,9 +105,18 @@ class ModelBenchmarkRunner:
         self.rate_limiter = rate_limiter or SlidingWindowRateLimiter(max_per_minute=20, max_per_day=50)
         self.circuit_breaker = circuit_breaker or CircuitBreaker(failure_threshold=3, recovery_timeout_sec=30.0)
         self.retry_policy = retry_policy or RetryPolicy(max_attempts=3)
-        self.transport = transport or OpenRouterHttpTransport(cost_guard=self.cost_guard, live_network_enabled=False)
+        self.transport = transport or OpenRouterHttpTransport(
+            cost_guard=self.cost_guard,
+            rate_limiter=self.rate_limiter,
+            ledger=self.ledger,
+            live_network_enabled=False,
+        )
         if self.transport.cost_guard is None:
             self.transport.cost_guard = self.cost_guard
+        if self.transport.rate_limiter is None:
+            self.transport.rate_limiter = self.rate_limiter
+        if self.transport.ledger is None:
+            self.transport.ledger = self.ledger
         self.store = store
         self.sleeper = sleeper or time.sleep
 
@@ -238,50 +247,61 @@ class ModelBenchmarkRunner:
         last_response: Optional[AdapterResponse] = None
 
         while attempt <= self.retry_policy.max_attempts:
-            try:
-                granted = self.rate_limiter.acquire()
-            except QuotaPersistenceError as qpe:
-                return ModelBenchmarkRunResult(
-                    run_id=run_id,
-                    model_id=model_id,
-                    modality=modality,
-                    success=False,
-                    latency_ms=0.0,
-                    tokens={"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
-                    token_provenance=MetricProvenance.UNKNOWN,
-                    latency_provenance=MetricProvenance.UNKNOWN,
-                    cost_usd=0.0,
-                    status_code=500,
-                    error_message=f"[QUOTA_PERSISTENCE_FAILED] {qpe}",
-                    timestamp=now_iso,
-                    metadata={"attempt": attempt},
-                )
+            # Single Quota Reservation Point:
+            # When live network is enabled on transport and rate_limiter is configured on it,
+            # quota is acquired atomically inside transport.dispatch() at Gate 7 to avoid double counting.
+            # In offline or mock mode, runner reserves quota directly here.
+            quota_handled_by_transport = (
+                self.transport is not None
+                and self.transport.live_network_enabled
+                and self.transport.rate_limiter is not None
+            )
 
-            if not granted:
-                wait_sec = self.rate_limiter.time_until_available()
+            if not quota_handled_by_transport:
                 try:
-                    self.ledger.record_event(
+                    granted = self.rate_limiter.acquire()
+                except QuotaPersistenceError as qpe:
+                    return ModelBenchmarkRunResult(
+                        run_id=run_id,
                         model_id=model_id,
-                        event_type=AvailabilityEventType.RATE_LIMITED_429,
-                        details={"run_id": run_id, "attempt": attempt, "wait_seconds": wait_sec},
+                        modality=modality,
+                        success=False,
+                        latency_ms=0.0,
+                        tokens={"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+                        token_provenance=MetricProvenance.UNKNOWN,
+                        latency_provenance=MetricProvenance.UNKNOWN,
+                        cost_usd=0.0,
+                        status_code=500,
+                        error_message=f"[QUOTA_PERSISTENCE_FAILED] {qpe}",
+                        timestamp=now_iso,
+                        metadata={"attempt": attempt},
                     )
-                except AuditPersistenceError:
-                    pass
-                return ModelBenchmarkRunResult(
-                    run_id=run_id,
-                    model_id=model_id,
-                    modality=modality,
-                    success=False,
-                    latency_ms=0.0,
-                    tokens={"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
-                    token_provenance=MetricProvenance.UNKNOWN,
-                    latency_provenance=MetricProvenance.UNKNOWN,
-                    cost_usd=0.0,
-                    status_code=429,
-                    error_message=f"[RATE_LIMIT_EXCEEDED] Limite de requisições atingido na tentativa {attempt}. Aguarde {wait_sec:.1f}s.",
-                    timestamp=now_iso,
-                    metadata={"time_until_available_sec": wait_sec, "attempt": attempt},
-                )
+
+                if not granted:
+                    wait_sec = self.rate_limiter.time_until_available()
+                    try:
+                        self.ledger.record_event(
+                            model_id=model_id,
+                            event_type=AvailabilityEventType.RATE_LIMITED_429,
+                            details={"run_id": run_id, "attempt": attempt, "wait_seconds": wait_sec},
+                        )
+                    except AuditPersistenceError:
+                        pass
+                    return ModelBenchmarkRunResult(
+                        run_id=run_id,
+                        model_id=model_id,
+                        modality=modality,
+                        success=False,
+                        latency_ms=0.0,
+                        tokens={"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+                        token_provenance=MetricProvenance.UNKNOWN,
+                        latency_provenance=MetricProvenance.UNKNOWN,
+                        cost_usd=0.0,
+                        status_code=429,
+                        error_message=f"[RATE_LIMIT_EXCEEDED] Limite de requisições atingido na tentativa {attempt}. Aguarde {wait_sec:.1f}s.",
+                        timestamp=now_iso,
+                        metadata={"time_until_available_sec": wait_sec, "attempt": attempt},
+                    )
 
             try:
                 resp = adapter.execute(model_id, inputs)

@@ -77,6 +77,22 @@ from ai_coordinator.openrouter import (
 )
 
 
+def _mp_quota_worker(db_path: str, account_id: str, max_per_minute: int, max_per_day: int, out_queue: Any) -> None:
+    """Worker function executed in an isolated operating system process for multiprocessing test."""
+    try:
+        from ai_coordinator.openrouter.resilience import SlidingWindowRateLimiter
+        limiter = SlidingWindowRateLimiter(
+            account_id=account_id,
+            max_per_minute=max_per_minute,
+            max_per_day=max_per_day,
+            sqlite_path=db_path,
+        )
+        granted = limiter.acquire()
+        out_queue.put(granted)
+    except Exception as exc:
+        out_queue.put(f"EXCEPTION: {exc}")
+
+
 def build_synthetic_openrouter_catalog() -> dict:
     """Generate representative OpenRouter catalog containing free and paid models across modalities."""
     return {
@@ -142,6 +158,18 @@ def build_synthetic_openrouter_catalog() -> dict:
                 "created": 1715000000,
             },
             {
+                "id": "fishaudio/fish-speech-1.5:free",
+                "name": "Fish Audio: Fish Speech 1.5 (free)",
+                "description": "Text to speech generation model",
+                "context_length": 4096,
+                "pricing": {"prompt": "0", "completion": "0", "image": "0", "request": "0"},
+                "architecture": {
+                    "modality": "text->audio",
+                    "supported_parameters": [],
+                },
+                "created": 1720000000,
+            },
+            {
                 "id": "adversarial/sneaky-model:free",
                 "name": "Adversarial Sneaky Model",
                 "description": "Claims to be free in ID but charges money",
@@ -190,9 +218,9 @@ class TestPhase4C1OpenRouterFree(unittest.TestCase):
 
     def test_01_registry_parsing_and_modality_classification(self) -> None:
         """Validate dynamic catalog parsing, zero-cost qualification, and modality inference."""
-        self.assertEqual(self.registry.total_models, 8)
+        self.assertEqual(self.registry.total_models, 9)
         free_models = self.registry.get_free_models()
-        self.assertEqual(len(free_models), 5, "Exatamente 5 dos 8 modelos devem ser qualificados como gratuitos")
+        self.assertEqual(len(free_models), 6, "Exatamente 6 dos 9 modelos devem ser qualificados como gratuitos")
 
         # Verify Text Modality
         text_models = self.registry.get_by_modality(ModelModality.TEXT)
@@ -210,11 +238,20 @@ class TestPhase4C1OpenRouterFree(unittest.TestCase):
         self.assertEqual(len(embed_models), 1)
         self.assertEqual(embed_models[0].id, "baai/bge-large-en-v1.5:free")
 
-        # Verify Speech Modality (Transcription)
+        # Verify Speech Modality (Transcription and Generation)
         speech_models = self.registry.get_by_modality(ModelModality.SPEECH)
-        self.assertEqual(len(speech_models), 1)
-        self.assertEqual(speech_models[0].id, "openai/whisper-large-v3:free")
-        self.assertIn(ModelModality.SPEECH_TRANSCRIPTION, speech_models[0].modalities)
+        self.assertEqual(len(speech_models), 2)
+        speech_ids = [m.id for m in speech_models]
+        self.assertIn("openai/whisper-large-v3:free", speech_ids)
+        self.assertIn("fishaudio/fish-speech-1.5:free", speech_ids)
+
+        trans_models = self.registry.get_by_modality(ModelModality.SPEECH_TRANSCRIPTION)
+        self.assertEqual(len(trans_models), 1)
+        self.assertEqual(trans_models[0].id, "openai/whisper-large-v3:free")
+
+        gen_models = self.registry.get_by_modality(ModelModality.SPEECH_GENERATION)
+        self.assertEqual(len(gen_models), 1)
+        self.assertEqual(gen_models[0].id, "fishaudio/fish-speech-1.5:free")
 
         # Verify Decision Modality
         decision_models = self.registry.get_by_modality(ModelModality.DECISIONS)
@@ -484,26 +521,38 @@ class TestPhase4C1OpenRouterFree(unittest.TestCase):
         mock_context_manager = MagicMock()
         mock_context_manager.__enter__.return_value = mock_http_response
 
-        with patch("urllib.request.urlopen", return_value=mock_context_manager):
-            live_transport = OpenRouterHttpTransport(cost_guard=self.cost_guard, api_key="sk-or-v1-fake-test-key", live_network_enabled=True)
-            adapter = TextModelAdapter(self.cost_guard, transport=live_transport)
-            adapter_res = adapter.execute("meta-llama/llama-3.2-3b-instruct:free", {"prompt": "Live dispatch test"})
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            db_path = os.path.join(tmp_dir, "quotas.db")
+            audit_path = os.path.join(tmp_dir, "audit.jsonl")
+            limiter = SlidingWindowRateLimiter(max_per_minute=20, max_per_day=50, sqlite_path=db_path)
+            ledger = AvailabilityLedger(storage_path=audit_path, require_durable=True)
 
-            self.assertTrue(adapter_res.success)
-            self.assertEqual(adapter_res.tokens["total_tokens"], 20)
-            self.assertEqual(adapter_res.token_provenance, MetricProvenance.MEASURED)
-            self.assertEqual(adapter_res.output_data["text"], "Live response from OpenRouter")
+            with patch("urllib.request.urlopen", return_value=mock_context_manager):
+                live_transport = OpenRouterHttpTransport(
+                    cost_guard=self.cost_guard,
+                    rate_limiter=limiter,
+                    ledger=ledger,
+                    api_key="sk-or-v1-fake-test-key",
+                    live_network_enabled=True,
+                )
+                adapter = TextModelAdapter(self.cost_guard, transport=live_transport)
+                adapter_res = adapter.execute("meta-llama/llama-3.2-3b-instruct:free", {"prompt": "Live dispatch test"})
+
+                self.assertTrue(adapter_res.success)
+                self.assertEqual(adapter_res.tokens["total_tokens"], 20)
+                self.assertEqual(adapter_res.token_provenance, MetricProvenance.MEASURED)
+                self.assertEqual(adapter_res.output_data["text"], "Live response from OpenRouter")
 
     def test_13_centralized_egress_gate_blocks_direct_dispatch_paid_model(self) -> None:
         """Revisão 4 - P0 Financeiro: dispatch() direto é interceptado pelo FreeCostGuard e rejeita modelos pagos."""
-        transport = OpenRouterHttpTransport(cost_guard=self.cost_guard, api_key="sk-test", live_network_enabled=True)
-        # Attempt to bypass via direct transport call with paid model
+        # 1. Gate 3 rejects paid model even before live network checks
+        transport = OpenRouterHttpTransport(cost_guard=self.cost_guard, api_key="sk-test", live_network_enabled=False)
         with self.assertRaises(UnauthorizedModelError) as ctx_paid:
             transport.dispatch("text", {"model": "openai/gpt-4o", "messages": []})
         self.assertIn("terminantemente proibidas", str(ctx_paid.exception))
 
-        # Attempt to dispatch without CostGuard fails closed
-        unguarded_transport = OpenRouterHttpTransport(cost_guard=None, api_key="sk-test", live_network_enabled=True)
+        # 2. Attempt to dispatch without CostGuard fails closed
+        unguarded_transport = OpenRouterHttpTransport(cost_guard=None, api_key="sk-test", live_network_enabled=False)
         with self.assertRaises(CostGuardError) as ctx_unguarded:
             unguarded_transport.dispatch("text", {"model": "meta-llama/llama-3.2-3b-instruct:free", "messages": []})
         self.assertIn("sem FreeCostGuard configurado", str(ctx_unguarded.exception))
@@ -530,7 +579,7 @@ class TestPhase4C1OpenRouterFree(unittest.TestCase):
         self.assertFalse(stale_registry.is_stale())
 
     def test_15_concurrent_multiprocess_atomic_sqlite_quota_competition(self) -> None:
-        """Revisão 4 - P1 Quotas: Dois workers disputando a última cota concorrentemente no SQLite."""
+        """Revisão 4 - P1 Quotas: Dois workers disputando a última cota concorrentemente no SQLite (threads)."""
         with tempfile.TemporaryDirectory() as tmp_dir:
             db_path = os.path.join(tmp_dir, "quotas.db")
             # Limit is strictly 1 per minute
@@ -553,7 +602,6 @@ class TestPhase4C1OpenRouterFree(unittest.TestCase):
         """Revisão 4 - P1 Auditoria: Falha de escrita no armazenamento durável de auditoria lança AuditPersistenceError."""
         # Using an impossible path on Windows/Posix (e.g. empty string or forbidden directory)
         invalid_path = os.path.join(tempfile.gettempdir(), "non_existent_dir_12345", "sub", "audit.jsonl")
-        # Ensure parent dir cannot be created or simulate failure
         ledger = AvailabilityLedger(storage_path="/invalid_root_never_created\0/audit.jsonl", require_durable=True)
         with self.assertRaises(AuditPersistenceError):
             ledger.record_event("test_model", AvailabilityEventType.MODEL_DISCOVERED)
@@ -572,14 +620,26 @@ class TestPhase4C1OpenRouterFree(unittest.TestCase):
         mock_context_manager = MagicMock()
         mock_context_manager.__enter__.return_value = mock_http_response
 
-        with patch("urllib.request.urlopen", return_value=mock_context_manager):
-            live_transport = OpenRouterHttpTransport(cost_guard=self.cost_guard, api_key="sk-test", live_network_enabled=True)
-            adapter = TextModelAdapter(self.cost_guard, transport=live_transport)
-            res = adapter.execute("meta-llama/llama-3.2-3b-instruct:free", {"prompt": "Test no usage"})
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            db_path = os.path.join(tmp_dir, "quotas.db")
+            audit_path = os.path.join(tmp_dir, "audit.jsonl")
+            limiter = SlidingWindowRateLimiter(max_per_minute=20, max_per_day=50, sqlite_path=db_path)
+            ledger = AvailabilityLedger(storage_path=audit_path, require_durable=True)
 
-            self.assertTrue(res.success)
-            self.assertEqual(res.token_provenance, MetricProvenance.UNKNOWN, "Sem campo 'usage', métrica deve ser UNKNOWN")
-            self.assertEqual(res.tokens["total_tokens"], 0)
+            with patch("urllib.request.urlopen", return_value=mock_context_manager):
+                live_transport = OpenRouterHttpTransport(
+                    cost_guard=self.cost_guard,
+                    rate_limiter=limiter,
+                    ledger=ledger,
+                    api_key="sk-test",
+                    live_network_enabled=True,
+                )
+                adapter = TextModelAdapter(self.cost_guard, transport=live_transport)
+                res = adapter.execute("meta-llama/llama-3.2-3b-instruct:free", {"prompt": "Test no usage"})
+
+                self.assertTrue(res.success)
+                self.assertEqual(res.token_provenance, MetricProvenance.UNKNOWN, "Sem campo 'usage', métrica deve ser UNKNOWN")
+                self.assertEqual(res.tokens["total_tokens"], 0)
 
     def test_18_unknown_modality_endpoint_rejected_fail_closed(self) -> None:
         """Revisão 4 - P1 Modalidades: Modalidade desconhecida deve ser rejeitada fail-closed sem fallback para /chat/completions."""
@@ -587,6 +647,218 @@ class TestPhase4C1OpenRouterFree(unittest.TestCase):
         with self.assertRaises(IncompatibleModalityEndpointError) as ctx_unknown:
             transport.get_endpoint_for_modality("telepathy_v1")
         self.assertIn("Modalidade desconhecida ou sem endpoint correspondente", str(ctx_unknown.exception))
+
+    def test_19_true_os_multiprocessing_atomic_sqlite_quota_competition(self) -> None:
+        """Revisão 5 - Determinação 5: Teste adversarial com múltiplos processos reais do SO via multiprocessing."""
+        import multiprocessing
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            db_path = os.path.join(tmp_dir, "mp_quotas.db")
+            # Strict limit: 1 request per minute
+            init_limiter = SlidingWindowRateLimiter(max_per_minute=1, max_per_day=10, sqlite_path=db_path)
+            self.assertEqual(init_limiter.max_per_minute, 1)
+
+            ctx = multiprocessing.get_context("spawn")
+            out_queue = ctx.Queue()
+
+            p1 = ctx.Process(target=_mp_quota_worker, args=(db_path, "default", 1, 10, out_queue))
+            p2 = ctx.Process(target=_mp_quota_worker, args=(db_path, "default", 1, 10, out_queue))
+
+            p1.start()
+            p2.start()
+
+            res1 = out_queue.get(timeout=10.0)
+            res2 = out_queue.get(timeout=10.0)
+
+            p1.join(timeout=5.0)
+            p2.join(timeout=5.0)
+
+            results = [res1, res2]
+            self.assertIn(True, results)
+            self.assertIn(False, results)
+            self.assertEqual(results.count(True), 1)
+            self.assertEqual(results.count(False), 1)
+
+    def test_20_official_catalog_client_https_and_untrusted_source_rejection(self) -> None:
+        """Revisão 5 - Determinação 2: Catálogo autenticado via HTTPS oficial e rejeição de fontes não confiáveis."""
+        from ai_coordinator.openrouter.registry import (
+            OfficialOpenRouterCatalogClient,
+            UntrustedCatalogSourceError,
+        )
+
+        # 1. Official client fetches and marks data as trusted
+        mock_http_response = MagicMock()
+        mock_http_response.getcode.return_value = 200
+        mock_http_response.read.return_value = json.dumps(build_synthetic_openrouter_catalog()).encode("utf-8")
+        mock_ctx = MagicMock()
+        mock_ctx.__enter__.return_value = mock_http_response
+
+        with patch("urllib.request.urlopen", return_value=mock_ctx):
+            client = OfficialOpenRouterCatalogClient()
+            catalog_data = client.fetch_catalog()
+            self.assertTrue(catalog_data.get("_trusted"))
+            self.assertEqual(catalog_data.get("_source"), "https://openrouter.ai/api/v1/models")
+
+        # 2. FreeModelRegistry with require_trusted_source=True rejects arbitrary dictionaries
+        secure_registry = FreeModelRegistry(require_trusted_source=True)
+        arbitrary_untrusted_data = build_synthetic_openrouter_catalog()
+
+        with self.assertRaises(UntrustedCatalogSourceError) as ctx_untrusted:
+            secure_registry.load_catalog_data(arbitrary_untrusted_data, is_trusted=False)
+        self.assertIn("apenas snapshots originados diretamente do endpoint oficial", str(ctx_untrusted.exception))
+
+        # 3. Trusted data is accepted
+        secure_registry.load_catalog_data(catalog_data, is_trusted=True)
+        self.assertEqual(secure_registry.total_models, 9)
+
+    def test_21_live_network_configuration_strict_validation(self) -> None:
+        """Revisão 5 - Determinação 3: Exigir CostGuard, SQLiteQuotaStore e Ledger Durável antes de autorizar rede real."""
+        # Missing CostGuard
+        with self.assertRaises(CostGuardError) as ctx_cg:
+            OpenRouterHttpTransport(cost_guard=None, live_network_enabled=True)
+        self.assertIn("Modo live exige FreeCostGuard", str(ctx_cg.exception))
+
+        # Missing SQLite RateLimiter
+        with self.assertRaises(CostGuardError) as ctx_limiter:
+            OpenRouterHttpTransport(cost_guard=self.cost_guard, rate_limiter=None, live_network_enabled=True)
+        self.assertIn("Modo live exige rate_limiter com SQLiteQuotaStore", str(ctx_limiter.exception))
+
+        # RateLimiter without SQLite (in-memory)
+        in_memory_limiter = SlidingWindowRateLimiter(sqlite_path=None)
+        with self.assertRaises(CostGuardError) as ctx_mem:
+            OpenRouterHttpTransport(cost_guard=self.cost_guard, rate_limiter=in_memory_limiter, live_network_enabled=True)
+        self.assertIn("Modo live exige rate_limiter com SQLiteQuotaStore", str(ctx_mem.exception))
+
+        # Missing or non-durable ledger
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            db_path = os.path.join(tmp_dir, "quotas.db")
+            valid_limiter = SlidingWindowRateLimiter(sqlite_path=db_path)
+
+            with self.assertRaises(AuditPersistenceError) as ctx_ledger:
+                OpenRouterHttpTransport(
+                    cost_guard=self.cost_guard,
+                    rate_limiter=valid_limiter,
+                    ledger=None,
+                    live_network_enabled=True,
+                )
+            self.assertIn("Modo live exige AvailabilityLedger configurado com require_durable=True", str(ctx_ledger.exception))
+
+    def test_22_single_quota_reservation_in_runner_and_transport(self) -> None:
+        """Revisão 5 - Determinação 4: Quota cobrada exatamente uma vez por tentativa no ponto de saída (sem dupla cobrança)."""
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            db_path = os.path.join(tmp_dir, "quotas.db")
+            audit_path = os.path.join(tmp_dir, "audit.jsonl")
+            limiter = SlidingWindowRateLimiter(max_per_minute=10, max_per_day=20, sqlite_path=db_path)
+            ledger = AvailabilityLedger(storage_path=audit_path, require_durable=True)
+
+            mock_http_response = MagicMock()
+            mock_http_response.getcode.return_value = 200
+            mock_http_response.headers = {"Content-Type": "application/json"}
+            mock_http_response.read.return_value = json.dumps({
+                "id": "gen-single-quota",
+                "choices": [{"message": {"content": "Hello single quota"}}],
+                "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15},
+            }).encode("utf-8")
+
+            mock_ctx = MagicMock()
+            mock_ctx.__enter__.return_value = mock_http_response
+
+            with patch("urllib.request.urlopen", return_value=mock_ctx):
+                live_transport = OpenRouterHttpTransport(
+                    cost_guard=self.cost_guard,
+                    rate_limiter=limiter,
+                    ledger=ledger,
+                    api_key="sk-or-v1-fake-key",
+                    live_network_enabled=True,
+                )
+                runner = ModelBenchmarkRunner(
+                    registry=self.registry,
+                    cost_guard=self.cost_guard,
+                    ledger=ledger,
+                    rate_limiter=limiter,
+                    transport=live_transport,
+                )
+
+                initial_reservations = limiter.requests_in_current_minute
+                res = runner.execute_task("meta-llama/llama-3.2-3b-instruct:free", ModelModality.TEXT, {"prompt": "Single charge test"})
+
+                self.assertTrue(res.success)
+                # Exactly 1 quota reservation occurred, NOT 2!
+                self.assertEqual(limiter.requests_in_current_minute - initial_reservations, 1)
+
+    def test_23_binary_audio_generation_and_transcription_contracts(self) -> None:
+        """Revisão 5 - Determinação 6: Contratos de áudio para geração binária e upload de transcrição."""
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            db_path = os.path.join(tmp_dir, "quotas.db")
+            audit_path = os.path.join(tmp_dir, "audit.jsonl")
+            limiter = SlidingWindowRateLimiter(max_per_minute=20, max_per_day=50, sqlite_path=db_path)
+            ledger = AvailabilityLedger(storage_path=audit_path, require_durable=True)
+
+            raw_wav_bytes = b"RIFF\x24\x00\x00\x00WAVEfmt \x10\x00\x00\x00\x01\x00\x01\x00"
+
+            mock_http_response = MagicMock()
+            mock_http_response.getcode.return_value = 200
+            mock_http_response.headers = {"Content-Type": "audio/wav"}
+            mock_http_response.read.return_value = raw_wav_bytes
+            mock_ctx = MagicMock()
+            mock_ctx.__enter__.return_value = mock_http_response
+
+            with patch("urllib.request.urlopen", return_value=mock_ctx):
+                live_transport = OpenRouterHttpTransport(
+                    cost_guard=self.cost_guard,
+                    rate_limiter=limiter,
+                    ledger=ledger,
+                    api_key="sk-test",
+                    live_network_enabled=True,
+                )
+                adapter = SpeechModelAdapter(self.cost_guard, transport=live_transport)
+
+                # 1. Voice generation (binary response)
+                gen_res = adapter.execute(
+                    "fishaudio/fish-speech-1.5:free",
+                    {"text_to_speak": "Hello world from synthetic speech", "format": "wav"},
+                )
+                self.assertTrue(gen_res.success)
+                self.assertIn("binary_data", gen_res.output_data)
+                self.assertEqual(gen_res.output_data["binary_data"], raw_wav_bytes)
+                self.assertEqual(gen_res.output_data["audio_bytes_length"], len(raw_wav_bytes))
+
+                # 2. Audio transcription (JSON response from upload)
+                mock_transcription_resp = MagicMock()
+                mock_transcription_resp.getcode.return_value = 200
+                mock_transcription_resp.headers = {"Content-Type": "application/json"}
+                mock_transcription_resp.read.return_value = json.dumps({"text": "Transcribed speech from audio upload"}).encode("utf-8")
+                mock_ctx.__enter__.return_value = mock_transcription_resp
+
+                trans_res = adapter.execute(
+                    "openai/whisper-large-v3:free",
+                    {"audio_bytes": "UklGRi4AAABXQVZFZg==", "format": "wav"},
+                )
+                self.assertTrue(trans_res.success)
+                self.assertEqual(trans_res.output_data.get("text"), "Transcribed speech from audio upload")
+
+    def test_24_scientific_metrics_partial_usage_classified_unknown(self) -> None:
+        """Revisão 5 - Determinação 7: Contagens parciais ou ausentes em usage são UNKNOWN, nunca MEASURED."""
+        from ai_coordinator.openrouter.adapters import extract_usage_with_provenance
+
+        # Full prompt and completion tokens -> MEASURED
+        full_usage = {"usage": {"prompt_tokens": 10, "completion_tokens": 20, "total_tokens": 30}}
+        toks, prov = extract_usage_with_provenance(full_usage)
+        self.assertEqual(prov, MetricProvenance.MEASURED)
+        self.assertEqual(toks["total_tokens"], 30)
+
+        # Missing completion_tokens -> UNKNOWN
+        partial_usage_no_comp = {"usage": {"prompt_tokens": 10, "total_tokens": 10}}
+        toks_no_comp, prov_no_comp = extract_usage_with_provenance(partial_usage_no_comp)
+        self.assertEqual(prov_no_comp, MetricProvenance.UNKNOWN)
+
+        # Missing prompt_tokens -> UNKNOWN
+        partial_usage_no_prompt = {"usage": {"completion_tokens": 15, "total_tokens": 15}}
+        toks_no_prompt, prov_no_prompt = extract_usage_with_provenance(partial_usage_no_prompt)
+        self.assertEqual(prov_no_prompt, MetricProvenance.UNKNOWN)
+
+        # Empty usage dict -> UNKNOWN
+        toks_empty, prov_empty = extract_usage_with_provenance({"usage": {}})
+        self.assertEqual(prov_empty, MetricProvenance.UNKNOWN)
 
 
 if __name__ == "__main__":

@@ -2,9 +2,12 @@
 
 Parses real-time catalog snapshots from the official OpenRouter API, filters
 strictly free-tier models, classifies modalities, and extracts capability metadata.
-Enforces strict validation on pricing: missing, NaN, infinite, or negative pricing
-is treated as INVALID and blocks free qualification.
-Enforces TTL and freshness verification: expired catalogs block execution fail-closed.
+Enforces:
+1. Strict validation on pricing: missing, NaN, infinite, or negative pricing
+   is treated as INVALID and blocks free qualification.
+2. TTL and freshness verification: expired catalogs block execution fail-closed.
+3. Authenticated provenance: OfficialOpenRouterCatalogClient fetches over verified HTTPS;
+   in production/live mode, untrusted external dictionaries are rejected.
 """
 from __future__ import annotations
 
@@ -17,8 +20,12 @@ import logging
 import math
 import time
 from typing import Any, Callable, Dict, List, Optional, Set
+import urllib.error
+import urllib.request
 
 logger = logging.getLogger(__name__)
+
+OFFICIAL_OPENROUTER_MODELS_URL = "https://openrouter.ai/api/v1/models"
 
 
 class ModelModality(str, Enum):
@@ -47,6 +54,11 @@ class InvalidPricingError(ValueError):
 
 class StaleCatalogError(Exception):
     """Raised when the model catalog snapshot is expired or cannot be freshly verified."""
+    pass
+
+
+class UntrustedCatalogSourceError(Exception):
+    """Raised when an unauthenticated or untrusted catalog source is provided in live mode."""
     pass
 
 
@@ -149,15 +161,12 @@ def infer_modalities(model_id: str, arch: Dict[str, Any], description: str) -> L
     desc_lower = (description or "").lower()
     modality_str = str(arch.get("modality", "")).lower()
 
-    # Reranking detection (e.g. nvidia/nemotron-rerank, bge-reranker, etc.)
     if "rerank" in model_lower or "rerank" in desc_lower or "rerank" in modality_str:
         modalities.add(ModelModality.RERANK)
 
-    # Embedding detection
     if "embed" in model_lower or "embedding" in desc_lower or "text->embedding" in modality_str:
         modalities.add(ModelModality.EMBEDDING)
 
-    # Speech detection: Separate Speech Transcription vs Generation
     is_speech_transcription = (
         "audio->text" in modality_str
         or "whisper" in model_lower
@@ -181,7 +190,6 @@ def infer_modalities(model_id: str, arch: Dict[str, Any], description: str) -> L
         modalities.add(ModelModality.SPEECH)
         modalities.add(ModelModality.SPEECH_GENERATION)
 
-    # Decision / Tool calling / Function calling detection
     tools_supported = False
     supported_params = arch.get("supported_parameters", [])
     if isinstance(supported_params, list):
@@ -190,32 +198,72 @@ def infer_modalities(model_id: str, arch: Dict[str, Any], description: str) -> L
     if tools_supported or "decision" in model_lower or "function" in desc_lower:
         modalities.add(ModelModality.DECISIONS)
 
-    # Standard text completion / chat
     if not modalities or "chat" in model_lower or "instruct" in model_lower or "text->text" in modality_str:
         modalities.add(ModelModality.TEXT)
 
-    # If it supports tools, it can also operate as decisions
     if tools_supported:
         modalities.add(ModelModality.DECISIONS)
 
     return sorted(list(modalities), key=lambda m: m.value)
 
 
+class OfficialOpenRouterCatalogClient:
+    """Official HTTPS catalog client directly querying OpenRouter's /api/v1/models endpoint."""
+
+    def __init__(self, endpoint_url: str = OFFICIAL_OPENROUTER_MODELS_URL, timeout_sec: float = 30.0) -> None:
+        self.endpoint_url = endpoint_url
+        self.timeout_sec = timeout_sec
+
+    def fetch_catalog(self) -> Dict[str, Any]:
+        """Fetch and structure-check official catalog over HTTPS.
+
+        Validates status 200, Content-Type application/json, and required data schema.
+        """
+        req = urllib.request.Request(
+            self.endpoint_url,
+            headers={
+                "User-Agent": "AI-Coordinator/0.5.1 (Scientific Benchmark Suite)",
+                "Accept": "application/json",
+            },
+            method="GET",
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=self.timeout_sec) as resp:
+                if resp.getcode() != 200:
+                    raise StaleCatalogError(f"HTTP {resp.getcode()} ao consultar catálogo oficial da OpenRouter.")
+                raw_bytes = resp.read()
+                data = json.loads(raw_bytes.decode("utf-8"))
+                if not isinstance(data, dict) or "data" not in data or not isinstance(data["data"], list):
+                    raise StaleCatalogError("Estrutura inválida retornada pelo endpoint oficial da OpenRouter.")
+
+                data["_source"] = self.endpoint_url
+                data["_trusted"] = True
+                data["_fetched_at_epoch"] = time.time()
+                return data
+        except Exception as exc:
+            logger.error("Falha ao consultar endpoint oficial da OpenRouter: %s", exc)
+            raise StaleCatalogError(f"Falha na consulta oficial HTTPS do catálogo: {exc}") from exc
+
+
 class FreeModelRegistry:
-    """Dynamic catalog registry and discovery engine with TTL validation and freshness checking."""
+    """Dynamic catalog registry and discovery engine with TTL validation and provenance checking."""
 
     def __init__(
         self,
         max_age_seconds: float = 3600.0,
         fetcher: Optional[Callable[[], Dict[str, Any]]] = None,
+        require_trusted_source: bool = False,
     ) -> None:
         self.max_age_seconds = max_age_seconds
         self.fetcher = fetcher
+        self.require_trusted_source = require_trusted_source
+
         self._entries_by_id: Dict[str, ModelCatalogEntry] = {}
         self._raw_snapshot: Optional[Dict[str, Any]] = None
         self._snapshot_timestamp: Optional[str] = None
         self._snapshot_epoch: Optional[float] = None
         self._provenance_hash: Optional[str] = None
+        self._source_url: str = "uninitialized"
 
     @property
     def total_models(self) -> int:
@@ -229,6 +277,10 @@ class FreeModelRegistry:
     def provenance_hash(self) -> Optional[str]:
         return self._provenance_hash
 
+    @property
+    def source_url(self) -> str:
+        return self._source_url
+
     def is_stale(self, now: Optional[float] = None) -> bool:
         """Check if the current catalog snapshot has exceeded its TTL."""
         if self._snapshot_epoch is None:
@@ -237,7 +289,7 @@ class FreeModelRegistry:
         return (t - self._snapshot_epoch) > self.max_age_seconds
 
     def ensure_fresh_catalog(self, force: bool = False, now: Optional[float] = None) -> None:
-        """Ensure catalog snapshot is fresh. If stale, fetch updates or raise StaleCatalogError."""
+        """Ensure catalog snapshot is fresh and trusted. Fetches updates or raises StaleCatalogError."""
         t = now if now is not None else time.time()
         if not force and not self.is_stale(now=t):
             return
@@ -245,7 +297,13 @@ class FreeModelRegistry:
         if self.fetcher is not None:
             try:
                 raw_data = self.fetcher()
-                self.load_catalog_data(raw_data, epoch=t)
+                is_trusted = bool(raw_data.get("_trusted", False))
+                self.load_catalog_data(
+                    raw_data,
+                    epoch=t,
+                    source=raw_data.get("_source", OFFICIAL_OPENROUTER_MODELS_URL),
+                    is_trusted=is_trusted,
+                )
                 return
             except Exception as exc:
                 logger.error("Falha ao atualizar catálogo dinamicamente: %s", exc)
@@ -264,11 +322,20 @@ class FreeModelRegistry:
         raw_data: Dict[str, Any],
         timestamp: Optional[str] = None,
         epoch: Optional[float] = None,
+        source: str = "untrusted_input",
+        is_trusted: bool = False,
     ) -> List[ModelCatalogEntry]:
         """Parse raw OpenRouter /api/v1/models response and index models."""
+        if self.require_trusted_source and not is_trusted:
+            raise UntrustedCatalogSourceError(
+                "[FAIL-CLOSED] Catálogo rejeitado: em modo de produção/live, apenas snapshots originados "
+                "diretamente do endpoint oficial HTTPS da OpenRouter são autorizados."
+            )
+
         self._raw_snapshot = raw_data
         self._snapshot_epoch = epoch if epoch is not None else time.time()
         self._snapshot_timestamp = timestamp or dt.datetime.now(dt.timezone.utc).isoformat()
+        self._source_url = source
         canonical_bytes = json.dumps(raw_data, sort_keys=True).encode("utf-8")
         self._provenance_hash = hashlib.sha256(canonical_bytes).hexdigest()
 
@@ -328,7 +395,6 @@ class FreeModelRegistry:
             desc = item.get("description", "")
             modalities = infer_modalities(m_id, arch, desc)
 
-            # Determine tool support
             supported_params = arch.get("supported_parameters", [])
             supports_tools = isinstance(supported_params, list) and any(
                 p in ("tools", "functions", "tool_choice") for p in supported_params
@@ -386,6 +452,7 @@ class FreeModelRegistry:
             "snapshot_timestamp": self._snapshot_timestamp,
             "snapshot_epoch": self._snapshot_epoch,
             "provenance_hash": self._provenance_hash,
+            "source_url": self._source_url,
             "total_models": len(self._entries_by_id),
             "free_models_count": len(self.get_free_models()),
             "models": [m.to_dict() for m in self._entries_by_id.values()],
