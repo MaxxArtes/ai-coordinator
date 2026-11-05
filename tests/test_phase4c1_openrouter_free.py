@@ -231,7 +231,7 @@ class TestPhase4C1OpenRouterFree(unittest.TestCase):
         mock_ctx = MagicMock()
         mock_ctx.__enter__.return_value = mock_http_response
 
-        with patch("urllib.request.urlopen", return_value=mock_ctx):
+        with patch("urllib.request.OpenerDirector.open", return_value=mock_ctx):
             client = OfficialOpenRouterCatalogClient()
             snapshot = client.fetch_catalog()
 
@@ -714,7 +714,7 @@ class TestPhase4C1OpenRouterFree(unittest.TestCase):
         mock_ctx = MagicMock()
         mock_ctx.__enter__.return_value = mock_http_response
 
-        with patch("urllib.request.urlopen", return_value=mock_ctx):
+        with patch("urllib.request.OpenerDirector.open", return_value=mock_ctx):
             client = OfficialOpenRouterCatalogClient()
             snapshot = client.fetch_catalog()
             self.assertIsInstance(snapshot, AuthenticatedCatalogSnapshot)
@@ -1090,7 +1090,7 @@ class TestPhase4C1OpenRouterFree(unittest.TestCase):
         mock_resp_http.read.return_value = b'{"data": []}'
         mock_ctx_http = MagicMock()
         mock_ctx_http.__enter__.return_value = mock_resp_http
-        with patch("urllib.request.urlopen", return_value=mock_ctx_http):
+        with patch("urllib.request.OpenerDirector.open", return_value=mock_ctx_http):
             with self.assertRaises(UntrustedCatalogSourceError) as ctx:
                 client.fetch_catalog()
             self.assertIn("esquema", str(ctx.exception).lower())
@@ -1103,7 +1103,7 @@ class TestPhase4C1OpenRouterFree(unittest.TestCase):
         mock_resp_foreign.read.return_value = b'{"data": []}'
         mock_ctx_foreign = MagicMock()
         mock_ctx_foreign.__enter__.return_value = mock_resp_foreign
-        with patch("urllib.request.urlopen", return_value=mock_ctx_foreign):
+        with patch("urllib.request.OpenerDirector.open", return_value=mock_ctx_foreign):
             with self.assertRaises(UntrustedCatalogSourceError) as ctx:
                 client.fetch_catalog()
             self.assertIn("host", str(ctx.exception).lower())
@@ -1116,7 +1116,7 @@ class TestPhase4C1OpenRouterFree(unittest.TestCase):
         mock_resp_path.read.return_value = b'{"data": []}'
         mock_ctx_path = MagicMock()
         mock_ctx_path.__enter__.return_value = mock_resp_path
-        with patch("urllib.request.urlopen", return_value=mock_ctx_path):
+        with patch("urllib.request.OpenerDirector.open", return_value=mock_ctx_path):
             with self.assertRaises(UntrustedCatalogSourceError) as ctx:
                 client.fetch_catalog()
             self.assertIn("caminho", str(ctx.exception).lower())
@@ -1129,7 +1129,7 @@ class TestPhase4C1OpenRouterFree(unittest.TestCase):
         mock_resp_ct.read.return_value = b'<html><body>Not JSON</body></html>'
         mock_ctx_ct = MagicMock()
         mock_ctx_ct.__enter__.return_value = mock_resp_ct
-        with patch("urllib.request.urlopen", return_value=mock_ctx_ct):
+        with patch("urllib.request.OpenerDirector.open", return_value=mock_ctx_ct):
             with self.assertRaises(UntrustedCatalogSourceError) as ctx:
                 client.fetch_catalog()
             self.assertIn("content-type", str(ctx.exception).lower())
@@ -1200,6 +1200,64 @@ class TestPhase4C1OpenRouterFree(unittest.TestCase):
         with self.assertRaises(UntrustedCatalogSourceError) as ctx:
             tampered_snapshot.verify_authenticity()
         self.assertIn("inválida ou forjada", str(ctx.exception))
+
+    def test_35_adversarial_preventive_302_redirect_block_to_external_domain(self) -> None:
+        """Auditoria Revisão 7: Simular HTTP 302 para domínio externo e comprovar que requisição redirecionada não é enviada."""
+        class Simulating302Handler(urllib.request.BaseHandler):
+            handler_order = 100
+
+            def __init__(self, redirect_target: str):
+                self.redirect_target = redirect_target
+                self.requests_sent = []
+
+            def default_open(self, req):
+                self.requests_sent.append(req.full_url)
+                headers = {"location": self.redirect_target}
+                fp = MagicMock()
+                fp.read.return_value = b""
+                fp.close.return_value = None
+                return self.parent.error("http", req, fp, 302, "Found", headers)
+
+        # 1. Simulate HTTP 302 to an external foreign domain
+        sim_handler = Simulating302Handler("https://evil-attacker-server.com/api/v1/models")
+        redirect_handler = StrictOpenRouterRedirectHandler()
+        opener = urllib.request.OpenerDirector()
+        opener.add_handler(sim_handler)
+        opener.add_handler(redirect_handler)
+
+        client = OfficialOpenRouterCatalogClient(opener=opener)
+        with self.assertRaises(UntrustedCatalogSourceError) as ctx_foreign:
+            client.fetch_catalog()
+
+        self.assertIn("redirecionamento não autorizado", str(ctx_foreign.exception).lower())
+        self.assertIn("evil-attacker-server.com", str(ctx_foreign.exception))
+        # PROOF: Only the initial request was sent; the redirected request was NEVER dispatched
+        self.assertEqual(len(sim_handler.requests_sent), 1)
+        self.assertEqual(sim_handler.requests_sent[0], "https://openrouter.ai/api/v1/models")
+        self.assertNotIn("evil-attacker-server.com", sim_handler.requests_sent)
+
+        # 2. Simulate HTTP 302 protocol downgrade to insecure HTTP
+        sim_downgrade = Simulating302Handler("http://openrouter.ai/api/v1/models")
+        opener_downgrade = urllib.request.OpenerDirector()
+        opener_downgrade.add_handler(sim_downgrade)
+        opener_downgrade.add_handler(StrictOpenRouterRedirectHandler())
+
+        client_downgrade = OfficialOpenRouterCatalogClient(opener=opener_downgrade)
+        with self.assertRaises(UntrustedCatalogSourceError) as ctx_downgrade:
+            client_downgrade.fetch_catalog()
+
+        self.assertIn("inseguro", str(ctx_downgrade.exception).lower())
+        self.assertEqual(len(sim_downgrade.requests_sent), 1)
+
+        # 3. Verify that the default client instance without arguments has StrictOpenRouterRedirectHandler installed
+        default_client = OfficialOpenRouterCatalogClient()
+        self.assertIsNotNone(default_client.opener)
+        handler_types = [type(h) for h in default_client.opener.handlers]
+        self.assertIn(
+            StrictOpenRouterRedirectHandler,
+            handler_types,
+            "StrictOpenRouterRedirectHandler deve estar obrigatoriamente instalado no opener padrão",
+        )
 
 
 if __name__ == "__main__":

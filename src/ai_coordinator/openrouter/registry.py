@@ -360,14 +360,16 @@ class OfficialOpenRouterCatalogClient:
     ) -> None:
         self.endpoint_url = OFFICIAL_OPENROUTER_MODELS_URL
         self.timeout_sec = timeout_sec
-        self.opener = opener
+        self.redirect_handler = StrictOpenRouterRedirectHandler()
+        self.opener = opener if opener is not None else urllib.request.build_opener(self.redirect_handler)
 
     def fetch_catalog(self) -> AuthenticatedCatalogSnapshot:
         """Fetch and structure-check official catalog over HTTPS.
 
         Validates:
         1. Official destination URL and HTTPS protocol.
-        2. Strict redirect policies (no downgrade to http, no foreign domains).
+        2. Strict redirect policies via integrated StrictOpenRouterRedirectHandler
+           (preventively blocks protocol downgrade and foreign domain redirects before request is sent).
         3. Effective response origin (hostname, path, status 200, Content-Type).
         4. Validates JSON payload schema with 'data' list.
         5. Returns an AuthenticatedCatalogSnapshot with cryptographic official HTTPS attestation.
@@ -384,8 +386,7 @@ class OfficialOpenRouterCatalogClient:
         )
         fetch_epoch = time.time()
         try:
-            open_fn = self.opener.open if self.opener is not None else urllib.request.urlopen
-            with open_fn(req, timeout=self.timeout_sec) as resp:
+            with self.opener.open(req, timeout=self.timeout_sec) as resp:
                 # 1. Effective destination and redirect validation
                 effective_url = resp.geturl() if hasattr(resp, "geturl") else self.endpoint_url
                 parsed_url = urllib.parse.urlparse(effective_url)
