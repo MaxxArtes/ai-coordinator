@@ -1,135 +1,101 @@
-# Relatório Científico da Linha de Base — AI Coordinator v0.5.1 (Fase 4C.0.5)
+# Relatório Científico da Linha de Base — AI Coordinator v0.5.1
 
-> **Status do Documento:** Candidato Preliminar de Staging (Não promovido a definitivo até homologação final da auditoria)  
-> **Data de Execução:** 4 de novembro de 2026  
-> **Branch de Desenvolvimento:** `feature/phase4c-0-baseline`  
-> **Commit de Referência:** [`a0f6abfdb9ab725c97e5f736303c67d5f4023121`](https://github.com/MaxxArtes/ai-coordinator/commit/a0f6abfdb9ab725c97e5f736303c67d5f4023121)  
-> **Referência Estável de Produção:** `v0.5.1` (Commit [`a2f8f65`](https://github.com/MaxxArtes/ai-coordinator/commit/a2f8f65dbb470d0acba853b5036e6d9af841b0e5))  
-> **Runtime Central:** `C:\Users\10864\.local\share\ai-coordinator-runtime` (`0.4.0+local.1` — Estritamente preservado)  
-> **Coordenador Central:** `D:\ai-memory\coordinator` (Tarefa `c220d508596e42d4`)  
+> **Status:** Linha de Base de Referência Sintética (Staging) — Pronta para Homologação  
+> **Identificador da Execução (Run ID):** `baseline_run_1793886354`  
+> **Data de Execução:** `2026-11-05T13:45:54.953835+00:00`  
+> **Hash de Integridade Raiz (SHA-256):** `399fc5c4fc77167fb64166b2adef6facb26c351682131e38fa8676de3cb6ef91`  
+> **Digest Canônico das Tarefas (SHA-256):** `25490d8db589e32b38cd07a7cb87ffd86b4e3ce82156b6798172392224eaf8a0`  
+> **Assinatura Digital Pública:** `19a8bc228dc4d5b439f41b66013dcd7857928b4a0f38a89daff79f1428b4bcb460e95dc8b086082eeea7906698b884c84a1f9b50459beb9e13c7a5228b236250ec96b49db1a5354593acc7231257455cf05450caa89f1ad9afc629b5adbf0a37a040747650d3c39327df281423f53df7adde801312659a507ff51d7f6e528821004c235f67b7a1bcca4dc11da5cf25ce6a1b866b9bd2fef9e731641eb5e9fa279a44a03890518484186138ef507ff739842ccc722507862740261054a30419060508b12c6f34c65745338d98e0226b022bd3235daac2edc39454dada66080b6f1a9b879ebff26cc4d4c36510d8a7830fcf4dbdba440e088859fbd7ab66f86009`  
+> **Algoritmo de Assinatura:** `RSASSA-PKCS1-v1_5-SHA256`  
+> **Fingerprint da Chave Pública da Autoridade:** `f0f3d377306e00092daf6dff94826e69d24c1174bc4b32ab81086419f4c995c6`  
 
 ---
 
-## 1. Proveniência e Metadados do Experimento
+## 1. Escopo e Classificação da Linha de Base
 
-| Metadado | Valor Registrado no Manifesto Canônico | Classificação |
+> [!IMPORTANT]
+> **Natureza Científica da Medição:**  
+> Esta referência é uma **baseline sintética offline de calibração** dos componentes locais do coordenador (oráculos determinísticos, instrumentação e armazenamento SQLite WAL).  
+> - As durações temporais ($T_{exec}$, $T_{telemetry}$, $T_{val}$, $T_{total}$) são medições computacionais locais e determinísticas em código Python executado pelo interpretador oficial.  
+> - Os valores de tokens (18,060 tokens totais) e custos (US$ 0.023240) são **estimativas sintéticas controladas** derivadas das tabelas do `PricingRegistry`, e **NÃO representam consumo real de APIs ou modelos de linguagem remotos**.  
+> - Zero chamadas de rede ou APIs proprietárias foram consumidas durante a campanha.
+
+---
+
+## 2. Metadados do Ambiente e Proveniência Criptográfica
+
+| Parâmetro | Valor Registrado | Observações |
 | :--- | :--- | :--- |
-| **Run ID** | `baseline_run_1793830314` | Identificador único de campanha |
-| **Commit Git** | `a0f6abfdb9ab725c97e5f736303c67d5f4023121` | Hash de proveniência rastreável |
-| **Branch Git** | `feature/phase4c-0-baseline` | Isolamento em branch de pesquisa |
-| **Estado do Repositório (`git_dirty`)** | `False` (limpo no momento da execução oficial) | Imutabilidade do workspace |
-| **Versão do Pacote** | `0.5.1` | Baseline da release v0.5.1 |
-| **Versão do Dataset** | `2026.11.03` | Especificação congelada das 9 tarefas |
-| **Versão da Tabela de Preços** | `2026.11.01` | Matriz determinística offline |
-| **Runtime Python** | `3.14.0rc2` | Ambiente de referência |
-| **Plataforma / Arquitetura** | `Windows 11 (AMD64)` | Runner local controlado |
-| **Otimizações Adaptativas Ativas** | `False` | Zero Top-P, Zipf, Heaps, FSRS ou LoRA |
-| **Chamadas a APIs Tarifadas** | `0` (Zero — 100% Offline) | Custo financeiro externo nulo |
+| **Versão do AI Coordinator** | `0.5.1` | Núcleo base sem dependências externas |
+| **Branch Git** | `feature/phase4c-0-baseline` | Branch oficial da Fase 4C |
+| **Commit Git** | `9e7265b90e3af6562b2c85b08c9fbceee217e34f` | SHA-1 canônico de proveniência |
+| **Estado da Árvore (git_dirty)** | `False` | Execução em árvore limpa e reprodutível |
+| **Versão Python** | `3.14.5` | Interpretador do ambiente de execução |
+| **Sistema Operacional** | `Windows 11 (AMD64)` | Plataforma anfitriã |
+| **Versão do Dataset Sintético** | `2026.11.03` | Versão imutável das Suítes A, B e C |
+| **Versão do PricingRegistry** | `2026.11.01` | Catálogo de precificação fixo |
+| **Heurísticas Adaptativas Ativas** | `False` | Estritamente desativadas (Zero LoRA, Zipf ou FSRS) |
+| **Protocolo de Repetições** | `10 iterações de 9 tarefas` | Total de 90 execuções registradas |
 
 ---
 
-## 2. Metodologia Experimental e Protocolo de Execução
+## 3. Protocolo Estatístico e Interpretação dos Intervalos de Confiança
 
-### 2.1 Justificativa Amostral e Ciclo de Aquecimento (Warmup)
-Para neutralizar ruídos transientes de *cold start*, alocação dinâmica de páginas do sistema operacional e compilação de bytecode Python:
-1. **Ciclo de Aquecimento (Warmup):** Uma iteração preliminar de 9 tarefas ($N_{warmup} = 9$) foi executada sobre uma conexão descartável SQLite em memória/WAL. O tempo médio de ciclo no aquecimento foi de $1.48 \text{ ms}$, estabilizando caches de descritores de arquivo e tabelas hash.
-2. **Campanha Oficial:** Executada imediatamente após o aquecimento, compreendendo **10 iterações completas** sobre as 9 tarefas das Suítes A (3), B (3) e C (3), totalizando uma amostra de **$N = 90$ execuções de tarefas**.
-3. **Poder Estatístico:** Com $N = 90$ ($df = 89$), o erro padrão da média decresce com fator $1/\sqrt{90} \approx 0.1054$, viabilizando intervalos de confiança de 95% estreitos ($t_{0.025; 89} \approx 1.987$) de ordem sub-milissegundo.
-
-### 2.2 Classificação Estrita de Métricas
-Em conformidade com as diretrizes de integridade científica da auditoria:
-- **Medidas (`MEASURED`):** Duração de execução do solver ($T_{exec}$), overhead computacional da telemetria ($T_{telemetry}$), tempo de validação dos oráculos ($T_{val}$) e duração total ($T_{total}$), aferidos pelo relógio monotônico de alta precisão `time.perf_counter()`.
-- **Estimadas (`ESTIMATED`):** Volume de tokens de entrada e saída, calculados deterministicamente pelo comprimento dos payloads JSON normalizados ($4 \text{ caracteres} \approx 1 \text{ token}$). **Não constituem medição física de consumo de APIs remotas**.
-- **Sintéticas (`ESTIMATED / SYNTHETIC`):** Custos em dólares (USD), derivados da aplicação estática da matriz de precificação offline do `PricingRegistry` sobre os tokens estimados.
-
----
-
-## 3. Resultados Estatísticos Consolidados ($N = 90$ Tarefas)
-
-### 3.1 Distribuição Temporal e Segregação de Fases (em Milissegundos)
-
-| Fase Temporal | Símbolo | Média ($\mu$) | IC 95% ($\pm t \cdot \frac{s}{\sqrt{N}}$) | Desvio Amostral ($s$, $ddof=1$) | Desvio Populacional ($\sigma$, $ddof=0$) | Mediana (p50) | Percentil 95 (p95) | Percentil 99 (p99) |
-| :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
-| **Execução Pura do Solver** | $T_{exec}$ | **$0.0148 \text{ ms}$** | $\pm 0.0031 \text{ ms}$ | $0.0147 \text{ ms}$ | $0.0146 \text{ ms}$ | $0.0120 \text{ ms}$ | $0.0321 \text{ ms}$ | $0.1057 \text{ ms}$ |
-| **Overhead da Telemetria** | $T_{telemetry}$ | **$0.5616 \text{ ms}$** | $\pm 0.0228 \text{ ms}$ | $0.1090 \text{ ms}$ | $0.1084 \text{ ms}$ | $0.5460 \text{ ms}$ | $0.7311 \text{ ms}$ | $1.0659 \text{ ms}$ |
-| **Validação dos Oráculos** | $T_{val}$ | **$0.9700 \text{ ms}$** | $\pm 0.0519 \text{ ms}$ | $0.2479 \text{ ms}$ | $0.2466 \text{ ms}$ | $0.9332 \text{ ms}$ | $1.7220 \text{ ms}$ | $1.8997 \text{ ms}$ |
-| **Duração Total Transcorrida** | $T_{total}$ | **$1.5463 \text{ ms}$** | $\pm 0.0670 \text{ ms}$ | $0.3198 \text{ ms}$ | $0.3180 \text{ ms}$ | $1.5120 \text{ ms}$ | $2.2979 \text{ ms}$ | $2.8517 \text{ ms}$ |
+A campanha empírica é composta por **10 repetições completas sobre um gabarito fixo de 9 tarefas determinísticas** (totalizando 90 observações).
 
 > [!NOTE]
-> A segregação comprova que o custo de execução algorítmica pura ($T_{exec}$) é de apenas $0.015 \text{ ms}$. A validação profunda de oráculos triplos consome $0.97 \text{ ms}$ ($62.7\%$ do ciclo), e a instrumentação observacional da telemetria SQLite em WAL consome $0.56 \text{ ms}$ ($36.3\%$). O overhead total médio por ciclo de tarefa é rigorosamente sub-2ms.
-
-### 3.2 Taxas de Conformidade e Vereditos dos Oráculos
-
-| Métrica de Conformidade | Taxa Homologada ($N = 90$) | Contagem Absoluta | Critério do Oráculo |
-| :--- | :--- | :--- | :--- |
-| **`passed_all_rate`** | **$100.00\%$** | $90 / 90$ | Aprovação simultânea funcional, de eficiência e segurança plena |
-| **`functional_success_rate`** | **$100.00\%$** | $90 / 90$ | Correspondência estrita de hash SHA-256 de saída vs. gabarito |
-| **`efficiency_success_rate`** | **$100.00\%$** | $90 / 90$ | Respeito estrito aos limites de tokens, custo e latência |
-| **`security_pass_rate`** | **$100.00\%$** | $90 / 90$ | Zero vazamentos de credenciais e imutabilidade SQLite comprovada |
-| **`security_unverified_rate`** | **$0.00\%$** | $0 / 90$ | Nenhuma tarefa com verificação omitida ou store nulo |
-| **`security_fail_rate`** | **$0.00\%$** | $0 / 90$ | Zero violações de segurança |
-
-### 3.3 Agregados de Tokens e Custos Sintéticos
-
-- **Total de Tokens Estimados:** $18,060 \text{ tokens}$ (Média: $200.67 \text{ tokens/tarefa}$).
-  - Tokens de Entrada: $12,740 \text{ tokens}$ (Média: $141.56 \text{ tokens/tarefa}$).
-  - Tokens de Saída: $5,320 \text{ tokens}$ (Média: $59.11 \text{ tokens/tarefa}$).
-  - Proveniência: `MetricProvenance.ESTIMATED`.
-- **Custo Sintético Projetado:** $\$0.023240 \text{ USD}$ (Média: $\$0.000258 \text{ USD/tarefa}$).
-  - Proveniência: `MetricProvenance.ESTIMATED / SYNTHETIC`.
+> **Alcance da Inferência Estatística:**  
+> Os 90 registros **não constituem problemas independentes**, mas sim 10 medições repetidas do mesmo conjunto invariante de 9 tarefas.  
+> Portanto, os desvios-padrão amostrais ($s, ddof=1$) e os intervalos de confiança calculados via distribuição $t$ de Student ($t=1.987, df=89$) descrevem **estritamente a estabilidade temporal da infraestrutura computacional local**, servindo como padrão de repetibilidade e calibração interna do runtime.
 
 ---
 
-## 4. Prova Criptográfica de Integridade e Autenticidade
+## 4. Momentos Estatísticos Consolidados ($N=90$)
 
-O artefato [`docs/benchmarks/baseline_reference_run.json`](file:///D:/ai-coordinator/docs/benchmarks/baseline_reference_run.json) foi autenticado hierarquicamente:
+| Métrica | Média | Desvio Amostral ($s, ddof=1$) | Desvio Pop. ($\sigma, ddof=0$) | Mediana (p50) | p95 | p99 | Min | Max | Intervalo de Confiança (95%) |
+| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
+| **$T_{exec}$ (Execução)** | 0.0132 ms | 0.0111 ms | 0.0110 ms | 0.0113 ms | 0.0378 ms | 0.0574 ms | 0.0016 ms | 0.0574 ms | **[0.0109, 0.0155]** (±0.0023) |
+| **$T_{telemetry}$ (Telemetria)** | 0.5898 ms | 0.1782 ms | 0.1772 ms | 0.5364 ms | 0.9621 ms | 1.2234 ms | 0.3993 ms | 1.2234 ms | **[0.5525, 0.6271]** (±0.0373) |
+| **$T_{val}$ (Validação Oráculos)** | 1.0219 ms | 0.5800 ms | 0.5767 ms | 0.8954 ms | 1.5347 ms | 5.6169 ms | 0.6589 ms | 5.6169 ms | **[0.9004, 1.1434]** (±0.1215) |
+| **$T_{total}$ (Ciclo Completo)** | 1.6249 ms | 0.6477 ms | 0.6440 ms | 1.5076 ms | 2.4348 ms | 6.2963 ms | 1.0598 ms | 6.2963 ms | **[1.4892, 1.7606]** (±0.1357) |
 
-```text
-===========================================================
- AI Coordinator — Verificador Independente de Baseline
-===========================================================
-  Arquivo:          docs/benchmarks/baseline_reference_run.json
-  Modo:             AUTENTICADO (HMAC-SHA256)
-  Run ID:           baseline_run_1793830314
-  Git Commit:       a0f6abfdb9ab...
-  Git Branch:       feature/phase4c-0-baseline (dirty=False)
-  Tarefas:          90 (10 iterações, 9 tarefas/iteração)
-  Dataset Versão:   2026.11.03
-  Pricing Versão:   2026.11.01
------------------------------------------------------------
-  [1/4] Hash de Integridade Raiz:        [OK] VÁLIDO
-  [2/4] Digest Canônico das Tarefas:     [OK] VÁLIDO
-  [3/4] Assinatura HMAC Raiz:            [OK] AUTÊNTICA
-  [4/4] Verificação Profunda Completa:    [OK] APROVADA
-  [CROSS-CHECK] Validador Interno:       [OK] CONCORDANTE
-===========================================================
-```
+### Totais de Tokens e Precificação Sintética
+- **Tokens de Entrada:** 12,880 tokens (143.1 tokens/tarefa)
+- **Tokens de Saída:** 5,180 tokens (57.6 tokens/tarefa)
+- **Total de Tokens Processados:** 18,060 tokens (200.67 tokens/tarefa)
+- **Custo Monetário Sintético Total:** US$ 0.023240 (Média: US$ 0.000258/tarefa)
+- **Conformidade Funcional:** 100.0% (90/90 tarefas)
+- **Conformidade de Segurança:** 100.0% (90/90 tarefas sem vazamento de credenciais)
 
-### Âncoras Criptográficas
-- **Hash SHA-256 do Manifesto Raiz:**  
-  `5af407c3b08e46feb32aa5b715e55619f9f6b96d626b15b6fc622366e1f04f3a`
-- **Digest Determinístico das 90 Tarefas (`task_results_digest`):**  
-  `6bd966ef9a16e36e03fd5686c3c9f6d56e47a9630693609fa3a323b319350b2c`
-- **Assinatura HMAC-SHA256 da Raiz:**  
-  `504fdb353b86236252134a394bc6724bdad14c578409fbee583aef4a6a4d6647`
+---
 
-### Procedimento de Auditoria Independente Desacoplada
-Qualquer auditor ou nó par pode verificar a autenticidade e a integridade de forma 100% autônoma, sem instalar dependências externas:
+## 5. Estatísticas Desagregadas por Tarefa ($K=9$ tarefas, $R=10$ repetições)
+
+| Tarefa | Suíte | Tipo | Repetições | $T_{exec}$ Média | $T_{telem}$ Média | $T_{val}$ Média | $T_{tot}$ Média | Tokens (In/Out) | Custo Total USD | Veredito |
+| :--- | :---: | :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
+| `suite_a_01_etl_aggregation` | suite_a_data_engineering | `tabular_etl` | 10 | 0.0226 ms | 0.6040 ms | 1.0857 ms | 1.7122 ms | 457 / 110 | US$ 0.000677 | [OK] PASS |
+| `suite_a_02_reconciliation` | suite_a_data_engineering | `ledger_reconciliation` | 10 | 0.0225 ms | 0.5991 ms | 0.9620 ms | 1.5836 ms | 441 / 36 | US$ 0.000513 | [OK] PASS |
+| `suite_a_03_schema_invariants` | suite_a_data_engineering | `schema_validation` | 10 | 0.0138 ms | 0.5575 ms | 1.4714 ms | 2.0427 ms | 192 / 141 | US$ 0.000474 | [OK] PASS |
+| `suite_b_01_sequential_dag_5_step` | suite_b_multi_hop_dag | `sequential_pipeline` | 10 | 0.0051 ms | 0.5870 ms | 1.0849 ms | 1.6769 ms | 21 / 66 | US$ 0.000153 | [OK] PASS |
+| `suite_b_02_fork_join_parallel` | suite_b_multi_hop_dag | `fork_join` | 10 | 0.0066 ms | 0.6628 ms | 0.9970 ms | 1.6664 ms | 35 / 30 | US$ 0.000095 | [OK] PASS |
+| `suite_b_03_dependency_fencing` | suite_b_multi_hop_dag | `dependency_resolution` | 10 | 0.0220 ms | 0.6224 ms | 0.8613 ms | 1.5057 ms | 19 / 24 | US$ 0.000067 | [OK] PASS |
+| `suite_c_01_adversarial_secret_injection` | suite_c_adversarial | `credential_sanitization_defense` | 10 | 0.0221 ms | 0.5044 ms | 0.9815 ms | 1.5080 ms | 78 / 59 | US$ 0.000196 | [OK] PASS |
+| `suite_c_02_malformed_payload_recovery` | suite_c_adversarial | `fault_recovery` | 10 | 0.0024 ms | 0.6160 ms | 0.8933 ms | 1.5117 ms | 31 / 27 | US$ 0.000085 | [OK] PASS |
+| `suite_c_03_budget_overrun_fencing` | suite_c_adversarial | `budget_fencing` | 10 | 0.0018 ms | 0.5545 ms | 0.8603 ms | 1.4167 ms | 14 / 25 | US$ 0.000064 | [OK] PASS |
+
+---
+
+## 6. Procedimento de Auditoria e Verificação Independente
+
+Auditores externos e pesquisadores independentes podem reproduzir a validação integral sem instalar dependências externas e sem necessitar de nenhuma credencial secreta:
 
 ```bash
-# Verificação de integridade estrutural (sem expor segredos):
+# Auditoria pública via Chave Pública Oficial da Autoridade (zero dependências / pure-Python stdlib):
 python scripts/verify_baseline_integrity.py --report docs/benchmarks/baseline_reference_run.json
-
-# Verificação criptográfica de autenticidade (via variável de ambiente segura):
-export AI_COORDINATOR_HMAC_KEY="ai-coordinator-baseline-v0.5.1-reference-secret-2026"
-python scripts/verify_baseline_integrity.py --report docs/benchmarks/baseline_reference_run.json --key-env AI_COORDINATOR_HMAC_KEY --cross-check
 ```
 
----
-
-## 5. Limitações Conhecidas e Fronteiras Experimentais
-
-1. **Solvers Algorítmicos Puros:** Os resultados de $T_{exec}$ refletem a velocidade de execução do código Python local (`CanonicalSolverRegistry`), e não a latência de geração de um modelo de linguagem real.
-2. **Ausência de Estocasticidade de Rede:** Por operar 100% offline, os tempos não sofrem variações de jitter de conectividade, filas em nuvem ou rate limits de provedores.
-3. **Ponto de Partida Imutável:** Este relatório e o arquivo `baseline_reference_run.json` servem unicamente como **ponto zero de calibração** (*zero-point baseline*). O ganho das futuras otimizações cognitivas adaptativas (Fases 4C.1 a 4C.4 — Zipf, Heaps, FSRS, LoRA) será medido pela variação percentual relativa sobre esta base imutável.
-4. **Status de Governança:** O arquivo `docs/benchmarks/baseline_reference_run.json` encontra-se em ambiente de staging e **não deve ser promovido a arquivo de produção final** até a homologação formal expressa pelo auditor independente.
+O utilitário executará a conferência criptográfica em 4 níveis:
+1. Reconstrução canônica e verificação do hash SHA-256 da raiz.
+2. Reconstrução canônica e verificação do digest SHA-256 das 90 tarefas individuais.
+3. Validação da assinatura digital assimétrica (RSASSA-PKCS1-v1_5 com SHA-256) atestando autenticidade de autoria da Autoridade.
+4. Auditoria individual e round-trip dos 90 relatórios de oráculos, confirmando taxa zero de vazamento de segredos e conformidade funcional.
