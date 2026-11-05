@@ -2,6 +2,8 @@
 
 Parses real-time catalog snapshots from the official OpenRouter API, filters
 strictly free-tier models, classifies modalities, and extracts capability metadata.
+Enforces strict validation on pricing: missing, NaN, infinite, or negative pricing
+is treated as INVALID and blocks free qualification.
 """
 from __future__ import annotations
 
@@ -9,6 +11,7 @@ import dataclasses
 from enum import Enum
 import json
 import logging
+import math
 from typing import Any, Callable, Dict, List, Optional, Set
 
 logger = logging.getLogger(__name__)
@@ -23,6 +26,19 @@ class ModelModality(str, Enum):
     SPEECH = "speech"
 
 
+class PricingStatus(str, Enum):
+    """Integrity status of model pricing data."""
+    VALID_ZERO = "VALID_ZERO"
+    PAID = "PAID"
+    INVALID = "INVALID"
+    UNKNOWN = "UNKNOWN"
+
+
+class InvalidPricingError(ValueError):
+    """Raised when a pricing value is missing, negative, NaN, infinite, or malformed."""
+    pass
+
+
 @dataclasses.dataclass(frozen=True)
 class ModelPricing:
     """Pricing structure per token or request in USD."""
@@ -30,13 +46,21 @@ class ModelPricing:
     completion: float
     image: float = 0.0
     request: float = 0.0
+    status: PricingStatus = PricingStatus.UNKNOWN
+
+    @property
+    def is_valid(self) -> bool:
+        """True only if pricing was validated without errors."""
+        return self.status in (PricingStatus.VALID_ZERO, PricingStatus.PAID)
 
     @property
     def is_strictly_zero(self) -> bool:
-        """True only if prompt, completion, and request costs are strictly $0.00."""
+        """True only if all pricing dimensions are verified and strictly $0.00."""
         return (
-            abs(self.prompt) < 1e-9
+            self.status == PricingStatus.VALID_ZERO
+            and abs(self.prompt) < 1e-9
             and abs(self.completion) < 1e-9
+            and abs(self.image) < 1e-9
             and abs(self.request) < 1e-9
         )
 
@@ -61,7 +85,13 @@ class ModelCatalogEntry:
             "id": self.id,
             "name": self.name,
             "context_length": self.context_length,
-            "pricing": dataclasses.asdict(self.pricing),
+            "pricing": {
+                "prompt": self.pricing.prompt,
+                "completion": self.pricing.completion,
+                "image": self.pricing.image,
+                "request": self.pricing.request,
+                "status": self.pricing.status.value,
+            },
             "modalities": [m.value for m in self.modalities],
             "supports_tools": self.supports_tools,
             "is_free": self.is_free,
@@ -72,15 +102,33 @@ class ModelCatalogEntry:
         }
 
 
-def parse_float_cost(val: Any) -> float:
-    """Safely parse cost value handling strings, floats, None, and negative numbers."""
+def parse_float_cost(val: Any, dimension_name: str = "cost") -> float:
+    """Strictly parse a cost value in USD.
+
+    Fails closed: missing, negative, NaN, infinite, or non-numeric values
+    raise InvalidPricingError.
+    """
     if val is None:
-        return 0.0
+        raise InvalidPricingError(f"Valor de preço ausente (None) para dimensão '{dimension_name}'.")
+
     try:
         f = float(val)
-        return max(0.0, f)
-    except (ValueError, TypeError):
-        return 0.0
+    except (ValueError, TypeError) as exc:
+        raise InvalidPricingError(
+            f"Valor de preço não-numérico ou malformado '{val}' para dimensão '{dimension_name}'."
+        ) from exc
+
+    if math.isnan(f) or math.isinf(f):
+        raise InvalidPricingError(
+            f"Valor de preço anômalo (NaN ou Infinito: {val}) para dimensão '{dimension_name}'."
+        )
+
+    if f < 0.0:
+        raise InvalidPricingError(
+            f"Valor de preço negativo ({val}) para dimensão '{dimension_name}'."
+        )
+
+    return f
 
 
 def infer_modalities(model_id: str, arch: Dict[str, Any], description: str) -> List[ModelModality]:
@@ -148,21 +196,50 @@ class FreeModelRegistry:
             if not isinstance(item, dict):
                 continue
             m_id = item.get("id", "")
-            if not m_id:
+            if not m_id or not isinstance(m_id, str):
                 continue
 
-            pricing_raw = item.get("pricing", {})
-            p_cost = parse_float_cost(pricing_raw.get("prompt"))
-            c_cost = parse_float_cost(pricing_raw.get("completion"))
-            img_cost = parse_float_cost(pricing_raw.get("image"))
-            req_cost = parse_float_cost(pricing_raw.get("request"))
+            pricing_raw = item.get("pricing")
+            pricing_status = PricingStatus.UNKNOWN
+            p_cost = 0.0
+            c_cost = 0.0
+            img_cost = 0.0
+            req_cost = 0.0
 
-            pricing = ModelPricing(prompt=p_cost, completion=c_cost, image=img_cost, request=req_cost)
+            if not isinstance(pricing_raw, dict):
+                pricing_status = PricingStatus.INVALID
+            else:
+                try:
+                    p_cost = parse_float_cost(pricing_raw.get("prompt"), "prompt")
+                    c_cost = parse_float_cost(pricing_raw.get("completion"), "completion")
+                    # image and request might default to 0.0 if key not in dict, but if present must be valid
+                    img_raw = pricing_raw.get("image", 0.0)
+                    req_raw = pricing_raw.get("request", 0.0)
+                    img_cost = parse_float_cost(img_raw, "image")
+                    req_cost = parse_float_cost(req_raw, "request")
+
+                    if p_cost == 0.0 and c_cost == 0.0 and img_cost == 0.0 and req_cost == 0.0:
+                        pricing_status = PricingStatus.VALID_ZERO
+                    else:
+                        pricing_status = PricingStatus.PAID
+                except InvalidPricingError as err:
+                    logger.debug("Preço inválido para modelo '%s': %s", m_id, err)
+                    pricing_status = PricingStatus.INVALID
+
+            pricing = ModelPricing(
+                prompt=p_cost,
+                completion=c_cost,
+                image=img_cost,
+                request=req_cost,
+                status=pricing_status,
+            )
 
             # Strict free-tier qualification:
-            # 1. Prompt and completion cost are strictly zero AND/OR
-            # 2. Model identifier ends with ':free'
-            is_free = (pricing.is_strictly_zero and img_cost == 0.0 and req_cost == 0.0) or m_id.endswith(":free")
+            # Requires SIMULTANEOUSLY:
+            # 1. Pricing status is strictly VALID_ZERO (prompt, completion, image, request all 0.00).
+            # 2. Suffix :free is an additional authorization check if configured, but cannot override non-zero cost.
+            # 3. If pricing is PAID or INVALID, is_free is permanently FALSE.
+            is_free = (pricing_status == PricingStatus.VALID_ZERO and pricing.is_strictly_zero)
 
             arch = item.get("architecture", {})
             if not isinstance(arch, dict):
@@ -217,7 +294,9 @@ class FreeModelRegistry:
     def is_model_free(self, model_id: str) -> bool:
         """Check if a given model ID is cataloged and confirmed as strictly free."""
         entry = self.get_model(model_id)
-        return entry.is_free if entry else False
+        if not entry:
+            return False
+        return entry.is_free and entry.pricing.is_strictly_zero
 
     def export_snapshot(self) -> Dict[str, Any]:
         """Export serialized snapshot of currently indexed models."""

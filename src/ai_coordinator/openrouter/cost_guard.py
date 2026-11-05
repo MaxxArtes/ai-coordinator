@@ -4,13 +4,14 @@ Guarantees that:
 1. No paid models or non-zero pricing endpoints can ever be called.
 2. If free eligibility cannot be verified with 100% certainty, execution fails closed.
 3. Fallbacks from free variants to paid variants are permanently prohibited.
+4. Ambiguous routes, unverified fallback chains, and unapproved routing parameters are rejected.
 """
 from __future__ import annotations
 
 import logging
 from typing import Any, Dict, List, Optional, Set
 
-from .registry import FreeModelRegistry, ModelCatalogEntry
+from .registry import FreeModelRegistry, ModelCatalogEntry, PricingStatus
 
 logger = logging.getLogger(__name__)
 
@@ -27,6 +28,11 @@ class UnauthorizedModelError(CostGuardError):
 
 class PaidFallbackBlockedError(CostGuardError):
     """Raised when a fallback mechanism attempts to switch to a non-free model."""
+    pass
+
+
+class AmbiguousRoutingError(CostGuardError):
+    """Raised when request payload specifies unverified or ambiguous routing parameters."""
     pass
 
 
@@ -89,17 +95,18 @@ class FreeCostGuard:
                 "Execução bloqueada preventivamente."
             )
 
-        # Verify strict zero cost
-        if not entry.is_free:
+        # Verify pricing integrity status
+        if entry.pricing.status != PricingStatus.VALID_ZERO:
             self._blocked_attempts_count += 1
             raise UnauthorizedModelError(
-                f"[FAIL-CLOSED] Modelo '{clean_id}' possui precificação não-nula "
-                f"(Prompt: ${entry.pricing.prompt}, Completion: ${entry.pricing.completion}). "
-                "Chamadas faturáveis são terminantemente proibidas."
+                f"[FAIL-CLOSED] Modelo '{clean_id}' possui precificação não-nula ou inválida "
+                f"(Status: {entry.pricing.status.value}, Prompt: ${entry.pricing.prompt}, "
+                f"Completion: ${entry.pricing.completion}, Request: ${entry.pricing.request}). "
+                "Chamadas com qualquer componente faturável são terminantemente proibidas."
             )
 
-        # Double check pricing structure
-        if not entry.pricing.is_strictly_zero and not clean_id.endswith(":free"):
+        # Verify strict zero cost in all dimensions
+        if not entry.is_free or not entry.pricing.is_strictly_zero:
             self._blocked_attempts_count += 1
             raise UnauthorizedModelError(
                 f"[FAIL-CLOSED] Ambiguidade na precificação do modelo '{clean_id}'. "
@@ -112,33 +119,68 @@ class FreeCostGuard:
     def sanitize_fallback_targets(self, targets: List[str]) -> List[str]:
         """Validate and filter a list of fallback candidate models.
 
-        Raises PaidFallbackBlockedError if any candidate in the fallback chain is paid.
+        Raises PaidFallbackBlockedError if any candidate in the fallback chain is paid or invalid.
         """
         authorized_targets = []
         for target in targets:
             try:
                 self.authorize_model_execution(target)
                 authorized_targets.append(target)
-            except UnauthorizedModelError as exc:
+            except (UnauthorizedModelError, CostGuardError) as exc:
                 raise PaidFallbackBlockedError(
-                    f"Tentativa de fallback bloqueada: candidato '{target}' não é elegível como gratuito: {exc}"
+                    f"Tentativa de fallback bloqueada: candidato '{target}' não é elegível como estritamente gratuito: {exc}"
                 ) from exc
         return authorized_targets
 
     def inspect_request_payload(self, payload: Dict[str, Any]) -> None:
-        """Inspect HTTP payload dictionary before dispatch, ensuring zero cost."""
+        """Inspect HTTP payload dictionary immediately before dispatch, ensuring zero cost.
+
+        Raises:
+            UnauthorizedModelError: If primary model is missing, invalid, or paid.
+            PaidFallbackBlockedError: If fallback chain contains non-free models.
+            AmbiguousRoutingError: If unrecognized or non-deterministic routing options exist.
+        """
+        if not isinstance(payload, dict):
+            raise CostGuardError("Payload de requisição deve ser um dicionário.")
+
         model_id = payload.get("model")
         if not model_id:
             raise UnauthorizedModelError("Payload de requisição sem campo obrigatório 'model'.")
-        self.authorize_model_execution(model_id)
+        self.authorize_model_execution(str(model_id))
 
-        # Reject paid models in route or fallback parameters
-        route_params = payload.get("route", "")
-        if route_params and "fallback" in str(route_params).lower():
-            # If route allows fallbacks, ensure no paid fallbacks can occur
-            pass
-
-        models_list = payload.get("models", [])
-        if isinstance(models_list, list) and models_list:
+        # Check fallback candidates array (models)
+        models_list = payload.get("models")
+        if models_list is not None:
+            if not isinstance(models_list, list) or not models_list:
+                raise AmbiguousRoutingError("Parâmetro 'models' deve ser uma lista não-vazia de identificadores.")
             for m in models_list:
-                self.authorize_model_execution(str(m))
+                try:
+                    self.authorize_model_execution(str(m))
+                except UnauthorizedModelError as exc:
+                    raise PaidFallbackBlockedError(
+                        f"Fallback proibido: candidato '{m}' na lista 'models' não é estritamente gratuito: {exc}"
+                    ) from exc
+
+        # Check routing parameters (route)
+        route_param = payload.get("route")
+        if route_param is not None:
+            route_str = str(route_param).strip().lower()
+            if route_str == "fallback":
+                if not models_list:
+                    raise AmbiguousRoutingError(
+                        "Parâmetro route='fallback' exige definição explícita do array 'models' com candidatos gratuitos."
+                    )
+            elif route_str not in ("", "none"):
+                raise AmbiguousRoutingError(
+                    f"Parâmetro de roteamento não reconhecido ou ambíguo: '{route_param}'. "
+                    "Apenas None ou route='fallback' com 'models' estritamente gratuitos são permitidos."
+                )
+
+        # Check provider routing options (provider)
+        provider_opts = payload.get("provider")
+        if isinstance(provider_opts, dict):
+            # If provider allows implicit fallbacks to non-free models, reject
+            if provider_opts.get("allow_fallbacks") is True and not models_list:
+                raise AmbiguousRoutingError(
+                    "provider.allow_fallbacks=True sem restrição de lista 'models' verificada pode desviar para modelos pagos."
+                )

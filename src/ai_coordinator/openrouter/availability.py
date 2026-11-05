@@ -5,6 +5,7 @@ Maintains an immutable historical record of:
 2. Availability states, HTTP 429 rate limits, and 503 provider errors.
 3. Price mutations and removals.
 4. Model identity preservation across benchmark iterations.
+5. Persistent audit storage across process restarts.
 """
 from __future__ import annotations
 
@@ -13,6 +14,7 @@ import datetime as dt
 from enum import Enum
 import json
 import logging
+import os
 import time
 from typing import Any, Dict, List, Optional
 
@@ -53,12 +55,57 @@ class AvailabilityEvent:
 
 
 class AvailabilityLedger:
-    """In-memory and persistent ledger tracking model availability and health."""
+    """Persistent ledger tracking model availability, errors, and catalog snapshots."""
 
-    def __init__(self, store: Optional[Any] = None) -> None:
+    def __init__(self, store: Optional[Any] = None, storage_path: Optional[str] = None) -> None:
         self.store = store
+        self.storage_path = storage_path
         self._events: List[AvailabilityEvent] = []
         self._snapshots: List[Dict[str, Any]] = []
+
+        if self.storage_path:
+            self._load_persisted_audit_trail()
+
+    def _load_persisted_audit_trail(self) -> None:
+        """Load historical events and snapshots from persistent storage."""
+        if not self.storage_path or not os.path.exists(self.storage_path):
+            return
+        try:
+            with open(self.storage_path, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    rec = json.loads(line)
+                    rec_type = rec.get("record_type")
+                    if rec_type == "event":
+                        ev = AvailabilityEvent(
+                            event_id=rec["event_id"],
+                            timestamp=rec["timestamp"],
+                            timestamp_epoch=float(rec["timestamp_epoch"]),
+                            model_id=rec["model_id"],
+                            event_type=AvailabilityEventType(rec["event_type"]),
+                            details=rec.get("details", {}),
+                        )
+                        self._events.append(ev)
+                    elif rec_type == "snapshot":
+                        self._snapshots.append({
+                            "recorded_at": rec["recorded_at"],
+                            "data": rec["data"],
+                        })
+        except Exception as exc:
+            logger.debug("Falha ao restaurar trilha de auditoria em %s: %s", self.storage_path, exc)
+
+    def _persist_record(self, record: Dict[str, Any]) -> None:
+        """Append record synchronously to persistent audit storage."""
+        if not self.storage_path:
+            return
+        try:
+            os.makedirs(os.path.dirname(os.path.abspath(self.storage_path)), exist_ok=True)
+            with open(self.storage_path, "a", encoding="utf-8") as f:
+                f.write(json.dumps(record, sort_keys=True) + "\n")
+        except Exception as exc:
+            logger.debug("Falha ao persistir registro em %s: %s", self.storage_path, exc)
 
     def record_event(
         self,
@@ -66,7 +113,7 @@ class AvailabilityLedger:
         event_type: AvailabilityEventType,
         details: Optional[Dict[str, Any]] = None,
     ) -> AvailabilityEvent:
-        """Record an availability or lifecycle event."""
+        """Record an availability or lifecycle event and persist it."""
         now_utc = dt.datetime.now(dt.timezone.utc).isoformat()
         epoch = time.time()
         ev_id = f"avail_{int(epoch * 1000)}_{len(self._events)}"
@@ -80,12 +127,27 @@ class AvailabilityLedger:
             details=details or {},
         )
         self._events.append(event)
+
+        # Synchronous append to audit storage
+        self._persist_record({
+            "record_type": "event",
+            **event.to_dict(),
+        })
         return event
 
     def record_snapshot(self, snapshot_data: Dict[str, Any]) -> None:
         """Record a full catalog snapshot for provenance and audit."""
-        self._snapshots.append({
-            "recorded_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+        rec_time = dt.datetime.now(dt.timezone.utc).isoformat()
+        snapshot_entry = {
+            "recorded_at": rec_time,
+            "data": snapshot_data,
+        }
+        self._snapshots.append(snapshot_entry)
+
+        # Synchronous append to audit storage
+        self._persist_record({
+            "record_type": "snapshot",
+            "recorded_at": rec_time,
             "data": snapshot_data,
         })
 

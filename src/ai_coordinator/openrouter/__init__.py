@@ -4,12 +4,16 @@ from .registry import (
     ModelPricing,
     ModelCatalogEntry,
     FreeModelRegistry,
+    PricingStatus,
+    InvalidPricingError,
+    parse_float_cost,
 )
 from .cost_guard import (
     FreeCostGuard,
     CostGuardError,
     UnauthorizedModelError,
     PaidFallbackBlockedError,
+    AmbiguousRoutingError,
 )
 from .availability import (
     AvailabilityEventType,
@@ -24,6 +28,12 @@ from .resilience import (
     RateLimitExceededError,
     RetryPolicy,
 )
+from .transport import (
+    OpenRouterHttpTransport,
+    HttpResponse,
+    LiveNetworkDisabledError,
+    TransportError,
+)
 from .adapters import (
     BaseModelAdapter,
     TextModelAdapter,
@@ -32,6 +42,10 @@ from .adapters import (
     DecisionModelAdapter,
     SpeechModelAdapter,
     AdapterResponse,
+    MetricProvenance,
+    IncompatibleModalityError,
+    ConfidentialDataDetectedError,
+    scrub_outbound_payload,
 )
 from .runner import (
     ModelBenchmarkRunner,
@@ -43,10 +57,14 @@ __all__ = [
     "ModelPricing",
     "ModelCatalogEntry",
     "FreeModelRegistry",
+    "PricingStatus",
+    "InvalidPricingError",
+    "parse_float_cost",
     "FreeCostGuard",
     "CostGuardError",
     "UnauthorizedModelError",
     "PaidFallbackBlockedError",
+    "AmbiguousRoutingError",
     "AvailabilityEventType",
     "AvailabilityEvent",
     "AvailabilityLedger",
@@ -56,6 +74,10 @@ __all__ = [
     "CircuitOpenError",
     "RateLimitExceededError",
     "RetryPolicy",
+    "OpenRouterHttpTransport",
+    "HttpResponse",
+    "LiveNetworkDisabledError",
+    "TransportError",
     "BaseModelAdapter",
     "TextModelAdapter",
     "EmbeddingModelAdapter",
@@ -63,6 +85,10 @@ __all__ = [
     "DecisionModelAdapter",
     "SpeechModelAdapter",
     "AdapterResponse",
+    "MetricProvenance",
+    "IncompatibleModalityError",
+    "ConfidentialDataDetectedError",
+    "scrub_outbound_payload",
     "ModelBenchmarkRunner",
     "ModelBenchmarkRunResult",
 ]

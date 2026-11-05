@@ -1,11 +1,11 @@
 """Benchmark orchestrator and evaluation runner for OpenRouter free models (Phase 4C.1).
 
 Coordinates:
-1. Dynamic model verification via FreeCostGuard.
-2. Resilience enforcement via RateLimiter and CircuitBreaker.
+1. Dynamic model verification via FreeCostGuard (fail-closed zero-cost enforcement).
+2. Resilience enforcement: RateLimiter (every attempt consumes quota), CircuitBreaker, and RetryPolicy.
 3. Modality adapter execution (Text, Embedding, Rerank, Decisions, Speech).
-4. AvailabilityLedger event auditing and snapshotting.
-5. CognitiveTelemetry integration.
+4. AvailabilityLedger event auditing and persistent snapshotting.
+5. Strict classification of metric provenance (MEASURED, ESTIMATED, SYNTHETIC, UNKNOWN).
 """
 from __future__ import annotations
 
@@ -18,8 +18,11 @@ from typing import Any, Callable, Dict, List, Optional
 from .adapters import (
     AdapterResponse,
     BaseModelAdapter,
+    ConfidentialDataDetectedError,
     DecisionModelAdapter,
     EmbeddingModelAdapter,
+    IncompatibleModalityError,
+    MetricProvenance,
     RerankModelAdapter,
     SpeechModelAdapter,
     TextModelAdapter,
@@ -34,6 +37,7 @@ from .resilience import (
     RetryPolicy,
     SlidingWindowRateLimiter,
 )
+from .transport import OpenRouterHttpTransport
 
 logger = logging.getLogger(__name__)
 
@@ -46,12 +50,19 @@ class ModelBenchmarkRunResult:
     modality: ModelModality
     success: bool
     latency_ms: float
-    reported_tokens: Dict[str, int]
+    tokens: Dict[str, int]
+    token_provenance: MetricProvenance
+    latency_provenance: MetricProvenance
     cost_usd: float
     status_code: int
     error_message: Optional[str]
     timestamp: str
     metadata: Dict[str, Any]
+
+    @property
+    def reported_tokens(self) -> Dict[str, int]:
+        """Backward-compatible alias for tokens."""
+        return self.tokens
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -60,7 +71,10 @@ class ModelBenchmarkRunResult:
             "modality": self.modality.value,
             "success": self.success,
             "latency_ms": round(self.latency_ms, 4),
-            "reported_tokens": self.reported_tokens,
+            "tokens": self.tokens,
+            "reported_tokens": self.tokens,
+            "token_provenance": self.token_provenance.value,
+            "latency_provenance": self.latency_provenance.value,
             "cost_usd": round(self.cost_usd, 6),
             "status_code": self.status_code,
             "error_message": self.error_message,
@@ -80,7 +94,9 @@ class ModelBenchmarkRunner:
         rate_limiter: Optional[SlidingWindowRateLimiter] = None,
         circuit_breaker: Optional[CircuitBreaker] = None,
         retry_policy: Optional[RetryPolicy] = None,
+        transport: Optional[OpenRouterHttpTransport] = None,
         store: Optional[Any] = None,
+        sleeper: Optional[Callable[[float], None]] = None,
     ) -> None:
         self.registry = registry
         self.cost_guard = cost_guard or FreeCostGuard(registry)
@@ -88,15 +104,17 @@ class ModelBenchmarkRunner:
         self.rate_limiter = rate_limiter or SlidingWindowRateLimiter(max_per_minute=20, max_per_day=50)
         self.circuit_breaker = circuit_breaker or CircuitBreaker(failure_threshold=3, recovery_timeout_sec=30.0)
         self.retry_policy = retry_policy or RetryPolicy(max_attempts=3)
+        self.transport = transport or OpenRouterHttpTransport(live_network_enabled=False)
         self.store = store
+        self.sleeper = sleeper or time.sleep
 
         # Initialize modality adapters
         self.adapters: Dict[ModelModality, BaseModelAdapter] = {
-            ModelModality.TEXT: TextModelAdapter(self.cost_guard),
-            ModelModality.EMBEDDING: EmbeddingModelAdapter(self.cost_guard),
-            ModelModality.RERANK: RerankModelAdapter(self.cost_guard),
-            ModelModality.DECISIONS: DecisionModelAdapter(self.cost_guard),
-            ModelModality.SPEECH: SpeechModelAdapter(self.cost_guard),
+            ModelModality.TEXT: TextModelAdapter(self.cost_guard, transport=self.transport),
+            ModelModality.EMBEDDING: EmbeddingModelAdapter(self.cost_guard, transport=self.transport),
+            ModelModality.RERANK: RerankModelAdapter(self.cost_guard, transport=self.transport),
+            ModelModality.DECISIONS: DecisionModelAdapter(self.cost_guard, transport=self.transport),
+            ModelModality.SPEECH: SpeechModelAdapter(self.cost_guard, transport=self.transport),
         }
 
     def register_custom_adapter(self, modality: ModelModality, adapter: BaseModelAdapter) -> None:
@@ -129,7 +147,9 @@ class ModelBenchmarkRunner:
                 modality=modality,
                 success=False,
                 latency_ms=0.0,
-                reported_tokens={"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+                tokens={"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+                token_provenance=MetricProvenance.UNKNOWN,
+                latency_provenance=MetricProvenance.UNKNOWN,
                 cost_usd=0.0,
                 status_code=403,
                 error_message=f"[COST_GUARD_BLOCKED] {cge}",
@@ -150,34 +170,14 @@ class ModelBenchmarkRunner:
                 modality=modality,
                 success=False,
                 latency_ms=0.0,
-                reported_tokens={"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+                tokens={"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+                token_provenance=MetricProvenance.UNKNOWN,
+                latency_provenance=MetricProvenance.UNKNOWN,
                 cost_usd=0.0,
                 status_code=503,
                 error_message="[CIRCUIT_BREAKER_OPEN] Endpoint temporariamente bloqueado por excesso de falhas consecutivas.",
                 timestamp=now_iso,
                 metadata={"state": self.circuit_breaker.state.value},
-            )
-
-        # Gate 3: Rate Limiting Inspection and Token Acquisition
-        if not self.rate_limiter.acquire():
-            wait_sec = self.rate_limiter.time_until_available()
-            self.ledger.record_event(
-                model_id=model_id,
-                event_type=AvailabilityEventType.RATE_LIMITED_429,
-                details={"run_id": run_id, "wait_seconds": wait_sec},
-            )
-            return ModelBenchmarkRunResult(
-                run_id=run_id,
-                model_id=model_id,
-                modality=modality,
-                success=False,
-                latency_ms=0.0,
-                reported_tokens={"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
-                cost_usd=0.0,
-                status_code=429,
-                error_message=f"[RATE_LIMIT_EXCEEDED] Limite de requisições atingido. Aguarde {wait_sec:.1f}s.",
-                timestamp=now_iso,
-                metadata={"time_until_available_sec": wait_sec},
             )
 
         adapter = self.adapters.get(modality)
@@ -188,7 +188,9 @@ class ModelBenchmarkRunner:
                 modality=modality,
                 success=False,
                 latency_ms=0.0,
-                reported_tokens={"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+                tokens={"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+                token_provenance=MetricProvenance.UNKNOWN,
+                latency_provenance=MetricProvenance.UNKNOWN,
                 cost_usd=0.0,
                 status_code=400,
                 error_message=f"Nenhum adaptador configurado para a modalidade '{modality.value}'.",
@@ -196,30 +198,63 @@ class ModelBenchmarkRunner:
                 metadata={},
             )
 
-        # Gate 4: Execution with Retry Policy
+        # Gate 3 & 4: Execution with Retry Policy where EVERY ATTEMPT consumes quota
         attempt = 1
         last_response: Optional[AdapterResponse] = None
+
         while attempt <= self.retry_policy.max_attempts:
+            # Every single attempt (initial or retry) must acquire quota
+            if not self.rate_limiter.acquire():
+                wait_sec = self.rate_limiter.time_until_available()
+                self.ledger.record_event(
+                    model_id=model_id,
+                    event_type=AvailabilityEventType.RATE_LIMITED_429,
+                    details={"run_id": run_id, "attempt": attempt, "wait_seconds": wait_sec},
+                )
+                return ModelBenchmarkRunResult(
+                    run_id=run_id,
+                    model_id=model_id,
+                    modality=modality,
+                    success=False,
+                    latency_ms=0.0,
+                    tokens={"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+                    token_provenance=MetricProvenance.UNKNOWN,
+                    latency_provenance=MetricProvenance.UNKNOWN,
+                    cost_usd=0.0,
+                    status_code=429,
+                    error_message=f"[RATE_LIMIT_EXCEEDED] Limite de requisições atingido na tentativa {attempt}. Aguarde {wait_sec:.1f}s.",
+                    timestamp=now_iso,
+                    metadata={"time_until_available_sec": wait_sec, "attempt": attempt},
+                )
+
             try:
                 resp = adapter.execute(model_id, inputs)
                 last_response = resp
+
+                # If response reports a Retry-After header, register it in the rate limiter
+                if resp.retry_after_sec is not None and resp.retry_after_sec > 0:
+                    self.rate_limiter.record_retry_after(resp.retry_after_sec)
+
                 if resp.success:
                     self.circuit_breaker.record_success()
                     self.ledger.record_event(
                         model_id=model_id,
                         event_type=AvailabilityEventType.BENCHMARK_EXECUTED,
-                        details={"run_id": run_id, "latency_ms": resp.latency_ms, "tokens": resp.reported_tokens},
+                        details={"run_id": run_id, "latency_ms": resp.latency_ms, "tokens": resp.tokens},
                     )
                     break
                 else:
                     if self.retry_policy.is_retryable_status(resp.status_code) and attempt < self.retry_policy.max_attempts:
-                        delay = self.retry_policy.calculate_delay(attempt)
-                        time.sleep(min(0.1, delay))  # Bound sleep in tests
+                        delay = self.retry_policy.calculate_delay(attempt, retry_after_sec=resp.retry_after_sec)
+                        self.sleeper(delay)
                         attempt += 1
                         continue
+
                     self.circuit_breaker.record_failure()
                     break
-            except Exception as exc:
+
+            except (IncompatibleModalityError, ConfidentialDataDetectedError, CostGuardError) as security_err:
+                # Fatal security or contract errors fail immediately without retry
                 self.circuit_breaker.record_failure()
                 return ModelBenchmarkRunResult(
                     run_id=run_id,
@@ -227,7 +262,32 @@ class ModelBenchmarkRunner:
                     modality=modality,
                     success=False,
                     latency_ms=0.0,
-                    reported_tokens={"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+                    tokens={"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+                    token_provenance=MetricProvenance.UNKNOWN,
+                    latency_provenance=MetricProvenance.UNKNOWN,
+                    cost_usd=0.0,
+                    status_code=400 if isinstance(security_err, IncompatibleModalityError) else 403,
+                    error_message=f"[{security_err.__class__.__name__}] {security_err}",
+                    timestamp=now_iso,
+                    metadata={"attempt": attempt, "fatal": True},
+                )
+            except Exception as exc:
+                self.circuit_breaker.record_failure()
+                if attempt < self.retry_policy.max_attempts:
+                    delay = self.retry_policy.calculate_delay(attempt)
+                    self.sleeper(delay)
+                    attempt += 1
+                    continue
+
+                return ModelBenchmarkRunResult(
+                    run_id=run_id,
+                    model_id=model_id,
+                    modality=modality,
+                    success=False,
+                    latency_ms=0.0,
+                    tokens={"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+                    token_provenance=MetricProvenance.UNKNOWN,
+                    latency_provenance=MetricProvenance.UNKNOWN,
                     cost_usd=0.0,
                     status_code=500,
                     error_message=f"Exceção inesperada na execução do adaptador: {exc}",
@@ -242,13 +302,17 @@ class ModelBenchmarkRunner:
                 modality=modality,
                 success=False,
                 latency_ms=0.0,
-                reported_tokens={"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+                tokens={"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+                token_provenance=MetricProvenance.UNKNOWN,
+                latency_provenance=MetricProvenance.UNKNOWN,
                 cost_usd=0.0,
                 status_code=500,
                 error_message="Nenhuma resposta obtida após tentativas.",
                 timestamp=now_iso,
-                metadata={},
+                metadata={"total_attempts": attempt},
             )
+
+        latency_prov = MetricProvenance.MEASURED if last_response.metadata.get("live_transport") else MetricProvenance.SYNTHETIC
 
         return ModelBenchmarkRunResult(
             run_id=run_id,
@@ -256,10 +320,12 @@ class ModelBenchmarkRunner:
             modality=modality,
             success=last_response.success,
             latency_ms=last_response.latency_ms,
-            reported_tokens=last_response.reported_tokens,
+            tokens=last_response.tokens,
+            token_provenance=last_response.token_provenance,
+            latency_provenance=latency_prov,
             cost_usd=last_response.cost_usd,
             status_code=last_response.status_code,
             error_message=last_response.error_message,
             timestamp=now_iso,
-            metadata=last_response.metadata,
+            metadata={**last_response.metadata, "attempts": attempt},
         )
