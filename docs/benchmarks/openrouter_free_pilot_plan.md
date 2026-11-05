@@ -1,6 +1,6 @@
 # Plano Experimental de Campanha Piloto — OpenRouter Free (Fase 4C.1)
 
-> **Status:** Proposta de Piloto Experimental — Atualizado após Auditoria Independente (Revisão 5)
+> **Status:** Homologação Técnica da Infraestrutura Experimental — Revisão 6 (Final)
 > **Branch:** `feature/phase4c-1-openrouter-free`  
 > **Política Financeira:** **Strict Zero-Cost Fail-Closed** (Custo Máximo Permitido: US$ 0.000000)
 
@@ -87,5 +87,42 @@ Em atendimento estrito à determinação 8 da Auditoria Independente:
 3. **Ativação da Campanha Piloto Real (Somente após aprovação expressa do usuário):**
    - Configuração de credencial `OPENROUTER_API_KEY` exclusivamente via variável de ambiente.
    - Habilitação explícita de `live_network_enabled=True`.
-   - Execução controlada do piloto de 10 chamadas com registro no `AvailabilityLedger`.
+   - Execução controlada do piloto com registro no `AvailabilityLedger`.
    - Comparação formal de métricas com a baseline v0.5.1.
+
+---
+
+## 7. Procedimento Operacional do Piloto TEXT — Chamada Inicial Única (Pendente de Autorização)
+
+Em cumprimento estrito às determinações da auditoria, o piloto operacional em ambiente real **NÃO foi executado** nesta etapa e permanece dependente de autorização formal expressa do usuário.
+
+Quando autorizado pelo usuário, o procedimento operacional consistirá em uma **única chamada determinística inicial controlada** seguindo os 6 passos sequenciais obrigatórios:
+
+### Passo 1: Verificação Prévia de Controles Financeiros e Conta
+- Confirmar no painel da OpenRouter que o **Spend Cap / Credit Limit** da conta está estritamente em **US$ 0.00**.
+- Confirmar que a chave de API fornecida via `$env:OPENROUTER_API_KEY` possui permissão exclusiva de inferência, sem métodos de faturamento associados.
+
+### Passo 2: Inicialização com Origem HTTPS Autenticada
+- Instanciar `OfficialOpenRouterCatalogClient` para obter `AuthenticatedCatalogSnapshot` assinado diretamente de `https://openrouter.ai/api/v1/models`.
+- Carregar o snapshot no `FreeModelRegistry(require_trusted_source=True)` via `load_authenticated_snapshot()`.
+- Validar `registry.is_authenticated_origin == True`.
+
+### Passo 3: Verificação de Elegibilidade Estrita do Modelo Alvo
+- Confirmar que o modelo escolhido é `meta-llama/llama-3.2-3b-instruct:free` (ou `google/gemini-2.0-flash-exp:free`).
+- Revalidar no `FreeCostGuard` que os preços declarados em todas as 4 dimensões (prompt, completion, image, request) são matematicamente iguais a US$ 0.000000.
+- Confirmar ausência de rotas de fallback pagas.
+
+### Passo 4: Configuração Durável de Quotas e Auditoria
+- Criar banco SQLite local para controle de quota atômica (`SlidingWindowRateLimiter(sqlite_path="data/pilot_quotas.db")`).
+- Criar arquivo durável de auditoria com `fsync` (`AvailabilityLedger(storage_path="docs/benchmarks/pilot_audit.jsonl", require_durable=True)`).
+
+### Passo 5: Execução da Chamada Única Controlada ($N=1$, Sequencial)
+- Modalidade: Estritamente **TEXT** (outras modalidades bloqueadas por `PILOT_SCOPE_RESTRICTION`).
+- Payload: Prompt sintético padrão determinístico da Suíte A (`"Classify sentiment: This product exceeded all my expectations."`).
+- Egress Gate: O `OpenRouterHttpTransport.dispatch()` inspeciona recursivamente o payload antes do envio, reserva 1 unidade de quota no SQLite, registra a intenção pré-flight, despacha a requisição HTTPS e grava o desfecho pós-flight.
+
+### Passo 6: Auditoria Pós-Execução e Classificação Científica
+- Verificar status HTTP (esperado 200).
+- Se presente o campo `usage` completo, classificar tokens como `MEASURED`; se ausente/parcial, classificar estritamente como `UNKNOWN`.
+- Registrar latência total reportada e definir `ttft_ms = None` com `ttft_provenance = UNKNOWN` (ausência de instrumentação de streaming).
+- Confirmar custo efetivo registrado: US$ 0.000000.

@@ -108,6 +108,13 @@ class OpenRouterHttpTransport:
             raise AuditPersistenceError(
                 "[FAIL-CLOSED] Modo live exige AvailabilityLedger configurado com require_durable=True e storage_path."
             )
+        if not self.cost_guard.registry.is_authenticated_origin:
+            from .registry import UntrustedCatalogSourceError
+            raise UntrustedCatalogSourceError(
+                "[FAIL-CLOSED] Modo live exige catálogo com origem oficial HTTPS comprovada "
+                "(AuthenticatedCatalogSnapshot). Dicionários locais, dados estáticos ou catálogos fabricados "
+                "são terminantemente proibidos em chamadas reais."
+            )
 
     def get_endpoint_for_modality(self, modality_str: str) -> str:
         """Resolve OpenRouter endpoint URL for a given modality. Rejects unknown modalities fail-closed."""
@@ -140,10 +147,10 @@ class OpenRouterHttpTransport:
         9. Outbound HTTP dispatch (supporting JSON and binary audio).
         10. Post-flight durable audit outcome recording and Retry-After handling.
         """
-        # Gate 1: Secret Scanning
+        # Gate 1: Comprehensive Recursive Privacy & Secret Inspection
         # Import lazily to avoid circular imports
-        from .adapters import scan_for_credentials
-        scan_for_credentials(json.dumps(payload))
+        from .adapters import inspect_payload_privacy_strictly
+        inspect_payload_privacy_strictly(payload)
 
         # Gate 2: Endpoint validation
         url = self.get_endpoint_for_modality(modality_str)
@@ -172,6 +179,14 @@ class OpenRouterHttpTransport:
             raise IncompatibleModalityEndpointError(
                 f"[FAIL-CLOSED] Modelo '{model_id}' não suporta a modalidade '{modality_str}'. "
                 f"Modalidades declaradas pelo catálogo: {entry_modality_values}."
+            )
+
+        # Gate 4b: Strict Pilot Scope Enforcement in Live Mode
+        # In live network mode, the initial pilot is strictly restricted to TEXT modality
+        if self.live_network_enabled and norm_mod != "text":
+            raise IncompatibleModalityEndpointError(
+                f"[PILOT_SCOPE_RESTRICTION] Em modo operacional ativo (live network), apenas a modalidade 'text' "
+                f"está homologada para execução inicial. Modalidade requisitada '{modality_str}' permanece restrita ao modo simulado."
             )
 
         # Gate 5: Opt-in network check

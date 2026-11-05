@@ -54,13 +54,37 @@ class ConfidentialDataDetectedError(Exception):
 
 
 CREDENTIAL_PATTERNS = [
-    re.compile(r"(?i)\bbearer\s+[a-zA-Z0-9_\-\.]{16,}\b"),
-    re.compile(r"\bsk-or-v1-[a-zA-Z0-9]{24,}\b"),
+    re.compile(r"(?i)\bbearer\s+[a-zA-Z0-9_\-\.]{8,}\b"),
+    re.compile(r"\bsk-or-v1-[a-zA-Z0-9]{20,}\b"),
     re.compile(r"\bsk-[a-zA-Z0-9]{20,}\b"),
     re.compile(r"\bAIza[0-9A-Za-z-_]{35}\b"),
     re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----"),
-    re.compile(r"(?i)\b(?:api[_\-]?key|secret|password|private[_\-]?key)\s*[:=]\s*['\"]?[a-zA-Z0-9_\-]{8,}['\"]?"),
+    re.compile(r"(?i)\b(?:api[_\-]?key|secret|password|passwd|private[_\-]?key|access[_\-]?token)\s*[:=]\s*['\"]?[^\s,'\"}]+"),
 ]
+
+RESERVED_SAFE_KEYS: Set[str] = {
+    "model", "messages", "role", "content", "name", "tools", "type", "function",
+    "description", "parameters", "properties", "required", "max_tokens", "prompt_tokens",
+    "completion_tokens", "total_tokens", "temperature", "top_p", "stream", "format",
+    "text_to_speak", "input", "audio_bytes", "response_format", "schema", "items",
+    "default", "enum", "title", "seed", "stop", "frequency_penalty", "presence_penalty",
+}
+
+SENSITIVE_KEY_SUBSTRINGS: Tuple[str, ...] = (
+    "api_key",
+    "apikey",
+    "password",
+    "passwd",
+    "secret",
+    "token",
+    "auth",
+    "authorization",
+    "credential",
+    "credentials",
+    "private_key",
+    "privkey",
+    "access_token",
+)
 
 
 def scan_for_credentials(text: str) -> None:
@@ -75,11 +99,53 @@ def scan_for_credentials(text: str) -> None:
             )
 
 
+def inspect_payload_privacy_strictly(data: Any, path: str = "root") -> None:
+    """Recursively and strictly inspect request payloads for sensitive fields and embedded credentials.
+
+    Enforces:
+    1. Structural field check: rejects any dictionary containing sensitive keys (api_key, password,
+       token, secret, auth, credential, etc.), regardless of value format or length.
+    2. Value credential scanning: scans all string values across any depth for API keys, Bearer tokens,
+       PEM certificates, or embedded assignments.
+
+    Raises ConfidentialDataDetectedError immediately on detection, aborting transmission before
+    quota reservation or network socket creation.
+    """
+    if isinstance(data, dict):
+        for k, v in data.items():
+            k_str = str(k)
+            k_lower = k_str.lower().strip()
+
+            # Check if key itself represents a sensitive field
+            if k_lower not in RESERVED_SAFE_KEYS:
+                # Check normalized key without punctuation
+                k_clean = re.sub(r"[^a-z0-9]", "", k_lower)
+                for term in SENSITIVE_KEY_SUBSTRINGS:
+                    term_clean = re.sub(r"[^a-z0-9]", "", term)
+                    if term_clean in k_clean:
+                        raise ConfidentialDataDetectedError(
+                            f"[PRIVACY_GATE_REJECTED] Detectado campo sensível proibido '{k_str}' "
+                            f"na localização '{path}.{k_str}'. Payloads com credenciais ou segredos "
+                            "são terminantemente rejeitados antes da transmissão."
+                        )
+
+            # Recursively inspect the value
+            inspect_payload_privacy_strictly(v, path=f"{path}.{k_str}")
+
+    elif isinstance(data, (list, tuple)):
+        for idx, item in enumerate(data):
+            inspect_payload_privacy_strictly(item, path=f"{path}[{idx}]")
+
+    elif isinstance(data, str):
+        scan_for_credentials(data)
+
+
 def scrub_outbound_payload(data: Any, reject_sensitive: bool = True) -> Any:
     """Recursively scrub sensitive keys and scan for embedded tokens in request payloads."""
+    if reject_sensitive:
+        inspect_payload_privacy_strictly(data)
+
     if isinstance(data, str):
-        if reject_sensitive:
-            scan_for_credentials(data)
         return data
 
     if isinstance(data, dict):
@@ -88,18 +154,13 @@ def scrub_outbound_payload(data: Any, reject_sensitive: bool = True) -> Any:
             k_str = str(k)
             k_lower = k_str.lower()
             if any(term in k_lower for term in ("key", "secret", "token", "password", "auth", "credential")):
-                if reject_sensitive:
-                    if isinstance(v, str) and len(v) > 8 and not v.startswith("[REDACTED"):
-                        raise ConfidentialDataDetectedError(
-                            f"Detectado campo confidencial '{k_str}' com conteúdo sensível no payload de envio."
-                        )
                 scrubbed[k] = "[REDACTED_BY_COST_GUARD]"
             else:
-                scrubbed[k] = scrub_outbound_payload(v, reject_sensitive=reject_sensitive)
+                scrubbed[k] = scrub_outbound_payload(v, reject_sensitive=False)
         return scrubbed
 
     if isinstance(data, (list, tuple)):
-        return [scrub_outbound_payload(x, reject_sensitive=reject_sensitive) for x in data]
+        return [scrub_outbound_payload(x, reject_sensitive=False) for x in data]
 
     return data
 
@@ -117,6 +178,7 @@ class AdapterResponse:
     cost_usd: float  # Strictly 0.0 for free-tier
     status_code: int = 200
     ttft_ms: Optional[float] = None
+    ttft_provenance: MetricProvenance = MetricProvenance.UNKNOWN
     retry_after_sec: Optional[float] = None
     error_message: Optional[str] = None
     metadata: Dict[str, Any] = dataclasses.field(default_factory=dict)
@@ -139,6 +201,7 @@ class AdapterResponse:
             "cost_usd": round(self.cost_usd, 6),
             "status_code": self.status_code,
             "ttft_ms": round(self.ttft_ms, 4) if self.ttft_ms is not None else None,
+            "ttft_provenance": self.ttft_provenance.value,
             "retry_after_sec": self.retry_after_sec,
             "error_message": self.error_message,
             "metadata": self.metadata,

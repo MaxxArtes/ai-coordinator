@@ -15,9 +15,11 @@ import dataclasses
 import datetime as dt
 from enum import Enum
 import hashlib
+import hmac
 import json
 import logging
 import math
+import secrets
 import time
 from typing import Any, Callable, Dict, List, Optional, Set
 import urllib.error
@@ -26,6 +28,7 @@ import urllib.request
 logger = logging.getLogger(__name__)
 
 OFFICIAL_OPENROUTER_MODELS_URL = "https://openrouter.ai/api/v1/models"
+_PROCESS_CATALOG_SECRET = secrets.token_bytes(32)
 
 
 class ModelModality(str, Enum):
@@ -207,17 +210,57 @@ def infer_modalities(model_id: str, arch: Dict[str, Any], description: str) -> L
     return sorted(list(modalities), key=lambda m: m.value)
 
 
+@dataclasses.dataclass(frozen=True)
+class AuthenticatedCatalogSnapshot:
+    """Tamper-evident catalog snapshot fetched exclusively from official OpenRouter HTTPS endpoint."""
+    raw_bytes: bytes
+    endpoint_url: str
+    fetched_at_epoch: float
+    hmac_signature: str
+
+    @classmethod
+    def create(cls, raw_bytes: bytes, endpoint_url: str = OFFICIAL_OPENROUTER_MODELS_URL) -> "AuthenticatedCatalogSnapshot":
+        if endpoint_url != OFFICIAL_OPENROUTER_MODELS_URL:
+            raise UntrustedCatalogSourceError(
+                f"[FAIL-CLOSED] Endpoint de catálogo não autorizado: '{endpoint_url}'. "
+                f"Apenas o endpoint oficial fixado '{OFFICIAL_OPENROUTER_MODELS_URL}' é permitido."
+            )
+        mac = hmac.new(_PROCESS_CATALOG_SECRET, raw_bytes, hashlib.sha256).hexdigest()
+        return cls(
+            raw_bytes=raw_bytes,
+            endpoint_url=endpoint_url,
+            fetched_at_epoch=time.time(),
+            hmac_signature=mac,
+        )
+
+    def verify_authenticity(self) -> Dict[str, Any]:
+        """Verify internal cryptographic seal and parse catalog payload."""
+        if self.endpoint_url != OFFICIAL_OPENROUTER_MODELS_URL:
+            raise UntrustedCatalogSourceError(
+                f"[FAIL-CLOSED] Violação de proveniência: URL '{self.endpoint_url}' diverge da oficial."
+            )
+        expected_mac = hmac.new(_PROCESS_CATALOG_SECRET, self.raw_bytes, hashlib.sha256).hexdigest()
+        if not hmac.compare_digest(expected_mac, self.hmac_signature):
+            raise UntrustedCatalogSourceError(
+                "[FAIL-CLOSED] Violação de integridade ou falsificação de catálogo detectada. Selo criptográfico inválido."
+            )
+        parsed = json.loads(self.raw_bytes.decode("utf-8"))
+        if not isinstance(parsed, dict) or "data" not in parsed or not isinstance(parsed["data"], list):
+            raise StaleCatalogError("Estrutura inválida retornada pelo endpoint oficial da OpenRouter.")
+        return parsed
+
+
 class OfficialOpenRouterCatalogClient:
     """Official HTTPS catalog client directly querying OpenRouter's /api/v1/models endpoint."""
 
-    def __init__(self, endpoint_url: str = OFFICIAL_OPENROUTER_MODELS_URL, timeout_sec: float = 30.0) -> None:
-        self.endpoint_url = endpoint_url
+    def __init__(self, timeout_sec: float = 30.0) -> None:
+        self.endpoint_url = OFFICIAL_OPENROUTER_MODELS_URL
         self.timeout_sec = timeout_sec
 
-    def fetch_catalog(self) -> Dict[str, Any]:
+    def fetch_catalog(self) -> AuthenticatedCatalogSnapshot:
         """Fetch and structure-check official catalog over HTTPS.
 
-        Validates status 200, Content-Type application/json, and required data schema.
+        Returns a tamper-evident AuthenticatedCatalogSnapshot sealed with an internal process HMAC.
         """
         req = urllib.request.Request(
             self.endpoint_url,
@@ -232,14 +275,9 @@ class OfficialOpenRouterCatalogClient:
                 if resp.getcode() != 200:
                     raise StaleCatalogError(f"HTTP {resp.getcode()} ao consultar catálogo oficial da OpenRouter.")
                 raw_bytes = resp.read()
-                data = json.loads(raw_bytes.decode("utf-8"))
-                if not isinstance(data, dict) or "data" not in data or not isinstance(data["data"], list):
-                    raise StaleCatalogError("Estrutura inválida retornada pelo endpoint oficial da OpenRouter.")
-
-                data["_source"] = self.endpoint_url
-                data["_trusted"] = True
-                data["_fetched_at_epoch"] = time.time()
-                return data
+                return AuthenticatedCatalogSnapshot.create(raw_bytes, self.endpoint_url)
+        except UntrustedCatalogSourceError:
+            raise
         except Exception as exc:
             logger.error("Falha ao consultar endpoint oficial da OpenRouter: %s", exc)
             raise StaleCatalogError(f"Falha na consulta oficial HTTPS do catálogo: {exc}") from exc
@@ -251,7 +289,7 @@ class FreeModelRegistry:
     def __init__(
         self,
         max_age_seconds: float = 3600.0,
-        fetcher: Optional[Callable[[], Dict[str, Any]]] = None,
+        fetcher: Optional[Callable[[], Any]] = None,
         require_trusted_source: bool = False,
     ) -> None:
         self.max_age_seconds = max_age_seconds
@@ -264,10 +302,16 @@ class FreeModelRegistry:
         self._snapshot_epoch: Optional[float] = None
         self._provenance_hash: Optional[str] = None
         self._source_url: str = "uninitialized"
+        self._is_authenticated_origin: bool = False
 
     @property
     def total_models(self) -> int:
         return len(self._entries_by_id)
+
+    @property
+    def is_authenticated_origin(self) -> bool:
+        """True only if current catalog snapshot was loaded from a verified AuthenticatedCatalogSnapshot."""
+        return self._is_authenticated_origin
 
     @property
     def snapshot_epoch(self) -> Optional[float]:
@@ -296,15 +340,22 @@ class FreeModelRegistry:
 
         if self.fetcher is not None:
             try:
-                raw_data = self.fetcher()
-                is_trusted = bool(raw_data.get("_trusted", False))
-                self.load_catalog_data(
-                    raw_data,
-                    epoch=t,
-                    source=raw_data.get("_source", OFFICIAL_OPENROUTER_MODELS_URL),
-                    is_trusted=is_trusted,
-                )
-                return
+                fetched = self.fetcher()
+                if isinstance(fetched, AuthenticatedCatalogSnapshot):
+                    self.load_authenticated_snapshot(fetched)
+                    return
+                elif self.require_trusted_source:
+                    raise UntrustedCatalogSourceError(
+                        "[FAIL-CLOSED] Catálogo rejeitado: o mecanismo de atualização não forneceu um "
+                        "AuthenticatedCatalogSnapshot oficial autenticado."
+                    )
+                elif isinstance(fetched, dict):
+                    self.load_catalog_data(fetched, epoch=t, source="dynamic_fetcher")
+                    return
+                else:
+                    raise StaleCatalogError(f"Tipo de retorno de fetcher desconhecido: {type(fetched)}")
+            except (UntrustedCatalogSourceError, StaleCatalogError):
+                raise
             except Exception as exc:
                 logger.error("Falha ao atualizar catálogo dinamicamente: %s", exc)
                 raise StaleCatalogError(
@@ -317,20 +368,59 @@ class FreeModelRegistry:
             "Execução bloqueada preventivamente."
         )
 
+    def load_authenticated_snapshot(
+        self,
+        snapshot: AuthenticatedCatalogSnapshot,
+    ) -> List[ModelCatalogEntry]:
+        """Load and index models from a cryptographically verified AuthenticatedCatalogSnapshot."""
+        if not isinstance(snapshot, AuthenticatedCatalogSnapshot):
+            raise UntrustedCatalogSourceError(
+                f"[FAIL-CLOSED] Objeto inválido para catálogo autenticado: esperado AuthenticatedCatalogSnapshot, recebido {type(snapshot)}."
+            )
+        raw_data = snapshot.verify_authenticity()
+        entries = self._index_raw_catalog(
+            raw_data=raw_data,
+            epoch=snapshot.fetched_at_epoch,
+            source=snapshot.endpoint_url,
+        )
+        self._is_authenticated_origin = True
+        return entries
+
     def load_catalog_data(
         self,
         raw_data: Dict[str, Any],
         timestamp: Optional[str] = None,
         epoch: Optional[float] = None,
         source: str = "untrusted_input",
-        is_trusted: bool = False,
     ) -> List[ModelCatalogEntry]:
-        """Parse raw OpenRouter /api/v1/models response and index models."""
-        if self.require_trusted_source and not is_trusted:
+        """Parse raw OpenRouter /api/v1/models response and index models for offline or test scenarios.
+
+        Always marks is_authenticated_origin = False. If require_trusted_source is True,
+        strictly raises UntrustedCatalogSourceError.
+        """
+        if self.require_trusted_source:
             raise UntrustedCatalogSourceError(
                 "[FAIL-CLOSED] Catálogo rejeitado: em modo de produção/live, apenas snapshots originados "
-                "diretamente do endpoint oficial HTTPS da OpenRouter são autorizados."
+                "diretamente do endpoint oficial HTTPS da OpenRouter (AuthenticatedCatalogSnapshot) são autorizados. "
+                "Dicionários manuais e dados locais são terminantemente proibidos."
             )
+
+        self._is_authenticated_origin = False
+        return self._index_raw_catalog(
+            raw_data=raw_data,
+            timestamp=timestamp,
+            epoch=epoch,
+            source=source,
+        )
+
+    def _index_raw_catalog(
+        self,
+        raw_data: Dict[str, Any],
+        timestamp: Optional[str] = None,
+        epoch: Optional[float] = None,
+        source: str = "untrusted_input",
+    ) -> List[ModelCatalogEntry]:
+        """Internal parser for raw catalog dictionaries."""
 
         self._raw_snapshot = raw_data
         self._snapshot_epoch = epoch if epoch is not None else time.time()

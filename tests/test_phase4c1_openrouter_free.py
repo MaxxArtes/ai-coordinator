@@ -35,6 +35,7 @@ import urllib.error
 from ai_coordinator.openrouter import (
     AmbiguousRoutingError,
     AuditPersistenceError,
+    AuthenticatedCatalogSnapshot,
     AvailabilityEvent,
     AvailabilityEventType,
     AvailabilityLedger,
@@ -59,6 +60,7 @@ from ai_coordinator.openrouter import (
     ModelCatalogEntry,
     ModelModality,
     ModelPricing,
+    OfficialOpenRouterCatalogClient,
     OpenRouterHttpTransport,
     PaidFallbackBlockedError,
     PricingStatus,
@@ -72,6 +74,7 @@ from ai_coordinator.openrouter import (
     StaleCatalogError,
     TextModelAdapter,
     UnauthorizedModelError,
+    UntrustedCatalogSourceError,
     parse_float_cost,
     scrub_outbound_payload,
 )
@@ -215,6 +218,13 @@ class TestPhase4C1OpenRouterFree(unittest.TestCase):
         self.registry.load_catalog_data(self.raw_catalog, timestamp="2026-11-05T10:00:00Z")
         self.cost_guard = FreeCostGuard(self.registry)
         self.ledger = AvailabilityLedger()
+
+    def _create_authenticated_guard(self) -> FreeCostGuard:
+        reg = FreeModelRegistry(max_age_seconds=3600.0, require_trusted_source=True)
+        raw_bytes = json.dumps(self.raw_catalog).encode("utf-8")
+        snapshot = AuthenticatedCatalogSnapshot.create(raw_bytes)
+        reg.load_authenticated_snapshot(snapshot)
+        return FreeCostGuard(reg)
 
     def test_01_registry_parsing_and_modality_classification(self) -> None:
         """Validate dynamic catalog parsing, zero-cost qualification, and modality inference."""
@@ -528,14 +538,15 @@ class TestPhase4C1OpenRouterFree(unittest.TestCase):
             ledger = AvailabilityLedger(storage_path=audit_path, require_durable=True)
 
             with patch("urllib.request.urlopen", return_value=mock_context_manager):
+                auth_guard = self._create_authenticated_guard()
                 live_transport = OpenRouterHttpTransport(
-                    cost_guard=self.cost_guard,
+                    cost_guard=auth_guard,
                     rate_limiter=limiter,
                     ledger=ledger,
                     api_key="sk-or-v1-fake-test-key",
                     live_network_enabled=True,
                 )
-                adapter = TextModelAdapter(self.cost_guard, transport=live_transport)
+                adapter = TextModelAdapter(auth_guard, transport=live_transport)
                 adapter_res = adapter.execute("meta-llama/llama-3.2-3b-instruct:free", {"prompt": "Live dispatch test"})
 
                 self.assertTrue(adapter_res.success)
@@ -627,14 +638,15 @@ class TestPhase4C1OpenRouterFree(unittest.TestCase):
             ledger = AvailabilityLedger(storage_path=audit_path, require_durable=True)
 
             with patch("urllib.request.urlopen", return_value=mock_context_manager):
+                auth_guard = self._create_authenticated_guard()
                 live_transport = OpenRouterHttpTransport(
-                    cost_guard=self.cost_guard,
+                    cost_guard=auth_guard,
                     rate_limiter=limiter,
                     ledger=ledger,
                     api_key="sk-test",
                     live_network_enabled=True,
                 )
-                adapter = TextModelAdapter(self.cost_guard, transport=live_transport)
+                adapter = TextModelAdapter(auth_guard, transport=live_transport)
                 res = adapter.execute("meta-llama/llama-3.2-3b-instruct:free", {"prompt": "Test no usage"})
 
                 self.assertTrue(res.success)
@@ -679,13 +691,8 @@ class TestPhase4C1OpenRouterFree(unittest.TestCase):
             self.assertEqual(results.count(False), 1)
 
     def test_20_official_catalog_client_https_and_untrusted_source_rejection(self) -> None:
-        """Revisão 5 - Determinação 2: Catálogo autenticado via HTTPS oficial e rejeição de fontes não confiáveis."""
-        from ai_coordinator.openrouter.registry import (
-            OfficialOpenRouterCatalogClient,
-            UntrustedCatalogSourceError,
-        )
-
-        # 1. Official client fetches and marks data as trusted
+        """Revisão 5 e 6 - P0 Catálogo: Origem autenticada oficial via HTTPS e rejeição de falsificações."""
+        # 1. Official client queries fixed HTTPS endpoint and returns AuthenticatedCatalogSnapshot
         mock_http_response = MagicMock()
         mock_http_response.getcode.return_value = 200
         mock_http_response.read.return_value = json.dumps(build_synthetic_openrouter_catalog()).encode("utf-8")
@@ -694,24 +701,38 @@ class TestPhase4C1OpenRouterFree(unittest.TestCase):
 
         with patch("urllib.request.urlopen", return_value=mock_ctx):
             client = OfficialOpenRouterCatalogClient()
-            catalog_data = client.fetch_catalog()
-            self.assertTrue(catalog_data.get("_trusted"))
-            self.assertEqual(catalog_data.get("_source"), "https://openrouter.ai/api/v1/models")
+            snapshot = client.fetch_catalog()
+            self.assertIsInstance(snapshot, AuthenticatedCatalogSnapshot)
+            self.assertEqual(snapshot.endpoint_url, "https://openrouter.ai/api/v1/models")
 
-        # 2. FreeModelRegistry with require_trusted_source=True rejects arbitrary dictionaries
+        # 2. Tampering with endpoint URL or forging an unverified snapshot fails closed
+        with self.assertRaises(UntrustedCatalogSourceError):
+            AuthenticatedCatalogSnapshot.create(b"{}", endpoint_url="https://evil-unauthorized-server.com/models")
+
+        # 3. Forged HMAC in snapshot is detected and rejected
+        forged_snapshot = AuthenticatedCatalogSnapshot(
+            raw_bytes=b"{}",
+            endpoint_url="https://openrouter.ai/api/v1/models",
+            fetched_at_epoch=time.time(),
+            hmac_signature="forged_invalid_hmac_signature_hex",
+        )
+        with self.assertRaises(UntrustedCatalogSourceError):
+            forged_snapshot.verify_authenticity()
+
+        # 4. FreeModelRegistry with require_trusted_source=True strictly rejects raw dictionaries
         secure_registry = FreeModelRegistry(require_trusted_source=True)
         arbitrary_untrusted_data = build_synthetic_openrouter_catalog()
-
         with self.assertRaises(UntrustedCatalogSourceError) as ctx_untrusted:
-            secure_registry.load_catalog_data(arbitrary_untrusted_data, is_trusted=False)
+            secure_registry.load_catalog_data(arbitrary_untrusted_data)
         self.assertIn("apenas snapshots originados diretamente do endpoint oficial", str(ctx_untrusted.exception))
 
-        # 3. Trusted data is accepted
-        secure_registry.load_catalog_data(catalog_data, is_trusted=True)
+        # 5. Verified AuthenticatedCatalogSnapshot is accepted and authenticates origin
+        secure_registry.load_authenticated_snapshot(snapshot)
         self.assertEqual(secure_registry.total_models, 9)
+        self.assertTrue(secure_registry.is_authenticated_origin)
 
     def test_21_live_network_configuration_strict_validation(self) -> None:
-        """Revisão 5 - Determinação 3: Exigir CostGuard, SQLiteQuotaStore e Ledger Durável antes de autorizar rede real."""
+        """Revisão 5 e 6 - P0 Configuração: Exigir CostGuard, SQLiteQuotaStore, Ledger Durável e Origem Autenticada."""
         # Missing CostGuard
         with self.assertRaises(CostGuardError) as ctx_cg:
             OpenRouterHttpTransport(cost_guard=None, live_network_enabled=True)
@@ -742,6 +763,18 @@ class TestPhase4C1OpenRouterFree(unittest.TestCase):
                 )
             self.assertIn("Modo live exige AvailabilityLedger configurado com require_durable=True", str(ctx_ledger.exception))
 
+            # Unauthenticated catalog origin in live mode
+            valid_ledger = AvailabilityLedger(storage_path=os.path.join(tmp_dir, "audit.jsonl"), require_durable=True)
+            self.assertFalse(self.cost_guard.registry.is_authenticated_origin)
+            with self.assertRaises(UntrustedCatalogSourceError) as ctx_unauth:
+                OpenRouterHttpTransport(
+                    cost_guard=self.cost_guard,
+                    rate_limiter=valid_limiter,
+                    ledger=valid_ledger,
+                    live_network_enabled=True,
+                )
+            self.assertIn("Modo live exige catálogo com origem oficial HTTPS comprovada", str(ctx_unauth.exception))
+
     def test_22_single_quota_reservation_in_runner_and_transport(self) -> None:
         """Revisão 5 - Determinação 4: Quota cobrada exatamente uma vez por tentativa no ponto de saída (sem dupla cobrança)."""
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -749,6 +782,7 @@ class TestPhase4C1OpenRouterFree(unittest.TestCase):
             audit_path = os.path.join(tmp_dir, "audit.jsonl")
             limiter = SlidingWindowRateLimiter(max_per_minute=10, max_per_day=20, sqlite_path=db_path)
             ledger = AvailabilityLedger(storage_path=audit_path, require_durable=True)
+            auth_guard = self._create_authenticated_guard()
 
             mock_http_response = MagicMock()
             mock_http_response.getcode.return_value = 200
@@ -764,15 +798,15 @@ class TestPhase4C1OpenRouterFree(unittest.TestCase):
 
             with patch("urllib.request.urlopen", return_value=mock_ctx):
                 live_transport = OpenRouterHttpTransport(
-                    cost_guard=self.cost_guard,
+                    cost_guard=auth_guard,
                     rate_limiter=limiter,
                     ledger=ledger,
                     api_key="sk-or-v1-fake-key",
                     live_network_enabled=True,
                 )
                 runner = ModelBenchmarkRunner(
-                    registry=self.registry,
-                    cost_guard=self.cost_guard,
+                    registry=auth_guard.registry,
+                    cost_guard=auth_guard,
                     ledger=ledger,
                     rate_limiter=limiter,
                     transport=live_transport,
@@ -787,54 +821,47 @@ class TestPhase4C1OpenRouterFree(unittest.TestCase):
 
     def test_23_binary_audio_generation_and_transcription_contracts(self) -> None:
         """Revisão 5 - Determinação 6: Contratos de áudio para geração binária e upload de transcrição."""
-        with tempfile.TemporaryDirectory() as tmp_dir:
-            db_path = os.path.join(tmp_dir, "quotas.db")
-            audit_path = os.path.join(tmp_dir, "audit.jsonl")
-            limiter = SlidingWindowRateLimiter(max_per_minute=20, max_per_day=50, sqlite_path=db_path)
-            ledger = AvailabilityLedger(storage_path=audit_path, require_durable=True)
+        raw_wav_bytes = b"RIFF\x24\x00\x00\x00WAVEfmt \x10\x00\x00\x00\x01\x00\x01\x00"
 
-            raw_wav_bytes = b"RIFF\x24\x00\x00\x00WAVEfmt \x10\x00\x00\x00\x01\x00\x01\x00"
+        # 1. Voice generation (binary response via mock_handler)
+        def mock_tts_handler(inputs: dict) -> dict:
+            return {
+                "success": True,
+                "status_code": 200,
+                "audio_result": {
+                    "binary_data": raw_wav_bytes,
+                    "audio_bytes_length": len(raw_wav_bytes),
+                    "format": "wav",
+                },
+            }
 
-            mock_http_response = MagicMock()
-            mock_http_response.getcode.return_value = 200
-            mock_http_response.headers = {"Content-Type": "audio/wav"}
-            mock_http_response.read.return_value = raw_wav_bytes
-            mock_ctx = MagicMock()
-            mock_ctx.__enter__.return_value = mock_http_response
+        tts_adapter = SpeechModelAdapter(self.cost_guard, mock_handler=mock_tts_handler)
+        gen_res = tts_adapter.execute(
+            "fishaudio/fish-speech-1.5:free",
+            {"text_to_speak": "Hello world from synthetic speech", "format": "wav"},
+        )
+        self.assertTrue(gen_res.success)
+        self.assertIn("binary_data", gen_res.output_data)
+        self.assertEqual(gen_res.output_data["binary_data"], raw_wav_bytes)
+        self.assertEqual(gen_res.output_data["audio_bytes_length"], len(raw_wav_bytes))
 
-            with patch("urllib.request.urlopen", return_value=mock_ctx):
-                live_transport = OpenRouterHttpTransport(
-                    cost_guard=self.cost_guard,
-                    rate_limiter=limiter,
-                    ledger=ledger,
-                    api_key="sk-test",
-                    live_network_enabled=True,
-                )
-                adapter = SpeechModelAdapter(self.cost_guard, transport=live_transport)
+        # 2. Audio transcription (upload response via mock_handler)
+        def mock_asr_handler(inputs: dict) -> dict:
+            return {
+                "success": True,
+                "status_code": 200,
+                "audio_result": {
+                    "text": "Transcribed speech from audio upload",
+                },
+            }
 
-                # 1. Voice generation (binary response)
-                gen_res = adapter.execute(
-                    "fishaudio/fish-speech-1.5:free",
-                    {"text_to_speak": "Hello world from synthetic speech", "format": "wav"},
-                )
-                self.assertTrue(gen_res.success)
-                self.assertIn("binary_data", gen_res.output_data)
-                self.assertEqual(gen_res.output_data["binary_data"], raw_wav_bytes)
-                self.assertEqual(gen_res.output_data["audio_bytes_length"], len(raw_wav_bytes))
-
-                # 2. Audio transcription (JSON response from upload)
-                mock_transcription_resp = MagicMock()
-                mock_transcription_resp.getcode.return_value = 200
-                mock_transcription_resp.headers = {"Content-Type": "application/json"}
-                mock_transcription_resp.read.return_value = json.dumps({"text": "Transcribed speech from audio upload"}).encode("utf-8")
-                mock_ctx.__enter__.return_value = mock_transcription_resp
-
-                trans_res = adapter.execute(
-                    "openai/whisper-large-v3:free",
-                    {"audio_bytes": "UklGRi4AAABXQVZFZg==", "format": "wav"},
-                )
-                self.assertTrue(trans_res.success)
-                self.assertEqual(trans_res.output_data.get("text"), "Transcribed speech from audio upload")
+        asr_adapter = SpeechModelAdapter(self.cost_guard, mock_handler=mock_asr_handler)
+        trans_res = asr_adapter.execute(
+            "openai/whisper-large-v3:free",
+            {"audio_bytes": "UklGRi4AAABXQVZFZg==", "format": "wav"},
+        )
+        self.assertTrue(trans_res.success)
+        self.assertEqual(trans_res.output_data.get("text"), "Transcribed speech from audio upload")
 
     def test_24_scientific_metrics_partial_usage_classified_unknown(self) -> None:
         """Revisão 5 - Determinação 7: Contagens parciais ou ausentes em usage são UNKNOWN, nunca MEASURED."""
@@ -859,6 +886,135 @@ class TestPhase4C1OpenRouterFree(unittest.TestCase):
         # Empty usage dict -> UNKNOWN
         toks_empty, prov_empty = extract_usage_with_provenance({"usage": {}})
         self.assertEqual(prov_empty, MetricProvenance.UNKNOWN)
+
+    def test_25_adversarial_fabricated_catalog_with_zero_cost_rejected_in_live_mode(self) -> None:
+        """Revisão 6 - P0 Catálogo: Catálogo fabricado com preço $0.00 é terminantemente rejeitado em modo live."""
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            db_path = os.path.join(tmp_dir, "quotas.db")
+            audit_path = os.path.join(tmp_dir, "audit.jsonl")
+            limiter = SlidingWindowRateLimiter(sqlite_path=db_path)
+            ledger = AvailabilityLedger(storage_path=audit_path, require_durable=True)
+
+            # Attacker fabricates an arbitrary catalog with 0 cost and attempts to inject into registry
+            fabricated_dict = {
+                "data": [
+                    {
+                        "id": "hacked/free-model:free",
+                        "pricing": {"prompt": "0", "completion": "0", "image": "0", "request": "0"},
+                        "architecture": {"modality": "text->text"},
+                        "_trusted": True,  # Forged flag
+                    }
+                ]
+            }
+            fake_registry = FreeModelRegistry()
+            fake_registry.load_catalog_data(fabricated_dict)
+            self.assertFalse(fake_registry.is_authenticated_origin)
+
+            fake_guard = FreeCostGuard(fake_registry)
+
+            # Live transport must reject unauthenticated catalog origin immediately
+            with self.assertRaises(UntrustedCatalogSourceError) as ctx_fake:
+                OpenRouterHttpTransport(
+                    cost_guard=fake_guard,
+                    rate_limiter=limiter,
+                    ledger=ledger,
+                    api_key="sk-test",
+                    live_network_enabled=True,
+                )
+            self.assertIn("Modo live exige catálogo com origem oficial HTTPS comprovada", str(ctx_fake.exception))
+
+    def test_26_transport_direct_dispatch_rejects_api_key_field(self) -> None:
+        """Revisão 6 - P0 Privacidade: Chamada direta ao dispatch() com campo 'api_key' é abortada no Gate 1."""
+        transport = OpenRouterHttpTransport(cost_guard=self.cost_guard, live_network_enabled=False)
+        payload = {
+            "model": "meta-llama/llama-3.2-3b-instruct:free",
+            "messages": [{"role": "user", "content": "Hello"}],
+            "api_key": "injected_secret_api_key_12345",
+        }
+        with self.assertRaises(ConfidentialDataDetectedError) as ctx:
+            transport.dispatch("text", payload)
+        self.assertIn("Detectado campo sensível proibido 'api_key'", str(ctx.exception))
+
+    def test_27_transport_direct_dispatch_rejects_password_field(self) -> None:
+        """Revisão 6 - P0 Privacidade: Chamada direta ao dispatch() com campo 'password' é abortada no Gate 1."""
+        transport = OpenRouterHttpTransport(cost_guard=self.cost_guard, live_network_enabled=False)
+        payload = {
+            "model": "meta-llama/llama-3.2-3b-instruct:free",
+            "messages": [{"role": "user", "content": "Hello"}],
+            "credentials": {"password": "my_admin_password"},
+        }
+        with self.assertRaises(ConfidentialDataDetectedError) as ctx:
+            transport.dispatch("text", payload)
+        self.assertIn("Detectado campo sensível proibido 'credentials'", str(ctx.exception))
+
+    def test_28_transport_direct_dispatch_rejects_bearer_in_messages(self) -> None:
+        """Revisão 6 - P0 Privacidade: Chamada direta com Bearer token ou chave embutida em mensagem é abortada no Gate 1."""
+        transport = OpenRouterHttpTransport(cost_guard=self.cost_guard, live_network_enabled=False)
+
+        # 1. Bearer token in message content
+        payload_bearer = {
+            "model": "meta-llama/llama-3.2-3b-instruct:free",
+            "messages": [{"role": "user", "content": "Please verify this token: Bearer abcdef1234567890"}],
+        }
+        with self.assertRaises(ConfidentialDataDetectedError):
+            transport.dispatch("text", payload_bearer)
+
+        # 2. OpenRouter API key pattern in message content
+        payload_sk = {
+            "model": "meta-llama/llama-3.2-3b-instruct:free",
+            "messages": [{"role": "user", "content": "Key is sk-or-v1-abcdef0123456789abcdef0123"}],
+        }
+        with self.assertRaises(ConfidentialDataDetectedError):
+            transport.dispatch("text", payload_sk)
+
+    def test_29_transport_live_mode_rejects_non_text_modalities(self) -> None:
+        """Revisão 6 - Escopo do Piloto: Chamada live em modalidade não-TEXT é bloqueada por restrição do piloto."""
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            db_path = os.path.join(tmp_dir, "quotas.db")
+            audit_path = os.path.join(tmp_dir, "audit.jsonl")
+            limiter = SlidingWindowRateLimiter(sqlite_path=db_path)
+            ledger = AvailabilityLedger(storage_path=audit_path, require_durable=True)
+            auth_guard = self._create_authenticated_guard()
+
+            live_transport = OpenRouterHttpTransport(
+                cost_guard=auth_guard,
+                rate_limiter=limiter,
+                ledger=ledger,
+                api_key="sk-test",
+                live_network_enabled=True,
+            )
+
+            # Attempting speech in live mode is blocked
+            with self.assertRaises(IncompatibleModalityEndpointError) as ctx_speech:
+                live_transport.dispatch("speech", {"model": "openai/whisper-large-v3:free", "audio_bytes": "abc"})
+            self.assertIn("PILOT_SCOPE_RESTRICTION", str(ctx_speech.exception))
+
+            # Attempting embedding in live mode is blocked
+            with self.assertRaises(IncompatibleModalityEndpointError) as ctx_embed:
+                live_transport.dispatch("embedding", {"model": "baai/bge-large-en-v1.5:free", "input": "test"})
+            self.assertIn("PILOT_SCOPE_RESTRICTION", str(ctx_embed.exception))
+
+    def test_30_ttft_metric_reported_unknown_without_streaming(self) -> None:
+        """Revisão 6 - Métricas: TTFT reportado explicitamente como UNKNOWN e None quando sem streaming."""
+        runner = ModelBenchmarkRunner(
+            registry=self.registry,
+            cost_guard=self.cost_guard,
+            ledger=self.ledger,
+        )
+
+        res = runner.execute_task(
+            "meta-llama/llama-3.2-3b-instruct:free",
+            ModelModality.TEXT,
+            {"prompt": "TTFT measurement test"},
+        )
+        self.assertTrue(res.success)
+        self.assertIsNone(res.ttft_ms, "Em chamadas não-streaming, TTFT numérico deve ser None")
+        self.assertEqual(res.ttft_provenance, MetricProvenance.UNKNOWN)
+
+        res_dict = res.to_dict()
+        self.assertIn("ttft_ms", res_dict)
+        self.assertIsNone(res_dict["ttft_ms"])
+        self.assertEqual(res_dict["ttft_provenance"], "UNKNOWN")
 
 
 if __name__ == "__main__":

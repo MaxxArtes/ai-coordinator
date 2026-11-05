@@ -59,6 +59,8 @@ class ModelBenchmarkRunResult:
     error_message: Optional[str]
     timestamp: str
     metadata: Dict[str, Any]
+    ttft_ms: Optional[float] = None
+    ttft_provenance: MetricProvenance = MetricProvenance.UNKNOWN
 
     @property
     def reported_tokens(self) -> Dict[str, int]:
@@ -81,6 +83,8 @@ class ModelBenchmarkRunResult:
             "error_message": self.error_message,
             "timestamp": self.timestamp,
             "metadata": self.metadata,
+            "ttft_ms": round(self.ttft_ms, 4) if self.ttft_ms is not None else None,
+            "ttft_provenance": self.ttft_provenance.value,
         }
 
 

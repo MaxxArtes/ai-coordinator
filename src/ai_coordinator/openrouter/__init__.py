@@ -7,6 +7,9 @@ from .registry import (
     PricingStatus,
     InvalidPricingError,
     StaleCatalogError,
+    UntrustedCatalogSourceError,
+    OfficialOpenRouterCatalogClient,
+    AuthenticatedCatalogSnapshot,
     parse_float_cost,
 )
 from .cost_guard import (
@@ -65,6 +68,9 @@ __all__ = [
     "PricingStatus",
     "InvalidPricingError",
     "StaleCatalogError",
+    "UntrustedCatalogSourceError",
+    "OfficialOpenRouterCatalogClient",
+    "AuthenticatedCatalogSnapshot",
     "parse_float_cost",
     "FreeCostGuard",
     "CostGuardError",
