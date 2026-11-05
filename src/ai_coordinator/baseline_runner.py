@@ -373,33 +373,22 @@ class BaselineEnvironmentMetadata:
         dataset_hashes: Optional[Dict[str, str]] = None,
         task_execution_order: Optional[List[str]] = None,
         iterations: int = 1,
+        cwd: Optional[str] = None,
     ) -> BaselineEnvironmentMetadata:
         git_sha = "unknown"
         git_branch = "unknown"
         git_dirty = False
         try:
-            res = subprocess.run(
-                ["git", "rev-parse", "HEAD"],
-                capture_output=True,
-                text=True,
-                timeout=3.0,
-            )
+            cmd_kwargs: Dict[str, Any] = {"capture_output": True, "text": True, "timeout": 3.0}
+            if cwd:
+                cmd_kwargs["cwd"] = cwd
+            res = subprocess.run(["git", "rev-parse", "HEAD"], **cmd_kwargs)
             if res.returncode == 0:
                 git_sha = res.stdout.strip()
-            res_branch = subprocess.run(
-                ["git", "branch", "--show-current"],
-                capture_output=True,
-                text=True,
-                timeout=3.0,
-            )
+            res_branch = subprocess.run(["git", "branch", "--show-current"], **cmd_kwargs)
             if res_branch.returncode == 0:
                 git_branch = res_branch.stdout.strip()
-            res_status = subprocess.run(
-                ["git", "status", "--porcelain"],
-                capture_output=True,
-                text=True,
-                timeout=3.0,
-            )
+            res_status = subprocess.run(["git", "status", "--porcelain"], **cmd_kwargs)
             if res_status.returncode == 0:
                 git_dirty = len(res_status.stdout.strip()) > 0
         except Exception:
@@ -453,6 +442,9 @@ class BaselineExecutionReport:
     success_rates: Dict[str, float]
     integrity_hash: str = ""
     oracle_signature: Optional[str] = None
+    digital_signature: Optional[str] = None
+    signature_algorithm: Optional[str] = None
+    public_key_fingerprint: Optional[str] = None
     task_results_digest: str = ""
     created_at: str = field(default_factory=lambda: dt.datetime.now(dt.timezone.utc).isoformat())
 
@@ -564,6 +556,21 @@ class BaselineExecutionReport:
 
         return True
 
+    def verify_digital_signature(self, pubkey_source: Union[str, Dict[str, Any]]) -> bool:
+        """Verify the public digital signature of the canonical root manifest using RSASSA-PKCS1-v1_5."""
+        if not self.digital_signature:
+            return False
+        from .crypto_signatures import load_public_key, rsa_verify
+        pub = load_public_key(pubkey_source)
+        manifest = self.compute_canonical_manifest()
+        canonical_bytes = json.dumps(_normalize_json_structure(manifest), sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode("utf-8")
+        return rsa_verify(
+            message_bytes=canonical_bytes,
+            signature_hex=self.digital_signature,
+            modulus_hex=pub["modulus"],
+            public_exponent=pub.get("public_exponent", 65537),
+        )
+
     def to_dict(self) -> Dict[str, Any]:
         return {
             "run_id": self.run_id,
@@ -578,6 +585,9 @@ class BaselineExecutionReport:
             "cost_aggregates": self.cost_aggregates,
             "integrity_hash": self.integrity_hash,
             "oracle_signature": self.oracle_signature,
+            "digital_signature": self.digital_signature,
+            "signature_algorithm": self.signature_algorithm,
+            "public_key_fingerprint": self.public_key_fingerprint,
             "task_execution_results": [r.to_dict() for r in self.task_execution_results],
         }
 
@@ -609,6 +619,9 @@ class BaselineExecutionReport:
             success_rates=d["success_rates"],
             integrity_hash=d.get("integrity_hash", ""),
             oracle_signature=d.get("oracle_signature"),
+            digital_signature=d.get("digital_signature"),
+            signature_algorithm=d.get("signature_algorithm"),
+            public_key_fingerprint=d.get("public_key_fingerprint"),
             task_results_digest=d.get("task_results_digest", ""),
             created_at=d.get("created_at", ""),
         )
@@ -617,9 +630,15 @@ class BaselineExecutionReport:
 class BaselineRunner:
     """Scientific benchmark runner for offline baseline execution without optimizations."""
 
-    def __init__(self, store: Optional[Any] = None, hmac_key: Optional[str] = None):
+    def __init__(
+        self,
+        store: Optional[Any] = None,
+        hmac_key: Optional[str] = None,
+        signing_private_key: Optional[Union[str, Dict[str, Any]]] = None,
+    ):
         self.store = store
         self.hmac_key = hmac_key
+        self.signing_private_key = signing_private_key
 
     def run_baseline(
         self,
@@ -856,8 +875,21 @@ class BaselineRunner:
         if self.hmac_key:
             oracle_signature = hmac.new(self.hmac_key.encode("utf-8"), manifest_bytes, hashlib.sha256).hexdigest()
 
+        digital_sig = None
+        sig_algo = None
+        pub_fp = None
+        if self.signing_private_key:
+            from .crypto_signatures import load_private_key, rsa_sign
+            priv = load_private_key(self.signing_private_key)
+            digital_sig = rsa_sign(manifest_bytes, priv["private_exponent"], priv["modulus"])
+            sig_algo = priv.get("algorithm", "RSASSA-PKCS1-v1_5-SHA256")
+            pub_fp = priv.get("fingerprint_sha256")
+
         return dataclasses.replace(
             report,
             integrity_hash=integrity_hash,
             oracle_signature=oracle_signature,
+            digital_signature=digital_sig,
+            signature_algorithm=sig_algo,
+            public_key_fingerprint=pub_fp,
         )

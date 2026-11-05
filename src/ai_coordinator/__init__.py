@@ -227,6 +227,13 @@ from .baseline_runner import (
     MetricDistribution,
     BaselineEnvironmentMetadata,
 )
+from .crypto_signatures import (
+    rsa_sign,
+    rsa_verify,
+    load_public_key,
+    load_private_key,
+    build_pkcs1_v15_padding,
+)
 
 __all__ = [
     "HumanWorkspace",
@@ -417,5 +424,10 @@ __all__ = [
     "TaskTimingBreakdown",
     "MetricDistribution",
     "BaselineEnvironmentMetadata",
+    "rsa_sign",
+    "rsa_verify",
+    "load_public_key",
+    "load_private_key",
+    "build_pkcs1_v15_padding",
 ]
 __version__ = "0.5.1"

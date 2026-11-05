@@ -9,6 +9,10 @@ backups/
 .env.*
 !.env.example
 *.log
+.keys/
+*.secret
+*privkey*
+
 
 # Python and package artifacts
 __pycache__/

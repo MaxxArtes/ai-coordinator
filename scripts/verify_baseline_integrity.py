@@ -6,40 +6,28 @@ using ONLY Python standard libraries (hashlib, hmac, json, math, os, sys).
 It does not depend on the ai_coordinator package, enabling independent third-party
 auditors to verify report integrity and authenticity without installing the coordinator.
 
-Security & Authentication Guarantees:
-1. Zero Process-Argument Secret Leakage:
-   HMAC keys are securely ingested via:
+Security & Authentication Architecture:
+1. Permanent Discontinuation of Direct CLI Secrets:
+   Passing secrets via --hmac-key or sys.argv is strictly rejected with a fatal error (CWE-214).
+   Secrets must only be ingested via:
    - Environment variables (--key-env NAME or default AI_COORDINATOR_HMAC_KEY)
    - Secure file reading (--key-file PATH)
    - Standard input stream (--key-stdin)
-   Secrets are NEVER logged, printed, or exposed in process arguments.
 
-2. Explicit Separation of Integrity vs. Authenticity:
-   - Mode 1 (SHA-256): Proves data has not been corrupted (structural integrity).
-     Explicitly states: "Autenticidade NÃO verificada (nenhuma chave HMAC fornecida)."
-   - Mode 2 (HMAC-SHA256): Proves provenance and cryptographic authorship.
-     States: "Integridade estrutural e autenticidade criptográfica confirmadas."
+2. Public-Key Asymmetric Digital Signature (RSASSA-PKCS1-v1_5 with SHA-256):
+   - Proves authentic authorship to external auditors without requiring any shared secrets.
+   - Verified against the project's published public key (keys/baseline_authority_pubkey.json
+     or custom path via --public-key PATH).
 
-3. Hierarchical Deep Audit:
-   - Root manifest SHA-256 hash
-   - Entire environment metadata dictionary (seeds, dataset_hashes, git_branch, git_dirty, versions)
-   - Deterministic task_results_digest covering all individual task executions
-   - Individual task report SHA-256 hashes and HMAC signatures
-   - Full round-trip fidelity including security_verdict taxonomy
+3. Internal Cluster HMAC-SHA256 Authentication:
+   - Provides symmetric mutual authentication for internal peer nodes and runners.
 
-Usage Examples:
-    # 1. Structural integrity check only (no secrets):
-    python scripts/verify_baseline_integrity.py --report baseline_reference_run.json
-
-    # 2. Cryptographic authentication via environment variable:
-    export AI_COORDINATOR_HMAC_KEY="my-secret"
-    python scripts/verify_baseline_integrity.py --report baseline_reference_run.json --key-env AI_COORDINATOR_HMAC_KEY
-
-    # 3. Cryptographic authentication via secure keyfile:
-    python scripts/verify_baseline_integrity.py --report baseline_reference_run.json --key-file /path/to/key.secret
-
-    # 4. Cryptographic authentication via stdin:
-    echo "my-secret" | python scripts/verify_baseline_integrity.py --report baseline_reference_run.json --key-stdin
+4. Hierarchical Deep Audit:
+   - Root manifest SHA-256 hash integrity.
+   - Asymmetric digital signature proof of authority.
+   - Deterministic task_results_digest matching all individual task results.
+   - Individual task report SHA-256 integrity and internal HMAC signatures.
+   - Full round-trip fidelity including security_verdict taxonomy.
 """
 from __future__ import annotations
 
@@ -51,6 +39,37 @@ import math
 import os
 import sys
 from typing import Any, Dict, List, Optional, Tuple
+
+# RFC 8017 / PKCS #1 v2.2 DigestInfo prefix for SHA-256
+SHA256_DIGEST_INFO = bytes.fromhex("3031300d060960864801650304020105000420")
+
+
+def rsa_verify_standalone(
+    message_bytes: bytes,
+    signature_hex: str,
+    modulus_hex: str,
+    public_exponent: int = 65537,
+    key_size_bytes: int = 256,
+) -> bool:
+    """Pure-Python standard-library verification of RSASSA-PKCS1-v1_5 SHA-256 signature."""
+    try:
+        sig_bytes = bytes.fromhex(signature_hex.strip())
+        if len(sig_bytes) != key_size_bytes:
+            return False
+        sig_int = int.from_bytes(sig_bytes, byteorder="big")
+        n = int(modulus_hex, 16)
+        if sig_int >= n:
+            return False
+        recovered_int = pow(sig_int, public_exponent, n)
+        recovered_em = recovered_int.to_bytes(key_size_bytes, byteorder="big")
+
+        digest = hashlib.sha256(message_bytes).digest()
+        t = SHA256_DIGEST_INFO + digest
+        ps_len = key_size_bytes - len(t) - 3
+        expected_em = b"\x00\x01" + (b"\xff" * ps_len) + b"\x00" + t
+        return hmac.compare_digest(recovered_em, expected_em)
+    except Exception:
+        return False
 
 
 def normalize_json_structure(data: Any) -> Any:
@@ -189,6 +208,7 @@ def compute_root_canonical_manifest(report_data: Dict[str, Any], task_digest: st
 def verify_standalone_baseline(
     report_data: Dict[str, Any],
     hmac_key: Optional[str] = None,
+    public_key_data: Optional[Dict[str, Any]] = None,
 ) -> Tuple[bool, List[str], Dict[str, Any]]:
     """Perform independent, zero-dependency cryptographic audit of the baseline report."""
     issues: List[str] = []
@@ -217,25 +237,42 @@ def verify_standalone_baseline(
     actual_root_hash = report_data.get("integrity_hash", "")
     audit_meta["expected_root_hash"] = expected_root_hash
     audit_meta["actual_root_hash"] = actual_root_hash
+    audit_meta["root_manifest_bytes"] = root_bytes
 
     if not actual_root_hash:
         issues.append("integrity_hash da raiz está ausente.")
     elif not hmac.compare_digest(actual_root_hash, expected_root_hash):
         issues.append(f"integrity_hash da raiz divergente: esperado '{expected_root_hash[:16]}...', obtido '{actual_root_hash[:16]}...'.")
 
-    # 3. Verify root HMAC-SHA256 signature (if hmac_key provided)
+    # 3. Verify Public Digital Signature (Asymmetric RSASSA-PKCS1-v1_5)
+    digital_sig = report_data.get("digital_signature")
+    audit_meta["actual_digital_signature"] = digital_sig
+    if digital_sig and public_key_data:
+        modulus = public_key_data.get("modulus", "")
+        pub_exp = public_key_data.get("public_exponent", 65537)
+        sig_valid = rsa_verify_standalone(root_bytes, digital_sig, modulus, pub_exp)
+        audit_meta["digital_signature_valid"] = sig_valid
+        if not sig_valid:
+            issues.append("digital_signature pública inválida (não confere com a chave pública da autoridade).")
+    elif digital_sig and not public_key_data:
+        audit_meta["digital_signature_valid"] = None
+        issues.append("digital_signature está presente no relatório, mas nenhuma chave pública foi fornecida para auditoria.")
+    else:
+        audit_meta["digital_signature_valid"] = None
+
+    # 4. Verify root HMAC-SHA256 signature (if internal hmac_key provided)
     if hmac_key is not None:
         actual_root_sig = report_data.get("oracle_signature")
         audit_meta["actual_root_signature"] = actual_root_sig
         if not actual_root_sig:
-            issues.append("oracle_signature da raiz está ausente (obrigatório no modo autenticado).")
+            issues.append("oracle_signature da raiz está ausente (obrigatório no modo autenticado por chave HMAC).")
         else:
             expected_root_sig = hmac.new(hmac_key.encode("utf-8"), root_bytes, hashlib.sha256).hexdigest()
             audit_meta["expected_root_signature"] = expected_root_sig
             if not hmac.compare_digest(actual_root_sig, expected_root_sig):
                 issues.append("oracle_signature da raiz inválido (HMAC não confere com a chave fornecida).")
 
-    # 4. Deep verification of every individual task report
+    # 5. Deep verification of every individual task report
     for idx, task_entry in enumerate(task_results):
         t_id = task_entry.get("task_id", f"task_{idx}")
         it_idx = task_entry.get("iteration", 0)
@@ -305,31 +342,53 @@ def resolve_hmac_key(args: argparse.Namespace) -> Optional[str]:
     if default_env:
         return default_env.strip()
 
-    # Legacy fallback: CLI argument (with security notice)
-    if getattr(args, "hmac_key", None):
-        print(
-            "[AVISO DE SEGURANÇA] O fornecimento de segredo HMAC diretamente via linha de comando pode expor a chave a processos e logs. "
-            "Recomenda-se utilizar --key-env, --key-file ou --key-stdin.",
-            file=sys.stderr,
-        )
-        return str(args.hmac_key).strip()
+    return None
 
+
+def locate_public_key(custom_path: Optional[str] = None) -> Optional[Dict[str, Any]]:
+    """Locate and load authority public key for public audit verification."""
+    candidates = []
+    if custom_path:
+        candidates.append(custom_path)
+
+    # Search in default project locations
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    candidates.append(os.path.join(script_dir, "..", "keys", "baseline_authority_pubkey.json"))
+    candidates.append(os.path.join(os.getcwd(), "keys", "baseline_authority_pubkey.json"))
+
+    for p in candidates:
+        if os.path.exists(p):
+            try:
+                with open(p, "r", encoding="utf-8") as f:
+                    return json.load(f)
+            except Exception:
+                pass
     return None
 
 
 def main() -> int:
+    # Strict security barrier: permanently forbid direct secrets in sys.argv (CWE-214)
+    for arg in sys.argv[1:]:
+        if arg in ("--hmac-key", "-k") or arg.startswith("--hmac-key="):
+            print(
+                "[ERRO FATAL DE SEGURANÇA] O parâmetro legado '--hmac-key' foi permanentemente descontinuado para evitar vazamento de credenciais na tabela de processos do SO (CWE-214).\n"
+                "Utilize exclusivamente as opções seguras: --key-env, --key-file ou --key-stdin.",
+                file=sys.stderr,
+            )
+            return 2
+
     parser = argparse.ArgumentParser(
         description="Verificador Independente e Standalone de Baseline Científica (Fase 4C.0.5 — AI Coordinator)",
-        epilog="Exemplo seguro: python verify_baseline_integrity.py --report run.json --key-env AI_COORDINATOR_HMAC_KEY",
+        epilog="Exemplo seguro: python verify_baseline_integrity.py --report baseline_reference_run.json",
     )
     parser.add_argument("--report", "-r", required=True, help="Caminho para o arquivo JSON do relatório de baseline")
+    parser.add_argument("--public-key", "-p", default=None, help="Caminho para arquivo JSON de chave pública da autoridade para auditoria pública")
 
-    # Secure key ingestion options
-    key_group = parser.add_argument_group("Autenticação HMAC Segura (Escolha um método)")
+    # Secure internal HMAC key ingestion options
+    key_group = parser.add_argument_group("Autenticação HMAC Interna (Opcional — Para nós do cluster)")
     key_group.add_argument("--key-env", help="Nome da variável de ambiente que contém a chave secreta HMAC")
     key_group.add_argument("--key-file", help="Caminho para arquivo protegido contendo a chave secreta HMAC")
     key_group.add_argument("--key-stdin", action="store_true", help="Lê a chave secreta HMAC da entrada padrão (pipe)")
-    key_group.add_argument("--hmac-key", "-k", default=None, help="[Legado] Chave direta (desencorajado por segurança)")
 
     parser.add_argument("--cross-check", action="store_true", help="Executa também verificação cruzada com módulos internos do AI Coordinator se instalados")
     args = parser.parse_args()
@@ -345,25 +404,32 @@ def main() -> int:
         print(f"[ERRO] Falha ao decodificar JSON de '{args.report}': {exc}", file=sys.stderr)
         return 1
 
+    pubkey_data = locate_public_key(args.public_key)
     hmac_key = resolve_hmac_key(args)
 
-    mode_label = "AUTENTICADO (HMAC-SHA256)" if hmac_key else "INTEGRIDADE ESTRUTURAL (SHA-256)"
+    mode_label = "PÚBLICA (Assinatura Digital RSASSA-PKCS1-v1_5)" if raw_data.get("digital_signature") else "INTEGRIDADE ESTRUTURAL (SHA-256)"
+    if hmac_key:
+        mode_label += " + HMAC INTERNO"
+
     env_meta = raw_data.get("environment", {})
 
     print(f"===========================================================")
     print(f" AI Coordinator — Verificador Independente de Baseline")
     print(f"===========================================================")
     print(f"  Arquivo:          {args.report}")
-    print(f"  Modo:             {mode_label}")
+    print(f"  Modo de Auditoria:{mode_label}")
+    if pubkey_data and raw_data.get("digital_signature"):
+        print(f"  Autoridade:       {pubkey_data.get('authority', 'Desconhecida')} (Key ID: {pubkey_data.get('key_id')})")
+        print(f"  Fingerprint:      {pubkey_data.get('fingerprint_sha256', '')[:16]}...")
     print(f"  Run ID:           {raw_data.get('run_id', 'desconhecido')}")
     print(f"  Git Commit:       {str(env_meta.get('git_commit', ''))[:12]}...")
     print(f"  Git Branch:       {env_meta.get('git_branch', 'unknown')} (dirty={env_meta.get('git_dirty', False)})")
-    print(f"  Tarefas:          {raw_data.get('total_tasks_executed', 0)} ({raw_data.get('iterations', 0)} iterações)")
+    print(f"  Tarefas:          {raw_data.get('total_tasks_executed', 0)} ({raw_data.get('iterations', 0)} repetições)")
     print(f"  Dataset Versão:   {env_meta.get('dataset_version', 'desconhecido')}")
     print(f"  Pricing Versão:   {env_meta.get('pricing_registry_version', 'desconhecido')}")
     print(f"-----------------------------------------------------------")
 
-    valid, issues, audit_meta = verify_standalone_baseline(raw_data, hmac_key)
+    valid, issues, audit_meta = verify_standalone_baseline(raw_data, hmac_key, pubkey_data)
 
     # Optional cross-check with internal package if available
     internal_valid = None
@@ -373,32 +439,56 @@ def main() -> int:
             from ai_coordinator.baseline_runner import BaselineExecutionReport
             rep_obj = BaselineExecutionReport.from_dict(raw_data)
             internal_valid = rep_obj.verify_full_report_integrity(hmac_key)
+            if pubkey_data and raw_data.get("digital_signature"):
+                digital_ok = rep_obj.verify_digital_signature(pubkey_data)
+                internal_valid = internal_valid and digital_ok
         except Exception as exc:
             print(f"  [AVISO] Verificação cruzada interna não pôde ser executada: {exc}")
 
     print(f"  [1/4] Hash de Integridade Raiz:        {'[OK] VÁLIDO' if hmac.compare_digest(audit_meta.get('expected_root_hash', 'a'), audit_meta.get('actual_root_hash', 'b')) else '[FALHA] DIVERGENTE'}")
     print(f"  [2/4] Digest Canônico das Tarefas:     {'[OK] VÁLIDO' if hmac.compare_digest(audit_meta.get('expected_task_digest', 'a'), audit_meta.get('actual_task_digest', 'b')) else '[FALHA] DIVERGENTE'}")
 
+    # Digital signature status
+    if raw_data.get("digital_signature"):
+        dig_val = audit_meta.get("digital_signature_valid")
+        if dig_val is True:
+            print(f"  [3a/4] Assinatura Digital Pública:     [OK] AUTÊNTICA (Comprovada por Chave Pública Oficial)")
+        elif dig_val is False:
+            print(f"  [3a/4] Assinatura Digital Pública:     [FALHA] INVÁLIDA OU ADULTERADA")
+        else:
+            print(f"  [3a/4] Assinatura Digital Pública:     [PENDENTE - Chave pública não encontrada]")
+    else:
+        print(f"  [3a/4] Assinatura Digital Pública:     [IGNORADO - Modo sem assinatura digital]")
+
+    # Internal HMAC status
     if hmac_key:
         sig_match = audit_meta.get("actual_root_signature") and hmac.compare_digest(audit_meta.get("expected_root_signature", "a"), audit_meta.get("actual_root_signature", "b"))
-        print(f"  [3/4] Assinatura HMAC Raiz:            {'[OK] AUTÊNTICA' if sig_match else '[FALHA] INVÁLIDA OU AUSENTE'}")
+        print(f"  [3b/4] Assinatura HMAC Interna:        {'[OK] AUTÊNTICA' if sig_match else '[FALHA] INVÁLIDA OU AUSENTE'}")
     else:
-        print(f"  [3/4] Assinatura HMAC Raiz:            [IGNORADO - Modo sem chave]")
+        print(f"  [3b/4] Assinatura HMAC Interna:        [IGNORADO - Modo sem chave interna]")
 
-    print(f"  [4/4] Verificação Profunda Completa:    {'[OK] APROVADA' if valid else '[FALHA] REPROVADA'}")
+    print(f"  [4/4] Verificação Profunda Completa:   {'[OK] APROVADA' if valid else '[FALHA] REPROVADA'}")
     if internal_valid is not None:
         print(f"  [CROSS-CHECK] Validador Interno:       {'[OK] CONCORDANTE' if internal_valid == valid else '[DIVERGÊNCIA]'}")
     print(f"===========================================================")
 
     if valid:
-        if hmac_key:
+        has_dig_sig = audit_meta.get("digital_signature_valid") is True
+        if has_dig_sig:
+            print(f"\n>>> SUCESSO: Integridade estrutural e autenticidade pública comprovadas criptograficamente.")
+            print(f"    Não requer nenhum segredo compartilhado. Prova de autoria pública confirmada.")
+            print(f"    Hash Raiz:    {audit_meta.get('actual_root_hash')}")
+            print(f"    Digest Tasks: {audit_meta.get('actual_task_digest')}")
+            if hmac_key:
+                print(f"    HMAC Raiz:    {audit_meta.get('actual_root_signature')}")
+        elif hmac_key:
             print(f"\n>>> SUCESSO: Integridade estrutural e autenticidade criptográfica confirmadas (HMAC-SHA256 válido).")
             print(f"    Hash Raiz:    {audit_meta.get('actual_root_hash')}")
             print(f"    Digest Tasks: {audit_meta.get('actual_task_digest')}")
             print(f"    HMAC Raiz:    {audit_meta.get('actual_root_signature')}")
         else:
             print(f"\n>>> SUCESSO: Integridade estrutural confirmada (SHA-256).")
-            print(f"    AVISO: Autenticidade NÃO verificada (nenhuma chave HMAC fornecida).")
+            print(f"    AVISO: Autenticidade NÃO verificada (nenhuma chave pública ou HMAC fornecida).")
             print(f"    Hash Raiz:    {audit_meta.get('actual_root_hash')}")
             print(f"    Digest Tasks: {audit_meta.get('actual_task_digest')}")
         return 0

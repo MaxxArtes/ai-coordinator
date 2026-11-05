@@ -392,7 +392,7 @@ class TestPhase4CBaselineExecution(unittest.TestCase):
         )
         self.assertEqual(res_no_key.returncode, 0)
         self.assertIn("Integridade estrutural confirmada (SHA-256)", res_no_key.stdout)
-        self.assertIn("AVISO: Autenticidade NÃO verificada (nenhuma chave HMAC fornecida)", res_no_key.stdout)
+        self.assertIn("AVISO: Autenticidade NÃO verificada", res_no_key.stdout)
         self.assertNotIn("100% íntegro e autêntico", res_no_key.stdout)
 
         # Case E: Isolated alteration of security_verdict is detected and rejected
@@ -432,6 +432,156 @@ class TestPhase4CBaselineExecution(unittest.TestCase):
         )
         self.assertEqual(res_empty.returncode, 1)
         self.assertIn("REPROVADO", res_empty.stderr)
+
+    def test_08_discontinuation_of_hmac_key_cli_argument(self) -> None:
+        """Validate permanent discontinuation and fatal rejection of --hmac-key / -k arguments (CWE-214)."""
+        script_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "scripts", "verify_baseline_integrity.py"))
+        report_path = os.path.join(self.test_dir, "dummy_report.json")
+        with open(report_path, "w", encoding="utf-8") as f:
+            json.dump({"run_id": "dummy"}, f)
+
+        # Test --hmac-key
+        res_long = subprocess.run(
+            [sys.executable, script_path, "--report", report_path, "--hmac-key", "secret123"],
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(res_long.returncode, 2, "Passagem de --hmac-key deve ser fatalmente rejeitada")
+        self.assertIn("permanentemente descontinuado", res_long.stderr)
+        self.assertIn("CWE-214", res_long.stderr)
+
+        # Test -k
+        res_short = subprocess.run(
+            [sys.executable, script_path, "--report", report_path, "-k", "secret123"],
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(res_short.returncode, 2, "Passagem de -k deve ser fatalmente rejeitada")
+        self.assertIn("permanentemente descontinuado", res_short.stderr)
+
+    def test_09_public_key_asymmetric_digital_signatures(self) -> None:
+        """Validate asymmetric RSASSA-PKCS1-v1_5 digital signing and public audit verification."""
+        repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+        pubkey_path = os.path.join(repo_root, "keys", "baseline_authority_pubkey.json")
+        privkey_path = os.path.join(repo_root, ".keys", "baseline_authority_privkey.json")
+
+        self.assertTrue(os.path.exists(pubkey_path), "Chave pública oficial deve existir no repositório")
+        if not os.path.exists(privkey_path):
+            self.skipTest("Chave privada local não encontrada neste runner (teste de geração oficial)")
+
+        with open(pubkey_path, "r", encoding="utf-8") as f:
+            pub_data = json.load(f)
+        with open(privkey_path, "r", encoding="utf-8") as f:
+            priv_data = json.load(f)
+
+        runner = BaselineRunner(store=self.store, hmac_key=self.hmac_secret, signing_private_key=priv_data)
+        report = runner.run_baseline(iterations=1)
+
+        # 1. Assert digital signature presence and structure
+        self.assertIsNotNone(report.digital_signature)
+        self.assertEqual(len(report.digital_signature), 512, "Assinatura RSA-2048 deve conter 512 caracteres hex")
+        self.assertEqual(report.signature_algorithm, "RSASSA-PKCS1-v1_5-SHA256")
+        self.assertEqual(report.public_key_fingerprint, pub_data.get("fingerprint_sha256"))
+
+        # 2. In-memory digital signature verification
+        self.assertTrue(report.verify_digital_signature(pub_data))
+
+        # 3. CLI public audit verification
+        report_path = os.path.join(self.test_dir, "test_digital_sig_report.json")
+        with open(report_path, "w", encoding="utf-8") as f:
+            json.dump(report.to_dict(), f, indent=2)
+
+        script_path = os.path.join(repo_root, "scripts", "verify_baseline_integrity.py")
+        res_cli = subprocess.run(
+            [sys.executable, script_path, "--report", report_path, "--public-key", pubkey_path],
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(res_cli.returncode, 0)
+        self.assertIn("Assinatura Digital Pública:     [OK] AUTÊNTICA (Comprovada por Chave Pública Oficial)", res_cli.stdout)
+        self.assertIn("autenticidade pública comprovadas criptograficamente", res_cli.stdout)
+
+        # 4. Adversarial: Tampered signature is rejected
+        tampered_dict = report.to_dict()
+        tampered_dict["digital_signature"] = "a" * 512
+        with open(report_path, "w", encoding="utf-8") as f:
+            json.dump(tampered_dict, f, indent=2)
+
+        res_bad_sig = subprocess.run(
+            [sys.executable, script_path, "--report", report_path, "--public-key", pubkey_path],
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(res_bad_sig.returncode, 1)
+        self.assertIn("REPROVADO", res_bad_sig.stderr)
+        self.assertIn("digital_signature pública inválida", res_bad_sig.stderr)
+
+    def test_10_codebase_security_scanner_zero_hardcoded_secrets(self) -> None:
+        """Scan codebase to assert complete absence of exposed credentials and hardcoded HMAC fallbacks."""
+        repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+        banned_literal = "-".join(["ai", "coordinator", "baseline", "v0.5.1", "reference", "secret", "2026"])
+
+        scanned_count = 0
+        for root, dirs, files in os.walk(repo_root):
+            # Skip git and cache directories
+            dirs[:] = [d for d in dirs if d not in (".git", "__pycache__", ".venv", "venv", "dist", "build", ".keys")]
+            for fname in files:
+                if fname.endswith((".py", ".md", ".json", ".yml", ".yaml")):
+                    fpath = os.path.join(root, fname)
+                    # Skip test file itself when scanning for banned literal definition
+                    if "test_phase4c_baseline_execution.py" in fname:
+                        continue
+                    scanned_count += 1
+                    with open(fpath, "r", encoding="utf-8", errors="ignore") as f:
+                        content = f.read()
+                    self.assertNotIn(
+                        banned_literal,
+                        content,
+                        f"A chave legada exposta '{banned_literal}' foi detectada em '{fpath}'.",
+                    )
+                    # For Python source files, forbid hardcoded fallback in AI_COORDINATOR_HMAC_KEY
+                    if fname.endswith(".py") and "test" not in fname:
+                        self.assertNotIn(
+                            'os.environ.get("AI_COORDINATOR_HMAC_KEY", "',
+                            content,
+                            f"Arquivo de produção '{fpath}' contém fallback de chave HMAC hardcoded.",
+                        )
+                        self.assertNotIn(
+                            "os.environ.get('AI_COORDINATOR_HMAC_KEY', '",
+                            content,
+                            f"Arquivo de produção '{fpath}' contém fallback de chave HMAC hardcoded.",
+                        )
+        self.assertGreater(scanned_count, 10, "Scanner de segurança deve inspecionar múltiplos arquivos")
+
+    def test_11_automated_markdown_report_generator_fidelity(self) -> None:
+        """Validate that generate_baseline_report_md produces exact parity between JSON and Markdown."""
+        repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+        gen_script = os.path.join(repo_root, "scripts", "generate_baseline_report_md.py")
+        self.assertTrue(os.path.exists(gen_script), "Script de geração de Markdown deve existir")
+
+        runner = BaselineRunner(store=self.store)
+        report = runner.run_baseline(iterations=1)
+        json_path = os.path.join(self.test_dir, "test_fidelity_run.json")
+        md_path = os.path.join(self.test_dir, "test_fidelity_report.md")
+
+        with open(json_path, "w", encoding="utf-8") as f:
+            json.dump(report.to_dict(), f, indent=2)
+
+        res = subprocess.run([sys.executable, gen_script, json_path, md_path], capture_output=True, text=True)
+        self.assertEqual(res.returncode, 0)
+        self.assertTrue(os.path.exists(md_path))
+
+        with open(md_path, "r", encoding="utf-8") as f:
+            md_text = f.read()
+
+        # Assert parity of critical fields
+        self.assertIn(f"`{report.environment.git_commit}`", md_text)
+        self.assertIn(f"`{report.environment.python_version}`", md_text)
+        self.assertIn(f"`{report.environment.git_dirty}`", md_text)
+        self.assertIn(f"{report.token_aggregates['total_input_tokens']:,} tokens", md_text)
+        self.assertIn(f"{report.token_aggregates['total_output_tokens']:,} tokens", md_text)
+        self.assertIn(f"{report.token_aggregates['total_tokens']:,} tokens", md_text)
+
 
 
 if __name__ == "__main__":
