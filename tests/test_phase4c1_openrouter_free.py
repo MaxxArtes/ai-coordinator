@@ -11,11 +11,18 @@ Validates:
 8. Sliding window rate limiter with quota consumption on every retry attempt.
 9. Persistent rate limiter and persistent availability audit ledger.
 10. Retry-After header awareness and real backoff delay execution.
-11. Metric provenance classification (SYNTHETIC vs MEASURED).
+11. Metric provenance classification (SYNTHETIC vs MEASURED vs UNKNOWN).
 12. HTTP transport default fail-closed state and mocked network dispatch.
+13. Centralized Egress Point: transport.dispatch() cannot bypass CostGuard.
+14. Catalog freshness TTL enforcement: stale catalog raises StaleCatalogError.
+15. Atomic cross-process SQLite quota reservation race condition protection.
+16. Ledger persistence failure fail-closed behavior (AuditPersistenceError).
+17. Responses missing 'usage' field are classified strictly as UNKNOWN.
+18. Unknown modalities reject fail-closed without fallback to /chat/completions.
 """
 from __future__ import annotations
 
+import concurrent.futures
 import io
 import json
 import os
@@ -27,6 +34,7 @@ import urllib.error
 
 from ai_coordinator.openrouter import (
     AmbiguousRoutingError,
+    AuditPersistenceError,
     AvailabilityEvent,
     AvailabilityEventType,
     AvailabilityLedger,
@@ -41,6 +49,7 @@ from ai_coordinator.openrouter import (
     FreeCostGuard,
     FreeModelRegistry,
     HttpResponse,
+    IncompatibleModalityEndpointError,
     IncompatibleModalityError,
     InvalidPricingError,
     LiveNetworkDisabledError,
@@ -53,11 +62,14 @@ from ai_coordinator.openrouter import (
     OpenRouterHttpTransport,
     PaidFallbackBlockedError,
     PricingStatus,
+    QuotaPersistenceError,
     RateLimitExceededError,
     RerankModelAdapter,
     RetryPolicy,
+    SQLiteQuotaStore,
     SlidingWindowRateLimiter,
     SpeechModelAdapter,
+    StaleCatalogError,
     TextModelAdapter,
     UnauthorizedModelError,
     parse_float_cost,
@@ -129,7 +141,6 @@ def build_synthetic_openrouter_catalog() -> dict:
                 },
                 "created": 1715000000,
             },
-            # Adversarial model: has :free suffix BUT positive pricing! (Must be rejected)
             {
                 "id": "adversarial/sneaky-model:free",
                 "name": "Adversarial Sneaky Model",
@@ -139,7 +150,6 @@ def build_synthetic_openrouter_catalog() -> dict:
                 "architecture": {"modality": "text->text"},
                 "created": 1735000000,
             },
-            # Paid models (Must be blocked strictly)
             {
                 "id": "openai/gpt-4o",
                 "name": "OpenAI: GPT-4o",
@@ -173,7 +183,7 @@ class TestPhase4C1OpenRouterFree(unittest.TestCase):
 
     def setUp(self) -> None:
         self.raw_catalog = build_synthetic_openrouter_catalog()
-        self.registry = FreeModelRegistry()
+        self.registry = FreeModelRegistry(max_age_seconds=3600.0)
         self.registry.load_catalog_data(self.raw_catalog, timestamp="2026-11-05T10:00:00Z")
         self.cost_guard = FreeCostGuard(self.registry)
         self.ledger = AvailabilityLedger()
@@ -200,10 +210,11 @@ class TestPhase4C1OpenRouterFree(unittest.TestCase):
         self.assertEqual(len(embed_models), 1)
         self.assertEqual(embed_models[0].id, "baai/bge-large-en-v1.5:free")
 
-        # Verify Speech Modality
+        # Verify Speech Modality (Transcription)
         speech_models = self.registry.get_by_modality(ModelModality.SPEECH)
         self.assertEqual(len(speech_models), 1)
         self.assertEqual(speech_models[0].id, "openai/whisper-large-v3:free")
+        self.assertIn(ModelModality.SPEECH_TRANSCRIPTION, speech_models[0].modalities)
 
         # Verify Decision Modality
         decision_models = self.registry.get_by_modality(ModelModality.DECISIONS)
@@ -213,13 +224,11 @@ class TestPhase4C1OpenRouterFree(unittest.TestCase):
 
     def test_02_cost_guard_fail_closed_adversarial_rejections(self) -> None:
         """Validate strict fail-closed rejection of paid models, fallbacks, and uncataloged endpoints."""
-        # 1. Free models pass authorization
         entry = self.cost_guard.authorize_model_execution("meta-llama/llama-3.2-3b-instruct:free")
         self.assertEqual(entry.pricing.prompt, 0.0)
         self.assertEqual(entry.pricing.completion, 0.0)
         self.assertTrue(entry.is_free)
 
-        # 2. Paid models are immediately rejected (fail-closed)
         with self.assertRaises(UnauthorizedModelError) as ctx_paid:
             self.cost_guard.authorize_model_execution("openai/gpt-4o")
         self.assertIn("terminantemente proibidas", str(ctx_paid.exception))
@@ -227,24 +236,20 @@ class TestPhase4C1OpenRouterFree(unittest.TestCase):
         with self.assertRaises(UnauthorizedModelError):
             self.cost_guard.authorize_model_execution("anthropic/claude-3.5-sonnet")
 
-        # 3. Adversarial model with :free suffix but positive price is rejected
         with self.assertRaises(UnauthorizedModelError):
             self.cost_guard.authorize_model_execution("adversarial/sneaky-model:free")
 
-        # 4. Uncataloged / missing models fail closed
         with self.assertRaises(UnauthorizedModelError) as ctx_missing:
             self.cost_guard.authorize_model_execution("unknown-org/stealth-model")
         self.assertIn("não foi encontrado no catálogo", str(ctx_missing.exception))
 
-        # 5. Prohibit paid fallback chains
         with self.assertRaises(PaidFallbackBlockedError) as ctx_fallback:
             self.cost_guard.sanitize_fallback_targets([
                 "meta-llama/llama-3.2-3b-instruct:free",
-                "openai/gpt-4o",  # Paid!
+                "openai/gpt-4o",
             ])
         self.assertIn("Tentativa de fallback bloqueada", str(ctx_fallback.exception))
 
-        # 6. Payload inspection blocks paid models in request dict
         with self.assertRaises(UnauthorizedModelError):
             self.cost_guard.inspect_request_payload({"model": "openai/gpt-4o", "prompt": "hello"})
 
@@ -252,42 +257,32 @@ class TestPhase4C1OpenRouterFree(unittest.TestCase):
 
     def test_03_parse_float_cost_adversarial_validation(self) -> None:
         """Determinação 1: parse_float_cost deve lançar InvalidPricingError para ausentes, negativos, NaN ou Inf."""
-        # Valid zero and positive
         self.assertEqual(parse_float_cost("0"), 0.0)
         self.assertEqual(parse_float_cost(0.0), 0.0)
         self.assertEqual(parse_float_cost("0.000005"), 0.000005)
 
-        # Missing (None) must raise InvalidPricingError
         with self.assertRaises(InvalidPricingError):
             parse_float_cost(None)
-
-        # Negative must raise InvalidPricingError
         with self.assertRaises(InvalidPricingError):
             parse_float_cost("-0.01")
         with self.assertRaises(InvalidPricingError):
             parse_float_cost(-5.0)
-
-        # NaN and Inf must raise InvalidPricingError
         with self.assertRaises(InvalidPricingError):
             parse_float_cost("NaN")
         with self.assertRaises(InvalidPricingError):
             parse_float_cost("Infinity")
         with self.assertRaises(InvalidPricingError):
             parse_float_cost(float("inf"))
-
-        # Malformed strings must raise InvalidPricingError
         with self.assertRaises(InvalidPricingError):
             parse_float_cost("invalid_cost_string")
 
     def test_04_free_qualification_requires_conjunction_and_rejects_free_suffix_alone(self) -> None:
-        """Determinação 2: Exigir conjunção obrigatória de preço zero em todas as dimensões. Sufixo :free isolado não basta."""
-        # Model with :free suffix but non-zero prompt cost
+        """Determinação 2: Exigir conjunção obrigatória de preço zero em todas as dimensões."""
         entry = self.registry.get_model("adversarial/sneaky-model:free")
         self.assertIsNotNone(entry)
-        self.assertFalse(entry.is_free, "Modelo com preço > 0 não pode ser qualificado como gratuito mesmo com sufixo :free")
+        self.assertFalse(entry.is_free)
         self.assertEqual(entry.pricing.status, PricingStatus.PAID)
 
-        # Incomplete catalog entry with NaN pricing
         corrupt_catalog = {
             "data": [
                 {
@@ -305,14 +300,12 @@ class TestPhase4C1OpenRouterFree(unittest.TestCase):
 
     def test_05_routing_and_fallback_adversarial_inspection(self) -> None:
         """Determinação 3: Eliminar rotas ambíguas, fallbacks implícitos e parâmetros de roteamento desconhecidos."""
-        # 1. Valid payload with free model
         self.cost_guard.inspect_request_payload({"model": "meta-llama/llama-3.2-3b-instruct:free"})
 
-        # 2. Unknown route parameter must raise AmbiguousRoutingError
         with self.assertRaises(AmbiguousRoutingError):
             self.cost_guard.inspect_request_payload({
                 "model": "meta-llama/llama-3.2-3b-instruct:free",
-                "route": "cheapest",  # Ambiguous/unknown
+                "route": "cheapest",
             })
 
         with self.assertRaises(AmbiguousRoutingError):
@@ -321,14 +314,12 @@ class TestPhase4C1OpenRouterFree(unittest.TestCase):
                 "route": "paid",
             })
 
-        # 3. Route fallback without explicit models list
         with self.assertRaises(AmbiguousRoutingError):
             self.cost_guard.inspect_request_payload({
                 "model": "meta-llama/llama-3.2-3b-instruct:free",
                 "route": "fallback",
             })
 
-        # 4. Route fallback with paid model in models list
         with self.assertRaises(PaidFallbackBlockedError):
             self.cost_guard.inspect_request_payload({
                 "model": "meta-llama/llama-3.2-3b-instruct:free",
@@ -336,7 +327,6 @@ class TestPhase4C1OpenRouterFree(unittest.TestCase):
                 "models": ["google/gemini-2.0-flash-exp:free", "openai/gpt-4o"],
             })
 
-        # 5. Route fallback with strictly free models list succeeds
         self.cost_guard.inspect_request_payload({
             "model": "meta-llama/llama-3.2-3b-instruct:free",
             "route": "fallback",
@@ -346,17 +336,14 @@ class TestPhase4C1OpenRouterFree(unittest.TestCase):
     def test_06_modality_and_tools_compatibility_enforcement(self) -> None:
         """Determinação 4: Bloquear modelos cuja modalidade ou parâmetros obrigatórios não tenham suporte comprovado."""
         text_adapter = TextModelAdapter(self.cost_guard)
-        # Attempting to call Text adapter with an Embedding-only model must raise IncompatibleModalityError
         with self.assertRaises(IncompatibleModalityError) as ctx_mod:
             text_adapter.execute("baai/bge-large-en-v1.5:free", {"prompt": "Hello"})
         self.assertIn("não declara suporte à modalidade 'text'", str(ctx_mod.exception))
 
-        # Attempting to call Rerank adapter with a Speech model must raise IncompatibleModalityError
         rerank_adapter = RerankModelAdapter(self.cost_guard)
         with self.assertRaises(IncompatibleModalityError):
             rerank_adapter.execute("openai/whisper-large-v3:free", {"query": "q", "documents": ["d"]})
 
-        # Decision adapter requiring tools on a model without tool support must raise IncompatibleModalityError
         decision_adapter = DecisionModelAdapter(self.cost_guard)
         with self.assertRaises(IncompatibleModalityError) as ctx_tools:
             decision_adapter.execute("baai/bge-large-en-v1.5:free", {
@@ -367,23 +354,18 @@ class TestPhase4C1OpenRouterFree(unittest.TestCase):
 
     def test_07_embedded_credential_detection_in_text(self) -> None:
         """Determinação 7: Detectar credenciais e segredos embutidos em textos e rejeitar preventivamente."""
-        # Bearer token embedded in prompt text
         with self.assertRaises(ConfidentialDataDetectedError):
             scrub_outbound_payload({"prompt": "User query with Authorization: Bearer 1234567890abcdef1234567890"})
 
-        # OpenRouter API key embedded in text
         with self.assertRaises(ConfidentialDataDetectedError):
             scrub_outbound_payload({"prompt": "Debug output sk-or-v1-abcdef0123456789abcdef0123456789"})
 
-        # OpenAI API key embedded in text
         with self.assertRaises(ConfidentialDataDetectedError):
             scrub_outbound_payload({"prompt": "Key sk-1234567890123456789012345"})
 
-        # Private key PEM block embedded in text
         with self.assertRaises(ConfidentialDataDetectedError):
             scrub_outbound_payload({"prompt": "-----BEGIN RSA PRIVATE KEY-----\nMIIEowIBAAKCAQEA..."})
 
-        # Normal text passes without error
         clean_res = scrub_outbound_payload({"prompt": "Normal safe prompt without secrets", "max_tokens": 100})
         self.assertEqual(clean_res["prompt"], "Normal safe prompt without secrets")
 
@@ -415,13 +397,11 @@ class TestPhase4C1OpenRouterFree(unittest.TestCase):
         res = runner.execute_task("meta-llama/llama-3.2-3b-instruct:free", ModelModality.TEXT, {"prompt": "Retry test"})
         self.assertTrue(res.success)
         self.assertEqual(call_count, 3)
-        self.assertEqual(len(mock_sleeps), 2)  # Two retries occurred
+        self.assertEqual(len(mock_sleeps), 2)
 
-        # Crucial check: all 3 attempts consumed quota from the rate limiter!
         self.assertEqual(limiter.requests_in_current_minute, 3)
         self.assertEqual(limiter.requests_in_current_day, 3)
 
-        # 4th request in the same minute must be blocked by rate limit
         res_blocked = runner.execute_task("meta-llama/llama-3.2-3b-instruct:free", ModelModality.TEXT, {"prompt": "Throttled"})
         self.assertFalse(res_blocked.success)
         self.assertEqual(res_blocked.status_code, 429)
@@ -440,7 +420,6 @@ class TestPhase4C1OpenRouterFree(unittest.TestCase):
             sleeper=lambda d: delays_executed.append(d),
         )
 
-        # Handler returns 429 with Retry-After: 4.5s
         def retry_after_handler(inputs: dict) -> dict:
             return {"success": False, "status_code": 429, "retry_after_sec": 4.5}
 
@@ -450,7 +429,6 @@ class TestPhase4C1OpenRouterFree(unittest.TestCase):
         res = runner.execute_task("meta-llama/llama-3.2-3b-instruct:free", ModelModality.TEXT, {"prompt": "Throttled prompt"})
         self.assertFalse(res.success)
         self.assertEqual(len(delays_executed), 1)
-        # Delay must respect the 4.5s Retry-After value
         self.assertGreaterEqual(delays_executed[0], 4.5)
 
     def test_10_availability_ledger_synchronous_persistence(self) -> None:
@@ -465,7 +443,6 @@ class TestPhase4C1OpenRouterFree(unittest.TestCase):
 
             self.assertTrue(os.path.exists(audit_path))
 
-            # Simulate process restart by creating a new ledger instance reading the same file
             recovered_ledger = AvailabilityLedger(storage_path=audit_path)
             events = recovered_ledger.get_events_for_model("meta-llama/llama-3.2-3b-instruct:free")
             self.assertEqual(len(events), 2)
@@ -483,7 +460,6 @@ class TestPhase4C1OpenRouterFree(unittest.TestCase):
 
         res = runner.execute_task("meta-llama/llama-3.2-3b-instruct:free", ModelModality.TEXT, {"prompt": "Metric test"})
         self.assertTrue(res.success)
-        # Mock execution must have SYNTHETIC provenance
         self.assertEqual(res.token_provenance, MetricProvenance.SYNTHETIC)
         self.assertEqual(res.latency_provenance, MetricProvenance.SYNTHETIC)
         self.assertIn("prompt_tokens", res.tokens)
@@ -491,13 +467,11 @@ class TestPhase4C1OpenRouterFree(unittest.TestCase):
 
     def test_12_http_transport_fail_closed_and_mocked_network_dispatch(self) -> None:
         """Determinação 10: Transporte HTTP real desativado por padrão (fail-closed) e testado com respostas mockadas."""
-        # 1. Default transport raises LiveNetworkDisabledError
-        transport = OpenRouterHttpTransport(live_network_enabled=False)
+        transport = OpenRouterHttpTransport(cost_guard=self.cost_guard, live_network_enabled=False)
         with self.assertRaises(LiveNetworkDisabledError) as ctx_disabled:
-            transport.dispatch("text", {"model": "test", "messages": []})
+            transport.dispatch("text", {"model": "meta-llama/llama-3.2-3b-instruct:free", "messages": []})
         self.assertIn("Transporte de rede HTTP real desativado por padrão", str(ctx_disabled.exception))
 
-        # 2. Enabled transport with mocked urllib response
         mock_http_response = MagicMock()
         mock_http_response.getcode.return_value = 200
         mock_http_response.headers = {"Content-Type": "application/json"}
@@ -511,7 +485,7 @@ class TestPhase4C1OpenRouterFree(unittest.TestCase):
         mock_context_manager.__enter__.return_value = mock_http_response
 
         with patch("urllib.request.urlopen", return_value=mock_context_manager):
-            live_transport = OpenRouterHttpTransport(api_key="sk-or-v1-fake-test-key", live_network_enabled=True)
+            live_transport = OpenRouterHttpTransport(cost_guard=self.cost_guard, api_key="sk-or-v1-fake-test-key", live_network_enabled=True)
             adapter = TextModelAdapter(self.cost_guard, transport=live_transport)
             adapter_res = adapter.execute("meta-llama/llama-3.2-3b-instruct:free", {"prompt": "Live dispatch test"})
 
@@ -519,6 +493,100 @@ class TestPhase4C1OpenRouterFree(unittest.TestCase):
             self.assertEqual(adapter_res.tokens["total_tokens"], 20)
             self.assertEqual(adapter_res.token_provenance, MetricProvenance.MEASURED)
             self.assertEqual(adapter_res.output_data["text"], "Live response from OpenRouter")
+
+    def test_13_centralized_egress_gate_blocks_direct_dispatch_paid_model(self) -> None:
+        """Revisão 4 - P0 Financeiro: dispatch() direto é interceptado pelo FreeCostGuard e rejeita modelos pagos."""
+        transport = OpenRouterHttpTransport(cost_guard=self.cost_guard, api_key="sk-test", live_network_enabled=True)
+        # Attempt to bypass via direct transport call with paid model
+        with self.assertRaises(UnauthorizedModelError) as ctx_paid:
+            transport.dispatch("text", {"model": "openai/gpt-4o", "messages": []})
+        self.assertIn("terminantemente proibidas", str(ctx_paid.exception))
+
+        # Attempt to dispatch without CostGuard fails closed
+        unguarded_transport = OpenRouterHttpTransport(cost_guard=None, api_key="sk-test", live_network_enabled=True)
+        with self.assertRaises(CostGuardError) as ctx_unguarded:
+            unguarded_transport.dispatch("text", {"model": "meta-llama/llama-3.2-3b-instruct:free", "messages": []})
+        self.assertIn("sem FreeCostGuard configurado", str(ctx_unguarded.exception))
+
+    def test_14_catalog_ttl_freshness_and_stale_rejection(self) -> None:
+        """Revisão 4 - P0 Catálogo: Catálogo expirado sem atualização remota deve falhar fechado com StaleCatalogError."""
+        stale_registry = FreeModelRegistry(max_age_seconds=10.0)
+        past_epoch = time.time() - 100.0  # 100s ago (exceeded 10s TTL)
+        stale_registry.load_catalog_data(self.raw_catalog, epoch=past_epoch)
+        self.assertTrue(stale_registry.is_stale())
+
+        stale_guard = FreeCostGuard(stale_registry)
+        with self.assertRaises(StaleCatalogError) as ctx_stale:
+            stale_guard.authorize_model_execution("meta-llama/llama-3.2-3b-instruct:free")
+        self.assertIn("Catálogo de modelos expirado", str(ctx_stale.exception))
+
+        # With dynamic fetcher configured, ensure_fresh_catalog succeeds
+        def mock_fetcher():
+            return build_synthetic_openrouter_catalog()
+
+        stale_registry.fetcher = mock_fetcher
+        refreshed_entry = stale_guard.authorize_model_execution("meta-llama/llama-3.2-3b-instruct:free")
+        self.assertIsNotNone(refreshed_entry)
+        self.assertFalse(stale_registry.is_stale())
+
+    def test_15_concurrent_multiprocess_atomic_sqlite_quota_competition(self) -> None:
+        """Revisão 4 - P1 Quotas: Dois workers disputando a última cota concorrentemente no SQLite."""
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            db_path = os.path.join(tmp_dir, "quotas.db")
+            # Limit is strictly 1 per minute
+            limiter = SlidingWindowRateLimiter(max_per_minute=1, max_per_day=10, sqlite_path=db_path)
+
+            results = []
+            def worker():
+                thread_limiter = SlidingWindowRateLimiter(max_per_minute=1, max_per_day=10, sqlite_path=db_path)
+                return thread_limiter.acquire()
+
+            with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+                futs = [executor.submit(worker) for _ in range(2)]
+                results = [f.result() for f in futs]
+
+            # Exactly one must succeed, and exactly one must fail
+            self.assertEqual(results.count(True), 1)
+            self.assertEqual(results.count(False), 1)
+
+    def test_16_ledger_persistence_failure_fail_closed(self) -> None:
+        """Revisão 4 - P1 Auditoria: Falha de escrita no armazenamento durável de auditoria lança AuditPersistenceError."""
+        # Using an impossible path on Windows/Posix (e.g. empty string or forbidden directory)
+        invalid_path = os.path.join(tempfile.gettempdir(), "non_existent_dir_12345", "sub", "audit.jsonl")
+        # Ensure parent dir cannot be created or simulate failure
+        ledger = AvailabilityLedger(storage_path="/invalid_root_never_created\0/audit.jsonl", require_durable=True)
+        with self.assertRaises(AuditPersistenceError):
+            ledger.record_event("test_model", AvailabilityEventType.MODEL_DISCOVERED)
+
+    def test_17_response_without_usage_classified_unknown(self) -> None:
+        """Revisão 4 - P2 Métricas: Respostas HTTP sem campo 'usage' são classificadas como UNKNOWN, nunca MEASURED."""
+        mock_http_response = MagicMock()
+        mock_http_response.getcode.return_value = 200
+        mock_http_response.headers = {"Content-Type": "application/json"}
+        # Provider returned choices, but omitted usage completely!
+        mock_http_response.read.return_value = json.dumps({
+            "id": "gen-no-usage",
+            "choices": [{"message": {"content": "Response without usage"}}],
+        }).encode("utf-8")
+
+        mock_context_manager = MagicMock()
+        mock_context_manager.__enter__.return_value = mock_http_response
+
+        with patch("urllib.request.urlopen", return_value=mock_context_manager):
+            live_transport = OpenRouterHttpTransport(cost_guard=self.cost_guard, api_key="sk-test", live_network_enabled=True)
+            adapter = TextModelAdapter(self.cost_guard, transport=live_transport)
+            res = adapter.execute("meta-llama/llama-3.2-3b-instruct:free", {"prompt": "Test no usage"})
+
+            self.assertTrue(res.success)
+            self.assertEqual(res.token_provenance, MetricProvenance.UNKNOWN, "Sem campo 'usage', métrica deve ser UNKNOWN")
+            self.assertEqual(res.tokens["total_tokens"], 0)
+
+    def test_18_unknown_modality_endpoint_rejected_fail_closed(self) -> None:
+        """Revisão 4 - P1 Modalidades: Modalidade desconhecida deve ser rejeitada fail-closed sem fallback para /chat/completions."""
+        transport = OpenRouterHttpTransport(cost_guard=self.cost_guard, live_network_enabled=False)
+        with self.assertRaises(IncompatibleModalityEndpointError) as ctx_unknown:
+            transport.get_endpoint_for_modality("telepathy_v1")
+        self.assertIn("Modalidade desconhecida ou sem endpoint correspondente", str(ctx_unknown.exception))
 
 
 if __name__ == "__main__":

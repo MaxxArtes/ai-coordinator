@@ -6,6 +6,7 @@ from .registry import (
     FreeModelRegistry,
     PricingStatus,
     InvalidPricingError,
+    StaleCatalogError,
     parse_float_cost,
 )
 from .cost_guard import (
@@ -19,9 +20,12 @@ from .availability import (
     AvailabilityEventType,
     AvailabilityEvent,
     AvailabilityLedger,
+    AuditPersistenceError,
 )
 from .resilience import (
     SlidingWindowRateLimiter,
+    SQLiteQuotaStore,
+    QuotaPersistenceError,
     CircuitState,
     CircuitBreaker,
     CircuitOpenError,
@@ -32,6 +36,7 @@ from .transport import (
     OpenRouterHttpTransport,
     HttpResponse,
     LiveNetworkDisabledError,
+    IncompatibleModalityEndpointError,
     TransportError,
 )
 from .adapters import (
@@ -59,6 +64,7 @@ __all__ = [
     "FreeModelRegistry",
     "PricingStatus",
     "InvalidPricingError",
+    "StaleCatalogError",
     "parse_float_cost",
     "FreeCostGuard",
     "CostGuardError",
@@ -68,7 +74,10 @@ __all__ = [
     "AvailabilityEventType",
     "AvailabilityEvent",
     "AvailabilityLedger",
+    "AuditPersistenceError",
     "SlidingWindowRateLimiter",
+    "SQLiteQuotaStore",
+    "QuotaPersistenceError",
     "CircuitState",
     "CircuitBreaker",
     "CircuitOpenError",
@@ -77,6 +86,7 @@ __all__ = [
     "OpenRouterHttpTransport",
     "HttpResponse",
     "LiveNetworkDisabledError",
+    "IncompatibleModalityEndpointError",
     "TransportError",
     "BaseModelAdapter",
     "TextModelAdapter",

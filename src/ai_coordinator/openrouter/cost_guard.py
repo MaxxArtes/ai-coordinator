@@ -5,13 +5,14 @@ Guarantees that:
 2. If free eligibility cannot be verified with 100% certainty, execution fails closed.
 3. Fallbacks from free variants to paid variants are permanently prohibited.
 4. Ambiguous routes, unverified fallback chains, and unapproved routing parameters are rejected.
+5. Models must be backed by fresh catalog data within valid TTL.
 """
 from __future__ import annotations
 
 import logging
 from typing import Any, Dict, List, Optional, Set
 
-from .registry import FreeModelRegistry, ModelCatalogEntry, PricingStatus
+from .registry import FreeModelRegistry, ModelCatalogEntry, PricingStatus, StaleCatalogError
 
 logger = logging.getLogger(__name__)
 
@@ -59,12 +60,13 @@ class FreeCostGuard:
     def authorized_calls(self) -> int:
         return self._authorized_calls_count
 
-    def authorize_model_execution(self, model_id: str) -> ModelCatalogEntry:
-        """Verify that model_id is cataloged, strictly free, and authorized.
+    def authorize_model_execution(self, model_id: str, verify_freshness: bool = True) -> ModelCatalogEntry:
+        """Verify that model_id is cataloged, fresh, strictly free, and authorized.
 
         Raises:
             UnauthorizedModelError: If model is missing from catalog, paid, or ambiguous.
             PaidFallbackBlockedError: If model looks like a paid fallback target.
+            StaleCatalogError: If catalog data has expired and cannot be refreshed.
         """
         if not model_id or not isinstance(model_id, str):
             self._blocked_attempts_count += 1
@@ -86,8 +88,13 @@ class FreeCostGuard:
                 f"Modelo '{clean_id}' rejeitado: a política exige sufixo explícito ':free'."
             )
 
-        # Query registry
-        entry = self.registry.get_model(clean_id)
+        # Query registry with freshness check
+        try:
+            entry = self.registry.get_model(clean_id, verify_freshness=verify_freshness)
+        except StaleCatalogError as stale_err:
+            self._blocked_attempts_count += 1
+            raise stale_err
+
         if not entry:
             self._blocked_attempts_count += 1
             raise UnauthorizedModelError(
@@ -179,7 +186,6 @@ class FreeCostGuard:
         # Check provider routing options (provider)
         provider_opts = payload.get("provider")
         if isinstance(provider_opts, dict):
-            # If provider allows implicit fallbacks to non-free models, reject
             if provider_opts.get("allow_fallbacks") is True and not models_list:
                 raise AmbiguousRoutingError(
                     "provider.allow_fallbacks=True sem restrição de lista 'models' verificada pode desviar para modelos pagos."

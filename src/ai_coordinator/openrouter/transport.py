@@ -1,10 +1,12 @@
-"""HTTP Transport abstraction for OpenRouter API (Phase 4C.1).
+"""HTTP Transport abstraction for OpenRouter API with centralized Egress Point Gate (Phase 4C.1).
 
 Guarantees:
-1. Strict opt-in control: Live network is permanently disabled by default (live_network_enabled=False).
-2. Endpoints separated by modality.
-3. Pure standard library implementation (urllib.request) with zero external dependencies.
-4. Captures Retry-After headers, status codes, and latency.
+1. Strict Egress Gate: Every dispatch MUST pass through FreeCostGuard validation
+   (model, price, modality compatibility, and payload inspection) before any HTTP request.
+2. Direct calls to dispatch() cannot bypass CostGuard.
+3. Strict opt-in control: Live network is permanently disabled by default (live_network_enabled=False).
+4. Endpoints strictly separated by modality without fallback to /chat/completions.
+5. Captures Retry-After headers, status codes, and latency.
 """
 from __future__ import annotations
 
@@ -17,6 +19,8 @@ from typing import Any, Dict, Optional
 import urllib.error
 import urllib.request
 
+from .cost_guard import CostGuardError, FreeCostGuard, UnauthorizedModelError
+
 logger = logging.getLogger(__name__)
 
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
@@ -27,6 +31,8 @@ MODALITY_ENDPOINTS = {
     "embedding": f"{OPENROUTER_BASE_URL}/embeddings",
     "rerank": f"{OPENROUTER_BASE_URL}/rerank",
     "speech": f"{OPENROUTER_BASE_URL}/audio/transcriptions",
+    "speech_transcription": f"{OPENROUTER_BASE_URL}/audio/transcriptions",
+    "speech_generation": f"{OPENROUTER_BASE_URL}/audio/speech",
 }
 
 
@@ -37,6 +43,11 @@ class TransportError(Exception):
 
 class LiveNetworkDisabledError(TransportError):
     """Raised when an attempt to use live network occurs while live_network_enabled=False."""
+    pass
+
+
+class IncompatibleModalityEndpointError(TransportError):
+    """Raised when an unknown modality is requested or endpoint is incompatible."""
     pass
 
 
@@ -52,21 +63,29 @@ class HttpResponse:
 
 
 class OpenRouterHttpTransport:
-    """Manages outbound HTTP requests to OpenRouter with strict fail-closed safeguards."""
+    """Manages outbound HTTP requests to OpenRouter with centralized egress validation."""
 
     def __init__(
         self,
+        cost_guard: Optional[FreeCostGuard] = None,
         api_key: Optional[str] = None,
         live_network_enabled: bool = False,
         timeout_sec: float = 30.0,
     ) -> None:
+        self.cost_guard = cost_guard
         self.api_key = api_key or os.getenv("OPENROUTER_API_KEY")
         self.live_network_enabled = live_network_enabled
         self.timeout_sec = timeout_sec
 
     def get_endpoint_for_modality(self, modality_str: str) -> str:
-        """Resolve OpenRouter endpoint URL for a given modality."""
-        return MODALITY_ENDPOINTS.get(modality_str.lower(), f"{OPENROUTER_BASE_URL}/chat/completions")
+        """Resolve OpenRouter endpoint URL for a given modality. Rejects unknown modalities fail-closed."""
+        norm_modality = str(modality_str).strip().lower()
+        if norm_modality not in MODALITY_ENDPOINTS:
+            raise IncompatibleModalityEndpointError(
+                f"[FAIL-CLOSED] Modalidade desconhecida ou sem endpoint correspondente: '{modality_str}'. "
+                f"Modalidades aceitas: {sorted(list(MODALITY_ENDPOINTS.keys()))}."
+            )
+        return MODALITY_ENDPOINTS[norm_modality]
 
     def dispatch(
         self,
@@ -76,8 +95,42 @@ class OpenRouterHttpTransport:
     ) -> HttpResponse:
         """Dispatch HTTP POST request to OpenRouter endpoint.
 
-        Raises LiveNetworkDisabledError if live_network_enabled is False.
+        Mandatory Gates before dispatch:
+        1. Modality endpoint validation (rejects unknown modalities fail-closed).
+        2. Centralized CostGuard validation (inspects payload, authorizes model and zero-cost guarantee).
+        3. Modality compatibility verification against catalog entry.
+        4. Live network opt-in gate (live_network_enabled must be True).
         """
+        # Gate 1: Endpoint validation
+        url = self.get_endpoint_for_modality(modality_str)
+
+        # Gate 2: Centralized Egress CostGuard enforcement
+        if self.cost_guard is None:
+            raise CostGuardError(
+                "[FAIL-CLOSED] OpenRouterHttpTransport não pode executar chamadas sem FreeCostGuard configurado. "
+                "Execução bloqueada preventivamente no ponto de saída HTTP."
+            )
+
+        if not isinstance(payload, dict):
+            raise CostGuardError("Payload de envio deve ser um dicionário.")
+
+        model_id = payload.get("model")
+        if not model_id:
+            raise UnauthorizedModelError("Payload de requisição sem campo obrigatório 'model'.")
+
+        self.cost_guard.inspect_request_payload(payload)
+        entry = self.cost_guard.authorize_model_execution(str(model_id))
+
+        # Gate 3: Verify modality compatibility
+        norm_mod = modality_str.strip().lower()
+        entry_modality_values = [m.value for m in entry.modalities]
+        if norm_mod not in entry_modality_values:
+            raise IncompatibleModalityEndpointError(
+                f"[FAIL-CLOSED] Modelo '{model_id}' não suporta a modalidade '{modality_str}'. "
+                f"Modalidades declaradas pelo catálogo: {entry_modality_values}."
+            )
+
+        # Gate 4: Opt-in network check
         if not self.live_network_enabled:
             raise LiveNetworkDisabledError(
                 "[FAIL-CLOSED] Transporte de rede HTTP real desativado por padrão. "
@@ -89,7 +142,6 @@ class OpenRouterHttpTransport:
                 "Chave de API da OpenRouter não configurada. Defina a variável de ambiente OPENROUTER_API_KEY."
             )
 
-        url = self.get_endpoint_for_modality(modality_str)
         headers = {
             "Content-Type": "application/json",
             "Authorization": f"Bearer {self.api_key}",
@@ -131,7 +183,6 @@ class OpenRouterHttpTransport:
             except Exception:
                 parsed_json = {"raw": body}
 
-            # Check Retry-After header
             retry_after = None
             if "Retry-After" in err_headers:
                 try:

@@ -5,13 +5,14 @@ Maintains an immutable historical record of:
 2. Availability states, HTTP 429 rate limits, and 503 provider errors.
 3. Price mutations and removals.
 4. Model identity preservation across benchmark iterations.
-5. Persistent audit storage across process restarts.
+5. Mandatory durable audit storage with fail-closed error propagation.
 """
 from __future__ import annotations
 
 import dataclasses
 import datetime as dt
 from enum import Enum
+import hashlib
 import json
 import logging
 import os
@@ -19,6 +20,11 @@ import time
 from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
+
+
+class AuditPersistenceError(Exception):
+    """Raised when an audit record or catalog snapshot cannot be durably written to storage."""
+    pass
 
 
 class AvailabilityEventType(str, Enum):
@@ -57,9 +63,15 @@ class AvailabilityEvent:
 class AvailabilityLedger:
     """Persistent ledger tracking model availability, errors, and catalog snapshots."""
 
-    def __init__(self, store: Optional[Any] = None, storage_path: Optional[str] = None) -> None:
+    def __init__(
+        self,
+        store: Optional[Any] = None,
+        storage_path: Optional[str] = None,
+        require_durable: bool = False,
+    ) -> None:
         self.store = store
         self.storage_path = storage_path
+        self.require_durable = require_durable
         self._events: List[AvailabilityEvent] = []
         self._snapshots: List[Dict[str, Any]] = []
 
@@ -94,18 +106,29 @@ class AvailabilityLedger:
                             "data": rec["data"],
                         })
         except Exception as exc:
+            if self.require_durable:
+                raise AuditPersistenceError(f"Falha ao carregar trilha durável em {self.storage_path}: {exc}") from exc
             logger.debug("Falha ao restaurar trilha de auditoria em %s: %s", self.storage_path, exc)
 
     def _persist_record(self, record: Dict[str, Any]) -> None:
-        """Append record synchronously to persistent audit storage."""
+        """Append record synchronously and flush to disk. Fails closed if write fails."""
         if not self.storage_path:
+            if self.require_durable:
+                raise AuditPersistenceError(
+                    "[FAIL-CLOSED] storage_path é obrigatório quando require_durable=True."
+                )
             return
+
         try:
             os.makedirs(os.path.dirname(os.path.abspath(self.storage_path)), exist_ok=True)
             with open(self.storage_path, "a", encoding="utf-8") as f:
                 f.write(json.dumps(record, sort_keys=True) + "\n")
+                f.flush()
+                os.fsync(f.fileno())
         except Exception as exc:
-            logger.debug("Falha ao persistir registro em %s: %s", self.storage_path, exc)
+            raise AuditPersistenceError(
+                f"[FAIL-CLOSED] Falha ao gravar registro no armazenamento de auditoria '{self.storage_path}': {exc}"
+            ) from exc
 
     def record_event(
         self,

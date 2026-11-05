@@ -4,14 +4,18 @@ Parses real-time catalog snapshots from the official OpenRouter API, filters
 strictly free-tier models, classifies modalities, and extracts capability metadata.
 Enforces strict validation on pricing: missing, NaN, infinite, or negative pricing
 is treated as INVALID and blocks free qualification.
+Enforces TTL and freshness verification: expired catalogs block execution fail-closed.
 """
 from __future__ import annotations
 
 import dataclasses
+import datetime as dt
 from enum import Enum
+import hashlib
 import json
 import logging
 import math
+import time
 from typing import Any, Callable, Dict, List, Optional, Set
 
 logger = logging.getLogger(__name__)
@@ -24,6 +28,8 @@ class ModelModality(str, Enum):
     RERANK = "rerank"
     DECISIONS = "decisions"
     SPEECH = "speech"
+    SPEECH_TRANSCRIPTION = "speech_transcription"
+    SPEECH_GENERATION = "speech_generation"
 
 
 class PricingStatus(str, Enum):
@@ -36,6 +42,11 @@ class PricingStatus(str, Enum):
 
 class InvalidPricingError(ValueError):
     """Raised when a pricing value is missing, negative, NaN, infinite, or malformed."""
+    pass
+
+
+class StaleCatalogError(Exception):
+    """Raised when the model catalog snapshot is expired or cannot be freshly verified."""
     pass
 
 
@@ -146,9 +157,29 @@ def infer_modalities(model_id: str, arch: Dict[str, Any], description: str) -> L
     if "embed" in model_lower or "embedding" in desc_lower or "text->embedding" in modality_str:
         modalities.add(ModelModality.EMBEDDING)
 
-    # Speech / Audio detection
-    if any(k in model_lower for k in ["audio", "speech", "whisper", "tts", "voice"]) or "audio" in modality_str:
+    # Speech detection: Separate Speech Transcription vs Generation
+    is_speech_transcription = (
+        "audio->text" in modality_str
+        or "whisper" in model_lower
+        or "transcription" in desc_lower
+        or "stt" in model_lower
+    )
+    is_speech_generation = (
+        "text->audio" in modality_str
+        or "tts" in model_lower
+        or "voice" in model_lower
+        or "speech generation" in desc_lower
+        or "fish audio" in desc_lower
+        or "heygen" in desc_lower
+    )
+
+    if is_speech_transcription:
         modalities.add(ModelModality.SPEECH)
+        modalities.add(ModelModality.SPEECH_TRANSCRIPTION)
+
+    if is_speech_generation:
+        modalities.add(ModelModality.SPEECH)
+        modalities.add(ModelModality.SPEECH_GENERATION)
 
     # Decision / Tool calling / Function calling detection
     tools_supported = False
@@ -171,21 +202,76 @@ def infer_modalities(model_id: str, arch: Dict[str, Any], description: str) -> L
 
 
 class FreeModelRegistry:
-    """Dynamic catalog registry and discovery engine for OpenRouter free models."""
+    """Dynamic catalog registry and discovery engine with TTL validation and freshness checking."""
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        max_age_seconds: float = 3600.0,
+        fetcher: Optional[Callable[[], Dict[str, Any]]] = None,
+    ) -> None:
+        self.max_age_seconds = max_age_seconds
+        self.fetcher = fetcher
         self._entries_by_id: Dict[str, ModelCatalogEntry] = {}
         self._raw_snapshot: Optional[Dict[str, Any]] = None
         self._snapshot_timestamp: Optional[str] = None
+        self._snapshot_epoch: Optional[float] = None
+        self._provenance_hash: Optional[str] = None
 
     @property
     def total_models(self) -> int:
         return len(self._entries_by_id)
 
-    def load_catalog_data(self, raw_data: Dict[str, Any], timestamp: Optional[str] = None) -> List[ModelCatalogEntry]:
+    @property
+    def snapshot_epoch(self) -> Optional[float]:
+        return self._snapshot_epoch
+
+    @property
+    def provenance_hash(self) -> Optional[str]:
+        return self._provenance_hash
+
+    def is_stale(self, now: Optional[float] = None) -> bool:
+        """Check if the current catalog snapshot has exceeded its TTL."""
+        if self._snapshot_epoch is None:
+            return True
+        t = now if now is not None else time.time()
+        return (t - self._snapshot_epoch) > self.max_age_seconds
+
+    def ensure_fresh_catalog(self, force: bool = False, now: Optional[float] = None) -> None:
+        """Ensure catalog snapshot is fresh. If stale, fetch updates or raise StaleCatalogError."""
+        t = now if now is not None else time.time()
+        if not force and not self.is_stale(now=t):
+            return
+
+        if self.fetcher is not None:
+            try:
+                raw_data = self.fetcher()
+                self.load_catalog_data(raw_data, epoch=t)
+                return
+            except Exception as exc:
+                logger.error("Falha ao atualizar catálogo dinamicamente: %s", exc)
+                raise StaleCatalogError(
+                    f"[FAIL-CLOSED] Falha ao consultar endpoint oficial de catálogo da OpenRouter: {exc}"
+                ) from exc
+
+        raise StaleCatalogError(
+            f"[FAIL-CLOSED] Catálogo de modelos expirado ({t - (self._snapshot_epoch or 0.0):.1f}s > "
+            f"{self.max_age_seconds:.1f}s) e nenhum mecanismo de atualização está disponível. "
+            "Execução bloqueada preventivamente."
+        )
+
+    def load_catalog_data(
+        self,
+        raw_data: Dict[str, Any],
+        timestamp: Optional[str] = None,
+        epoch: Optional[float] = None,
+    ) -> List[ModelCatalogEntry]:
         """Parse raw OpenRouter /api/v1/models response and index models."""
         self._raw_snapshot = raw_data
-        self._snapshot_timestamp = timestamp
+        self._snapshot_epoch = epoch if epoch is not None else time.time()
+        self._snapshot_timestamp = timestamp or dt.datetime.now(dt.timezone.utc).isoformat()
+        canonical_bytes = json.dumps(raw_data, sort_keys=True).encode("utf-8")
+        self._provenance_hash = hashlib.sha256(canonical_bytes).hexdigest()
+
         self._entries_by_id.clear()
 
         data_list = raw_data.get("data", [])
@@ -212,7 +298,6 @@ class FreeModelRegistry:
                 try:
                     p_cost = parse_float_cost(pricing_raw.get("prompt"), "prompt")
                     c_cost = parse_float_cost(pricing_raw.get("completion"), "completion")
-                    # image and request might default to 0.0 if key not in dict, but if present must be valid
                     img_raw = pricing_raw.get("image", 0.0)
                     req_raw = pricing_raw.get("request", 0.0)
                     img_cost = parse_float_cost(img_raw, "image")
@@ -234,11 +319,6 @@ class FreeModelRegistry:
                 status=pricing_status,
             )
 
-            # Strict free-tier qualification:
-            # Requires SIMULTANEOUSLY:
-            # 1. Pricing status is strictly VALID_ZERO (prompt, completion, image, request all 0.00).
-            # 2. Suffix :free is an additional authorization check if configured, but cannot override non-zero cost.
-            # 3. If pricing is PAID or INVALID, is_free is permanently FALSE.
             is_free = (pricing_status == PricingStatus.VALID_ZERO and pricing.is_strictly_zero)
 
             arch = item.get("architecture", {})
@@ -287,13 +367,15 @@ class FreeModelRegistry:
                 results.append(m)
         return results
 
-    def get_model(self, model_id: str) -> Optional[ModelCatalogEntry]:
-        """Get catalog entry by exact model ID."""
+    def get_model(self, model_id: str, verify_freshness: bool = True) -> Optional[ModelCatalogEntry]:
+        """Get catalog entry by exact model ID, verifying freshness if requested."""
+        if verify_freshness:
+            self.ensure_fresh_catalog()
         return self._entries_by_id.get(model_id)
 
-    def is_model_free(self, model_id: str) -> bool:
-        """Check if a given model ID is cataloged and confirmed as strictly free."""
-        entry = self.get_model(model_id)
+    def is_model_free(self, model_id: str, verify_freshness: bool = True) -> bool:
+        """Check if a given model ID is cataloged, fresh, and confirmed as strictly free."""
+        entry = self.get_model(model_id, verify_freshness=verify_freshness)
         if not entry:
             return False
         return entry.is_free and entry.pricing.is_strictly_zero
@@ -302,6 +384,8 @@ class FreeModelRegistry:
         """Export serialized snapshot of currently indexed models."""
         return {
             "snapshot_timestamp": self._snapshot_timestamp,
+            "snapshot_epoch": self._snapshot_epoch,
+            "provenance_hash": self._provenance_hash,
             "total_models": len(self._entries_by_id),
             "free_models_count": len(self.get_free_models()),
             "models": [m.to_dict() for m in self._entries_by_id.values()],
