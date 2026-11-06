@@ -4,16 +4,23 @@
 Prepares the single-call controlled experiment (N=1, TEXT modality, strict US$ 0.000000).
 
 Enforces:
-1. Strict financial pre-checks (Spend Cap US$ 0.00, no auto-recharge).
+1. Official key verification endpoint (https://openrouter.ai/api/v1/key).
+2. Strict financial pre-checks (Spend Cap US$ 0.00, no auto-recharge).
    Classifies requirements as VERIFIED, PENDING, or FAILED.
+   Requires finite numeric limit == 0.0 (is_free_tier alone is insufficient).
+   Tracks provenance with EvidenceSource (API, HUMAN_DOCUMENTED, OPERATOR_FLAG, LOCAL_INVARIANT).
    Blocks inference fail-closed if any financial protection is unconfirmed.
-2. Official catalog fetching via OfficialOpenRouterCatalogClient(timeout_sec=...).
-3. Dynamic selection of verified free text model from authenticated catalog.
-4. Formal execution authorization record binding model, US$ 0.00 budget, code commit, and timestamp.
-5. Offline dry-run verification by default (identifies catalog, tokens, latency, cost as SYNTHETIC).
-6. Live execution requires --live, --authorized-by-user, and verified financial protections.
-7. Atomic SQLite quota store and durable AvailabilityLedger with fsync.
-8. Strict classification of metric provenance (MEASURED vs UNKNOWN).
+3. Strict credential redirect defense: RejectAllRedirectsHandler rejects any HTTP redirect
+   to prevent credential leakage to unauthorized destinations.
+4. Official catalog fetching via OfficialOpenRouterCatalogClient(timeout_sec=...).
+5. Dynamic selection of verified free text model from authenticated catalog.
+6. Formal execution authorization manifest binding model, US$ 0.00 budget, code commit, and authorizer.
+   Strict resolve_current_commit() with zero fallback to stale hashes.
+7. Offline dry-run verification by default (identifies catalog, tokens, latency, cost as SYNTHETIC).
+8. Strict single-attempt guarantee (RetryPolicy max_attempts=1, zero retries on 429/503/timeout).
+9. Live execution requires --live, --authorized-by-user, and verified financial protections.
+10. Atomic SQLite quota store and durable AvailabilityLedger with fsync.
+11. Strict classification of metric provenance (MEASURED vs UNKNOWN).
 """
 from __future__ import annotations
 
@@ -23,12 +30,14 @@ import datetime as dt
 from enum import Enum
 import hashlib
 import json
+import math
 import os
+import re
 import subprocess
 import sys
 import tempfile
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 import urllib.parse
 import urllib.request
 
@@ -48,6 +57,7 @@ from ai_coordinator.openrouter import (
     ModelModality,
     OfficialOpenRouterCatalogClient,
     OpenRouterHttpTransport,
+    RetryPolicy,
     SlidingWindowRateLimiter,
     StrictOpenRouterRedirectHandler,
     UntrustedCatalogSourceError,
@@ -62,6 +72,53 @@ class RequirementStatus(str, Enum):
     FAILED = "FAILED"
 
 
+class EvidenceSource(str, Enum):
+    """Provenance and evidence classification for operational requirements."""
+    API = "API"
+    HUMAN_DOCUMENTED = "HUMAN_DOCUMENTED"
+    OPERATOR_FLAG = "OPERATOR_FLAG"
+    LOCAL_INVARIANT = "LOCAL_INVARIANT"
+    PENDING = "PENDING"
+
+
+class OpenRouterAccountSecurityError(RuntimeError):
+    """Raised when an insecure operation or redirect is detected during account verification."""
+    pass
+
+
+class RejectAllRedirectsHandler(urllib.request.HTTPRedirectHandler):
+    """Strict handler rejecting all redirects to prevent credential transmission to unauthorized destinations."""
+
+    def redirect_request(
+        self,
+        req: urllib.request.Request,
+        fp: Any,
+        code: int,
+        msg: str,
+        headers: Any,
+        newurl: str,
+    ) -> Optional[urllib.request.Request]:
+        raise OpenRouterAccountSecurityError(
+            f"[FAIL-CLOSED] Redirecionamento HTTP {code} para '{newurl}' rejeitado categoricamente. "
+            "Requisições autenticadas com chave de API não seguem redirecionamentos."
+        )
+
+    def http_error_301(self, req: Any, fp: Any, code: int, msg: str, headers: Any) -> Any:
+        return self.redirect_request(req, fp, code, msg, headers, headers.get("Location", ""))
+
+    def http_error_302(self, req: Any, fp: Any, code: int, msg: str, headers: Any) -> Any:
+        return self.redirect_request(req, fp, code, msg, headers, headers.get("Location", ""))
+
+    def http_error_303(self, req: Any, fp: Any, code: int, msg: str, headers: Any) -> Any:
+        return self.redirect_request(req, fp, code, msg, headers, headers.get("Location", ""))
+
+    def http_error_307(self, req: Any, fp: Any, code: int, msg: str, headers: Any) -> Any:
+        return self.redirect_request(req, fp, code, msg, headers, headers.get("Location", ""))
+
+    def http_error_308(self, req: Any, fp: Any, code: int, msg: str, headers: Any) -> Any:
+        return self.redirect_request(req, fp, code, msg, headers, headers.get("Location", ""))
+
+
 @dataclasses.dataclass(frozen=True)
 class ExecutionAuthorizationRecord:
     """Formal authorization manifest binding execution parameters to human/operational consent."""
@@ -74,13 +131,15 @@ class ExecutionAuthorizationRecord:
     spend_cap_verified: bool
     auto_recharge_verified: bool
     manifest_id: str
+    authorizer: str = "operator"
+    evidence_source: str = "OPERATOR_FLAG"
 
     def to_dict(self) -> Dict[str, Any]:
         return dataclasses.asdict(self)
 
 
 def resolve_current_commit() -> str:
-    """Resolve current Git commit hash or fallback to known revision."""
+    """Resolve current Git commit hash strictly from repository. Fails closed if unavailable."""
     try:
         res = subprocess.run(
             ["git", "-C", REPO_ROOT, "rev-parse", "HEAD"],
@@ -89,11 +148,52 @@ def resolve_current_commit() -> str:
             check=True,
         )
         commit = res.stdout.strip()
-        if commit:
+        if commit and re.fullmatch(r"[0-9a-f]{40}", commit):
             return commit
-    except Exception:
-        pass
-    return "06b460bb1c3979027ccdb2af38245fdfc0ea1827"
+        raise ValueError(f"Formato de hash de commit inválido retornado pelo git: '{commit}'")
+    except Exception as e:
+        raise RuntimeError(f"Impossível resolver commit atual via 'git rev-parse HEAD': {e}") from e
+
+
+def validate_authorization_manifest(
+    manifest_data: Dict[str, Any],
+    expected_model: str,
+    expected_commit: str,
+) -> Tuple[bool, str]:
+    """Validate external authorization manifest file against execution parameters."""
+    required = ["target_model", "max_budget_usd", "code_commit", "authorizer", "valid_until"]
+    missing = [f for f in required if f not in manifest_data or manifest_data[f] is None]
+    if missing:
+        return False, f"Campos obrigatórios ausentes no manifesto: {missing}"
+
+    authorizer = str(manifest_data["authorizer"]).strip()
+    if not authorizer:
+        return False, "Identidade do autorizador ('authorizer') não pode estar vazia"
+
+    budget = manifest_data["max_budget_usd"]
+    if not isinstance(budget, (int, float)) or isinstance(budget, bool):
+        return False, f"Orçamento inválido no manifesto: {budget}"
+    if not math.isfinite(budget) or float(budget) != 0.0:
+        return False, f"Orçamento no manifesto ({budget}) excede US$ 0.000000"
+
+    target_model = manifest_data["target_model"]
+    if target_model != expected_model:
+        return False, f"Modelo no manifesto ('{target_model}') diverge do modelo selecionado ('{expected_model}')"
+
+    code_commit = manifest_data["code_commit"]
+    if code_commit != expected_commit:
+        return False, f"Commit no manifesto ('{code_commit}') diverge do HEAD atual ('{expected_commit}')"
+
+    valid_until = str(manifest_data["valid_until"])
+    try:
+        exp_dt = dt.datetime.fromisoformat(valid_until.replace("Z", "+00:00"))
+        now_utc = dt.datetime.now(dt.timezone.utc)
+        if exp_dt < now_utc:
+            return False, f"Manifesto de autorização expirado em {valid_until}"
+    except Exception as e:
+        return False, f"Formato inválido de valid_until ('{valid_until}'): {e}"
+
+    return True, f"Manifesto formal comprovado (autorizador: '{authorizer}', commit: {code_commit[:8]})"
 
 
 class OpenRouterAccountVerifier:
@@ -104,12 +204,24 @@ class OpenRouterAccountVerifier:
         timeout_sec: float = 15.0,
         opener: Optional[urllib.request.OpenerDirector] = None,
     ) -> None:
-        self.endpoint_url = "https://openrouter.ai/api/v1/auth/key"
+        self.endpoint_url = "https://openrouter.ai/api/v1/key"
         self.timeout_sec = timeout_sec
-        self.opener = opener if opener is not None else urllib.request.build_opener()
+        self.redirect_handler = RejectAllRedirectsHandler()
+        self.opener = opener if opener is not None else urllib.request.build_opener(self.redirect_handler)
 
     def verify_key_limits(self, api_key: str) -> Dict[str, Any]:
         """Query key info from OpenRouter and extract limit, usage, and tier."""
+        parsed_target = urllib.parse.urlparse(self.endpoint_url)
+        if (
+            parsed_target.scheme.lower() != "https"
+            or (parsed_target.hostname or "").lower() != "openrouter.ai"
+            or parsed_target.path != "/api/v1/key"
+        ):
+            return {
+                "status": "FAILED",
+                "error": f"Endpoint não autorizado: '{self.endpoint_url}'. Apenas 'https://openrouter.ai/api/v1/key' é permitido.",
+            }
+
         req = urllib.request.Request(
             self.endpoint_url,
             headers={
@@ -121,21 +233,55 @@ class OpenRouterAccountVerifier:
         )
         try:
             with self.opener.open(req, timeout=self.timeout_sec) as resp:
+                effective_url = resp.geturl() if hasattr(resp, "geturl") else self.endpoint_url
+                parsed_effective = urllib.parse.urlparse(effective_url)
+                if (
+                    parsed_effective.scheme.lower() != "https"
+                    or (parsed_effective.hostname or "").lower() != "openrouter.ai"
+                    or parsed_effective.path != "/api/v1/key"
+                ):
+                    return {
+                        "status": "FAILED",
+                        "error": f"URL final inesperada ou redirecionamento não autorizado: '{effective_url}'",
+                    }
+
                 status_code = resp.getcode() if hasattr(resp, "getcode") else getattr(resp, "status", getattr(resp, "code", 200))
                 if status_code != 200:
                     return {"status": "FAILED", "error": f"HTTP {status_code}"}
+
                 raw_bytes = resp.read()
-                data = json.loads(raw_bytes.decode("utf-8")).get("data", {})
-                limit = data.get("limit")
+                try:
+                    payload = json.loads(raw_bytes.decode("utf-8"))
+                except Exception as json_err:
+                    return {"status": "FAILED", "error": f"Resposta JSON inválida: {json_err}"}
+
+                data = payload.get("data")
+                if not isinstance(data, dict):
+                    return {"status": "FAILED", "error": "Campo 'data' ausente ou inválido na resposta da API"}
+
+                raw_limit = data.get("limit")
                 usage = data.get("usage", 0.0)
                 is_free = data.get("is_free_tier", False)
+                label = data.get("label", "")
+
+                # Strict validation of limit:
+                # Must be a finite numeric float/int, not bool, and strictly 0.0.
+                # In OpenRouter API, limit=null indicates UNLIMITED spending (positive risk).
+                limit_is_zero = False
+                if raw_limit is not None and not isinstance(raw_limit, bool) and isinstance(raw_limit, (int, float)):
+                    if math.isfinite(raw_limit) and float(raw_limit) == 0.0:
+                        limit_is_zero = True
+
                 return {
                     "status": "OK",
-                    "limit": limit,
+                    "limit": raw_limit,
+                    "limit_is_zero": limit_is_zero,
                     "usage": usage,
                     "is_free_tier": is_free,
-                    "label": data.get("label", ""),
+                    "label": label,
                 }
+        except OpenRouterAccountSecurityError as sec_err:
+            return {"status": "FAILED", "error": str(sec_err)}
         except Exception as e:
             return {"status": "ERROR", "error": str(e)}
 
@@ -149,8 +295,11 @@ def evaluate_requirements(
     modality: ModelModality = ModelModality.TEXT,
     db_path: Optional[str] = None,
     ledger_path: Optional[str] = None,
+    authorized_by_user: bool = False,
+    manifest_validation_result: Optional[Tuple[bool, str]] = None,
+    require_api_verification: bool = False,
 ) -> Dict[str, Dict[str, Any]]:
-    """Evaluate and classify all financial and operational requirements."""
+    """Evaluate and classify all financial and operational requirements with explicit evidence provenance."""
     reqs: Dict[str, Dict[str, Any]] = {}
 
     # 1. API_KEY_PRESENT
@@ -158,31 +307,50 @@ def evaluate_requirements(
     masked_key = f"{api_key[:6]}...{api_key[-4:]}" if len(api_key) > 10 else ("CONFIGURADA" if has_key else "NÃO CONFIGURADA")
     reqs["API_KEY_PRESENT"] = {
         "status": RequirementStatus.VERIFIED if has_key else RequirementStatus.FAILED,
+        "evidence_source": EvidenceSource.LOCAL_INVARIANT if has_key else EvidenceSource.PENDING,
         "details": f"Chave de API: {masked_key}",
     }
 
     # 2. SPEND_CAP_ENFORCED
-    if key_verification and key_verification.get("status") == "OK":
-        limit = key_verification.get("limit")
-        is_free = key_verification.get("is_free_tier", False)
-        if limit == 0.0 or is_free or (limit is not None and float(limit) <= 0.0):
-            reqs["SPEND_CAP_ENFORCED"] = {
-                "status": RequirementStatus.VERIFIED,
-                "details": f"Verificado via endpoint /api/v1/auth/key (limit={limit}, is_free_tier={is_free})",
-            }
+    if key_verification is not None:
+        if key_verification.get("status") == "OK":
+            if key_verification.get("limit_is_zero") is True:
+                reqs["SPEND_CAP_ENFORCED"] = {
+                    "status": RequirementStatus.VERIFIED,
+                    "evidence_source": EvidenceSource.API,
+                    "details": f"Verificado via endpoint oficial /api/v1/key (limit={key_verification.get('limit')}, is_free_tier={key_verification.get('is_free_tier')})",
+                }
+            else:
+                raw_limit = key_verification.get("limit")
+                is_free = key_verification.get("is_free_tier")
+                desc = "ausente/ilimitado (null)" if raw_limit is None else f"US$ {raw_limit}"
+                reqs["SPEND_CAP_ENFORCED"] = {
+                    "status": RequirementStatus.FAILED,
+                    "evidence_source": EvidenceSource.API,
+                    "details": f"Limite {desc} detectado (is_free_tier={is_free}); exige-se Hard Cap US$ 0.00 numérico",
+                }
         else:
             reqs["SPEND_CAP_ENFORCED"] = {
                 "status": RequirementStatus.FAILED,
-                "details": f"Limite positivo detectado: US$ {limit} (exige-se Hard Cap US$ 0.00)",
+                "evidence_source": EvidenceSource.API,
+                "details": f"Falha na consulta à API: {key_verification.get('error')} (bloqueio fail-closed; confirmação booleana desconsiderada)",
             }
+    elif require_api_verification:
+        reqs["SPEND_CAP_ENFORCED"] = {
+            "status": RequirementStatus.PENDING,
+            "evidence_source": EvidenceSource.PENDING,
+            "details": "Verificação automática via API /api/v1/key obrigatória mas não executada",
+        }
     elif spend_cap_confirmed:
         reqs["SPEND_CAP_ENFORCED"] = {
             "status": RequirementStatus.VERIFIED,
-            "details": "Confirmado pelo operador no painel OpenRouter (Hard Cap US$ 0.00)",
+            "evidence_source": EvidenceSource.OPERATOR_FLAG,
+            "details": "Confirmado manualmente pelo operador no painel OpenRouter (Hard Cap US$ 0.00; sem comprovação por API)",
         }
     else:
         reqs["SPEND_CAP_ENFORCED"] = {
             "status": RequirementStatus.PENDING,
+            "evidence_source": EvidenceSource.PENDING,
             "details": "Pendente de comprovação efetiva na conta OpenRouter (Hard Cap US$ 0.00)",
         }
 
@@ -190,11 +358,13 @@ def evaluate_requirements(
     if auto_recharge_confirmed:
         reqs["AUTO_RECHARGE_DISABLED"] = {
             "status": RequirementStatus.VERIFIED,
+            "evidence_source": EvidenceSource.OPERATOR_FLAG,
             "details": "Confirmado pelo operador no painel OpenRouter (Recarga automática DESATIVADA)",
         }
     else:
         reqs["AUTO_RECHARGE_DISABLED"] = {
             "status": RequirementStatus.PENDING,
+            "evidence_source": EvidenceSource.PENDING,
             "details": "Pendente de confirmação manual no painel OpenRouter",
         }
 
@@ -203,16 +373,19 @@ def evaluate_requirements(
         if model_entry.is_free:
             reqs["MODEL_ZERO_COST"] = {
                 "status": RequirementStatus.VERIFIED,
+                "evidence_source": EvidenceSource.LOCAL_INVARIANT,
                 "details": f"Preço $0.00 confirmado (prompt={model_entry.pricing.prompt}, completion={model_entry.pricing.completion})",
             }
         else:
             reqs["MODEL_ZERO_COST"] = {
                 "status": RequirementStatus.FAILED,
+                "evidence_source": EvidenceSource.LOCAL_INVARIANT,
                 "details": f"Modelo {model_entry.id} não possui custo zero comprovado",
             }
     else:
         reqs["MODEL_ZERO_COST"] = {
             "status": RequirementStatus.PENDING,
+            "evidence_source": EvidenceSource.PENDING,
             "details": "Aguardando consulta e validação no FreeCostGuard",
         }
 
@@ -220,11 +393,13 @@ def evaluate_requirements(
     if modality == ModelModality.TEXT:
         reqs["MODALITY_SCOPE_RESTRICTED"] = {
             "status": RequirementStatus.VERIFIED,
+            "evidence_source": EvidenceSource.LOCAL_INVARIANT,
             "details": "Restrito estritamente a TEXT (gate fail-closed [PILOT_SCOPE_RESTRICTION])",
         }
     else:
         reqs["MODALITY_SCOPE_RESTRICTED"] = {
             "status": RequirementStatus.FAILED,
+            "evidence_source": EvidenceSource.LOCAL_INVARIANT,
             "details": f"Modalidade {modality.value} proibida no escopo do piloto inicial",
         }
 
@@ -232,11 +407,13 @@ def evaluate_requirements(
     if db_path:
         reqs["QUOTA_PERSISTENCE_READY"] = {
             "status": RequirementStatus.VERIFIED,
+            "evidence_source": EvidenceSource.LOCAL_INVARIANT,
             "details": f"SQLite atômico configurado em {os.path.basename(db_path)}",
         }
     else:
         reqs["QUOTA_PERSISTENCE_READY"] = {
             "status": RequirementStatus.PENDING,
+            "evidence_source": EvidenceSource.PENDING,
             "details": "Pendente de inicialização de storage",
         }
 
@@ -244,28 +421,60 @@ def evaluate_requirements(
     if ledger_path:
         reqs["AUDIT_PERSISTENCE_READY"] = {
             "status": RequirementStatus.VERIFIED,
+            "evidence_source": EvidenceSource.LOCAL_INVARIANT,
             "details": f"AvailabilityLedger com fsync configurado em {os.path.basename(ledger_path)}",
         }
     else:
         reqs["AUDIT_PERSISTENCE_READY"] = {
             "status": RequirementStatus.PENDING,
+            "evidence_source": EvidenceSource.PENDING,
             "details": "Pendente de inicialização de storage",
+        }
+
+    # 8. EXECUTION_AUTHORIZATION
+    if manifest_validation_result is not None:
+        is_valid, reason = manifest_validation_result
+        if is_valid:
+            reqs["EXECUTION_AUTHORIZATION"] = {
+                "status": RequirementStatus.VERIFIED,
+                "evidence_source": EvidenceSource.HUMAN_DOCUMENTED,
+                "details": reason,
+            }
+        else:
+            reqs["EXECUTION_AUTHORIZATION"] = {
+                "status": RequirementStatus.FAILED,
+                "evidence_source": EvidenceSource.HUMAN_DOCUMENTED,
+                "details": f"Manifesto formal rejeitado: {reason}",
+            }
+    elif authorized_by_user:
+        reqs["EXECUTION_AUTHORIZATION"] = {
+            "status": RequirementStatus.VERIFIED,
+            "evidence_source": EvidenceSource.OPERATOR_FLAG,
+            "details": "Flag operacional --authorized-by-user presente (indicação de intenção operacional, não comprovada por manifesto formal)",
+        }
+    else:
+        reqs["EXECUTION_AUTHORIZATION"] = {
+            "status": RequirementStatus.FAILED,
+            "evidence_source": EvidenceSource.PENDING,
+            "details": "Execução não autorizada pelo operador (ausência de flag ou manifesto)",
         }
 
     return reqs
 
 
 def print_requirements_table(reqs: Dict[str, Dict[str, Any]]) -> None:
-    """Print a clean formatted table of requirement statuses."""
-    print("=" * 88)
+    """Print a clean formatted table of requirement statuses and evidence sources."""
+    print("=" * 105)
     print(" AI Coordinator — Matriz de Pré-Requisitos Financeiros e Operacionais (Piloto 4C.1)")
-    print("=" * 88)
-    print(f" {'Requisito':<28} | {'Situação':<10} | {'Detalhes'}")
-    print("-" * 88)
+    print("=" * 105)
+    print(f" {'Requisito':<28} | {'Situação':<10} | {'Origem Evidência':<18} | {'Detalhes'}")
+    print("-" * 105)
     for req_name, info in reqs.items():
         status_val = info["status"].value if isinstance(info["status"], RequirementStatus) else str(info["status"])
-        print(f" {req_name:<28} | {status_val:<10} | {info['details']}")
-    print("=" * 88)
+        source_val = info.get("evidence_source", EvidenceSource.PENDING)
+        source_str = source_val.value if isinstance(source_val, EvidenceSource) else str(source_val)
+        print(f" {req_name:<28} | {status_val:<10} | {source_str:<18} | {info['details']}")
+    print("=" * 105)
 
 
 def prepare_offline_dry_run() -> int:
@@ -318,6 +527,7 @@ def prepare_offline_dry_run() -> int:
             modality=ModelModality.TEXT,
             db_path=db_path,
             ledger_path=ledger_path,
+            authorized_by_user=False,
         )
         print_requirements_table(reqs)
 
@@ -331,12 +541,14 @@ def prepare_offline_dry_run() -> int:
             live_network_enabled=False,  # Keep offline
         )
 
+        strict_single_attempt_policy = RetryPolicy(max_attempts=1)
         runner = ModelBenchmarkRunner(
             registry=registry,
             cost_guard=guard,
             ledger=ledger,
             rate_limiter=limiter,
             transport=transport,
+            retry_policy=strict_single_attempt_policy,
         )
 
         sim_called = False
@@ -408,6 +620,13 @@ def execute_live_pilot(
         print("O piloto em ambiente real depende de autorização formal expressa do usuário.", file=sys.stderr)
         return 1
 
+    # Resolve commit strictly
+    try:
+        commit_hash = resolve_current_commit()
+    except Exception as e:
+        print(f"[ERRO CRÍTICO] Falha ao verificar commit atual do repositório: {e}", file=sys.stderr)
+        return 1
+
     api_key = (api_key_override or os.environ.get("OPENROUTER_API_KEY", "")).strip()
 
     # Step 1: Storage paths setup
@@ -416,9 +635,9 @@ def execute_live_pilot(
     db_path = os.path.join(bench_directory, "pilot_quotas.db")
     ledger_path = os.path.join(bench_directory, "pilot_audit.jsonl")
 
-    # Step 2: Query account verification endpoint if requested or present
+    # Step 2: Query account verification endpoint if requested or in live mode with key
     key_verification: Optional[Dict[str, Any]] = None
-    if verify_key_endpoint and api_key:
+    if (verify_key_endpoint or api_key) and api_key:
         verifier = account_verifier or OpenRouterAccountVerifier(timeout_sec=15.0)
         key_verification = verifier.verify_key_limits(api_key)
 
@@ -454,7 +673,25 @@ def execute_live_pilot(
         print(f"[ERRO CRÍTICO] Modelo {chosen_model} não autorizado pelo FreeCostGuard: {e}")
         return 1
 
-    # Step 6: Evaluate requirements matrix before any inference dispatch
+    # Step 6: Validate manifest if provided
+    manifest_validation_result: Optional[Tuple[bool, str]] = None
+    manifest_data: Optional[Dict[str, Any]] = None
+    if authorization_manifest_path:
+        if not os.path.exists(authorization_manifest_path):
+            manifest_validation_result = (False, f"Arquivo de manifesto não encontrado: {authorization_manifest_path}")
+        else:
+            try:
+                with open(authorization_manifest_path, "r", encoding="utf-8") as f:
+                    manifest_data = json.load(f)
+                manifest_validation_result = validate_authorization_manifest(
+                    manifest_data,
+                    expected_model=chosen_model,
+                    expected_commit=commit_hash,
+                )
+            except Exception as e:
+                manifest_validation_result = (False, f"Erro ao ler manifesto JSON: {e}")
+
+    # Step 7: Evaluate requirements matrix before any inference dispatch
     print("[Passo 4/6] Avaliando matriz de pré-requisitos financeiros e operacionais...")
     reqs = evaluate_requirements(
         api_key=api_key,
@@ -465,6 +702,9 @@ def execute_live_pilot(
         modality=ModelModality.TEXT,
         db_path=db_path,
         ledger_path=ledger_path,
+        authorized_by_user=authorized_by_user,
+        manifest_validation_result=manifest_validation_result,
+        require_api_verification=verify_key_endpoint,
     )
     print_requirements_table(reqs)
 
@@ -473,14 +713,17 @@ def execute_live_pilot(
     if unverified:
         print(f"\n[BLOQUEIO FINANCEIRO] Impossível prosseguir para inferência: {len(unverified)} requisito(s) NÃO VERIFICADO(S):")
         for u in unverified:
-            print(f"  - {u}: {reqs[u]['status'].value} ({reqs[u]['details']})")
+            source_str = reqs[u].get("evidence_source", EvidenceSource.PENDING)
+            source_val = source_str.value if isinstance(source_str, EvidenceSource) else str(source_str)
+            print(f"  - {u}: {reqs[u]['status'].value} [{source_val}] ({reqs[u]['details']})")
         print("\nA inferência live está terminantemente bloqueada até a comprovação de todos os requisitos.")
         return 1
 
-    # Step 7: Build and register formal ExecutionAuthorizationRecord
-    commit_hash = resolve_current_commit()
+    # Step 8: Build and register formal ExecutionAuthorizationRecord
     now_iso = dt.datetime.now(dt.timezone.utc).isoformat()
     manifest_id = f"auth_{hashlib.sha256(f'{chosen_model}:{commit_hash}:{now_iso}'.encode()).hexdigest()[:16]}"
+    authorizer_identity = manifest_data.get("authorizer", "operator") if manifest_data else "operator"
+    evidence_type = "HUMAN_DOCUMENTED" if manifest_validation_result and manifest_validation_result[0] else "OPERATOR_FLAG"
 
     auth_record = ExecutionAuthorizationRecord(
         target_model=chosen_model,
@@ -492,16 +735,11 @@ def execute_live_pilot(
         spend_cap_verified=True,
         auto_recharge_verified=True,
         manifest_id=manifest_id,
+        authorizer=authorizer_identity,
+        evidence_source=evidence_type,
     )
 
-    if authorization_manifest_path and os.path.exists(authorization_manifest_path):
-        with open(authorization_manifest_path, "r", encoding="utf-8") as f:
-            ext_auth = json.load(f)
-            if ext_auth.get("max_budget_usd", -1) != 0.0:
-                print(f"[ERRO CRÍTICO] Orçamento no manifesto externo ({ext_auth.get('max_budget_usd')}) excede US$ 0.000000.")
-                return 1
-
-    # Step 8: Initialize durable rate limiter and ledger
+    # Step 9: Initialize durable rate limiter and ledger
     limiter = SlidingWindowRateLimiter(sqlite_path=db_path, max_per_minute=20, max_per_day=50)
     ledger = AvailabilityLedger(storage_path=ledger_path, require_durable=True)
 
@@ -512,8 +750,8 @@ def execute_live_pilot(
         details={"stage": "pilot_authorization_manifest", "authorization_manifest": auth_record.to_dict()},
     )
 
-    # Step 9: Configure live transport
-    print("\n[Passo 5/6] Ativando OpenRouterHttpTransport em modo LIVE...")
+    # Step 10: Configure live transport with STRICT SINGLE ATTEMPT (NO RETRIES)
+    print("\n[Passo 5/6] Ativando OpenRouterHttpTransport em modo LIVE (tentativa única estrita N=1)...")
     transport = custom_transport or OpenRouterHttpTransport(
         cost_guard=guard,
         rate_limiter=limiter,
@@ -522,15 +760,17 @@ def execute_live_pilot(
         live_network_enabled=True,  # LIVE OPT-IN
     )
 
+    strict_single_attempt_policy = RetryPolicy(max_attempts=1)
     runner = ModelBenchmarkRunner(
         registry=registry,
         cost_guard=guard,
         ledger=ledger,
         rate_limiter=limiter,
         transport=transport,
+        retry_policy=strict_single_attempt_policy,
     )
 
-    # Step 10: Dispatch single controlled call (N=1)
+    # Step 11: Dispatch single controlled call (N=1)
     prompt = "Classify sentiment: This product exceeded all my expectations."
     print(f"[Passo 6/6] Despachando chamada controlada N=1 para {chosen_model}...")
     t0 = time.perf_counter()
@@ -554,7 +794,7 @@ def execute_live_pilot(
     if result.error_message:
         print(f"  Mensagem de Erro: {result.error_message}")
     print(f"  Auditoria gravada em: {ledger_path}")
-    print(f"  Manifesto de Autorização: {manifest_id}")
+    print(f"  Manifesto de Autorização: {manifest_id} (origem: {evidence_type})")
     print("=" * 88)
 
     # Save run artifact
@@ -576,7 +816,7 @@ def main() -> int:
     parser.add_argument("--authorized-by-user", action="store_true", default=False, help="Indicação operacional de autorização humana")
     parser.add_argument("--confirm-spend-cap-zero", action="store_true", default=False, help="Confirmar Spend Cap US$ 0.00 verificado no painel")
     parser.add_argument("--confirm-no-auto-recharge", action="store_true", default=False, help="Confirmar recarga automática desativada no painel")
-    parser.add_argument("--verify-key-endpoint", action="store_true", default=False, help="Consultar endpoint /api/v1/auth/key para verificação")
+    parser.add_argument("--verify-key-endpoint", action="store_true", default=False, help="Consultar endpoint /api/v1/key para verificação")
     parser.add_argument("--authorization-manifest", type=str, default=None, help="Caminho para manifesto JSON de autorização formal")
     parser.add_argument("--model-id", type=str, default=None, help="Sobrescrever ID do modelo gratuito")
 
@@ -589,12 +829,35 @@ def main() -> int:
             verifier = OpenRouterAccountVerifier()
             key_verification = verifier.verify_key_limits(api_key)
 
+        manifest_validation_result = None
+        if args.authorization_manifest:
+            try:
+                commit_hash = resolve_current_commit()
+            except Exception:
+                commit_hash = "unresolved"
+            if not os.path.exists(args.authorization_manifest):
+                manifest_validation_result = (False, f"Arquivo não encontrado: {args.authorization_manifest}")
+            else:
+                try:
+                    with open(args.authorization_manifest, "r", encoding="utf-8") as f:
+                        m_data = json.load(f)
+                    manifest_validation_result = validate_authorization_manifest(
+                        m_data,
+                        expected_model=args.model_id or m_data.get("target_model", ""),
+                        expected_commit=commit_hash,
+                    )
+                except Exception as e:
+                    manifest_validation_result = (False, f"Erro ao ler JSON: {e}")
+
         reqs = evaluate_requirements(
             api_key=api_key,
             key_verification=key_verification,
             spend_cap_confirmed=args.confirm_spend_cap_zero,
             auto_recharge_confirmed=args.confirm_no_auto_recharge,
             modality=ModelModality.TEXT,
+            authorized_by_user=args.authorized_by_user,
+            manifest_validation_result=manifest_validation_result,
+            require_api_verification=args.verify_key_endpoint,
         )
         print_requirements_table(reqs)
         unverified = [k for k, v in reqs.items() if v["status"] != RequirementStatus.VERIFIED]
