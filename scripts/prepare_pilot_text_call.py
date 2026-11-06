@@ -298,6 +298,7 @@ def evaluate_requirements(
     authorized_by_user: bool = False,
     manifest_validation_result: Optional[Tuple[bool, str]] = None,
     require_api_verification: bool = False,
+    require_documented_authorization: bool = False,
 ) -> Dict[str, Dict[str, Any]]:
     """Evaluate and classify all financial and operational requirements with explicit evidence provenance."""
     reqs: Dict[str, Dict[str, Any]] = {}
@@ -446,6 +447,15 @@ def evaluate_requirements(
                 "evidence_source": EvidenceSource.HUMAN_DOCUMENTED,
                 "details": f"Manifesto formal rejeitado: {reason}",
             }
+    elif require_documented_authorization:
+        reqs["EXECUTION_AUTHORIZATION"] = {
+            "status": RequirementStatus.PENDING,
+            "evidence_source": EvidenceSource.PENDING,
+            "details": (
+                "Manifesto formal documentado (--authorization-manifest) é OBRIGATÓRIO para o piloto real N=1. "
+                "A flag operacional isolada (--authorized-by-user) não comprova consentimento humano independente."
+            ),
+        }
     elif authorized_by_user:
         reqs["EXECUTION_AUTHORIZATION"] = {
             "status": RequirementStatus.VERIFIED,
@@ -705,6 +715,7 @@ def execute_live_pilot(
         authorized_by_user=authorized_by_user,
         manifest_validation_result=manifest_validation_result,
         require_api_verification=verify_key_endpoint,
+        require_documented_authorization=True,
     )
     print_requirements_table(reqs)
 
@@ -790,7 +801,12 @@ def execute_live_pilot(
     print(f"  Latência Total: {result.latency_ms:.2f} ms (medido localmente: {elapsed:.2f} ms)")
     print(f"  Tokens Reportados: {result.tokens} (Proveniência: {result.token_provenance.value})")
     print(f"  TTFT: {result.ttft_ms} (Proveniência: {result.ttft_provenance.value})")
-    print(f"  Custo Reportado: US$ {result.cost_usd:.6f}")
+    cost_prov_val = (
+        result.cost_provenance.value
+        if isinstance(getattr(result, "cost_provenance", None), MetricProvenance)
+        else str(getattr(result, "cost_provenance", "UNKNOWN"))
+    )
+    print(f"  Custo Reportado: US$ {result.cost_usd:.6f} (Proveniência: {cost_prov_val} — presumido pelo catálogo, não cobrança efetiva faturada)")
     if result.error_message:
         print(f"  Mensagem de Erro: {result.error_message}")
     print(f"  Auditoria gravada em: {ledger_path}")
@@ -800,6 +816,8 @@ def execute_live_pilot(
     # Save run artifact
     result_dict = result.to_dict()
     result_dict["authorization_record"] = auth_record.to_dict()
+    result_dict["cost_provenance"] = cost_prov_val
+    result_dict["cost_statement"] = "Presumido pelo catálogo com base no preço declarado US$ 0.00; não representa cobrança bancária ou fatura confirmada pela API."
     result_json_path = os.path.join(bench_directory, "pilot_live_n1_result.json")
     with open(result_json_path, "w", encoding="utf-8") as f:
         json.dump(result_dict, f, indent=2)

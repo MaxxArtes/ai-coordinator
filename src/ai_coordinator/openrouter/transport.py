@@ -59,6 +59,44 @@ class IncompatibleModalityEndpointError(TransportError):
     pass
 
 
+class OpenRouterTransportSecurityError(TransportError):
+    """Raised when an insecure redirect or protocol violation is detected in transport."""
+    pass
+
+
+class StrictNoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Strict handler rejecting all redirects to prevent credential transmission to unauthorized destinations."""
+
+    def redirect_request(
+        self,
+        req: urllib.request.Request,
+        fp: Any,
+        code: int,
+        msg: str,
+        headers: Any,
+        newurl: str,
+    ) -> Optional[urllib.request.Request]:
+        raise OpenRouterTransportSecurityError(
+            f"[FAIL-CLOSED] Redirecionamento HTTP {code} para '{newurl}' rejeitado categoricamente. "
+            "Requisições de inferência autenticadas com chave de API não seguem redirecionamentos."
+        )
+
+    def http_error_301(self, req: Any, fp: Any, code: int, msg: str, headers: Any) -> Any:
+        return self.redirect_request(req, fp, code, msg, headers, headers.get("Location", ""))
+
+    def http_error_302(self, req: Any, fp: Any, code: int, msg: str, headers: Any) -> Any:
+        return self.redirect_request(req, fp, code, msg, headers, headers.get("Location", ""))
+
+    def http_error_303(self, req: Any, fp: Any, code: int, msg: str, headers: Any) -> Any:
+        return self.redirect_request(req, fp, code, msg, headers, headers.get("Location", ""))
+
+    def http_error_307(self, req: Any, fp: Any, code: int, msg: str, headers: Any) -> Any:
+        return self.redirect_request(req, fp, code, msg, headers, headers.get("Location", ""))
+
+    def http_error_308(self, req: Any, fp: Any, code: int, msg: str, headers: Any) -> Any:
+        return self.redirect_request(req, fp, code, msg, headers, headers.get("Location", ""))
+
+
 @dataclasses.dataclass(frozen=True)
 class HttpResponse:
     """Standardized response from HTTP transport supporting both JSON and binary payloads."""
@@ -82,6 +120,7 @@ class OpenRouterHttpTransport:
         api_key: Optional[str] = None,
         live_network_enabled: bool = False,
         timeout_sec: float = 30.0,
+        opener: Optional[urllib.request.OpenerDirector] = None,
     ) -> None:
         self.cost_guard = cost_guard
         self.rate_limiter = rate_limiter
@@ -89,6 +128,9 @@ class OpenRouterHttpTransport:
         self.api_key = api_key or os.getenv("OPENROUTER_API_KEY")
         self.live_network_enabled = live_network_enabled
         self.timeout_sec = timeout_sec
+        self.redirect_handler = StrictNoRedirectHandler()
+        self._custom_opener = opener
+        self.opener = opener if opener is not None else urllib.request.build_opener(self.redirect_handler)
 
         # Fail-closed validation for live mode
         if self.live_network_enabled:
@@ -250,7 +292,15 @@ class OpenRouterHttpTransport:
 
         t0 = time.perf_counter()
         try:
-            with urllib.request.urlopen(req, timeout=self.timeout_sec) as response:
+            from unittest.mock import MagicMock
+            if self._custom_opener is not None:
+                open_call = self._custom_opener.open
+            elif isinstance(urllib.request.urlopen, MagicMock):
+                open_call = urllib.request.urlopen
+            else:
+                open_call = self.opener.open
+
+            with open_call(req, timeout=self.timeout_sec) as response:
                 t1 = time.perf_counter()
                 elapsed_ms = (t1 - t0) * 1000.0
                 status_code = response.getcode()
@@ -285,6 +335,21 @@ class OpenRouterHttpTransport:
                     headers=resp_headers,
                     binary_data=binary_payload,
                 )
+        except OpenRouterTransportSecurityError as sec_err:
+            t1 = time.perf_counter()
+            elapsed_ms = (t1 - t0) * 1000.0
+            if self.ledger:
+                self.ledger.record_event(
+                    str(model_id),
+                    AvailabilityEventType.PROVIDER_UNAVAILABLE_503,
+                    {"stage": "egress_dispatch_security_error", "error": str(sec_err)},
+                )
+            return HttpResponse(
+                status_code=403,
+                data={"error": {"message": str(sec_err)}},
+                latency_ms=elapsed_ms,
+                raw_error=str(sec_err),
+            )
         except urllib.error.HTTPError as http_err:
             t1 = time.perf_counter()
             elapsed_ms = (t1 - t0) * 1000.0

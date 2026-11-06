@@ -176,6 +176,7 @@ class AdapterResponse:
     tokens: Dict[str, int]
     token_provenance: MetricProvenance
     cost_usd: float  # Strictly 0.0 for free-tier
+    cost_provenance: MetricProvenance = MetricProvenance.UNKNOWN
     status_code: int = 200
     ttft_ms: Optional[float] = None
     ttft_provenance: MetricProvenance = MetricProvenance.UNKNOWN
@@ -199,6 +200,7 @@ class AdapterResponse:
             "reported_tokens": self.tokens,
             "token_provenance": self.token_provenance.value,
             "cost_usd": round(self.cost_usd, 6),
+            "cost_provenance": self.cost_provenance.value if isinstance(self.cost_provenance, MetricProvenance) else str(self.cost_provenance),
             "status_code": self.status_code,
             "ttft_ms": round(self.ttft_ms, 4) if self.ttft_ms is not None else None,
             "ttft_provenance": self.ttft_provenance.value,
@@ -306,6 +308,7 @@ class TextModelAdapter(BaseModelAdapter):
                 tokens={"prompt_tokens": in_tok, "completion_tokens": out_tok, "total_tokens": in_tok + out_tok},
                 token_provenance=MetricProvenance.SYNTHETIC,
                 cost_usd=0.0,
+                cost_provenance=MetricProvenance.SYNTHETIC,
                 status_code=mock_res.get("status_code", 200),
                 retry_after_sec=mock_res.get("retry_after_sec"),
                 metadata={"provider": entry.provider_name},
@@ -330,6 +333,7 @@ class TextModelAdapter(BaseModelAdapter):
                 tokens=tokens_dict,
                 token_provenance=token_prov,
                 cost_usd=0.0,
+                cost_provenance=MetricProvenance.UNKNOWN,  # Presumed from catalog, unverified as billed transaction
                 status_code=res.status_code,
                 retry_after_sec=res.retry_after_sec,
                 error_message=res.raw_error,
@@ -347,6 +351,7 @@ class TextModelAdapter(BaseModelAdapter):
             tokens={"prompt_tokens": 50, "completion_tokens": 25, "total_tokens": 75},
             token_provenance=MetricProvenance.SYNTHETIC,
             cost_usd=0.0,
+            cost_provenance=MetricProvenance.SYNTHETIC,
             status_code=200,
             metadata={"offline_simulated": True, "provider": entry.provider_name},
         )

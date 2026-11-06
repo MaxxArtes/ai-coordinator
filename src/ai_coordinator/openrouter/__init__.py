@@ -41,6 +41,8 @@ from .transport import (
     HttpResponse,
     LiveNetworkDisabledError,
     IncompatibleModalityEndpointError,
+    OpenRouterTransportSecurityError,
+    StrictNoRedirectHandler,
     TransportError,
 )
 from .adapters import (
@@ -93,6 +95,8 @@ __all__ = [
     "RetryPolicy",
     "OpenRouterHttpTransport",
     "HttpResponse",
+    "OpenRouterTransportSecurityError",
+    "StrictNoRedirectHandler",
     "LiveNetworkDisabledError",
     "IncompatibleModalityEndpointError",
     "TransportError",

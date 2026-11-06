@@ -61,6 +61,7 @@ class ModelBenchmarkRunResult:
     metadata: Dict[str, Any]
     ttft_ms: Optional[float] = None
     ttft_provenance: MetricProvenance = MetricProvenance.UNKNOWN
+    cost_provenance: MetricProvenance = MetricProvenance.UNKNOWN
 
     @property
     def reported_tokens(self) -> Dict[str, int]:
@@ -79,6 +80,7 @@ class ModelBenchmarkRunResult:
             "token_provenance": self.token_provenance.value,
             "latency_provenance": self.latency_provenance.value,
             "cost_usd": round(self.cost_usd, 6),
+            "cost_provenance": self.cost_provenance.value if isinstance(self.cost_provenance, MetricProvenance) else str(self.cost_provenance),
             "status_code": self.status_code,
             "error_message": self.error_message,
             "timestamp": self.timestamp,
@@ -420,6 +422,7 @@ class ModelBenchmarkRunner:
             token_provenance=last_response.token_provenance,
             latency_provenance=latency_prov,
             cost_usd=last_response.cost_usd,
+            cost_provenance=getattr(last_response, "cost_provenance", MetricProvenance.UNKNOWN),
             status_code=last_response.status_code,
             error_message=last_response.error_message,
             timestamp=now_iso,

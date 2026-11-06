@@ -5,14 +5,16 @@ Verifies:
 2. Requirement classification (VERIFIED, PENDING, FAILED) with explicit EvidenceSource.
 3. OpenRouterAccountVerifier key limit inspection on official endpoint (https://openrouter.ai/api/v1/key).
 4. Spend cap verification: is_free_tier alone does NOT prove US$ 0.00; finite numeric 0.0 is strictly required.
-5. Anti-redirect defense: RejectAllRedirectsHandler rejects any HTTP redirect (301/302) fail-closed.
-6. Fail-closed API verification: API errors or positive limits do not silently fall back to boolean flags.
-7. Authorization manifest validation: validates model, US$ 0.00 budget, code commit, authorizer, and validity.
-8. Single attempt guarantee: RetryPolicy(max_attempts=1) ensures exactly 1 dispatch, zero retries on 429/503.
-9. End-to-end simulated --live execution flow with mocked catalog, account verification, and transport.
-10. Preservation of audit trail in AvailabilityLedger and atomic quota reservation in SQLite.
-11. Strict blocking when any financial prerequisite is unconfirmed or unauthorized.
-12. Explicit identification of synthetic provenance in dry-run mode.
+5. Anti-redirect defense in account verifier: RejectAllRedirectsHandler rejects HTTP 301/302 fail-closed.
+6. Anti-redirect defense in inference transport: StrictNoRedirectHandler rejects HTTP 302 fail-closed before
+   any credential (Authorization: Bearer) is sent to a foreign destination.
+7. Fail-closed API verification: API errors or positive limits do not silently fall back to boolean flags.
+8. Authorization manifest validation: validates model, US$ 0.00 budget, code commit, authorizer, and validity.
+9. Strict documented manifest requirement: OPERATOR_FLAG alone cannot authorize live execution.
+10. Single attempt guarantee: RetryPolicy(max_attempts=1) ensures exactly 1 dispatch, zero retries on 429/503.
+11. Cost provenance classification: live inference responses classify cost as UNKNOWN (presumed from catalog,
+    not unverified billed transaction).
+12. End-to-end simulated --live execution flow with mocked catalog, account verification, and transport.
 13. Strict resolve_current_commit() without stale fallback hash.
 """
 from __future__ import annotations
@@ -45,8 +47,10 @@ from ai_coordinator.openrouter import (
     ModelModality,
     OfficialOpenRouterCatalogClient,
     OpenRouterHttpTransport,
+    OpenRouterTransportSecurityError,
     RetryPolicy,
     SlidingWindowRateLimiter,
+    StrictNoRedirectHandler,
 )
 from ai_coordinator.openrouter.registry import _create_official_https_snapshot
 
@@ -99,6 +103,19 @@ class TestPhase4C1PilotPreflight(unittest.TestCase):
 
     def tearDown(self) -> None:
         shutil.rmtree(self.tmp_dir, ignore_errors=True)
+
+    def _create_valid_manifest_file(self, target_model: str) -> str:
+        manifest_path = os.path.join(self.tmp_dir, "valid_manifest.json")
+        with open(manifest_path, "w", encoding="utf-8") as f:
+            json.dump({
+                "target_model": target_model,
+                "max_budget_usd": 0.0,
+                "code_commit": resolve_current_commit(),
+                "authorizer": "operator_admin",
+                "valid_until": (dt.datetime.now(dt.timezone.utc) + dt.timedelta(days=7)).isoformat(),
+                "execution_scope": "N=1 live pilot",
+            }, f)
+        return manifest_path
 
     def test_01_catalog_client_signature_matches_requirements(self) -> None:
         """Ajuste 1: OfficialOpenRouterCatalogClient configura timeout_sec no construtor e fetch_catalog() tem aridade 0."""
@@ -268,7 +285,7 @@ class TestPhase4C1PilotPreflight(unittest.TestCase):
 
     def test_07_authorization_manifest_validation_and_divergence(self) -> None:
         """Ajuste 6 & 7: Validação de manifesto externo e rejeição de divergências (modelo, commit, orçamento, validade)."""
-        head_commit = "d733f25a3c20fbedb6a0639d4bd35db49f21b933"
+        head_commit = resolve_current_commit()
         valid_date = (dt.datetime.now(dt.timezone.utc) + dt.timedelta(days=7)).isoformat()
         expired_date = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=1)).isoformat()
 
@@ -349,32 +366,38 @@ class TestPhase4C1PilotPreflight(unittest.TestCase):
         limiter = SlidingWindowRateLimiter(sqlite_path=self.db_path)
         ledger = AvailabilityLedger(storage_path=self.ledger_path, require_durable=True)
 
+        mock_opener = MagicMock()
+        mock_opener.open.return_value = mock_cm
+
         mock_transport = OpenRouterHttpTransport(
             cost_guard=guard,
             rate_limiter=limiter,
             ledger=ledger,
             api_key="sk-or-v1-fake-live-key",
             live_network_enabled=True,
+            opener=mock_opener,
         )
 
-        with patch("urllib.request.urlopen", return_value=mock_cm) as mock_urlopen:
-            exit_code = execute_live_pilot(
-                api_key_override="sk-or-v1-fake-live-key",
-                catalog_client=mock_client,
-                account_verifier=mock_verifier,
-                confirm_spend_cap_zero=True,
-                confirm_no_auto_recharge=True,
-                verify_key_endpoint=True,
-                authorized_by_user=True,
-                bench_dir=self.tmp_dir,
-                custom_transport=mock_transport,
-            )
+        manifest_file = self._create_valid_manifest_file("meta-llama/llama-3.2-3b-instruct:free")
+
+        exit_code = execute_live_pilot(
+            api_key_override="sk-or-v1-fake-live-key",
+            catalog_client=mock_client,
+            account_verifier=mock_verifier,
+            confirm_spend_cap_zero=True,
+            confirm_no_auto_recharge=True,
+            verify_key_endpoint=True,
+            authorization_manifest_path=manifest_file,
+            authorized_by_user=True,
+            bench_dir=self.tmp_dir,
+            custom_transport=mock_transport,
+        )
 
         self.assertEqual(exit_code, 1, "Execução deve retornar 1 ao receber HTTP 429.")
         self.assertEqual(
-            mock_urlopen.call_count,
+            mock_opener.open.call_count,
             1,
-            f"Deve despachar exatamente 1 requisição HTTP (sem retries), mas despachou {mock_urlopen.call_count}.",
+            f"Deve despachar exatamente 1 requisição HTTP (sem retries), mas despachou {mock_opener.open.call_count}.",
         )
 
     def test_10_e2e_simulated_live_execution_full_flow(self) -> None:
@@ -409,29 +432,35 @@ class TestPhase4C1PilotPreflight(unittest.TestCase):
         limiter = SlidingWindowRateLimiter(sqlite_path=self.db_path)
         ledger = AvailabilityLedger(storage_path=self.ledger_path, require_durable=True)
 
+        mock_opener = MagicMock()
+        mock_opener.open.return_value = mock_cm
+
         mock_transport = OpenRouterHttpTransport(
             cost_guard=guard,
             rate_limiter=limiter,
             ledger=ledger,
             api_key="sk-or-v1-fake-live-key",
             live_network_enabled=True,
+            opener=mock_opener,
         )
 
-        with patch("urllib.request.urlopen", return_value=mock_cm) as mock_urlopen:
-            exit_code = execute_live_pilot(
-                api_key_override="sk-or-v1-fake-live-key",
-                catalog_client=mock_client,
-                account_verifier=mock_verifier,
-                confirm_spend_cap_zero=True,
-                confirm_no_auto_recharge=True,
-                verify_key_endpoint=True,
-                authorized_by_user=True,
-                bench_dir=self.tmp_dir,
-                custom_transport=mock_transport,
-            )
+        manifest_file = self._create_valid_manifest_file("meta-llama/llama-3.2-3b-instruct:free")
+
+        exit_code = execute_live_pilot(
+            api_key_override="sk-or-v1-fake-live-key",
+            catalog_client=mock_client,
+            account_verifier=mock_verifier,
+            confirm_spend_cap_zero=True,
+            confirm_no_auto_recharge=True,
+            verify_key_endpoint=True,
+            authorization_manifest_path=manifest_file,
+            authorized_by_user=True,
+            bench_dir=self.tmp_dir,
+            custom_transport=mock_transport,
+        )
 
         self.assertEqual(exit_code, 0)
-        self.assertEqual(mock_urlopen.call_count, 1)
+        self.assertEqual(mock_opener.open.call_count, 1)
 
         # Verify quota persistence
         self.assertEqual(limiter.requests_in_current_minute, 1)
@@ -453,6 +482,7 @@ class TestPhase4C1PilotPreflight(unittest.TestCase):
         self.assertEqual(saved_result["tokens"]["total_tokens"], 18)
         self.assertEqual(saved_result["token_provenance"], MetricProvenance.MEASURED.value)
         self.assertEqual(saved_result["authorization_record"]["max_budget_usd"], 0.0)
+        self.assertEqual(saved_result["cost_provenance"], MetricProvenance.UNKNOWN.value)
 
     def test_11_e2e_simulated_live_blocked_if_spend_cap_unverified(self) -> None:
         """Ajuste 4: Se o Spend Cap estiver PENDING (não confirmado), o caminho live é BLOQUEADO antes da inferência."""
@@ -473,12 +503,15 @@ class TestPhase4C1PilotPreflight(unittest.TestCase):
             live_network_enabled=True,
         )
 
+        manifest_file = self._create_valid_manifest_file("meta-llama/llama-3.2-3b-instruct:free")
+
         with patch("urllib.request.urlopen") as mock_urlopen:
             exit_code = execute_live_pilot(
                 api_key_override="sk-or-v1-fake-live-key",
                 catalog_client=mock_client,
                 confirm_spend_cap_zero=False,  # Unconfirmed!
                 confirm_no_auto_recharge=True,
+                authorization_manifest_path=manifest_file,
                 authorized_by_user=True,
                 bench_dir=self.tmp_dir,
                 custom_transport=mock_transport,
@@ -506,12 +539,15 @@ class TestPhase4C1PilotPreflight(unittest.TestCase):
             live_network_enabled=True,
         )
 
+        manifest_file = self._create_valid_manifest_file("meta-llama/llama-3.2-3b-instruct:free")
+
         with patch("urllib.request.urlopen") as mock_urlopen:
             exit_code = execute_live_pilot(
                 api_key_override="sk-or-v1-fake-live-key",
                 catalog_client=mock_client,
                 confirm_spend_cap_zero=True,
                 confirm_no_auto_recharge=False,  # Unconfirmed!
+                authorization_manifest_path=manifest_file,
                 authorized_by_user=True,
                 bench_dir=self.tmp_dir,
                 custom_transport=mock_transport,
@@ -525,7 +561,102 @@ class TestPhase4C1PilotPreflight(unittest.TestCase):
         exit_code = execute_live_pilot(authorized_by_user=False)
         self.assertEqual(exit_code, 1)
 
-    def test_14_dry_run_identifies_synthetic_metrics(self) -> None:
+    def test_14_e2e_simulated_live_blocked_if_authorization_manifest_is_missing(self) -> None:
+        """Ajuste P1: Para a execução real N=1, OPERATOR_FLAG sozinho é recusado e manifesto documentado é obrigatório."""
+        mock_client = MagicMock(spec=OfficialOpenRouterCatalogClient)
+        mock_client.fetch_catalog.return_value = self.official_snapshot
+
+        mock_verifier = MagicMock(spec=OpenRouterAccountVerifier)
+        mock_verifier.verify_key_limits.return_value = {
+            "status": "OK",
+            "limit": 0.0,
+            "limit_is_zero": True,
+            "usage": 0.0,
+            "is_free_tier": True,
+        }
+
+        registry = FreeModelRegistry(require_trusted_source=True)
+        registry.load_authenticated_snapshot(self.official_snapshot)
+        guard = FreeCostGuard(registry)
+        limiter = SlidingWindowRateLimiter(sqlite_path=self.db_path)
+        ledger = AvailabilityLedger(storage_path=self.ledger_path, require_durable=True)
+
+        mock_transport = OpenRouterHttpTransport(
+            cost_guard=guard,
+            rate_limiter=limiter,
+            ledger=ledger,
+            api_key="sk-or-v1-fake-live-key",
+            live_network_enabled=True,
+        )
+
+        with patch("urllib.request.urlopen") as mock_urlopen:
+            exit_code = execute_live_pilot(
+                api_key_override="sk-or-v1-fake-live-key",
+                catalog_client=mock_client,
+                account_verifier=mock_verifier,
+                confirm_spend_cap_zero=True,
+                confirm_no_auto_recharge=True,
+                authorization_manifest_path=None,  # Missing manifest!
+                authorized_by_user=True,
+                bench_dir=self.tmp_dir,
+                custom_transport=mock_transport,
+            )
+
+        self.assertEqual(exit_code, 1, "Live N=1 deve falhar fail-closed quando manifesto não for fornecido.")
+        mock_urlopen.assert_not_called()
+
+    def test_15_transport_rejects_http_302_redirect_fail_closed(self) -> None:
+        """Ajuste P0: StrictNoRedirectHandler em OpenRouterHttpTransport bloqueia HTTP 302 antes de transmitir credenciais."""
+        handler = StrictNoRedirectHandler()
+        mock_req = MagicMock()
+
+        # Rejection of HTTP 302
+        with self.assertRaises(OpenRouterTransportSecurityError) as cm302:
+            handler.http_error_302(
+                mock_req,
+                fp=None,
+                code=302,
+                msg="Found",
+                headers={"Location": "https://malicious-intercept.com/leak"},
+            )
+        self.assertIn("rejeitado categoricamente", str(cm302.exception))
+        self.assertIn("302", str(cm302.exception))
+
+        # Rejection of HTTP 301
+        with self.assertRaises(OpenRouterTransportSecurityError) as cm301:
+            handler.http_error_301(
+                mock_req,
+                fp=None,
+                code=301,
+                msg="Moved Permanently",
+                headers={"Location": "http://openrouter.ai/api/v1/chat/completions"},
+            )
+        self.assertIn("rejeitado categoricamente", str(cm301.exception))
+
+        # Verify transport dispatch returns 403 error response when redirect occurs
+        mock_opener = MagicMock()
+        mock_opener.open.side_effect = OpenRouterTransportSecurityError("Redirecionamento bloqueado")
+
+        registry = FreeModelRegistry(require_trusted_source=True)
+        registry.load_authenticated_snapshot(self.official_snapshot)
+        guard = FreeCostGuard(registry)
+        limiter = SlidingWindowRateLimiter(sqlite_path=self.db_path)
+        ledger = AvailabilityLedger(storage_path=self.ledger_path, require_durable=True)
+
+        transport = OpenRouterHttpTransport(
+            cost_guard=guard,
+            rate_limiter=limiter,
+            ledger=ledger,
+            api_key="sk-or-v1-fake-live-key",
+            live_network_enabled=True,
+            opener=mock_opener,
+        )
+
+        resp = transport.dispatch("text", {"model": "meta-llama/llama-3.2-3b-instruct:free", "messages": []})
+        self.assertEqual(resp.status_code, 403)
+        self.assertIn("Redirecionamento bloqueado", resp.raw_error)
+
+    def test_16_dry_run_identifies_synthetic_metrics(self) -> None:
         """Ajuste 5: O modo dry-run identifica explicitamente catálogo, latência, tokens e custo como sintéticos."""
         ret = prepare_offline_dry_run()
         self.assertEqual(ret, 0)
