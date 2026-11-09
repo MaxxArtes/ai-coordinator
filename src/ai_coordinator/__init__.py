@@ -300,6 +300,16 @@ from .openrouter import (
     scrub_outbound_payload,
     ModelBenchmarkRunner,
     ModelBenchmarkRunResult,
+    AtomicDispatchQuotaStore,
+    TransactionalOutboxProjector,
+    GovernedFallbackEngine,
+    DispatchReservation,
+    FallbackDecision,
+    QuotaSecurityError,
+    BudgetExhaustedError,
+    IllegalStateTransitionError,
+    ReservationNotFoundError,
+    PersistentReplayAttackError,
 )
 
 __all__ = [
@@ -559,5 +569,15 @@ __all__ = [
     "scrub_outbound_payload",
     "ModelBenchmarkRunner",
     "ModelBenchmarkRunResult",
+    "AtomicDispatchQuotaStore",
+    "TransactionalOutboxProjector",
+    "GovernedFallbackEngine",
+    "DispatchReservation",
+    "FallbackDecision",
+    "QuotaSecurityError",
+    "BudgetExhaustedError",
+    "IllegalStateTransitionError",
+    "ReservationNotFoundError",
+    "PersistentReplayAttackError",
 ]
 __version__ = "0.5.1"
