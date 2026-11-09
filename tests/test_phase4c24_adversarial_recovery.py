@@ -22,6 +22,7 @@ from __future__ import annotations
 import concurrent.futures
 import datetime as dt
 import json
+import multiprocessing
 import os
 import shutil
 import tempfile
@@ -34,6 +35,7 @@ from ai_coordinator.manifest_auth import (
     PERMISSION_DISPATCH_OPENROUTER_FREE,
     CanonicalAuthorizationManifest,
     Ed25519Signer,
+    HumanOperationalApproval,
     HumanOperationalAuthorizationError,
     KeyAuthorityError,
     SignedAuthorizationManifest,
@@ -50,10 +52,16 @@ from ai_coordinator.openrouter.atomic_quota import (
     BudgetExhaustedError,
     GovernedFallbackEngine,
     IllegalStateTransitionError,
+    LedgerCorruptionError,
     PersistentReplayAttackError,
     QuotaSecurityError,
     ReservationNotFoundError,
     TransactionalOutboxProjector,
+)
+from ai_coordinator.openrouter.mp_workers import (
+    mp_contention_worker,
+    mp_outbox_projector_worker,
+    mp_recovery_scanner_worker,
 )
 from ai_coordinator.openrouter.cost_guard import (
     FreeCostGuard,
@@ -129,17 +137,25 @@ class TestPhase4C24AdversarialRecovery(unittest.TestCase):
         self.catalog.load_catalog_data(raw_catalog, epoch=self.now_utc.timestamp())
         self.cost_guard = FreeCostGuard(registry=self.catalog)
 
-        # Store and Projector
+        # Store, Projector, and Authenticated Human Session
+        self.human_session = HumanOperationalApproval.create(
+            operator_identity="security_operator_root",
+            session_id="cli-sess-4c24-adversarial",
+            authorization_id="auth-pilot-session",
+        )
         self.store = AtomicDispatchQuotaStore(
             db_path=self.db_path,
             default_trust_store=self.trust_store,
             expected_commit=self.valid_commit,
+            default_human_session=self.human_session,
         )
         self.projector = TransactionalOutboxProjector(store=self.store, ledger_path=self.ledger_path)
         self.fallback_engine = GovernedFallbackEngine(
             quota_store=self.store,
             projector=self.projector,
             cost_guard=self.cost_guard,
+            default_trust_store=self.trust_store,
+            expected_commit=self.valid_commit,
         )
 
     def tearDown(self) -> None:
@@ -322,19 +338,37 @@ class TestPhase4C24AdversarialRecovery(unittest.TestCase):
     # SCENARIO 5: Disk Read-Only Failure & Ledger Corruption Tolerance
     # =======================================================================
 
-    def test_05_corrupted_ledger_recovery_skips_bad_lines_without_crash(self) -> None:
-        """TC-05: Projector safely handles corrupt/truncated lines in JSONL ledger without data loss."""
+    def test_05_corrupted_ledger_detection_fail_closed_and_verified_quarantine(self) -> None:
+        """TC-05 (Auditor P1): Detects ledger corruption, fails closed on projection, and recovers via quarantine."""
         # Pre-populate ledger with valid line and a corrupt non-JSON line
         os.makedirs(os.path.dirname(self.ledger_path), exist_ok=True)
         with open(self.ledger_path, "w", encoding="utf-8") as f:
-            f.write(json.dumps({"event_id": "evt_existing_001", "event_type": "DUMMY"}) + "\n")
+            f.write(json.dumps({"event_id": "evt_existing_001", "event_type": "DUMMY", "created_at_epoch": time.time()}) + "\n")
             f.write("CORRUPTED_NON_JSON_DATA_GARBAGE!@#$%\n")
-            f.write(json.dumps({"event_id": "evt_existing_002", "event_type": "DUMMY"}) + "\n")
+            f.write(json.dumps({"event_id": "evt_existing_002", "event_type": "DUMMY", "created_at_epoch": time.time()}) + "\n")
 
-        # Projector reads existing IDs without raising JSONDecodeError
-        existing = self.projector._read_existing_ledger_event_ids()
-        self.assertIn("evt_existing_001", existing)
-        self.assertIn("evt_existing_002", existing)
+        # 1. verify_ledger_integrity detects corruption and lists errors
+        is_valid, errors, valid_ids = self.projector.verify_ledger_integrity()
+        self.assertFalse(is_valid)
+        self.assertGreaterEqual(len(errors), 1)
+        self.assertIn("invalid JSON", errors[0])
+
+        # 2. project_pending_events blocks fail-closed when corruption is detected
+        with self.assertRaises(LedgerCorruptionError) as ctx:
+            self.projector.project_pending_events()
+        self.assertIn("Ledger corruption detected", str(ctx.exception))
+
+        # 3. Verified recovery tool isolates corrupted line into quarantine and repairs ledger
+        repaired_cnt, quar_cnt, quar_path = self.projector.recover_and_quarantine_corrupt_ledger()
+        self.assertEqual(repaired_cnt, 2)
+        self.assertEqual(quar_cnt, 1)
+        self.assertTrue(os.path.exists(quar_path))
+
+        # 4. Integrity check passes after recovery
+        is_valid2, errors2, valid_ids2 = self.projector.verify_ledger_integrity()
+        self.assertTrue(is_valid2)
+        self.assertEqual(len(errors2), 0)
+        self.assertEqual(valid_ids2, {"evt_existing_001", "evt_existing_002"})
 
     # =======================================================================
     # SCENARIO 6: Replay of Manifests and Reservation Reuse Attempts
@@ -424,10 +458,26 @@ class TestPhase4C24AdversarialRecovery(unittest.TestCase):
     # =======================================================================
 
     def test_09_consent_mandatory_no_default_and_imposter_rejection(self) -> None:
-        """TC-09 (Auditor P0): Enforces mandatory consent and rejects imposter identity."""
+        """TC-09 (Auditor P0): Enforces authenticated human approval, rejects isolated boolean flags and imposters."""
         signed = self._sign_manifest(auth_id="auth-consent-checks")
 
-        # 1. False consent rejected
+        # 1. Isolated boolean flag on store without default session MUST BE REJECTED
+        store_no_session = AtomicDispatchQuotaStore(
+            db_path=os.path.join(self.tmp_dir, "isolated_flag_test.db"),
+            default_trust_store=self.trust_store,
+            expected_commit=self.valid_commit,
+            default_human_session=None,  # No default human session
+        )
+        with self.assertRaises(HumanOperationalAuthorizationError) as ctx:
+            store_no_session.register_budget_from_signed_manifest(
+                signed_manifest=signed,
+                trust_store=self.trust_store,
+                expected_commit=self.valid_commit,
+                human_operator_consent=True,  # Isolated boolean flag alone!
+            )
+        self.assertIn("isolated boolean consent flag is prohibited", str(ctx.exception).lower())
+
+        # 2. False consent rejected
         with self.assertRaises(HumanOperationalAuthorizationError) as ctx:
             self.store.register_budget_from_signed_manifest(
                 signed_manifest=signed,
@@ -437,7 +487,7 @@ class TestPhase4C24AdversarialRecovery(unittest.TestCase):
             )
         self.assertIn("mandatory", str(ctx.exception).lower())
 
-        # 2. Imposter identity rejected
+        # 3. Imposter identity rejected
         with self.assertRaises(HumanOperationalAuthorizationError) as ctx:
             self.store.register_budget_from_signed_manifest(
                 signed_manifest=signed,
@@ -445,8 +495,23 @@ class TestPhase4C24AdversarialRecovery(unittest.TestCase):
                 expected_commit=self.valid_commit,
                 human_operator_consent=True,
                 human_operator_identity="imposter_hacker",  # does not match manifest
+                human_session_id="cli-sess-fake",
             )
         self.assertIn("identity mismatch", str(ctx.exception).lower())
+
+        # 4. Authenticated HumanOperationalApproval succeeds
+        valid_approval = HumanOperationalApproval.create(
+            operator_identity="security_operator_root",
+            session_id="cli-sess-valid-operator-4c24",
+            authorization_id=signed.manifest.authorization_id,
+        )
+        b_id = store_no_session.register_budget_from_signed_manifest(
+            signed_manifest=signed,
+            trust_store=self.trust_store,
+            expected_commit=self.valid_commit,
+            human_approval=valid_approval,
+        )
+        self.assertTrue(b_id.startswith("budget_"))
 
     # =======================================================================
     # SCENARIO 9: Paid Model or Stale Catalog in Fallback (FreeCostGuard P0)
@@ -488,7 +553,7 @@ class TestPhase4C24AdversarialRecovery(unittest.TestCase):
     # =======================================================================
 
     def test_11_fallback_rejected_without_proven_http_429(self) -> None:
-        """TC-11: Fallback requires proven HTTP 429 failure on matching reservation."""
+        """TC-11 (Auditor P0): Rejects fallback on UNKNOWN, HTTP 200, HTTP 400, or missing HTTP status."""
         signed = self._sign_manifest(auth_id="auth-fb-provenance", max_dispatches=2)
         b_id = self.store.register_budget_from_signed_manifest(
             signed_manifest=signed,
@@ -496,21 +561,63 @@ class TestPhase4C24AdversarialRecovery(unittest.TestCase):
             expected_commit=self.valid_commit,
             human_operator_consent=True,
         )
-        res1 = self.store.acquire_reservation(b_id, "att_prov", 0, "liquid/lfm-3-1.7b:free")
-        self.store.commit_send(res1.reservation_id)
-        # Reservation actually succeeded with HTTP 200
-        self.store.record_completion(res1.reservation_id, http_status_code=200)
 
-        # Attempting fallback on a successful reservation must be rejected
+        # 1. Successful reservation (HTTP 200) -> Rejected
+        res1 = self.store.acquire_reservation(b_id, "att_prov1", 0, "liquid/lfm-3-1.7b:free")
+        self.store.commit_send(res1.reservation_id)
+        self.store.record_completion(res1.reservation_id, http_status_code=200)
         with self.assertRaises(QuotaSecurityError) as ctx:
             self.fallback_engine.evaluate_fallback(
                 budget_id=b_id,
                 failed_reservation=res1,
                 allowed_models=signed.manifest.allowed_models,
-                logical_attempt_id="att_prov",
+                logical_attempt_id="att_prov1",
                 catalog_registry=self.catalog,
             )
-        self.assertIn("must be 'FAILED'", str(ctx.exception))
+        self.assertIn("only 'failed'", str(ctx.exception).lower())
+
+        # 2. Ambiguous UNKNOWN reservation (e.g. socket timeout/crash) -> STRICTLY REJECTED
+        signed2 = self._sign_manifest(auth_id="auth-fb-unknown-block", max_dispatches=2)
+        b_id2 = self.store.register_budget_from_signed_manifest(
+            signed_manifest=signed2,
+            trust_store=self.trust_store,
+            expected_commit=self.valid_commit,
+            human_operator_consent=True,
+        )
+        res_unk = self.store.acquire_reservation(b_id2, "att_unk", 0, "liquid/lfm-3-1.7b:free")
+        self.store.commit_send(res_unk.reservation_id)
+        self.store.record_failure_unknown(res_unk.reservation_id, reason="Simulated network drop")
+        with self.assertRaises(QuotaSecurityError) as ctx:
+            self.fallback_engine.evaluate_fallback(
+                budget_id=b_id2,
+                failed_reservation=res_unk,
+                allowed_models=signed2.manifest.allowed_models,
+                logical_attempt_id="att_unk",
+                catalog_registry=self.catalog,
+            )
+        self.assertIn("unknown", str(ctx.exception).lower())
+
+        # 3. Non-429/503 HTTP status (e.g. HTTP 400 Bad Request) -> REJECTED
+        signed3 = self._sign_manifest(auth_id="auth-fb-http400-block", max_dispatches=2)
+        b_id3 = self.store.register_budget_from_signed_manifest(
+            signed_manifest=signed3,
+            trust_store=self.trust_store,
+            expected_commit=self.valid_commit,
+            human_operator_consent=True,
+        )
+        res_400 = self.store.acquire_reservation(b_id3, "att_400", 0, "liquid/lfm-3-1.7b:free")
+        self.store.commit_send(res_400.reservation_id)
+        self.store.record_completion(res_400.reservation_id, http_status_code=400)
+        with self.assertRaises(QuotaSecurityError) as ctx:
+            self.fallback_engine.evaluate_fallback(
+                budget_id=b_id3,
+                failed_reservation=res_400,
+                allowed_models=signed3.manifest.allowed_models,
+                logical_attempt_id="att_400",
+                catalog_registry=self.catalog,
+            )
+        self.assertIn("400", str(ctx.exception))
+        self.assertIn("only proven http 429 and 503", str(ctx.exception).lower())
 
     # =======================================================================
     # SCENARIO 11: Idempotent Outbox Recovery (Crash Between fsync and SQLite)
@@ -580,6 +687,165 @@ class TestPhase4C24AdversarialRecovery(unittest.TestCase):
         self.assertEqual(recovered, [res2.reservation_id])
         self.assertEqual(self.store.get_reservation(res1.reservation_id).state, STATE_COMPLETED)
         self.assertEqual(self.store.get_reservation(res2.reservation_id).state, STATE_UNKNOWN)
+
+    # =======================================================================
+    # SCENARIO 13: SEND_COMMITTED Missing Evidence Fails Closed (Auditor P0)
+    # =======================================================================
+
+    def test_14_commit_send_missing_trust_store_or_commit_fails_closed(self) -> None:
+        """TC-14 (Auditor P0): commit_send strictly blocks fail-closed if TrustStore or commit HEAD is missing."""
+        signed = self._sign_manifest(auth_id="auth-pic-evidence-missing", max_dispatches=2)
+        b_id = self.store.register_budget_from_signed_manifest(
+            signed_manifest=signed,
+            trust_store=self.trust_store,
+            expected_commit=self.valid_commit,
+            human_operator_consent=True,
+        )
+
+        # 1. Missing Trust Store blocks fail-closed
+        store_no_ts = AtomicDispatchQuotaStore(
+            db_path=self.db_path,
+            default_trust_store=None,  # No TrustStore available
+            expected_commit=self.valid_commit,
+            default_human_session=self.human_session,
+        )
+        res_no_ts = store_no_ts.acquire_reservation(b_id, "att_no_ts", 0, "liquid/lfm-3-1.7b:free")
+        with self.assertRaises(QuotaSecurityError) as ctx:
+            store_no_ts.commit_send(res_no_ts.reservation_id)
+        self.assertIn("trust store is mandatory", str(ctx.exception).lower())
+        self.assertEqual(store_no_ts.get_reservation(res_no_ts.reservation_id).state, STATE_FAILED)
+
+        # 2. Missing Execution Commit HEAD blocks fail-closed
+        store_no_commit = AtomicDispatchQuotaStore(
+            db_path=self.db_path,
+            default_trust_store=self.trust_store,
+            expected_commit=None,  # No commit HEAD available
+            default_human_session=self.human_session,
+        )
+        res_no_cm = store_no_commit.acquire_reservation(b_id, "att_no_cm", 1, "liquid/lfm-3-1.7b:free")
+        with self.assertRaises(QuotaSecurityError) as ctx:
+            store_no_commit.commit_send(res_no_cm.reservation_id)
+        self.assertIn("runtime code commit is mandatory", str(ctx.exception).lower())
+        self.assertEqual(store_no_commit.get_reservation(res_no_cm.reservation_id).state, STATE_FAILED)
+
+    # =======================================================================
+    # SCENARIO 14: Multi-Process Contention for Final Quota (Auditor P0)
+    # =======================================================================
+
+    def test_15_multiprocess_contention_for_final_unit_of_max_dispatches(self) -> None:
+        """TC-15 (Auditor Mandate): Separate OS processes compete for final quota; exactly 1 wins."""
+        signed = self._sign_manifest(auth_id="auth-mp-contention", max_dispatches=1)
+        b_id = self.store.register_budget_from_signed_manifest(
+            signed_manifest=signed,
+            trust_store=self.trust_store,
+            expected_commit=self.valid_commit,
+            human_operator_consent=True,
+        )
+
+        queue = multiprocessing.Queue()
+        processes = []
+        process_count = 4
+
+        for i in range(process_count):
+            p = multiprocessing.Process(
+                target=mp_contention_worker,
+                args=(self.db_path, b_id, f"mp_att_{i}", 0, "liquid/lfm-3-1.7b:free", queue),
+            )
+            processes.append(p)
+            p.start()
+
+        for p in processes:
+            p.join(timeout=10.0)
+
+        results = [queue.get(timeout=2.0) for _ in range(process_count)]
+        statuses = [r[0] for r in results]
+
+        self.assertEqual(statuses.count("SUCCESS"), 1, f"Expected exactly 1 process to acquire quota: {results}")
+        self.assertEqual(statuses.count("EXHAUSTED"), process_count - 1, f"Expected other processes to fail exhausted: {results}")
+        self.assertEqual(statuses.count("ERROR"), 0, f"Unexpected worker error in processes: {results}")
+
+    # =======================================================================
+    # SCENARIO 15: Multi-Process Concurrent Outbox Projection (Auditor P1)
+    # =======================================================================
+
+    def test_16_multiprocess_concurrent_outbox_projection_no_data_loss(self) -> None:
+        """TC-16 (Auditor Mandate): Multiple OS processes project outbox events simultaneously without data loss or corruption."""
+        signed = self._sign_manifest(auth_id="auth-mp-projection", max_dispatches=4)
+        b_id = self.store.register_budget_from_signed_manifest(
+            signed_manifest=signed,
+            trust_store=self.trust_store,
+            expected_commit=self.valid_commit,
+            human_operator_consent=True,
+        )
+        for i in range(3):
+            r = self.store.acquire_reservation(b_id, f"mp_proj_{i}", i, "liquid/lfm-3-1.7b:free")
+            self.store.commit_send(r.reservation_id)
+            self.store.record_completion(r.reservation_id, http_status_code=200)
+
+        queue = multiprocessing.Queue()
+        processes = []
+        process_count = 4
+
+        for _ in range(process_count):
+            p = multiprocessing.Process(
+                target=mp_outbox_projector_worker,
+                args=(self.db_path, self.ledger_path, queue),
+            )
+            processes.append(p)
+            p.start()
+
+        for p in processes:
+            p.join(timeout=10.0)
+
+        results = [queue.get(timeout=2.0) for _ in range(process_count)]
+        for tag, val in results:
+            self.assertIn(tag, ("PROJECTED",), f"Worker error in multi-process projection: {val}")
+
+        # Verify ledger integrity
+        is_ok, errors, event_ids = self.projector.verify_ledger_integrity()
+        self.assertTrue(is_ok, f"Ledger integrity compromised during multi-process projection: {errors}")
+        self.assertGreater(len(event_ids), 0)
+
+    # =======================================================================
+    # SCENARIO 16: Multi-Process Simultaneous Crash Recovery Scanner
+    # =======================================================================
+
+    def test_17_multiprocess_simultaneous_crash_recovery_scanner(self) -> None:
+        """TC-17 (Auditor Mandate): Multiple OS processes run crash recovery scanner simultaneously without split-brain."""
+        signed = self._sign_manifest(auth_id="auth-mp-recovery", max_dispatches=5)
+        b_id = self.store.register_budget_from_signed_manifest(
+            signed_manifest=signed,
+            trust_store=self.trust_store,
+            expected_commit=self.valid_commit,
+            human_operator_consent=True,
+        )
+        res_ids = []
+        for i in range(4):
+            r = self.store.acquire_reservation(b_id, f"mp_rec_{i}", i, "liquid/lfm-3-1.7b:free")
+            self.store.commit_send(r.reservation_id)
+            res_ids.append(r.reservation_id)
+
+        queue = multiprocessing.Queue()
+        processes = []
+        process_count = 3
+
+        for _ in range(process_count):
+            p = multiprocessing.Process(
+                target=mp_recovery_scanner_worker,
+                args=(self.db_path, 0.0, queue),
+            )
+            processes.append(p)
+            p.start()
+
+        for p in processes:
+            p.join(timeout=10.0)
+
+        results = [queue.get(timeout=2.0) for _ in range(process_count)]
+        recovered_counts = [val for tag, val in results if tag == "RECOVERED"]
+        self.assertEqual(sum(recovered_counts), 4, f"Total recovered reservations must equal 4 across all processes: {results}")
+
+        for rid in res_ids:
+            self.assertEqual(self.store.get_reservation(rid).state, STATE_UNKNOWN)
 
 
 if __name__ == "__main__":

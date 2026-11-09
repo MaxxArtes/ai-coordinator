@@ -238,6 +238,7 @@ from .manifest_auth import (
     CanonicalAuthorizationManifest,
     SignedAuthorizationManifest,
     SignatureMetadata,
+    HumanOperationalApproval,
     Ed25519Signer,
     Ed25519Verifier,
     TrustedKeyEntry,
@@ -310,6 +311,7 @@ from .openrouter import (
     IllegalStateTransitionError,
     ReservationNotFoundError,
     PersistentReplayAttackError,
+    LedgerCorruptionError,
 )
 
 __all__ = [

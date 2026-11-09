@@ -25,6 +25,7 @@ from ai_coordinator.manifest_auth import (
     PERMISSION_DISPATCH_OPENROUTER_FREE,
     CanonicalAuthorizationManifest,
     Ed25519Signer,
+    HumanOperationalApproval,
     HumanOperationalAuthorizationError,
     KeyAuthorityError,
     SignedAuthorizationManifest,
@@ -108,13 +109,25 @@ class TestPhase4C2AtomicQuotaAndFallback(unittest.TestCase):
         self.catalog.load_catalog_data(raw_catalog, epoch=self.now_utc.timestamp())
         self.cost_guard = FreeCostGuard(registry=self.catalog)
 
-        # Store and Projector
-        self.store = AtomicDispatchQuotaStore(db_path=self.db_path)
+        # Store, Session, and Projector
+        self.human_session = HumanOperationalApproval.create(
+            operator_identity="security_operator_root",
+            session_id="cli-sess-4c23-pilot",
+            authorization_id="auth-pilot-session",
+        )
+        self.store = AtomicDispatchQuotaStore(
+            db_path=self.db_path,
+            default_trust_store=self.trust_store,
+            expected_commit=self.valid_commit,
+            default_human_session=self.human_session,
+        )
         self.projector = TransactionalOutboxProjector(store=self.store, ledger_path=self.ledger_path)
         self.fallback_engine = GovernedFallbackEngine(
             quota_store=self.store,
             projector=self.projector,
             cost_guard=self.cost_guard,
+            default_trust_store=self.trust_store,
+            expected_commit=self.valid_commit,
         )
 
     def tearDown(self) -> None:
@@ -168,7 +181,12 @@ class TestPhase4C2AtomicQuotaAndFallback(unittest.TestCase):
         self.assertIn("replay attack prevented", str(ctx.exception).lower())
 
         # Simulate restart: fresh store instance on same DB file must still reject!
-        new_store_instance = AtomicDispatchQuotaStore(db_path=self.db_path)
+        new_store_instance = AtomicDispatchQuotaStore(
+            db_path=self.db_path,
+            default_trust_store=self.trust_store,
+            expected_commit=self.valid_commit,
+            default_human_session=self.human_session,
+        )
         with self.assertRaises(PersistentReplayAttackError) as ctx:
             new_store_instance.register_budget_from_signed_manifest(
                 signed_manifest=signed,

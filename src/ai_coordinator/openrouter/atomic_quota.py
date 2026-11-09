@@ -24,6 +24,7 @@ from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 
 from ai_coordinator.manifest_auth import (
     CanonicalAuthorizationManifest,
+    HumanOperationalApproval,
     HumanOperationalAuthorizationError,
     KeyAuthorityError,
     ReplayAuthorizationError,
@@ -81,6 +82,10 @@ class OutboxPersistenceError(QuotaSecurityError):
 
 class PersistentReplayAttackError(QuotaSecurityError):
     """Raised when an authorization_id has already been consumed in the persistent SQLite store."""
+
+
+class LedgerCorruptionError(QuotaSecurityError):
+    """Raised when pilot_audit.jsonl ledger exhibits syntax corruption, tampering, or missing required fields."""
 
 
 # ---------------------------------------------------------------------------
@@ -150,12 +155,14 @@ class AtomicDispatchQuotaStore:
         db_path: str = ":memory:",
         default_trust_store: Optional[TrustStore] = None,
         expected_commit: Optional[str] = None,
+        default_human_session: Optional[HumanOperationalApproval] = None,
     ):
         self.db_path = db_path
         self._is_memory = db_path == ":memory:"
         self._conn: Optional[sqlite3.Connection] = None
         self.default_trust_store = default_trust_store
         self.expected_commit = expected_commit
+        self.default_human_session = default_human_session
         self._init_database()
 
     def _get_connection(self) -> sqlite3.Connection:
@@ -256,27 +263,72 @@ class AtomicDispatchQuotaStore:
         signed_manifest: SignedAuthorizationManifest,
         trust_store: TrustStore,
         expected_commit: str,
-        human_operator_consent: bool,
+        human_operator_consent: Optional[bool] = None,
         human_operator_identity: Optional[str] = None,
+        human_session_id: Optional[str] = None,
+        human_approval: Optional[Union[HumanOperationalApproval, Dict[str, Any]]] = None,
         check_time_utc: Optional[dt.datetime] = None,
     ) -> str:
         """Validate signed manifest using Tripartite Verifier and atomically register budget.
 
         Persists authorization_id in consumed_authorizations to guarantee cross-process,
         cross-restart anti-replay protection.
-        human_operator_consent is strictly mandatory with no default value.
+        Requires authenticated human operator authorization (HumanOperationalApproval).
+        Isolated boolean flags without authenticated human session are strictly prohibited.
         """
-        if human_operator_consent is not True:
+        # 1. Enforce human consent and authenticated operator identity
+        if human_operator_consent is False:
             raise HumanOperationalAuthorizationError(
                 "Human operational consent is missing or false: explicit consent (True) is mandatory by operator"
             )
-        if human_operator_identity is not None and human_operator_identity.strip() != signed_manifest.manifest.authorizer_identity.strip():
+
+        resolved_approval: Optional[HumanOperationalApproval] = None
+        if human_approval is not None:
+            if isinstance(human_approval, HumanOperationalApproval):
+                resolved_approval = human_approval
+            elif isinstance(human_approval, dict):
+                resolved_approval = HumanOperationalApproval.from_dict(human_approval)
+            else:
+                raise HumanOperationalAuthorizationError(
+                    f"human_approval must be HumanOperationalApproval or dict, got: {type(human_approval)}"
+                )
+        elif human_operator_identity is not None and human_session_id is not None:
+            if human_operator_consent is not True:
+                raise HumanOperationalAuthorizationError(
+                    "Explicit consent (human_operator_consent=True) is mandatory alongside operator identity and session"
+                )
+            resolved_approval = HumanOperationalApproval.create(
+                operator_identity=human_operator_identity,
+                session_id=human_session_id,
+                authorization_id=signed_manifest.manifest.authorization_id,
+            )
+        elif self.default_human_session is not None:
+            if human_operator_consent is not True and human_operator_consent is not None:
+                raise HumanOperationalAuthorizationError(
+                    "Human operational consent is missing or false: explicit consent (True) is mandatory by operator"
+                )
+            resolved_approval = self.default_human_session
+        else:
             raise HumanOperationalAuthorizationError(
-                f"Operator identity mismatch: operator identity '{human_operator_identity}' diverges from "
-                f"manifest authorizer '{signed_manifest.manifest.authorizer_identity}'"
+                "Isolated boolean consent flag is prohibited: verifiable human operator identity and authenticated "
+                "session (HumanOperationalApproval) are mandatory to prove human authorization"
             )
 
-        # 1. Enforce tripartite verification (Tiers 1, 2, and 3)
+        if resolved_approval.explicit_consent is not True:
+            raise HumanOperationalAuthorizationError(
+                "Human operational consent is missing or false: explicit consent (True) is mandatory by operator"
+            )
+        if resolved_approval.operator_identity.strip() != signed_manifest.manifest.authorizer_identity.strip():
+            raise HumanOperationalAuthorizationError(
+                f"Operator identity mismatch: operator identity '{resolved_approval.operator_identity}' diverges from "
+                f"manifest authorizer '{signed_manifest.manifest.authorizer_identity}'"
+            )
+        if not resolved_approval.session_id or not resolved_approval.session_id.strip():
+            raise HumanOperationalAuthorizationError(
+                "Human operational approval requires non-empty session_id"
+            )
+
+        # 2. Enforce tripartite verification (Tiers 1, 2, and 3)
         verifier = TripartiteAuthorizationVerifier(trust_store=trust_store)
         res = verifier.verify(
             signed_manifest=signed_manifest,
@@ -284,7 +336,7 @@ class AtomicDispatchQuotaStore:
             requested_model=signed_manifest.manifest.allowed_models[0],
             requested_modality="text",
             requested_dispatches=signed_manifest.manifest.max_dispatches,
-            human_operator_consent=human_operator_consent,
+            human_operator_consent=True,
             at_time_utc=check_time_utc,
             check_replay=False,  # Replay is verified persistently via SQLite UNIQUE constraint below
         )
@@ -330,6 +382,10 @@ class AtomicDispatchQuotaStore:
                     "allowed_models": list(manifest.allowed_models),
                     "canonical_sha256": manifest.canonical_sha256(),
                     "key_id": signed_manifest.signature.key_id,
+                    "operator_identity": resolved_approval.operator_identity,
+                    "session_id": resolved_approval.session_id,
+                    "approval_token": resolved_approval.approval_token,
+                    "approved_at_utc": resolved_approval.approved_at_utc,
                 }),
             ))
 
@@ -499,13 +555,15 @@ class AtomicDispatchQuotaStore:
         """Advance reservation from RESERVED to SEND_COMMITTED (Point of Irreversible Commitment - PIC).
 
         Revalidates critical authorization invariants at the PIC:
-        1. Temporal validity: manifest valid_until_utc must not be expired.
-        2. Code commit: runtime HEAD must match manifest code_commit.
-        3. Key authority: authorizer public key in Trust Store must not be revoked or expired.
-        4. Model & scope: target_model must be in allowed_models.
+        1. Availability of verified Trust Store and code commit HEAD (mandatory).
+        2. Temporal validity: manifest valid_until_utc must not be expired.
+        3. Code commit: runtime HEAD must match manifest code_commit.
+        4. Key authority: authorizer public key in Trust Store must not be revoked or expired.
+        5. Model & scope: target_model must be in allowed_models.
 
         Persisted with fsync in SQLite BEFORE opening TLS socket.
         From this point onward, budget is permanently drained and cannot be returned.
+        Fail-closed: any missing evidence, inconsistency, or invalidity transitions to FAILED and raises.
         """
         now_epoch = time.time()
         now_dt = at_time_utc or dt.datetime.now(dt.timezone.utc)
@@ -539,7 +597,25 @@ class AtomicDispatchQuotaStore:
                 raise QuotaSecurityError(f"Budget '{budget_id}' not found at PIC")
             valid_until_str, budget_code_commit, authorizer_id, allowed_models_raw, manifest_id = b_row[0], b_row[1], b_row[2], b_row[3], b_row[4]
 
-            # 1. Temporal revalidation
+            # 1. Mandatory Trust Store Check
+            if effective_trust_store is None:
+                conn.execute("UPDATE dispatch_reservations SET state = ?, completed_at_epoch = ? WHERE reservation_id = ?;", (STATE_FAILED, now_epoch, reservation_id))
+                conn.execute("INSERT INTO outbox_events (event_id, reservation_id, aggregate_id, event_type, payload_json, created_at_epoch, projected_at_epoch) VALUES (?, ?, ?, ?, ?, ?, NULL);",
+                             (f"evt_pic_block_{uuid.uuid4().hex[:12]}", reservation_id, budget_id, "PIC_BLOCKED_MISSING_TRUST_STORE", json.dumps({"reason": "Trust Store is required at PIC but missing/unconfigured"}), now_epoch))
+                conn.execute("COMMIT;")
+                in_tx = False
+                raise QuotaSecurityError("Commit send blocked at PIC: Trust Store is mandatory for key revalidation but missing or unconfigured")
+
+            # 2. Mandatory Effective Commit Check
+            if not effective_commit or not effective_commit.strip():
+                conn.execute("UPDATE dispatch_reservations SET state = ?, completed_at_epoch = ? WHERE reservation_id = ?;", (STATE_FAILED, now_epoch, reservation_id))
+                conn.execute("INSERT INTO outbox_events (event_id, reservation_id, aggregate_id, event_type, payload_json, created_at_epoch, projected_at_epoch) VALUES (?, ?, ?, ?, ?, ?, NULL);",
+                             (f"evt_pic_block_{uuid.uuid4().hex[:12]}", reservation_id, budget_id, "PIC_BLOCKED_MISSING_COMMIT", json.dumps({"reason": "Runtime code commit HEAD is required at PIC but missing/unconfigured"}), now_epoch))
+                conn.execute("COMMIT;")
+                in_tx = False
+                raise QuotaSecurityError("Commit send blocked at PIC: runtime code commit is mandatory for commit verification but missing or unconfigured")
+
+            # 3. Temporal revalidation
             try:
                 exp_dt = dt.datetime.fromisoformat(valid_until_str.replace("Z", "+00:00"))
                 if now_dt > exp_dt:
@@ -552,8 +628,8 @@ class AtomicDispatchQuotaStore:
             except (ValueError, TypeError) as err:
                 raise QuotaSecurityError(f"Malformed valid_until timestamp at PIC: {err}") from err
 
-            # 2. Code commit revalidation
-            if effective_commit is not None and effective_commit.strip().lower() != budget_code_commit.strip().lower():
+            # 4. Code commit revalidation
+            if effective_commit.strip().lower() != budget_code_commit.strip().lower():
                 conn.execute("UPDATE dispatch_reservations SET state = ?, completed_at_epoch = ? WHERE reservation_id = ?;", (STATE_FAILED, now_epoch, reservation_id))
                 conn.execute("INSERT INTO outbox_events (event_id, reservation_id, aggregate_id, event_type, payload_json, created_at_epoch, projected_at_epoch) VALUES (?, ?, ?, ?, ?, ?, NULL);",
                              (f"evt_pic_block_{uuid.uuid4().hex[:12]}", reservation_id, budget_id, "PIC_BLOCKED_COMMIT_MISMATCH", json.dumps({"reason": f"Commit divergence: {effective_commit} != {budget_code_commit}"}), now_epoch))
@@ -561,35 +637,46 @@ class AtomicDispatchQuotaStore:
                 in_tx = False
                 raise QuotaSecurityError(f"Commit send blocked at PIC: runtime commit '{effective_commit}' diverges from manifest commit '{budget_code_commit}'")
 
-            # 3. Model revalidation
+            # 5. Model revalidation
             allowed_models = json.loads(allowed_models_raw)
             if target_model not in allowed_models:
+                conn.execute("UPDATE dispatch_reservations SET state = ?, completed_at_epoch = ? WHERE reservation_id = ?;", (STATE_FAILED, now_epoch, reservation_id))
+                conn.execute("INSERT INTO outbox_events (event_id, reservation_id, aggregate_id, event_type, payload_json, created_at_epoch, projected_at_epoch) VALUES (?, ?, ?, ?, ?, ?, NULL);",
+                             (f"evt_pic_block_{uuid.uuid4().hex[:12]}", reservation_id, budget_id, "PIC_BLOCKED_MODEL_UNAUTHORIZED", json.dumps({"target_model": target_model, "allowed": allowed_models}), now_epoch))
+                conn.execute("COMMIT;")
+                in_tx = False
                 raise QuotaSecurityError(f"Commit send blocked at PIC: target model '{target_model}' not authorized in {allowed_models}")
 
-            # 4. Key revocation / validity revalidation in Trust Store
-            if effective_trust_store is not None:
-                cur = conn.execute("SELECT details_json FROM consumed_authorizations WHERE authorization_id = ?", (manifest_id,))
-                c_row = cur.fetchone()
-                key_id = None
-                if c_row:
-                    try:
-                        key_id = json.loads(c_row[0]).get("key_id")
-                    except Exception:
-                        pass
-                
-                if key_id:
-                    is_key_ok, key_reason = effective_trust_store.is_key_authorized(
-                        key_id=key_id,
-                        required_permission="dispatch:openrouter_free",
-                        at_time_utc=now_dt,
-                    )
-                    if not is_key_ok:
-                        conn.execute("UPDATE dispatch_reservations SET state = ?, completed_at_epoch = ? WHERE reservation_id = ?;", (STATE_FAILED, now_epoch, reservation_id))
-                        conn.execute("INSERT INTO outbox_events (event_id, reservation_id, aggregate_id, event_type, payload_json, created_at_epoch, projected_at_epoch) VALUES (?, ?, ?, ?, ?, ?, NULL);",
-                                     (f"evt_pic_block_{uuid.uuid4().hex[:12]}", reservation_id, budget_id, "PIC_BLOCKED_KEY_REVOKED", json.dumps({"key_id": key_id, "reason": key_reason}), now_epoch))
-                        conn.execute("COMMIT;")
-                        in_tx = False
-                        raise KeyAuthorityError(f"Commit send blocked at PIC: authorizer key '{key_id}' is revoked or expired: {key_reason}")
+            # 6. Authorizer Key Identity & Trust Store revalidation
+            cur = conn.execute("SELECT details_json FROM consumed_authorizations WHERE authorization_id = ?", (manifest_id,))
+            c_row = cur.fetchone()
+            key_id = None
+            if c_row and c_row[0]:
+                try:
+                    key_id = json.loads(c_row[0]).get("key_id")
+                except Exception:
+                    pass
+
+            if not key_id or not key_id.strip():
+                conn.execute("UPDATE dispatch_reservations SET state = ?, completed_at_epoch = ? WHERE reservation_id = ?;", (STATE_FAILED, now_epoch, reservation_id))
+                conn.execute("INSERT INTO outbox_events (event_id, reservation_id, aggregate_id, event_type, payload_json, created_at_epoch, projected_at_epoch) VALUES (?, ?, ?, ?, ?, ?, NULL);",
+                             (f"evt_pic_block_{uuid.uuid4().hex[:12]}", reservation_id, budget_id, "PIC_BLOCKED_MISSING_KEY_ID", json.dumps({"reason": "Authorizer key identity is missing or unverified"}), now_epoch))
+                conn.execute("COMMIT;")
+                in_tx = False
+                raise KeyAuthorityError("Commit send blocked at PIC: authorizer key identity is missing or unverified")
+
+            is_key_ok, key_reason = effective_trust_store.is_key_authorized(
+                key_id=key_id,
+                required_permission="dispatch:openrouter_free",
+                at_time_utc=now_dt,
+            )
+            if not is_key_ok:
+                conn.execute("UPDATE dispatch_reservations SET state = ?, completed_at_epoch = ? WHERE reservation_id = ?;", (STATE_FAILED, now_epoch, reservation_id))
+                conn.execute("INSERT INTO outbox_events (event_id, reservation_id, aggregate_id, event_type, payload_json, created_at_epoch, projected_at_epoch) VALUES (?, ?, ?, ?, ?, ?, NULL);",
+                             (f"evt_pic_block_{uuid.uuid4().hex[:12]}", reservation_id, budget_id, "PIC_BLOCKED_KEY_REVOKED", json.dumps({"key_id": key_id, "reason": key_reason}), now_epoch))
+                conn.execute("COMMIT;")
+                in_tx = False
+                raise KeyAuthorityError(f"Commit send blocked at PIC: authorizer key '{key_id}' is revoked or expired: {key_reason}")
 
             # Update state to SEND_COMMITTED
             conn.execute("""
@@ -872,39 +959,165 @@ class AtomicDispatchQuotaStore:
 
 
 # ---------------------------------------------------------------------------
+# Cross-Process File Lock for Safe JSONL Ledger Writes
+# ---------------------------------------------------------------------------
+
+class _InterProcessFileLock:
+    """Minimal, robust cross-process file lock using atomic OS file creation flags."""
+
+    def __init__(self, lock_path: str, timeout_sec: float = 10.0):
+        self.lock_path = lock_path
+        self.timeout_sec = timeout_sec
+        self._fd: Optional[int] = None
+        self._acquired = False
+
+    def __enter__(self) -> "_InterProcessFileLock":
+        start = time.time()
+        while True:
+            try:
+                self._fd = os.open(self.lock_path, os.O_CREAT | os.O_EXCL | os.O_RDWR)
+                self._acquired = True
+                return self
+            except FileExistsError:
+                if time.time() - start > self.timeout_sec:
+                    # Stale lock recovery (> 30s)
+                    try:
+                        mtime = os.path.getmtime(self.lock_path)
+                        if time.time() - mtime > 30.0:
+                            os.unlink(self.lock_path)
+                            continue
+                    except OSError:
+                        pass
+                    raise TimeoutError(f"Timed out waiting for inter-process ledger lock: '{self.lock_path}'")
+                time.sleep(0.02)
+
+    def __exit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
+        if self._acquired:
+            if self._fd is not None:
+                try:
+                    os.close(self._fd)
+                except OSError:
+                    pass
+                self._fd = None
+            try:
+                if os.path.exists(self.lock_path):
+                    os.unlink(self.lock_path)
+            except OSError:
+                pass
+            self._acquired = False
+
+
+# ---------------------------------------------------------------------------
 # Transactional Outbox Projector (Projetor para pilot_audit.jsonl)
 # ---------------------------------------------------------------------------
 
 class TransactionalOutboxProjector:
-    """Projects unprojected outbox events from SQLite into append-only JSONL with fsync."""
+    """Projects unprojected outbox events from SQLite into append-only JSONL with fsync and integrity validation."""
 
     def __init__(self, store: AtomicDispatchQuotaStore, ledger_path: str):
         self.store = store
         self.ledger_path = ledger_path
 
-    def _read_existing_ledger_event_ids(self) -> Set[str]:
-        """Read existing event_id entries already committed to JSONL ledger."""
+    def verify_ledger_integrity(self) -> Tuple[bool, List[str], Set[str]]:
+        """Inspect JSONL ledger file for structural, JSON, and schema integrity.
+
+        Returns (is_valid, error_list, existing_event_ids).
+        Fail-closed: returns is_valid=False on any unparseable line, missing required fields, or corruption.
+        """
         if not os.path.exists(self.ledger_path):
-            return set()
-        existing = set()
-        try:
-            with open(self.ledger_path, "r", encoding="utf-8") as f:
-                for line in f:
-                    line = line.strip()
-                    if not line:
+            return True, [], set()
+
+        errors: List[str] = []
+        valid_ids: Set[str] = set()
+        line_num = 0
+
+        with open(self.ledger_path, "r", encoding="utf-8", errors="replace") as f:
+            for raw_line in f:
+                line_num += 1
+                stripped = raw_line.strip()
+                if not stripped:
+                    continue
+                try:
+                    record = json.loads(stripped)
+                    if not isinstance(record, dict):
+                        errors.append(f"Line {line_num}: JSON root is not an object ({type(record).__name__})")
                         continue
-                    try:
-                        record = json.loads(line)
-                        if "event_id" in record:
-                            existing.add(str(record["event_id"]))
-                    except Exception:
-                        pass
-        except Exception:
-            pass
-        return existing
+                    if "event_id" not in record or not record["event_id"]:
+                        errors.append(f"Line {line_num}: missing or empty 'event_id'")
+                        continue
+                    if "event_type" not in record:
+                        errors.append(f"Line {line_num}: missing 'event_type'")
+                        continue
+                    ev_id = str(record["event_id"])
+                    if ev_id in valid_ids:
+                        errors.append(f"Line {line_num}: duplicate event_id '{ev_id}' found in ledger")
+                        continue
+                    valid_ids.add(ev_id)
+                except json.JSONDecodeError as err:
+                    errors.append(f"Line {line_num}: invalid JSON syntax ({err})")
+
+        return len(errors) == 0, errors, valid_ids
+
+    def recover_and_quarantine_corrupt_ledger(self) -> Tuple[int, int, str]:
+        """Explicit verified recovery tool: quarantines corrupted lines and preserves valid audit records.
+
+        Returns (recovered_records_count, quarantined_lines_count, quarantine_file_path).
+        """
+        if not os.path.exists(self.ledger_path):
+            return 0, 0, ""
+
+        quarantine_path = f"{self.ledger_path}.corrupt_{int(time.time())}_{uuid.uuid4().hex[:6]}.bak"
+        recovered_records: List[Dict[str, Any]] = []
+        quarantined_lines: List[Tuple[int, str]] = []
+        line_num = 0
+
+        with open(self.ledger_path, "r", encoding="utf-8", errors="replace") as f:
+            for raw_line in f:
+                line_num += 1
+                stripped = raw_line.strip()
+                if not stripped:
+                    continue
+                try:
+                    record = json.loads(stripped)
+                    if isinstance(record, dict) and "event_id" in record and record["event_id"] and "event_type" in record:
+                        recovered_records.append(record)
+                    else:
+                        quarantined_lines.append((line_num, raw_line))
+                except Exception:
+                    quarantined_lines.append((line_num, raw_line))
+
+        if quarantined_lines:
+            with open(quarantine_path, "w", encoding="utf-8") as qf:
+                for ln, ltxt in quarantined_lines:
+                    qf.write(f"LINE {ln}: {ltxt}")
+                qf.flush()
+                os.fsync(qf.fileno())
+
+        # Rewrite ledger atomically with only valid records
+        temp_ledger = f"{self.ledger_path}.tmp_{uuid.uuid4().hex[:8]}"
+        with open(temp_ledger, "w", encoding="utf-8") as f:
+            for rec in recovered_records:
+                f.write(json.dumps(rec) + "\n")
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(temp_ledger, self.ledger_path)
+
+        return len(recovered_records), len(quarantined_lines), quarantine_path
 
     def project_pending_events(self) -> int:
-        """Read unprojected events, append to ledger file with fsync idempotently, and mark projected."""
+        """Read unprojected events, append to ledger file with fsync idempotently, and mark projected.
+
+        Fail-closed: if ledger corruption is detected, raises LedgerCorruptionError
+        and refuses to append onto corrupted evidence until verified recovery.
+        """
+        # 1. Enforce ledger integrity check fail-closed
+        is_ok, errors, existing_ids = self.verify_ledger_integrity()
+        if not is_ok:
+            raise LedgerCorruptionError(
+                f"Ledger corruption detected in '{self.ledger_path}' ({len(errors)} error(s)): "
+                f"{'; '.join(errors[:3])}. Projection blocked fail-closed until verified recovery."
+            )
+
         conn = self.store._get_connection()
         now_epoch = time.time()
         in_tx = False
@@ -928,24 +1141,25 @@ class TransactionalOutboxProjector:
             os.makedirs(os.path.dirname(os.path.abspath(self.ledger_path)), exist_ok=True)
 
             # Deduplicate against already projected events in JSONL file (Crash recovery safety)
-            existing_ids = self._read_existing_ledger_event_ids()
             new_events = [p for p in pending if p[0] not in existing_ids]
 
             if new_events:
-                with open(self.ledger_path, "a", encoding="utf-8") as f:
-                    for ev_id, res_id, agg_id, ev_type, payload_str, created_epoch in new_events:
-                        record = {
-                            "event_id": ev_id,
-                            "reservation_id": res_id,
-                            "aggregate_id": agg_id,
-                            "event_type": ev_type,
-                            "payload": json.loads(payload_str),
-                            "created_at_epoch": created_epoch,
-                            "projected_at_epoch": now_epoch,
-                        }
-                        f.write(json.dumps(record) + "\n")
-                    f.flush()
-                    os.fsync(f.fileno())
+                lock_path = f"{self.ledger_path}.lock"
+                with _InterProcessFileLock(lock_path):
+                    with open(self.ledger_path, "a", encoding="utf-8") as f:
+                        for ev_id, res_id, agg_id, ev_type, payload_str, created_epoch in new_events:
+                            record = {
+                                "event_id": ev_id,
+                                "reservation_id": res_id,
+                                "aggregate_id": agg_id,
+                                "event_type": ev_type,
+                                "payload": json.loads(payload_str),
+                                "created_at_epoch": created_epoch,
+                                "projected_at_epoch": now_epoch,
+                            }
+                            f.write(json.dumps(record) + "\n")
+                        f.flush()
+                        os.fsync(f.fileno())
 
             # Mark all as projected in SQLite (both newly appended and previously flushed)
             for ev_id, _, _, _, _, _ in pending:
@@ -991,10 +1205,14 @@ class GovernedFallbackEngine:
         quota_store: AtomicDispatchQuotaStore,
         projector: TransactionalOutboxProjector,
         cost_guard: FreeCostGuard,
+        default_trust_store: Optional[TrustStore] = None,
+        expected_commit: Optional[str] = None,
     ):
         self.store = quota_store
         self.projector = projector
         self.cost_guard = cost_guard
+        self.default_trust_store = default_trust_store or quota_store.default_trust_store
+        self.expected_commit = expected_commit or quota_store.expected_commit
 
     def evaluate_fallback(
         self,
@@ -1028,15 +1246,39 @@ class GovernedFallbackEngine:
             raise QuotaSecurityError(
                 f"Fallback rejected: failed reservation '{failed_reservation.reservation_id}' does not exist in store"
             )
-        if stored_res.state not in (STATE_FAILED, STATE_UNKNOWN):
+
+        # Check divergence between supplied reservation and persisted reservation
+        if (
+            failed_reservation.budget_id != stored_res.budget_id
+            or failed_reservation.sequence_index != stored_res.sequence_index
+            or failed_reservation.target_model != stored_res.target_model
+            or failed_reservation.logical_attempt_id != stored_res.logical_attempt_id
+        ):
+            raise QuotaSecurityError(
+                f"Fallback rejected: supplied reservation metadata diverges from persisted store record for reservation '{failed_reservation.reservation_id}'"
+            )
+
+        if failed_reservation.http_status_code is not None and failed_reservation.http_status_code != stored_res.http_status_code:
+            raise QuotaSecurityError(
+                f"Fallback rejected: supplied HTTP status ({failed_reservation.http_status_code}) diverges from persisted HTTP status ({stored_res.http_status_code})"
+            )
+
+        if failed_reservation.state == STATE_UNKNOWN or stored_res.state == STATE_UNKNOWN:
+            raise QuotaSecurityError(
+                f"Fallback rejected: reservation '{failed_reservation.reservation_id}' is in UNKNOWN state "
+                "(ambiguous outcome prohibits automatic fallback)"
+            )
+
+        # Strictly require state == STATE_FAILED and http_status_code in (429, 503)
+        if stored_res.state != STATE_FAILED:
             raise QuotaSecurityError(
                 f"Fallback rejected: reservation '{failed_reservation.reservation_id}' is in state '{stored_res.state}', "
-                f"must be '{STATE_FAILED}' or '{STATE_UNKNOWN}'"
+                f"only '{STATE_FAILED}' with proven HTTP 429/503 is eligible (UNKNOWN or other states prohibit automatic fallback)"
             )
-        if stored_res.http_status_code is not None and stored_res.http_status_code not in (429, 503):
+        if stored_res.http_status_code not in (429, 503):
             raise QuotaSecurityError(
-                f"Fallback rejected: HTTP status {stored_res.http_status_code} is not an authorized fallback trigger "
-                f"(only HTTP 429 and 503 are eligible)"
+                f"Fallback rejected: HTTP status code is {stored_res.http_status_code}, "
+                f"only proven HTTP 429 and 503 are eligible fallback triggers"
             )
 
         budget_status = self.store.get_budget_status(budget_id)
@@ -1184,8 +1426,8 @@ class GovernedFallbackEngine:
         )
         self.store.commit_send(
             reservation_id=new_reservation.reservation_id,
-            trust_store=self.store.default_trust_store,
-            expected_commit=self.store.expected_commit,
+            trust_store=self.default_trust_store,
+            expected_commit=self.expected_commit,
         )
         self.projector.project_pending_events()
 

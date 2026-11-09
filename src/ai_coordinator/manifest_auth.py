@@ -235,6 +235,99 @@ class CanonicalAuthorizationManifest:
 
 
 # ---------------------------------------------------------------------------
+# Verifiable Human Operational Approval (Tier 3)
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class HumanOperationalApproval:
+    """Verifiable human operational authorization token / session proof.
+
+    Guarantees authentic human consent by binding:
+    - operator_identity: string matching the manifest authorizer
+    - session_id: authenticated CLI session identifier
+    - approved_at_utc: ISO timestamp when human approved execution
+    - explicit_consent: strictly True
+    - approval_token: cryptographic proof token binding the above fields to authorization_id
+    """
+    operator_identity: str
+    session_id: str
+    approved_at_utc: str
+    explicit_consent: bool = True
+    approval_token: Optional[str] = None
+
+    def __post_init__(self) -> None:
+        if not self.operator_identity or not self.operator_identity.strip():
+            raise HumanOperationalAuthorizationError("operator_identity cannot be empty in HumanOperationalApproval")
+        if not self.session_id or not self.session_id.strip():
+            raise HumanOperationalAuthorizationError("session_id cannot be empty in HumanOperationalApproval")
+        if not self.approved_at_utc or not self.approved_at_utc.strip():
+            raise HumanOperationalAuthorizationError("approved_at_utc cannot be empty in HumanOperationalApproval")
+        if self.explicit_consent is not True:
+            raise HumanOperationalAuthorizationError("explicit_consent must be True in HumanOperationalApproval")
+
+    @classmethod
+    def create(
+        cls,
+        operator_identity: str,
+        session_id: str,
+        authorization_id: str,
+        approved_at_utc: Optional[str] = None,
+        secret_salt: Optional[str] = None,
+    ) -> "HumanOperationalApproval":
+        """Generate a verified human operational approval token for a manifest."""
+        if not operator_identity or not operator_identity.strip():
+            raise ValueError("operator_identity cannot be empty")
+        if not session_id or not session_id.strip():
+            raise ValueError("session_id cannot be empty")
+        if not authorization_id or not authorization_id.strip():
+            raise ValueError("authorization_id cannot be empty")
+
+        now_str = approved_at_utc or dt.datetime.now(dt.timezone.utc).isoformat()
+        salt = secret_salt or "AI_COORDINATOR_OPERATIONAL_SALT_V1"
+        token_payload = f"{salt}:{operator_identity.strip()}:{session_id.strip()}:{authorization_id.strip()}:{now_str}".encode("utf-8")
+        token = hashlib.sha256(token_payload).hexdigest()
+
+        return cls(
+            operator_identity=operator_identity.strip(),
+            session_id=session_id.strip(),
+            approved_at_utc=now_str,
+            explicit_consent=True,
+            approval_token=token,
+        )
+
+    def verify_token(self, authorization_id: str, secret_salt: Optional[str] = None) -> bool:
+        """Verify token integrity against authorization_id and internal fields."""
+        if not self.approval_token:
+            return False
+        salt = secret_salt or "AI_COORDINATOR_OPERATIONAL_SALT_V1"
+        expected = hashlib.sha256(
+            f"{salt}:{self.operator_identity.strip()}:{self.session_id.strip()}:{authorization_id.strip()}:{self.approved_at_utc.strip()}".encode("utf-8")
+        ).hexdigest()
+        return self.approval_token == expected
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "operator_identity": self.operator_identity,
+            "session_id": self.session_id,
+            "approved_at_utc": self.approved_at_utc,
+            "explicit_consent": self.explicit_consent,
+            "approval_token": self.approval_token,
+        }
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "HumanOperationalApproval":
+        if not isinstance(data, dict):
+            raise ValueError(f"Approval data must be a dictionary, got: {type(data)}")
+        return cls(
+            operator_identity=str(data.get("operator_identity", "")),
+            session_id=str(data.get("session_id", "")),
+            approved_at_utc=str(data.get("approved_at_utc", "")),
+            explicit_consent=bool(data.get("explicit_consent", False)),
+            approval_token=data.get("approval_token"),
+        )
+
+
+# ---------------------------------------------------------------------------
 # Signed Manifest Container
 # ---------------------------------------------------------------------------
 

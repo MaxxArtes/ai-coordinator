@@ -79,6 +79,7 @@ from .atomic_quota import (
     IllegalStateTransitionError,
     ReservationNotFoundError,
     PersistentReplayAttackError,
+    LedgerCorruptionError,
 )
 
 __all__ = [
@@ -147,4 +148,5 @@ __all__ = [
     "IllegalStateTransitionError",
     "ReservationNotFoundError",
     "PersistentReplayAttackError",
+    "LedgerCorruptionError",
 ]
