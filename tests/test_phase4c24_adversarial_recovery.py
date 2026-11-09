@@ -36,6 +36,7 @@ from ai_coordinator.manifest_auth import (
     CanonicalAuthorizationManifest,
     Ed25519Signer,
     HumanOperationalApproval,
+    HumanOperationalAuthority,
     HumanOperationalAuthorizationError,
     KeyAuthorityError,
     SignedAuthorizationManifest,
@@ -57,7 +58,9 @@ from ai_coordinator.openrouter.atomic_quota import (
     QuotaSecurityError,
     ReservationNotFoundError,
     TransactionalOutboxProjector,
+    _InterProcessFileLock,
 )
+from ai_coordinator.process import safe_process_alive
 from ai_coordinator.openrouter.mp_workers import (
     mp_contention_worker,
     mp_outbox_projector_worker,
@@ -137,17 +140,15 @@ class TestPhase4C24AdversarialRecovery(unittest.TestCase):
         self.catalog.load_catalog_data(raw_catalog, epoch=self.now_utc.timestamp())
         self.cost_guard = FreeCostGuard(registry=self.catalog)
 
-        # Store, Projector, and Authenticated Human Session
-        self.human_session = HumanOperationalApproval.create(
-            operator_identity="security_operator_root",
-            session_id="cli-sess-4c24-adversarial",
-            authorization_id="auth-pilot-session",
-        )
+        # Human Authority, Principal, Store, Projector
+        self.human_authority = HumanOperationalAuthority()
+        self.human_principal = self.human_authority.issue_session(owner_id="security_operator_root")
         self.store = AtomicDispatchQuotaStore(
             db_path=self.db_path,
             default_trust_store=self.trust_store,
             expected_commit=self.valid_commit,
-            default_human_session=self.human_session,
+            human_authority=self.human_authority,
+            default_human_principal=self.human_principal,
         )
         self.projector = TransactionalOutboxProjector(store=self.store, ledger_path=self.ledger_path)
         self.fallback_engine = GovernedFallbackEngine(
@@ -342,10 +343,13 @@ class TestPhase4C24AdversarialRecovery(unittest.TestCase):
         """TC-05 (Auditor P1): Detects ledger corruption, fails closed on projection, and recovers via quarantine."""
         # Pre-populate ledger with valid line and a corrupt non-JSON line
         os.makedirs(os.path.dirname(self.ledger_path), exist_ok=True)
+        raw_initial_content = (
+            json.dumps({"event_id": "evt_existing_001", "event_type": "DUMMY", "created_at_epoch": time.time()}) + "\n"
+            + "CORRUPTED_NON_JSON_DATA_GARBAGE!@#$%\n"
+            + json.dumps({"event_id": "evt_existing_002", "event_type": "DUMMY", "created_at_epoch": time.time()}) + "\n"
+        )
         with open(self.ledger_path, "w", encoding="utf-8") as f:
-            f.write(json.dumps({"event_id": "evt_existing_001", "event_type": "DUMMY", "created_at_epoch": time.time()}) + "\n")
-            f.write("CORRUPTED_NON_JSON_DATA_GARBAGE!@#$%\n")
-            f.write(json.dumps({"event_id": "evt_existing_002", "event_type": "DUMMY", "created_at_epoch": time.time()}) + "\n")
+            f.write(raw_initial_content)
 
         # 1. verify_ledger_integrity detects corruption and lists errors
         is_valid, errors, valid_ids = self.projector.verify_ledger_integrity()
@@ -358,11 +362,20 @@ class TestPhase4C24AdversarialRecovery(unittest.TestCase):
             self.projector.project_pending_events()
         self.assertIn("Ledger corruption detected", str(ctx.exception))
 
-        # 3. Verified recovery tool isolates corrupted line into quarantine and repairs ledger
-        repaired_cnt, quar_cnt, quar_path = self.projector.recover_and_quarantine_corrupt_ledger()
+        # 3. Verified recovery tool preserves raw full backup, isolates corrupted line into quarantine and repairs ledger
+        repaired_cnt, quar_cnt, quar_path, full_bak_path = self.projector.recover_and_quarantine_corrupt_ledger()
         self.assertEqual(repaired_cnt, 2)
         self.assertEqual(quar_cnt, 1)
         self.assertTrue(os.path.exists(quar_path))
+        self.assertTrue(os.path.exists(full_bak_path))
+
+        # Verify full backup contains exact byte copy of pre-recovery raw ledger
+        with open(full_bak_path, "r", encoding="utf-8") as bf:
+            self.assertEqual(bf.read(), raw_initial_content)
+
+        # Verify quarantine contains the corrupt line
+        with open(quar_path, "r", encoding="utf-8") as qf:
+            self.assertIn("CORRUPTED_NON_JSON_DATA_GARBAGE!@#$%", qf.read())
 
         # 4. Integrity check passes after recovery
         is_valid2, errors2, valid_ids2 = self.projector.verify_ledger_integrity()
@@ -458,7 +471,8 @@ class TestPhase4C24AdversarialRecovery(unittest.TestCase):
     # =======================================================================
 
     def test_09_consent_mandatory_no_default_and_imposter_rejection(self) -> None:
-        """TC-09 (Auditor P0): Enforces authenticated human approval, rejects isolated boolean flags and imposters."""
+        """TC-09 (Auditor P0): Enforces authenticated human approval, rejects isolated boolean flags,
+        forged tokens, imposter identities, expired approvals, worker issuance, and cross-manifest reuse."""
         signed = self._sign_manifest(auth_id="auth-consent-checks")
 
         # 1. Isolated boolean flag on store without default session MUST BE REJECTED
@@ -466,7 +480,9 @@ class TestPhase4C24AdversarialRecovery(unittest.TestCase):
             db_path=os.path.join(self.tmp_dir, "isolated_flag_test.db"),
             default_trust_store=self.trust_store,
             expected_commit=self.valid_commit,
-            default_human_session=None,  # No default human session
+            human_authority=self.human_authority,
+            default_human_principal=None,
+            default_human_session=None,
         )
         with self.assertRaises(HumanOperationalAuthorizationError) as ctx:
             store_no_session.register_budget_from_signed_manifest(
@@ -487,22 +503,93 @@ class TestPhase4C24AdversarialRecovery(unittest.TestCase):
             )
         self.assertIn("mandatory", str(ctx.exception).lower())
 
-        # 3. Imposter identity rejected
+        # 3. Forged token (fabricated without authority secret) rejected
+        forged_approval = HumanOperationalApproval(
+            authorization_id=signed.manifest.authorization_id,
+            operator_identity="security_operator_root",
+            session_token=f"hsess_security_operator_root_{'0' * 64}",
+            valid_from_utc=self.now_utc.isoformat(),
+            valid_until_utc=(self.now_utc + dt.timedelta(hours=1)).isoformat(),
+            approval_token="fake_hmac_signature_token_000000000000000000000000000000000000000000",
+            explicit_consent=True,
+        )
         with self.assertRaises(HumanOperationalAuthorizationError) as ctx:
-            self.store.register_budget_from_signed_manifest(
+            store_no_session.register_budget_from_signed_manifest(
                 signed_manifest=signed,
                 trust_store=self.trust_store,
                 expected_commit=self.valid_commit,
-                human_operator_consent=True,
-                human_operator_identity="imposter_hacker",  # does not match manifest
-                human_session_id="cli-sess-fake",
+                human_approval=forged_approval,
             )
-        self.assertIn("identity mismatch", str(ctx.exception).lower())
+        self.assertTrue(
+            "adulterado" in str(ctx.exception).lower() or "invalido" in str(ctx.exception).lower()
+        )
 
-        # 4. Authenticated HumanOperationalApproval succeeds
-        valid_approval = HumanOperationalApproval.create(
-            operator_identity="security_operator_root",
-            session_id="cli-sess-valid-operator-4c24",
+        # 4. Imposter identity rejected
+        imposter_principal = self.human_authority.issue_session(owner_id="imposter_hacker")
+        imposter_approval = self.human_authority.issue_approval(
+            principal=imposter_principal,
+            authorization_id=signed.manifest.authorization_id,
+        )
+        with self.assertRaises(HumanOperationalAuthorizationError) as ctx:
+            store_no_session.register_budget_from_signed_manifest(
+                signed_manifest=signed,
+                trust_store=self.trust_store,
+                expected_commit=self.valid_commit,
+                human_approval=imposter_approval,
+            )
+        self.assertIn("operator_identity mismatch", str(ctx.exception).lower())
+
+        # 5. Cross-manifest reuse rejected (approval for manifest A presented for manifest B)
+        signed_other = self._sign_manifest(auth_id="auth-other-manifest-999")
+        approval_for_other = self.human_authority.issue_approval(
+            principal=self.human_principal,
+            authorization_id=signed_other.manifest.authorization_id,
+        )
+        with self.assertRaises(HumanOperationalAuthorizationError) as ctx:
+            store_no_session.register_budget_from_signed_manifest(
+                signed_manifest=signed,  # signed has auth-consent-checks, approval has auth-other-manifest-999
+                trust_store=self.trust_store,
+                expected_commit=self.valid_commit,
+                human_approval=approval_for_other,
+            )
+        self.assertIn("authorization_id mismatch", str(ctx.exception).lower())
+
+        # 6. Expired approval rejected
+        expired_approval = self.human_authority.issue_approval(
+            principal=self.human_principal,
+            authorization_id=signed.manifest.authorization_id,
+            valid_duration_seconds=1.0,
+            at_time_utc=self.now_utc - dt.timedelta(hours=2),
+        )
+        with self.assertRaises(HumanOperationalAuthorizationError) as ctx:
+            store_no_session.register_budget_from_signed_manifest(
+                signed_manifest=signed,
+                trust_store=self.trust_store,
+                expected_commit=self.valid_commit,
+                human_approval=expired_approval,
+                check_time_utc=self.now_utc,
+            )
+        self.assertIn("expirada", str(ctx.exception).lower())
+
+        # 7. Subordinate worker lockout: AI_COORDINATOR_ROLE=worker prohibited from issuing approvals
+        orig_role = os.environ.get("AI_COORDINATOR_ROLE")
+        try:
+            os.environ["AI_COORDINATOR_ROLE"] = "worker"
+            with self.assertRaises(HumanOperationalAuthorizationError) as ctx:
+                self.human_authority.issue_approval(
+                    principal=self.human_principal,
+                    authorization_id=signed.manifest.authorization_id,
+                )
+            self.assertIn("proibidos", str(ctx.exception).lower())
+        finally:
+            if orig_role is not None:
+                os.environ["AI_COORDINATOR_ROLE"] = orig_role
+            else:
+                os.environ.pop("AI_COORDINATOR_ROLE", None)
+
+        # 8. Authentic HumanOperationalApproval succeeds
+        valid_approval = self.human_authority.issue_approval(
+            principal=self.human_principal,
             authorization_id=signed.manifest.authorization_id,
         )
         b_id = store_no_session.register_budget_from_signed_manifest(
@@ -707,7 +794,8 @@ class TestPhase4C24AdversarialRecovery(unittest.TestCase):
             db_path=self.db_path,
             default_trust_store=None,  # No TrustStore available
             expected_commit=self.valid_commit,
-            default_human_session=self.human_session,
+            human_authority=self.human_authority,
+            default_human_principal=self.human_principal,
         )
         res_no_ts = store_no_ts.acquire_reservation(b_id, "att_no_ts", 0, "liquid/lfm-3-1.7b:free")
         with self.assertRaises(QuotaSecurityError) as ctx:
@@ -720,7 +808,8 @@ class TestPhase4C24AdversarialRecovery(unittest.TestCase):
             db_path=self.db_path,
             default_trust_store=self.trust_store,
             expected_commit=None,  # No commit HEAD available
-            default_human_session=self.human_session,
+            human_authority=self.human_authority,
+            default_human_principal=self.human_principal,
         )
         res_no_cm = store_no_commit.acquire_reservation(b_id, "att_no_cm", 1, "liquid/lfm-3-1.7b:free")
         with self.assertRaises(QuotaSecurityError) as ctx:
@@ -846,6 +935,43 @@ class TestPhase4C24AdversarialRecovery(unittest.TestCase):
 
         for rid in res_ids:
             self.assertEqual(self.store.get_reservation(rid).state, STATE_UNKNOWN)
+
+    # =======================================================================
+    # SCENARIO 16: Inter-Process File Lock Dead PID Reclamation & Liveness (Auditor P1)
+    # =======================================================================
+
+    def test_18_inter_process_lock_dead_pid_reclamation_and_living_pid_contention(self) -> None:
+        """TC-18 (Auditor P1): _InterProcessFileLock reclaims locks from dead PIDs and blocks on live PIDs."""
+        lock_file = os.path.join(self.tmp_dir, "test_ipc.lock")
+
+        # 1. Dead PID simulation: write lock file with an impossible/dead PID (e.g. 9999999)
+        dead_pid = 9999999
+        self.assertFalse(safe_process_alive(dead_pid))
+        with open(lock_file, "w", encoding="utf-8") as f:
+            f.write(json.dumps({"pid": dead_pid, "acquired_at_epoch": time.time()}))
+
+        # Lock acquisition MUST detect dead PID and immediately reclaim the lock
+        with _InterProcessFileLock(lock_file, timeout_sec=1.0) as lock:
+            self.assertTrue(lock._acquired)
+            self.assertTrue(os.path.exists(lock_file))
+
+        # Lock is cleanly released on exit
+        self.assertFalse(os.path.exists(lock_file))
+
+        # 2. Living PID contention simulation: write lock file with current active PID
+        current_pid = os.getpid()
+        self.assertTrue(safe_process_alive(current_pid))
+        with open(lock_file, "w", encoding="utf-8") as f:
+            f.write(json.dumps({"pid": current_pid, "acquired_at_epoch": time.time()}))
+
+        # Contention attempt MUST NOT steal the lock from active PID and MUST timeout
+        with self.assertRaises(TimeoutError) as ctx:
+            with _InterProcessFileLock(lock_file, timeout_sec=0.1, retry_delay_sec=0.02):
+                pass
+        self.assertIn("held by active PID", str(ctx.exception))
+        # Lock file was preserved because PID is alive
+        self.assertTrue(os.path.exists(lock_file))
+        os.unlink(lock_file)
 
 
 if __name__ == "__main__":

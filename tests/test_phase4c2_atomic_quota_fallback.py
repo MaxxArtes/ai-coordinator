@@ -26,6 +26,7 @@ from ai_coordinator.manifest_auth import (
     CanonicalAuthorizationManifest,
     Ed25519Signer,
     HumanOperationalApproval,
+    HumanOperationalAuthority,
     HumanOperationalAuthorizationError,
     KeyAuthorityError,
     SignedAuthorizationManifest,
@@ -109,17 +110,15 @@ class TestPhase4C2AtomicQuotaAndFallback(unittest.TestCase):
         self.catalog.load_catalog_data(raw_catalog, epoch=self.now_utc.timestamp())
         self.cost_guard = FreeCostGuard(registry=self.catalog)
 
-        # Store, Session, and Projector
-        self.human_session = HumanOperationalApproval.create(
-            operator_identity="security_operator_root",
-            session_id="cli-sess-4c23-pilot",
-            authorization_id="auth-pilot-session",
-        )
+        # Human Authority, Principal, Store, and Projector
+        self.human_authority = HumanOperationalAuthority()
+        self.human_principal = self.human_authority.issue_session(owner_id="security_operator_root")
         self.store = AtomicDispatchQuotaStore(
             db_path=self.db_path,
             default_trust_store=self.trust_store,
             expected_commit=self.valid_commit,
-            default_human_session=self.human_session,
+            human_authority=self.human_authority,
+            default_human_principal=self.human_principal,
         )
         self.projector = TransactionalOutboxProjector(store=self.store, ledger_path=self.ledger_path)
         self.fallback_engine = GovernedFallbackEngine(
@@ -185,7 +184,8 @@ class TestPhase4C2AtomicQuotaAndFallback(unittest.TestCase):
             db_path=self.db_path,
             default_trust_store=self.trust_store,
             expected_commit=self.valid_commit,
-            default_human_session=self.human_session,
+            human_authority=self.human_authority,
+            default_human_principal=self.human_principal,
         )
         with self.assertRaises(PersistentReplayAttackError) as ctx:
             new_store_instance.register_budget_from_signed_manifest(

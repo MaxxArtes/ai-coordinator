@@ -239,6 +239,7 @@ from .manifest_auth import (
     SignedAuthorizationManifest,
     SignatureMetadata,
     HumanOperationalApproval,
+    HumanOperationalAuthority,
     Ed25519Signer,
     Ed25519Verifier,
     TrustedKeyEntry,

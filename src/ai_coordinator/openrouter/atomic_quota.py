@@ -16,15 +16,18 @@ import hashlib
 import json
 import math
 import os
+import shutil
 import sqlite3
 import time
 import uuid
 from dataclasses import asdict, dataclass
-from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Set, Tuple, Union
 
+from ai_coordinator.human_workspace import HumanPrincipal
 from ai_coordinator.manifest_auth import (
     CanonicalAuthorizationManifest,
     HumanOperationalApproval,
+    HumanOperationalAuthority,
     HumanOperationalAuthorizationError,
     KeyAuthorityError,
     ReplayAuthorizationError,
@@ -32,6 +35,7 @@ from ai_coordinator.manifest_auth import (
     TripartiteAuthorizationVerifier,
     TrustStore,
 )
+from ai_coordinator.process import safe_process_alive
 from ai_coordinator.openrouter.cost_guard import FreeCostGuard
 from ai_coordinator.openrouter.registry import FreeModelRegistry
 
@@ -155,14 +159,27 @@ class AtomicDispatchQuotaStore:
         db_path: str = ":memory:",
         default_trust_store: Optional[TrustStore] = None,
         expected_commit: Optional[str] = None,
-        default_human_session: Optional[HumanOperationalApproval] = None,
+        human_authority: Optional[HumanOperationalAuthority] = None,
+        default_human_principal: Optional[HumanPrincipal] = None,
+        default_human_session: Optional[Union[HumanPrincipal, HumanOperationalApproval]] = None,
     ):
         self.db_path = db_path
         self._is_memory = db_path == ":memory:"
         self._conn: Optional[sqlite3.Connection] = None
         self.default_trust_store = default_trust_store
         self.expected_commit = expected_commit
-        self.default_human_session = default_human_session
+        self.human_authority = human_authority or HumanOperationalAuthority()
+
+        if isinstance(default_human_session, HumanPrincipal):
+            self.default_human_principal = default_human_session
+            self.default_human_approval = None
+        elif isinstance(default_human_session, HumanOperationalApproval):
+            self.default_human_approval = default_human_session
+            self.default_human_principal = default_human_principal
+        else:
+            self.default_human_principal = default_human_principal
+            self.default_human_approval = None
+
         self._init_database()
 
     def _get_connection(self) -> sqlite3.Connection:
@@ -292,43 +309,38 @@ class AtomicDispatchQuotaStore:
                 raise HumanOperationalAuthorizationError(
                     f"human_approval must be HumanOperationalApproval or dict, got: {type(human_approval)}"
                 )
-        elif human_operator_identity is not None and human_session_id is not None:
+        elif self.default_human_principal is not None:
             if human_operator_consent is not True:
                 raise HumanOperationalAuthorizationError(
-                    "Explicit consent (human_operator_consent=True) is mandatory alongside operator identity and session"
+                    "Human operational consent is missing or false: explicit consent (True) is mandatory by operator"
                 )
-            resolved_approval = HumanOperationalApproval.create(
-                operator_identity=human_operator_identity,
-                session_id=human_session_id,
+            # Operator principal configured on store issues authentic approval for this exact manifest
+            resolved_approval = self.human_authority.issue_approval(
+                principal=self.default_human_principal,
                 authorization_id=signed_manifest.manifest.authorization_id,
+                at_time_utc=check_time_utc,
             )
-        elif self.default_human_session is not None:
+        elif self.default_human_approval is not None:
             if human_operator_consent is not True and human_operator_consent is not None:
                 raise HumanOperationalAuthorizationError(
                     "Human operational consent is missing or false: explicit consent (True) is mandatory by operator"
                 )
-            resolved_approval = self.default_human_session
+            resolved_approval = self.default_human_approval
         else:
             raise HumanOperationalAuthorizationError(
                 "Isolated boolean consent flag is prohibited: verifiable human operator identity and authenticated "
-                "session (HumanOperationalApproval) are mandatory to prove human authorization"
+                "approval (HumanOperationalApproval) issued by HumanOperationalAuthority are mandatory to prove human authorization"
             )
 
-        if resolved_approval.explicit_consent is not True:
-            raise HumanOperationalAuthorizationError(
-                "Human operational consent is missing or false: explicit consent (True) is mandatory by operator"
-            )
-        if resolved_approval.operator_identity.strip() != signed_manifest.manifest.authorizer_identity.strip():
-            raise HumanOperationalAuthorizationError(
-                f"Operator identity mismatch: operator identity '{resolved_approval.operator_identity}' diverges from "
-                f"manifest authorizer '{signed_manifest.manifest.authorizer_identity}'"
-            )
-        if not resolved_approval.session_id or not resolved_approval.session_id.strip():
-            raise HumanOperationalAuthorizationError(
-                "Human operational approval requires non-empty session_id"
-            )
+        # 2. Cryptographic verification of human approval fail-closed
+        self.human_authority.verify_approval(
+            approval=resolved_approval,
+            expected_authorization_id=signed_manifest.manifest.authorization_id,
+            expected_operator_identity=signed_manifest.manifest.authorizer_identity,
+            at_time_utc=check_time_utc,
+        )
 
-        # 2. Enforce tripartite verification (Tiers 1, 2, and 3)
+        # 3. Enforce tripartite verification (Tiers 1, 2, and 3)
         verifier = TripartiteAuthorizationVerifier(trust_store=trust_store)
         res = verifier.verify(
             signed_manifest=signed_manifest,
@@ -339,6 +351,8 @@ class AtomicDispatchQuotaStore:
             human_operator_consent=True,
             at_time_utc=check_time_utc,
             check_replay=False,  # Replay is verified persistently via SQLite UNIQUE constraint below
+            human_approval=resolved_approval,
+            human_authority=self.human_authority,
         )
         if not res.is_fully_authorized:
             if not res.tier1_crypto_valid:
@@ -383,10 +397,12 @@ class AtomicDispatchQuotaStore:
                     "canonical_sha256": manifest.canonical_sha256(),
                     "key_id": signed_manifest.signature.key_id,
                     "operator_identity": resolved_approval.operator_identity,
-                    "session_id": resolved_approval.session_id,
+                    "session_token": resolved_approval.session_token,
                     "approval_token": resolved_approval.approval_token,
-                    "approved_at_utc": resolved_approval.approved_at_utc,
-                }),
+                    "valid_from_utc": resolved_approval.valid_from_utc,
+                    "valid_until_utc": resolved_approval.valid_until_utc,
+                    "purpose": resolved_approval.purpose,
+                }, sort_keys=True),
             ))
 
             # Record in global_dispatch_budgets
@@ -963,11 +979,12 @@ class AtomicDispatchQuotaStore:
 # ---------------------------------------------------------------------------
 
 class _InterProcessFileLock:
-    """Minimal, robust cross-process file lock using atomic OS file creation flags."""
+    """Minimal, robust cross-process file lock using atomic OS file creation flags and PID liveness validation."""
 
-    def __init__(self, lock_path: str, timeout_sec: float = 10.0):
+    def __init__(self, lock_path: str, timeout_sec: float = 10.0, retry_delay_sec: float = 0.02):
         self.lock_path = lock_path
         self.timeout_sec = timeout_sec
+        self.retry_delay_sec = retry_delay_sec
         self._fd: Optional[int] = None
         self._acquired = False
 
@@ -975,21 +992,56 @@ class _InterProcessFileLock:
         start = time.time()
         while True:
             try:
+                # O_CREAT | O_EXCL provides atomic creation semantics on Windows and POSIX
                 self._fd = os.open(self.lock_path, os.O_CREAT | os.O_EXCL | os.O_RDWR)
+                payload = json.dumps({
+                    "pid": os.getpid(),
+                    "acquired_at_epoch": time.time(),
+                }).encode("utf-8")
+                os.write(self._fd, payload)
+                os.fsync(self._fd)
                 self._acquired = True
                 return self
             except FileExistsError:
-                if time.time() - start > self.timeout_sec:
-                    # Stale lock recovery (> 30s)
+                # Lock file already exists: inspect owning PID
+                owner_pid: Optional[int] = None
+                try:
+                    with open(self.lock_path, "r", encoding="utf-8") as f:
+                        content = f.read().strip()
+                        if content:
+                            data = json.loads(content)
+                            if isinstance(data, dict):
+                                owner_pid = data.get("pid")
+                except Exception:
+                    pass
+
+                if owner_pid is not None and isinstance(owner_pid, int):
+                    # Check if owner PID is verifiably alive
+                    if not safe_process_alive(owner_pid):
+                        # Owner process is dead! Safe to unlink orphaned stale lock
+                        try:
+                            os.unlink(self.lock_path)
+                            continue
+                        except OSError:
+                            pass
+                else:
+                    # If lock file exists but has no readable PID, check if older than 5.0 seconds
                     try:
                         mtime = os.path.getmtime(self.lock_path)
-                        if time.time() - mtime > 30.0:
+                        if time.time() - mtime > 5.0:
                             os.unlink(self.lock_path)
                             continue
                     except OSError:
                         pass
-                    raise TimeoutError(f"Timed out waiting for inter-process ledger lock: '{self.lock_path}'")
-                time.sleep(0.02)
+
+                # If owner process is still alive, do NOT unlink based on elapsed time alone!
+                if time.time() - start > self.timeout_sec:
+                    raise TimeoutError(
+                        f"Timed out waiting for inter-process lock '{self.lock_path}' "
+                        f"(held by active PID {owner_pid})"
+                    )
+
+                time.sleep(self.retry_delay_sec)
 
     def __exit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
         if self._acquired:
@@ -1010,6 +1062,24 @@ class _InterProcessFileLock:
 # ---------------------------------------------------------------------------
 # Transactional Outbox Projector (Projetor para pilot_audit.jsonl)
 # ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class LedgerRecoveryResult:
+    """Outcome of ledger quarantine and recovery operation."""
+    recovered_count: int
+    quarantined_count: int
+    quarantine_path: str
+    full_backup_path: str
+
+    def __iter__(self):
+        return iter((self.recovered_count, self.quarantined_count, self.quarantine_path, self.full_backup_path))
+
+    def __getitem__(self, idx: int) -> Any:
+        return (self.recovered_count, self.quarantined_count, self.quarantine_path, self.full_backup_path)[idx]
+
+    def __len__(self) -> int:
+        return 4
+
 
 class TransactionalOutboxProjector:
     """Projects unprojected outbox events from SQLite into append-only JSONL with fsync and integrity validation."""
@@ -1058,94 +1128,117 @@ class TransactionalOutboxProjector:
 
         return len(errors) == 0, errors, valid_ids
 
-    def recover_and_quarantine_corrupt_ledger(self) -> Tuple[int, int, str]:
-        """Explicit verified recovery tool: quarantines corrupted lines and preserves valid audit records.
+    def recover_and_quarantine_corrupt_ledger(self) -> LedgerRecoveryResult:
+        """Explicit verified recovery tool: preserves raw full copy, quarantines corrupted lines,
+        and rewrites valid audit records.
 
-        Returns (recovered_records_count, quarantined_lines_count, quarantine_file_path).
+        Synchronized via _InterProcessFileLock across processes.
+        Returns LedgerRecoveryResult(recovered_count, quarantined_count, quarantine_path, full_backup_path).
         """
         if not os.path.exists(self.ledger_path):
-            return 0, 0, ""
+            return LedgerRecoveryResult(0, 0, "", "")
 
-        quarantine_path = f"{self.ledger_path}.corrupt_{int(time.time())}_{uuid.uuid4().hex[:6]}.bak"
-        recovered_records: List[Dict[str, Any]] = []
-        quarantined_lines: List[Tuple[int, str]] = []
-        line_num = 0
+        lock_path = f"{self.ledger_path}.lock"
+        os.makedirs(os.path.dirname(os.path.abspath(self.ledger_path)), exist_ok=True)
 
-        with open(self.ledger_path, "r", encoding="utf-8", errors="replace") as f:
-            for raw_line in f:
-                line_num += 1
-                stripped = raw_line.strip()
-                if not stripped:
-                    continue
-                try:
-                    record = json.loads(stripped)
-                    if isinstance(record, dict) and "event_id" in record and record["event_id"] and "event_type" in record:
-                        recovered_records.append(record)
-                    else:
+        with _InterProcessFileLock(lock_path):
+            ts_str = int(time.time())
+            uid_str = uuid.uuid4().hex[:6]
+            full_backup_path = f"{self.ledger_path}.full_backup_{ts_str}_{uid_str}.bak"
+            quarantine_path = f"{self.ledger_path}.corrupt_{ts_str}_{uid_str}.bak"
+
+            # 1. Preserve 100% full raw byte-for-byte copy of the corrupted ledger with fsync
+            with open(self.ledger_path, "rb") as src_f, open(full_backup_path, "wb") as dst_f:
+                shutil.copyfileobj(src_f, dst_f)
+                dst_f.flush()
+                os.fsync(dst_f.fileno())
+
+            # 2. Parse lines to identify valid records vs corrupted lines
+            recovered_records: List[Dict[str, Any]] = []
+            quarantined_lines: List[Tuple[int, str]] = []
+            line_num = 0
+
+            with open(self.ledger_path, "r", encoding="utf-8", errors="replace") as f:
+                for raw_line in f:
+                    line_num += 1
+                    stripped = raw_line.strip()
+                    if not stripped:
+                        continue
+                    try:
+                        record = json.loads(stripped)
+                        if isinstance(record, dict) and "event_id" in record and record["event_id"] and "event_type" in record:
+                            recovered_records.append(record)
+                        else:
+                            quarantined_lines.append((line_num, raw_line))
+                    except Exception:
                         quarantined_lines.append((line_num, raw_line))
-                except Exception:
-                    quarantined_lines.append((line_num, raw_line))
 
-        if quarantined_lines:
-            with open(quarantine_path, "w", encoding="utf-8") as qf:
-                for ln, ltxt in quarantined_lines:
-                    qf.write(f"LINE {ln}: {ltxt}")
-                qf.flush()
-                os.fsync(qf.fileno())
+            # 3. Write quarantined lines with fsync
+            if quarantined_lines:
+                with open(quarantine_path, "w", encoding="utf-8") as qf:
+                    for ln, ltxt in quarantined_lines:
+                        qf.write(f"LINE {ln}: {ltxt}")
+                    qf.flush()
+                    os.fsync(qf.fileno())
 
-        # Rewrite ledger atomically with only valid records
-        temp_ledger = f"{self.ledger_path}.tmp_{uuid.uuid4().hex[:8]}"
-        with open(temp_ledger, "w", encoding="utf-8") as f:
-            for rec in recovered_records:
-                f.write(json.dumps(rec) + "\n")
-            f.flush()
-            os.fsync(f.fileno())
-        os.replace(temp_ledger, self.ledger_path)
+            # 4. Rewrite ledger atomically with only valid records
+            temp_ledger = f"{self.ledger_path}.tmp_{uuid.uuid4().hex[:8]}"
+            with open(temp_ledger, "w", encoding="utf-8") as f:
+                for rec in recovered_records:
+                    f.write(json.dumps(rec) + "\n")
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(temp_ledger, self.ledger_path)
 
-        return len(recovered_records), len(quarantined_lines), quarantine_path
+            return LedgerRecoveryResult(
+                recovered_count=len(recovered_records),
+                quarantined_count=len(quarantined_lines),
+                quarantine_path=quarantine_path if quarantined_lines else "",
+                full_backup_path=full_backup_path,
+            )
 
     def project_pending_events(self) -> int:
         """Read unprojected events, append to ledger file with fsync idempotently, and mark projected.
 
+        Protected by _InterProcessFileLock across verification, file append, and SQLite mark-as-projected.
         Fail-closed: if ledger corruption is detected, raises LedgerCorruptionError
         and refuses to append onto corrupted evidence until verified recovery.
         """
-        # 1. Enforce ledger integrity check fail-closed
-        is_ok, errors, existing_ids = self.verify_ledger_integrity()
-        if not is_ok:
-            raise LedgerCorruptionError(
-                f"Ledger corruption detected in '{self.ledger_path}' ({len(errors)} error(s)): "
-                f"{'; '.join(errors[:3])}. Projection blocked fail-closed until verified recovery."
-            )
+        lock_path = f"{self.ledger_path}.lock"
+        os.makedirs(os.path.dirname(os.path.abspath(self.ledger_path)), exist_ok=True)
 
-        conn = self.store._get_connection()
-        now_epoch = time.time()
-        in_tx = False
-        try:
-            conn.execute("BEGIN IMMEDIATE;")
-            in_tx = True
-            cur = conn.execute("""
-            SELECT event_id, reservation_id, aggregate_id, event_type, payload_json, created_at_epoch
-            FROM outbox_events
-            WHERE projected_at_epoch IS NULL
-            ORDER BY created_at_epoch ASC
-            """)
-            pending = cur.fetchall()
+        with _InterProcessFileLock(lock_path):
+            # 1. Enforce ledger integrity check fail-closed UNDER LOCK
+            is_ok, errors, existing_ids = self.verify_ledger_integrity()
+            if not is_ok:
+                raise LedgerCorruptionError(
+                    f"Ledger corruption detected in '{self.ledger_path}' ({len(errors)} error(s)): "
+                    f"{'; '.join(errors[:3])}. Projection blocked fail-closed until verified recovery."
+                )
 
-            if not pending:
-                conn.execute("COMMIT;")
-                in_tx = False
-                return 0
+            conn = self.store._get_connection()
+            now_epoch = time.time()
+            in_tx = False
+            try:
+                conn.execute("BEGIN IMMEDIATE;")
+                in_tx = True
+                cur = conn.execute("""
+                SELECT event_id, reservation_id, aggregate_id, event_type, payload_json, created_at_epoch
+                FROM outbox_events
+                WHERE projected_at_epoch IS NULL
+                ORDER BY created_at_epoch ASC
+                """)
+                pending = cur.fetchall()
 
-            # Ensure parent directory exists
-            os.makedirs(os.path.dirname(os.path.abspath(self.ledger_path)), exist_ok=True)
+                if not pending:
+                    conn.execute("COMMIT;")
+                    in_tx = False
+                    return 0
 
-            # Deduplicate against already projected events in JSONL file (Crash recovery safety)
-            new_events = [p for p in pending if p[0] not in existing_ids]
+                # Deduplicate against already projected events in JSONL file (Crash recovery safety)
+                new_events = [p for p in pending if p[0] not in existing_ids]
 
-            if new_events:
-                lock_path = f"{self.ledger_path}.lock"
-                with _InterProcessFileLock(lock_path):
+                if new_events:
                     with open(self.ledger_path, "a", encoding="utf-8") as f:
                         for ev_id, res_id, agg_id, ev_type, payload_str, created_epoch in new_events:
                             record = {
@@ -1161,25 +1254,25 @@ class TransactionalOutboxProjector:
                         f.flush()
                         os.fsync(f.fileno())
 
-            # Mark all as projected in SQLite (both newly appended and previously flushed)
-            for ev_id, _, _, _, _, _ in pending:
-                conn.execute("""
-                UPDATE outbox_events
-                SET projected_at_epoch = ?
-                WHERE event_id = ?
-                """, (now_epoch, ev_id))
+                # Mark all as projected in SQLite (both newly appended and previously flushed)
+                for ev_id, _, _, _, _, _ in pending:
+                    conn.execute("""
+                    UPDATE outbox_events
+                    SET projected_at_epoch = ?
+                    WHERE event_id = ?
+                    """, (now_epoch, ev_id))
 
-            conn.execute("COMMIT;")
-            in_tx = False
-            return len(pending)
-        finally:
-            if in_tx:
-                try:
-                    conn.execute("ROLLBACK;")
-                except Exception:
-                    pass
-            if not self.store._is_memory:
-                conn.close()
+                conn.execute("COMMIT;")
+                in_tx = False
+                return len(pending)
+            finally:
+                if in_tx:
+                    try:
+                        conn.execute("ROLLBACK;")
+                    except Exception:
+                        pass
+                if not self.store._is_memory:
+                    conn.close()
 
     def verify_event_projected(self, event_id: str) -> bool:
         """Check whether specific outbox event has been durably projected to disk."""

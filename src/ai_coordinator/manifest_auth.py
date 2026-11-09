@@ -17,16 +17,20 @@ from __future__ import annotations
 
 import datetime as dt
 import hashlib
+import hmac
 import json
 import math
 import os
 import re
+import secrets
 import tempfile
 from dataclasses import asdict, dataclass, field
 from typing import Any, Dict, List, Optional, Sequence, Set, Tuple, Union
 
 from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives.asymmetric import ed25519
+
+from .human_workspace import HumanPrincipal
 
 # Canonical schema version for Phase 4C.2
 SCHEMA_VERSION_1_0 = "1.0"
@@ -235,81 +239,65 @@ class CanonicalAuthorizationManifest:
 
 
 # ---------------------------------------------------------------------------
-# Verifiable Human Operational Approval (Tier 3)
+# Verifiable Human Operational Approval & Authority (Tier 3)
 # ---------------------------------------------------------------------------
 
 @dataclass(frozen=True)
 class HumanOperationalApproval:
     """Verifiable human operational authorization token / session proof.
 
-    Guarantees authentic human consent by binding:
+    Guarantees authentic human consent cryptographically bound to:
+    - authorization_id: manifest authorization ID
     - operator_identity: string matching the manifest authorizer
-    - session_id: authenticated CLI session identifier
-    - approved_at_utc: ISO timestamp when human approved execution
+    - session_token: authenticated session token (from HumanWorkspace / HumanPrincipal)
+    - valid_from_utc: ISO timestamp when approval becomes valid
+    - valid_until_utc: ISO timestamp when approval expires
+    - approval_token: cryptographic HMAC-SHA256 proof token issued by HumanOperationalAuthority
+    - purpose: authorization purpose (default: 'dispatch:openrouter_free')
     - explicit_consent: strictly True
-    - approval_token: cryptographic proof token binding the above fields to authorization_id
     """
+    authorization_id: str
     operator_identity: str
-    session_id: str
-    approved_at_utc: str
+    session_token: str
+    valid_from_utc: str
+    valid_until_utc: str
+    approval_token: str
+    purpose: str = PERMISSION_DISPATCH_OPENROUTER_FREE
     explicit_consent: bool = True
-    approval_token: Optional[str] = None
 
     def __post_init__(self) -> None:
-        if not self.operator_identity or not self.operator_identity.strip():
+        if not self.authorization_id or not isinstance(self.authorization_id, str) or not self.authorization_id.strip():
+            raise HumanOperationalAuthorizationError("authorization_id cannot be empty in HumanOperationalApproval")
+        if not self.operator_identity or not isinstance(self.operator_identity, str) or not self.operator_identity.strip():
             raise HumanOperationalAuthorizationError("operator_identity cannot be empty in HumanOperationalApproval")
-        if not self.session_id or not self.session_id.strip():
-            raise HumanOperationalAuthorizationError("session_id cannot be empty in HumanOperationalApproval")
-        if not self.approved_at_utc or not self.approved_at_utc.strip():
-            raise HumanOperationalAuthorizationError("approved_at_utc cannot be empty in HumanOperationalApproval")
+        if not self.session_token or not isinstance(self.session_token, str) or not self.session_token.strip():
+            raise HumanOperationalAuthorizationError("session_token cannot be empty in HumanOperationalApproval")
+        if not self.valid_from_utc or not isinstance(self.valid_from_utc, str) or not self.valid_from_utc.strip():
+            raise HumanOperationalAuthorizationError("valid_from_utc cannot be empty in HumanOperationalApproval")
+        if not self.valid_until_utc or not isinstance(self.valid_until_utc, str) or not self.valid_until_utc.strip():
+            raise HumanOperationalAuthorizationError("valid_until_utc cannot be empty in HumanOperationalApproval")
+        if not self.approval_token or not isinstance(self.approval_token, str) or not self.approval_token.strip():
+            raise HumanOperationalAuthorizationError("approval_token cannot be empty in HumanOperationalApproval")
         if self.explicit_consent is not True:
-            raise HumanOperationalAuthorizationError("explicit_consent must be True in HumanOperationalApproval")
-
-    @classmethod
-    def create(
-        cls,
-        operator_identity: str,
-        session_id: str,
-        authorization_id: str,
-        approved_at_utc: Optional[str] = None,
-        secret_salt: Optional[str] = None,
-    ) -> "HumanOperationalApproval":
-        """Generate a verified human operational approval token for a manifest."""
-        if not operator_identity or not operator_identity.strip():
-            raise ValueError("operator_identity cannot be empty")
-        if not session_id or not session_id.strip():
-            raise ValueError("session_id cannot be empty")
-        if not authorization_id or not authorization_id.strip():
-            raise ValueError("authorization_id cannot be empty")
-
-        now_str = approved_at_utc or dt.datetime.now(dt.timezone.utc).isoformat()
-        salt = secret_salt or "AI_COORDINATOR_OPERATIONAL_SALT_V1"
-        token_payload = f"{salt}:{operator_identity.strip()}:{session_id.strip()}:{authorization_id.strip()}:{now_str}".encode("utf-8")
-        token = hashlib.sha256(token_payload).hexdigest()
-
-        return cls(
-            operator_identity=operator_identity.strip(),
-            session_id=session_id.strip(),
-            approved_at_utc=now_str,
-            explicit_consent=True,
-            approval_token=token,
-        )
-
-    def verify_token(self, authorization_id: str, secret_salt: Optional[str] = None) -> bool:
-        """Verify token integrity against authorization_id and internal fields."""
-        if not self.approval_token:
-            return False
-        salt = secret_salt or "AI_COORDINATOR_OPERATIONAL_SALT_V1"
-        expected = hashlib.sha256(
-            f"{salt}:{self.operator_identity.strip()}:{self.session_id.strip()}:{authorization_id.strip()}:{self.approved_at_utc.strip()}".encode("utf-8")
-        ).hexdigest()
-        return self.approval_token == expected
+            raise HumanOperationalAuthorizationError("explicit_consent must be strictly True in HumanOperationalApproval")
+        try:
+            t_from = dt.datetime.fromisoformat(self.valid_from_utc.replace("Z", "+00:00"))
+            t_until = dt.datetime.fromisoformat(self.valid_until_utc.replace("Z", "+00:00"))
+            if t_until < t_from:
+                raise HumanOperationalAuthorizationError("valid_until_utc cannot precede valid_from_utc")
+        except Exception as exc:
+            if isinstance(exc, HumanOperationalAuthorizationError):
+                raise
+            raise HumanOperationalAuthorizationError(f"Invalid timestamp format in HumanOperationalApproval: {exc}")
 
     def to_dict(self) -> Dict[str, Any]:
         return {
+            "authorization_id": self.authorization_id,
             "operator_identity": self.operator_identity,
-            "session_id": self.session_id,
-            "approved_at_utc": self.approved_at_utc,
+            "session_token": self.session_token,
+            "valid_from_utc": self.valid_from_utc,
+            "valid_until_utc": self.valid_until_utc,
+            "purpose": self.purpose,
             "explicit_consent": self.explicit_consent,
             "approval_token": self.approval_token,
         }
@@ -317,14 +305,188 @@ class HumanOperationalApproval:
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "HumanOperationalApproval":
         if not isinstance(data, dict):
-            raise ValueError(f"Approval data must be a dictionary, got: {type(data)}")
+            raise HumanOperationalAuthorizationError(f"Approval data must be a dictionary, got: {type(data)}")
         return cls(
+            authorization_id=str(data.get("authorization_id", "")),
             operator_identity=str(data.get("operator_identity", "")),
-            session_id=str(data.get("session_id", "")),
-            approved_at_utc=str(data.get("approved_at_utc", "")),
+            session_token=str(data.get("session_token", "")),
+            valid_from_utc=str(data.get("valid_from_utc", "")),
+            valid_until_utc=str(data.get("valid_until_utc", "")),
+            purpose=str(data.get("purpose", PERMISSION_DISPATCH_OPENROUTER_FREE)),
             explicit_consent=bool(data.get("explicit_consent", False)),
-            approval_token=data.get("approval_token"),
+            approval_token=str(data.get("approval_token", "")),
         )
+
+
+class HumanOperationalAuthority:
+    """Cryptographic authority issuing and validating verifiable human operational approvals.
+
+    Holds private authority secret (32 random bytes or derived from supervisor secret).
+    Prevents unauthorized callers or worker agents from forging human operational consent.
+    """
+
+    def __init__(
+        self,
+        authority_secret: Optional[bytes] = None,
+        supervisor_key: Optional[str] = None,
+    ):
+        self._secret = authority_secret or secrets.token_bytes(32)
+        self.supervisor_key = supervisor_key or secrets.token_hex(16)
+
+    def issue_session(self, owner_id: str, role: str = "human") -> HumanPrincipal:
+        """Issue an authenticated HumanPrincipal session for an authorized operator."""
+        if os.environ.get("AI_COORDINATOR_ROLE") == "worker":
+            raise HumanOperationalAuthorizationError("Workers subordinados estao proibidos de criar sessoes humanas")
+        if not owner_id or not isinstance(owner_id, str):
+            raise ValueError("owner_id obrigatorio")
+        cleaned = owner_id.strip()
+        if not re.fullmatch(r"[a-zA-Z0-9_.-]{1,64}", cleaned):
+            raise ValueError("owner_id contem caracteres invalidos")
+        digest = hmac.new(self._secret, f"human_session:{cleaned}".encode("utf-8"), hashlib.sha256).hexdigest()
+        session_token = f"hsess_{cleaned}_{digest}"
+        return HumanPrincipal(owner_id=cleaned, role=role, session_token=session_token)
+
+    def issue_approval(
+        self,
+        principal: HumanPrincipal,
+        authorization_id: str,
+        valid_duration_seconds: float = 3600.0,
+        purpose: str = PERMISSION_DISPATCH_OPENROUTER_FREE,
+        at_time_utc: Optional[dt.datetime] = None,
+    ) -> HumanOperationalApproval:
+        """Issue a cryptographically signed HumanOperationalApproval binding operator and manifest."""
+        if os.environ.get("AI_COORDINATOR_ROLE") == "worker":
+            raise HumanOperationalAuthorizationError(
+                "Workers subordinados estao estritamente proibidos de emitir autorizacao operacional humana"
+            )
+        if not isinstance(principal, HumanPrincipal):
+            raise HumanOperationalAuthorizationError("Principal invalido: deve ser instancia de HumanPrincipal")
+        if principal.role == "worker":
+            raise HumanOperationalAuthorizationError("Papel 'worker' nao autorizado a emitir autorizacao operacional")
+        if not principal.session_token:
+            raise HumanOperationalAuthorizationError("Principal deve possuir session_token valido")
+
+        # Verify session token integrity
+        expected_prefix = f"hsess_{principal.owner_id}_"
+        if not principal.session_token.startswith(expected_prefix):
+            raise HumanOperationalAuthorizationError("Token de sessao invalido: prefixo divergente do proprietario")
+        token_digest = principal.session_token[len(expected_prefix):]
+        expected_digest = hmac.new(
+            self._secret,
+            f"human_session:{principal.owner_id}".encode("utf-8"),
+            hashlib.sha256,
+        ).hexdigest()
+        if not hmac.compare_digest(token_digest, expected_digest):
+            raise HumanOperationalAuthorizationError("Token de sessao falsificado ou invalido para o proprietario")
+
+        if not authorization_id or not isinstance(authorization_id, str) or not authorization_id.strip():
+            raise HumanOperationalAuthorizationError("authorization_id obrigatorio para emissao de aprovacao")
+
+        now = at_time_utc or dt.datetime.now(dt.timezone.utc)
+        if now.tzinfo is None:
+            now = now.replace(tzinfo=dt.timezone.utc)
+        valid_from_str = now.isoformat()
+        valid_until_str = (now + dt.timedelta(seconds=valid_duration_seconds)).isoformat()
+
+        # Compute HMAC signature binding all critical fields
+        sig = self._compute_token(
+            authorization_id=authorization_id.strip(),
+            operator_identity=principal.owner_id.strip(),
+            session_token=principal.session_token.strip(),
+            valid_from_utc=valid_from_str,
+            valid_until_utc=valid_until_str,
+            purpose=purpose.strip(),
+        )
+
+        return HumanOperationalApproval(
+            authorization_id=authorization_id.strip(),
+            operator_identity=principal.owner_id.strip(),
+            session_token=principal.session_token.strip(),
+            valid_from_utc=valid_from_str,
+            valid_until_utc=valid_until_str,
+            purpose=purpose.strip(),
+            explicit_consent=True,
+            approval_token=sig,
+        )
+
+    def _compute_token(
+        self,
+        authorization_id: str,
+        operator_identity: str,
+        session_token: str,
+        valid_from_utc: str,
+        valid_until_utc: str,
+        purpose: str,
+    ) -> str:
+        canonical_msg = f"{authorization_id}:{operator_identity}:{session_token}:{valid_from_utc}:{valid_until_utc}:{purpose}"
+        return hmac.new(self._secret, canonical_msg.encode("utf-8"), hashlib.sha256).hexdigest()
+
+    def verify_approval(
+        self,
+        approval: HumanOperationalApproval,
+        expected_authorization_id: str,
+        expected_operator_identity: str,
+        at_time_utc: Optional[dt.datetime] = None,
+    ) -> bool:
+        """Verify authenticity, identity, temporal validity, and integrity of HumanOperationalApproval."""
+        if not isinstance(approval, HumanOperationalApproval):
+            raise HumanOperationalAuthorizationError("approval deve ser instancia de HumanOperationalApproval")
+        if approval.explicit_consent is not True:
+            raise HumanOperationalAuthorizationError("explicit_consent deve ser strictly True")
+        if approval.authorization_id.strip() != expected_authorization_id.strip():
+            raise HumanOperationalAuthorizationError(
+                f"authorization_id mismatch: aprovacao vinculada a '{approval.authorization_id}', "
+                f"mas manifesto requer '{expected_authorization_id}'"
+            )
+        if approval.operator_identity.strip() != expected_operator_identity.strip():
+            raise HumanOperationalAuthorizationError(
+                f"operator_identity mismatch: aprovacao vinculada a '{approval.operator_identity}', "
+                f"mas manifesto requer '{expected_operator_identity}'"
+            )
+
+        # Check temporal window
+        now = at_time_utc or dt.datetime.now(dt.timezone.utc)
+        if now.tzinfo is None:
+            now = now.replace(tzinfo=dt.timezone.utc)
+
+        t_from = dt.datetime.fromisoformat(approval.valid_from_utc.replace("Z", "+00:00"))
+        t_until = dt.datetime.fromisoformat(approval.valid_until_utc.replace("Z", "+00:00"))
+
+        if now < t_from - dt.timedelta(seconds=60):
+            raise HumanOperationalAuthorizationError(
+                f"Aprovacao ainda nao e valida (valid_from={approval.valid_from_utc}, now={now.isoformat()})"
+            )
+        if now > t_until:
+            raise HumanOperationalAuthorizationError(
+                f"Aprovacao expirada em {approval.valid_until_utc} (now={now.isoformat()})"
+            )
+
+        # Check session token integrity
+        expected_prefix = f"hsess_{approval.operator_identity}_"
+        if not approval.session_token.startswith(expected_prefix):
+            raise HumanOperationalAuthorizationError("Session token invalido para operador")
+        token_digest = approval.session_token[len(expected_prefix):]
+        expected_digest = hmac.new(
+            self._secret,
+            f"human_session:{approval.operator_identity}".encode("utf-8"),
+            hashlib.sha256,
+        ).hexdigest()
+        if not hmac.compare_digest(token_digest, expected_digest):
+            raise HumanOperationalAuthorizationError("Session token adulterado ou desconhecido")
+
+        # Verify HMAC signature
+        expected_token = self._compute_token(
+            authorization_id=approval.authorization_id.strip(),
+            operator_identity=approval.operator_identity.strip(),
+            session_token=approval.session_token.strip(),
+            valid_from_utc=approval.valid_from_utc.strip(),
+            valid_until_utc=approval.valid_until_utc.strip(),
+            purpose=approval.purpose.strip(),
+        )
+        if not hmac.compare_digest(approval.approval_token.strip(), expected_token):
+            raise HumanOperationalAuthorizationError("approval_token HMAC invalido, falsificado ou adulterado")
+
+        return True
 
 
 # ---------------------------------------------------------------------------
@@ -836,6 +998,8 @@ class TripartiteAuthorizationVerifier:
         required_permission: str = PERMISSION_DISPATCH_OPENROUTER_FREE,
         at_time_utc: Optional[dt.datetime] = None,
         check_replay: bool = True,
+        human_approval: Optional[HumanOperationalApproval] = None,
+        human_authority: Optional[HumanOperationalAuthority] = None,
     ) -> TripartiteVerificationResult:
         """Perform full tripartite verification.
 
@@ -984,6 +1148,20 @@ class TripartiteAuthorizationVerifier:
                         f"Replay attack prevented: authorization_id '{manifest.authorization_id}' "
                         "has already been consumed"
                     )
+                # 9. Cryptographic Human Operational Approval (if authority and approval provided)
+                elif human_approval is not None and human_authority is not None:
+                    try:
+                        human_authority.verify_approval(
+                            approval=human_approval,
+                            expected_authorization_id=manifest.authorization_id,
+                            expected_operator_identity=manifest.authorizer_identity,
+                            at_time_utc=now,
+                        )
+                        tier3_valid = True
+                        tier3_reason = "Human operational constraints, authenticated approval, commit match, budget, and scope fully verified"
+                    except Exception as exc:
+                        tier3_valid = False
+                        tier3_reason = f"Human operational approval rejected: {exc}"
                 else:
                     tier3_valid = True
                     tier3_reason = "Human operational constraints, commit match, budget, and scope fully verified"
@@ -1020,6 +1198,8 @@ class TripartiteAuthorizationVerifier:
         required_permission: str = PERMISSION_DISPATCH_OPENROUTER_FREE,
         at_time_utc: Optional[dt.datetime] = None,
         check_replay: bool = True,
+        human_approval: Optional[HumanOperationalApproval] = None,
+        human_authority: Optional[HumanOperationalAuthority] = None,
     ) -> TripartiteVerificationResult:
         """Perform full tripartite verification and raise specific exception on failure."""
         result = self.verify(
@@ -1032,6 +1212,8 @@ class TripartiteAuthorizationVerifier:
             required_permission=required_permission,
             at_time_utc=at_time_utc,
             check_replay=check_replay,
+            human_approval=human_approval,
+            human_authority=human_authority,
         )
 
         if not result.tier1_crypto_valid:
