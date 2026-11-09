@@ -111,8 +111,12 @@ class TestPhase4C2AtomicQuotaAndFallback(unittest.TestCase):
         self.cost_guard = FreeCostGuard(registry=self.catalog)
 
         # Human Authority, Principal, Store, and Projector
-        self.human_authority = HumanOperationalAuthority()
-        self.human_principal = self.human_authority.issue_session(owner_id="security_operator_root")
+        self.supervisor_key = "test_sup_secret_key_4c23"
+        self.human_authority = HumanOperationalAuthority(supervisor_key=self.supervisor_key)
+        self.human_principal = self.human_authority.issue_session(
+            owner_id="security_operator_root",
+            supervisor_key=self.supervisor_key,
+        )
         self.store = AtomicDispatchQuotaStore(
             db_path=self.db_path,
             default_trust_store=self.trust_store,

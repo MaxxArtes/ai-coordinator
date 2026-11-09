@@ -30,7 +30,7 @@ from typing import Any, Dict, List, Optional, Sequence, Set, Tuple, Union
 from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives.asymmetric import ed25519
 
-from .human_workspace import HumanPrincipal
+from .human_workspace import HumanPrincipal, HumanWorkspace
 
 # Canonical schema version for Phase 4C.2
 SCHEMA_VERSION_1_0 = "1.0"
@@ -323,6 +323,7 @@ class HumanOperationalAuthority:
 
     Holds private authority secret (32 random bytes or derived from supervisor secret).
     Prevents unauthorized callers or worker agents from forging human operational consent.
+    Requires previous operator authentication via supervisor key or trusted HumanWorkspace.
     """
 
     def __init__(
@@ -333,10 +334,31 @@ class HumanOperationalAuthority:
         self._secret = authority_secret or secrets.token_bytes(32)
         self.supervisor_key = supervisor_key or secrets.token_hex(16)
 
-    def issue_session(self, owner_id: str, role: str = "human") -> HumanPrincipal:
-        """Issue an authenticated HumanPrincipal session for an authorized operator."""
+    @classmethod
+    def from_workspace(cls, workspace: HumanWorkspace) -> "HumanOperationalAuthority":
+        """Instantiate authority cryptographically bound to a trusted HumanWorkspace."""
+        return cls(
+            authority_secret=workspace.supervisor_secret,
+            supervisor_key=workspace.supervisor_key,
+        )
+
+    def issue_session(
+        self,
+        owner_id: str,
+        supervisor_key: str,
+        role: str = "human",
+    ) -> HumanPrincipal:
+        """Issue an authenticated HumanPrincipal session for an authorized operator.
+
+        Requires proof of operator authentication via matching supervisor authentication key.
+        Simple self-declaration of identity without supervisor authentication is strictly rejected.
+        """
         if os.environ.get("AI_COORDINATOR_ROLE") == "worker":
             raise HumanOperationalAuthorizationError("Workers subordinados estao proibidos de criar sessoes humanas")
+        if not supervisor_key or not self.supervisor_key or not hmac.compare_digest(str(supervisor_key).strip(), self.supervisor_key):
+            raise HumanOperationalAuthorizationError(
+                "Emissao de sessao negada: autenticacao previa do operador e obrigatoria (chave de supervisor ausente ou invalida)"
+            )
         if not owner_id or not isinstance(owner_id, str):
             raise ValueError("owner_id obrigatorio")
         cleaned = owner_id.strip()
@@ -366,7 +388,7 @@ class HumanOperationalAuthority:
         if not principal.session_token:
             raise HumanOperationalAuthorizationError("Principal deve possuir session_token valido")
 
-        # Verify session token integrity
+        # Verify session token integrity against authority secret
         expected_prefix = f"hsess_{principal.owner_id}_"
         if not principal.session_token.startswith(expected_prefix):
             raise HumanOperationalAuthorizationError("Token de sessao invalido: prefixo divergente do proprietario")
@@ -381,6 +403,9 @@ class HumanOperationalAuthority:
 
         if not authorization_id or not isinstance(authorization_id, str) or not authorization_id.strip():
             raise HumanOperationalAuthorizationError("authorization_id obrigatorio para emissao de aprovacao")
+
+        if not purpose or not isinstance(purpose, str) or not purpose.strip():
+            raise HumanOperationalAuthorizationError("purpose obrigatorio para emissao de aprovacao")
 
         now = at_time_utc or dt.datetime.now(dt.timezone.utc)
         if now.tzinfo is None:
@@ -426,9 +451,10 @@ class HumanOperationalAuthority:
         approval: HumanOperationalApproval,
         expected_authorization_id: str,
         expected_operator_identity: str,
+        expected_purpose: str = PERMISSION_DISPATCH_OPENROUTER_FREE,
         at_time_utc: Optional[dt.datetime] = None,
     ) -> bool:
-        """Verify authenticity, identity, temporal validity, and integrity of HumanOperationalApproval."""
+        """Verify authenticity, identity, temporal validity, purpose, and integrity of HumanOperationalApproval."""
         if not isinstance(approval, HumanOperationalApproval):
             raise HumanOperationalAuthorizationError("approval deve ser instancia de HumanOperationalApproval")
         if approval.explicit_consent is not True:
@@ -442,6 +468,11 @@ class HumanOperationalAuthority:
             raise HumanOperationalAuthorizationError(
                 f"operator_identity mismatch: aprovacao vinculada a '{approval.operator_identity}', "
                 f"mas manifesto requer '{expected_operator_identity}'"
+            )
+        if approval.purpose.strip() != expected_purpose.strip():
+            raise HumanOperationalAuthorizationError(
+                f"purpose mismatch: aprovacao vinculada ao proposito '{approval.purpose}', "
+                f"mas operacao requer '{expected_purpose}'"
             )
 
         # Check temporal window
@@ -977,15 +1008,25 @@ class TripartiteVerificationResult:
 class TripartiteAuthorizationVerifier:
     """Core verification engine enforcing the three-tier authorization model."""
 
-    def __init__(self, trust_store: TrustStore, replay_cache: Optional[Set[str]] = None):
+    def __init__(
+        self,
+        trust_store: TrustStore,
+        replay_cache: Optional[Set[str]] = None,
+        human_authority: Optional[HumanOperationalAuthority] = None,
+    ):
         if not isinstance(trust_store, TrustStore):
             raise TypeError("trust_store must be an instance of TrustStore")
         self._trust_store = trust_store
         self._replay_cache = replay_cache if replay_cache is not None else set()
+        self._human_authority = human_authority
 
     @property
     def trust_store(self) -> TrustStore:
         return self._trust_store
+
+    @property
+    def human_authority(self) -> Optional[HumanOperationalAuthority]:
+        return self._human_authority
 
     def verify(
         self,
@@ -1007,6 +1048,7 @@ class TripartiteAuthorizationVerifier:
         TripartiteVerificationResult for telemetry, logging, and audit.
         """
         now = at_time_utc or dt.datetime.now(dt.timezone.utc)
+        resolved_authority = human_authority or self._human_authority
         manifest = signed_manifest.manifest
         sig_meta = signed_manifest.signature
         canonical_bytes = manifest.to_canonical_bytes()
@@ -1149,12 +1191,13 @@ class TripartiteAuthorizationVerifier:
                         "has already been consumed"
                     )
                 # 9. Cryptographic Human Operational Approval (if authority and approval provided)
-                elif human_approval is not None and human_authority is not None:
+                elif human_approval is not None and resolved_authority is not None:
                     try:
-                        human_authority.verify_approval(
+                        resolved_authority.verify_approval(
                             approval=human_approval,
                             expected_authorization_id=manifest.authorization_id,
                             expected_operator_identity=manifest.authorizer_identity,
+                            expected_purpose=required_permission,
                             at_time_utc=now,
                         )
                         tier3_valid = True

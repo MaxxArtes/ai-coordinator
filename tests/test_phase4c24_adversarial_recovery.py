@@ -25,6 +25,7 @@ import json
 import multiprocessing
 import os
 import shutil
+import sqlite3
 import tempfile
 import time
 import unittest
@@ -38,8 +39,10 @@ from ai_coordinator.manifest_auth import (
     HumanOperationalApproval,
     HumanOperationalAuthority,
     HumanOperationalAuthorizationError,
+    HumanWorkspace,
     KeyAuthorityError,
     SignedAuthorizationManifest,
+    TripartiteAuthorizationVerifier,
     TrustStore,
     TrustedKeyEntry,
 )
@@ -141,8 +144,12 @@ class TestPhase4C24AdversarialRecovery(unittest.TestCase):
         self.cost_guard = FreeCostGuard(registry=self.catalog)
 
         # Human Authority, Principal, Store, Projector
-        self.human_authority = HumanOperationalAuthority()
-        self.human_principal = self.human_authority.issue_session(owner_id="security_operator_root")
+        self.supervisor_key = "test_sup_secret_key_4c24"
+        self.human_authority = HumanOperationalAuthority(supervisor_key=self.supervisor_key)
+        self.human_principal = self.human_authority.issue_session(
+            owner_id="security_operator_root",
+            supervisor_key=self.supervisor_key,
+        )
         self.store = AtomicDispatchQuotaStore(
             db_path=self.db_path,
             default_trust_store=self.trust_store,
@@ -475,6 +482,24 @@ class TestPhase4C24AdversarialRecovery(unittest.TestCase):
         forged tokens, imposter identities, expired approvals, worker issuance, and cross-manifest reuse."""
         signed = self._sign_manifest(auth_id="auth-consent-checks")
 
+        # 0. Supervisor Key Authentication Enforcement on Session Issuance (Auditor P0)
+        with self.assertRaises(HumanOperationalAuthorizationError) as ctx:
+            self.human_authority.issue_session(owner_id="security_operator_root", supervisor_key="invalid_supervisor_key")
+        self.assertIn("chave de supervisor ausente ou invalida", str(ctx.exception).lower())
+
+        with self.assertRaises(HumanOperationalAuthorizationError) as ctx:
+            self.human_authority.issue_session(owner_id="security_operator_root", supervisor_key="")
+        self.assertIn("chave de supervisor ausente ou invalida", str(ctx.exception).lower())
+
+        # HumanWorkspace integration via from_workspace
+        ws_conn = sqlite3.connect(":memory:")
+        ws = HumanWorkspace(db=ws_conn, supervisor_key="ws_secret_supervisor_key_999")
+        ws_auth = HumanOperationalAuthority.from_workspace(ws)
+        ws_session = ws_auth.issue_session(owner_id="security_operator_root", supervisor_key="ws_secret_supervisor_key_999")
+        self.assertEqual(ws_session.owner_id, "security_operator_root")
+        with self.assertRaises(HumanOperationalAuthorizationError):
+            ws_auth.issue_session(owner_id="security_operator_root", supervisor_key="wrong_key")
+
         # 1. Isolated boolean flag on store without default session MUST BE REJECTED
         store_no_session = AtomicDispatchQuotaStore(
             db_path=os.path.join(self.tmp_dir, "isolated_flag_test.db"),
@@ -525,7 +550,10 @@ class TestPhase4C24AdversarialRecovery(unittest.TestCase):
         )
 
         # 4. Imposter identity rejected
-        imposter_principal = self.human_authority.issue_session(owner_id="imposter_hacker")
+        imposter_principal = self.human_authority.issue_session(
+            owner_id="imposter_hacker",
+            supervisor_key=self.supervisor_key,
+        )
         imposter_approval = self.human_authority.issue_approval(
             principal=imposter_principal,
             authorization_id=signed.manifest.authorization_id,
@@ -553,6 +581,53 @@ class TestPhase4C24AdversarialRecovery(unittest.TestCase):
                 human_approval=approval_for_other,
             )
         self.assertIn("authorization_id mismatch", str(ctx.exception).lower())
+
+        # 5b. Purpose Validation and Purpose Mismatch Rejection (Auditor P0)
+        with self.assertRaises(HumanOperationalAuthorizationError) as ctx:
+            self.human_authority.issue_approval(
+                principal=self.human_principal,
+                authorization_id=signed.manifest.authorization_id,
+                purpose="",
+            )
+        self.assertIn("purpose obrigatorio", str(ctx.exception).lower())
+
+        wrong_purpose_approval = self.human_authority.issue_approval(
+            principal=self.human_principal,
+            authorization_id=signed.manifest.authorization_id,
+            purpose="catalog:sync",
+        )
+        with self.assertRaises(HumanOperationalAuthorizationError) as ctx:
+            store_no_session.register_budget_from_signed_manifest(
+                signed_manifest=signed,
+                trust_store=self.trust_store,
+                expected_commit=self.valid_commit,
+                human_approval=wrong_purpose_approval,
+            )
+        self.assertIn("purpose mismatch", str(ctx.exception).lower())
+
+        # Direct authority verification raises fail-closed exception
+        with self.assertRaises(HumanOperationalAuthorizationError) as ctx:
+            self.human_authority.verify_approval(
+                approval=wrong_purpose_approval,
+                expected_authorization_id=signed.manifest.authorization_id,
+                expected_operator_identity=signed.manifest.authorizer_identity,
+                expected_purpose=PERMISSION_DISPATCH_OPENROUTER_FREE,
+            )
+        self.assertIn("purpose mismatch", str(ctx.exception).lower())
+
+        # Tripartite verifier reports failure in TripartiteVerificationResult
+        verifier = TripartiteAuthorizationVerifier(trust_store=self.trust_store, human_authority=self.human_authority)
+        res = verifier.verify(
+            signed_manifest=signed,
+            expected_commit=self.valid_commit,
+            requested_model="liquid/lfm-3-1.7b:free",
+            human_operator_consent=True,
+            human_approval=wrong_purpose_approval,
+            required_permission=PERMISSION_DISPATCH_OPENROUTER_FREE,
+        )
+        self.assertFalse(res.is_fully_authorized)
+        self.assertFalse(res.tier3_human_authorized)
+        self.assertIn("purpose mismatch", res.tier3_reason.lower())
 
         # 6. Expired approval rejected
         expired_approval = self.human_authority.issue_approval(
@@ -941,14 +1016,20 @@ class TestPhase4C24AdversarialRecovery(unittest.TestCase):
     # =======================================================================
 
     def test_18_inter_process_lock_dead_pid_reclamation_and_living_pid_contention(self) -> None:
-        """TC-18 (Auditor P1): _InterProcessFileLock reclaims locks from dead PIDs and blocks on live PIDs."""
+        """TC-18 (Auditor P1): _InterProcessFileLock reclaims locks from dead PIDs, detects PID recycling, and fails closed on indeterminate locks."""
+        from ai_coordinator.openrouter.atomic_quota import _get_process_create_time_ns
+
         lock_file = os.path.join(self.tmp_dir, "test_ipc.lock")
 
-        # 1. Dead PID simulation: write lock file with an impossible/dead PID (e.g. 9999999)
+        # 1. Dead PID simulation: write lock file with an impossible/dead PID (e.g. 9999999) and creation timestamp
         dead_pid = 9999999
         self.assertFalse(safe_process_alive(dead_pid))
         with open(lock_file, "w", encoding="utf-8") as f:
-            f.write(json.dumps({"pid": dead_pid, "acquired_at_epoch": time.time()}))
+            f.write(json.dumps({
+                "pid": dead_pid,
+                "create_time_ns": 1000000000000,
+                "acquired_at_epoch": time.time(),
+            }))
 
         # Lock acquisition MUST detect dead PID and immediately reclaim the lock
         with _InterProcessFileLock(lock_file, timeout_sec=1.0) as lock:
@@ -958,11 +1039,33 @@ class TestPhase4C24AdversarialRecovery(unittest.TestCase):
         # Lock is cleanly released on exit
         self.assertFalse(os.path.exists(lock_file))
 
-        # 2. Living PID contention simulation: write lock file with current active PID
+        # 2. PID recycling simulation: write lock file with current active PID, but mismatched creation time
         current_pid = os.getpid()
-        self.assertTrue(safe_process_alive(current_pid))
+        self.assertFalse(safe_process_alive(current_pid, expected_create_time_ns=9999999999999999))
         with open(lock_file, "w", encoding="utf-8") as f:
-            f.write(json.dumps({"pid": current_pid, "acquired_at_epoch": time.time()}))
+            f.write(json.dumps({
+                "pid": current_pid,
+                "create_time_ns": 9999999999999999,
+                "acquired_at_epoch": time.time(),
+            }))
+
+        # Lock acquisition MUST recognize PID recycling (creation time mismatch) and safely reclaim
+        with _InterProcessFileLock(lock_file, timeout_sec=1.0) as lock:
+            self.assertTrue(lock._acquired)
+            self.assertTrue(os.path.exists(lock_file))
+
+        # Lock is cleanly released on exit
+        self.assertFalse(os.path.exists(lock_file))
+
+        # 3. Living PID contention simulation: write lock file with current active PID and actual creation time
+        actual_create_time = _get_process_create_time_ns(current_pid)
+        self.assertTrue(safe_process_alive(current_pid, expected_create_time_ns=actual_create_time))
+        with open(lock_file, "w", encoding="utf-8") as f:
+            f.write(json.dumps({
+                "pid": current_pid,
+                "create_time_ns": actual_create_time,
+                "acquired_at_epoch": time.time(),
+            }))
 
         # Contention attempt MUST NOT steal the lock from active PID and MUST timeout
         with self.assertRaises(TimeoutError) as ctx:
@@ -970,6 +1073,20 @@ class TestPhase4C24AdversarialRecovery(unittest.TestCase):
                 pass
         self.assertIn("held by active PID", str(ctx.exception))
         # Lock file was preserved because PID is alive
+        self.assertTrue(os.path.exists(lock_file))
+        os.unlink(lock_file)
+
+        # 4. Indeterminate lock file simulation (corrupted/missing PID) - Fail-Closed
+        # Write corrupted/unreadable lock payload
+        with open(lock_file, "w", encoding="utf-8") as f:
+            f.write("{invalid_json_corrupted_lock_header")
+
+        # Contention attempt MUST NOT delete or steal corrupted lock based on age; MUST raise TimeoutError
+        with self.assertRaises(TimeoutError) as ctx:
+            with _InterProcessFileLock(lock_file, timeout_sec=0.1, retry_delay_sec=0.02):
+                pass
+        self.assertIn("unknown/indeterminate owner", str(ctx.exception))
+        # Lock file was strictly preserved!
         self.assertTrue(os.path.exists(lock_file))
         os.unlink(lock_file)
 

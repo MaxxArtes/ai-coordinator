@@ -30,12 +30,17 @@ from ai_coordinator.manifest_auth import (
     HumanOperationalAuthority,
     HumanOperationalAuthorizationError,
     KeyAuthorityError,
+    PERMISSION_DISPATCH_OPENROUTER_FREE,
     ReplayAuthorizationError,
     SignedAuthorizationManifest,
     TripartiteAuthorizationVerifier,
     TrustStore,
 )
-from ai_coordinator.process import safe_process_alive
+from ai_coordinator.process import (
+    PosixProcessController,
+    WindowsProcessController,
+    safe_process_alive,
+)
 from ai_coordinator.openrouter.cost_guard import FreeCostGuard
 from ai_coordinator.openrouter.registry import FreeModelRegistry
 
@@ -337,6 +342,7 @@ class AtomicDispatchQuotaStore:
             approval=resolved_approval,
             expected_authorization_id=signed_manifest.manifest.authorization_id,
             expected_operator_identity=signed_manifest.manifest.authorizer_identity,
+            expected_purpose=PERMISSION_DISPATCH_OPENROUTER_FREE,
             at_time_utc=check_time_utc,
         )
 
@@ -978,6 +984,19 @@ class AtomicDispatchQuotaStore:
 # Cross-Process File Lock for Safe JSONL Ledger Writes
 # ---------------------------------------------------------------------------
 
+def _get_process_create_time_ns(pid: int) -> Optional[int]:
+    """Query OS kernel process creation time in Unix nanoseconds."""
+    if pid <= 0:
+        return None
+    try:
+        if os.name == "nt":
+            return WindowsProcessController.get_creation_time(pid)
+        else:
+            return PosixProcessController.get_creation_time(pid)
+    except Exception:
+        return None
+
+
 class _InterProcessFileLock:
     """Minimal, robust cross-process file lock using atomic OS file creation flags and PID liveness validation."""
 
@@ -990,12 +1009,15 @@ class _InterProcessFileLock:
 
     def __enter__(self) -> "_InterProcessFileLock":
         start = time.time()
+        my_pid = os.getpid()
+        my_create_time_ns = _get_process_create_time_ns(my_pid)
         while True:
             try:
                 # O_CREAT | O_EXCL provides atomic creation semantics on Windows and POSIX
                 self._fd = os.open(self.lock_path, os.O_CREAT | os.O_EXCL | os.O_RDWR)
                 payload = json.dumps({
-                    "pid": os.getpid(),
+                    "pid": my_pid,
+                    "create_time_ns": my_create_time_ns,
                     "acquired_at_epoch": time.time(),
                 }).encode("utf-8")
                 os.write(self._fd, payload)
@@ -1003,42 +1025,50 @@ class _InterProcessFileLock:
                 self._acquired = True
                 return self
             except FileExistsError:
-                # Lock file already exists: inspect owning PID
+                # Lock file already exists: inspect owning PID and OS creation timestamp
                 owner_pid: Optional[int] = None
+                owner_create_time_ns: Optional[int] = None
+                raw_content: Optional[str] = None
                 try:
                     with open(self.lock_path, "r", encoding="utf-8") as f:
-                        content = f.read().strip()
-                        if content:
-                            data = json.loads(content)
+                        raw_content = f.read().strip()
+                        if raw_content:
+                            data = json.loads(raw_content)
                             if isinstance(data, dict):
                                 owner_pid = data.get("pid")
+                                owner_create_time_ns = data.get("create_time_ns")
                 except Exception:
                     pass
 
+                # If owner identity (PID) is known and integer:
                 if owner_pid is not None and isinstance(owner_pid, int):
-                    # Check if owner PID is verifiably alive
-                    if not safe_process_alive(owner_pid):
-                        # Owner process is dead! Safe to unlink orphaned stale lock
+                    # Check if owner process is verifiably alive and matches creation time
+                    is_alive = safe_process_alive(owner_pid, expected_create_time_ns=owner_create_time_ns)
+                    if not is_alive:
+                        # Owner process is verifiably dead or PID was recycled!
+                        # Safely reclaim orphaned stale lock, guarded against TOCTOU race:
+                        # re-verify lock file still exists and still holds the same unliving owner payload
                         try:
-                            os.unlink(self.lock_path)
-                            continue
+                            with open(self.lock_path, "r", encoding="utf-8") as f:
+                                current_content = f.read().strip()
+                            if current_content == raw_content:
+                                os.unlink(self.lock_path)
+                                continue
                         except OSError:
                             pass
-                else:
-                    # If lock file exists but has no readable PID, check if older than 5.0 seconds
-                    try:
-                        mtime = os.path.getmtime(self.lock_path)
-                        if time.time() - mtime > 5.0:
-                            os.unlink(self.lock_path)
-                            continue
-                    except OSError:
-                        pass
 
-                # If owner process is still alive, do NOT unlink based on elapsed time alone!
+                # Indeterminate or unreadable owner:
+                # DO NOT unlink! Completely eliminate mtime age-based unlinking.
+                # Treat indeterminate owners as UNKNOWN and block conservadoramente.
+
                 if time.time() - start > self.timeout_sec:
+                    if owner_pid is not None:
+                        owner_desc = f"active PID {owner_pid} (create_time_ns={owner_create_time_ns})"
+                    else:
+                        owner_desc = "unknown/indeterminate owner"
                     raise TimeoutError(
                         f"Timed out waiting for inter-process lock '{self.lock_path}' "
-                        f"(held by active PID {owner_pid})"
+                        f"(held by {owner_desc})"
                     )
 
                 time.sleep(self.retry_delay_sec)

@@ -1,10 +1,10 @@
-# AI Coordinator — Relatório de Homologação Final da Fase 4C.2.4 (Revisão 13)
+# AI Coordinator — Relatório de Homologação Final da Fase 4C.2.4 (Revisão 14)
 
-**Documento:** Relatório Técnico de Resolução dos Apontamentos de Segurança da Revisão 13 e Homologação Criptográfica  
-**Versão:** 3.0.0 (Revisão 13)  
+**Documento:** Relatório Técnico de Resolução dos Apontamentos de Segurança da Revisão 14 e Homologação Criptográfica  
+**Versão:** 4.0.0 (Revisão 14)  
 **Data:** 2026-11-09  
 **Fase:** 4C.2.4 — Auditoria Adversarial, Correções P0/P1 e Recuperação Conservadora  
-**Tarefa ai-coordinator:** `1a52600ee41f4ccd` (Revisão 13)  
+**Tarefa ai-coordinator:** `1a52600ee41f4ccd` (Revisão 14)  
 **Status:** Implementação Concluída, 100% Validada Offline (58/58 Testes Aprovados)  
 **Repositório:** `D:\ai-coordinator`  
 **Branch de Trabalho:** `feature/phase4c-2-ed25519-truststore`  
@@ -12,56 +12,59 @@
 
 ---
 
-## 1. Resumo Executivo e Atendimento aos Apontamentos da Revisão 13
+## 1. Resumo Executivo e Atendimento aos Apontamentos da Revisão 14
 
-Na auditoria da Revisão 12, foram identificados 2 apontamentos prioritários (1 P0 crítico e 1 P1 arquitetural). Ambos foram integralmente resolvidos, implementados e validados por suítes de teste offline com 58 cenários:
+Na auditoria da Revisão 13, o auditor independente apontou 4 requisitos obrigatórios (2 P0 de segurança e 2 P1 de robustez e concorrência). Todos foram integralmente implementados e comprovados offline:
 
-| Item | Gravidade | Apontamento da Revisão 12 | Resolução Técnica Implementada na Revisão 13 | Evidência de Teste |
+| Item | Gravidade | Apontamento da Auditoria (Revisão 13) | Resolução Técnica Implementada na Revisão 14 | Evidência de Teste |
 | :---: | :---: | :--- | :--- | :---: |
-| **1** | **P0** | **Consentimento humano ainda falsificável:** `HumanOperationalApproval` utilizava SHA-256 com salt fixo público no código-fonte (`"AI_COORDINATOR_OPERATIONAL_SALT_V1"`), sem autoridade privada ou autenticação real da sessão humana, permitindo forjamento por qualquer chamador. | Eliminado qualquer salt fixo ou estático. Criada a autoridade criptográfica [`HumanOperationalAuthority`](file:///D:/ai-coordinator/src/ai_coordinator/manifest_auth.py#L305) com segredo privado (`_secret` de 32 bytes aleatórios) integrado ao ecossistema do [`HumanWorkspace`](file:///D:/ai-coordinator/src/ai_coordinator/human_workspace.py#L101). O token é um HMAC-SHA256 que vincula criptograficamente: `authorization_id`, `operator_identity`, `session_token`, janela de validade (`valid_from_utc`, `valid_until_utc`), propósito e consentimento explícito. Chamadores sem sessão/aprovação autêntica, tokens adulterados, autorizações reutilizadas em outros manifestos, aprovações expiradas ou tentativas de emissão por agentes com papel `worker` são sumariamente rejeitados fail-closed. | `test_09` (4C.2.4) com 8 casos de teste |
-| **2** | **P1** | **Integridade do Ledger e Sincronização do Outbox:** Recuperação não preservava cópia bruta integral antes do expurgo; verificação de integridade era executada fora da trava inter-processos (TOCTOU); remoção de lock baseada em tempo decorrido podia usurpar processos vivos em pausas de I/O. | 1. [`recover_and_quarantine_corrupt_ledger()`](file:///D:/ai-coordinator/src/ai_coordinator/openrouter/atomic_quota.py#L1085) agora gera uma cópia bruta integral byte-a-byte do ledger pré-recuperação (`.full_backup_<ts>_<uid>.bak`) com `fsync` antes de qualquer alteração.<br>2. Toda a rotina de projeção ([`project_pending_events()`](file:///D:/ai-coordinator/src/ai_coordinator/openrouter/atomic_quota.py#L1145)) e recuperação agora roda estritamente **sob a proteção de [`_InterProcessFileLock`](file:///D:/ai-coordinator/src/ai_coordinator/openrouter/atomic_quota.py#L981)**, eliminando a corrida TOCTOU.<br>3. [`_InterProcessFileLock`](file:///D:/ai-coordinator/src/ai_coordinator/openrouter/atomic_quota.py#L981) grava PID e timestamp de aquisição; o descarte de locks órfãos consulta ativamente [`safe_process_alive(owner_pid)`](file:///D:/ai-coordinator/src/ai_coordinator/process.py#L1042) e **nunca** remove travas de processos comprovadamente vivos. | `test_05`, `test_16`, `test_18` (4C.2.4) |
+| **1** | **P0** | **Autenticação Prévia na Emissão de Sessão:** `HumanOperationalAuthority.issue_session(owner_id)` aceitava auto-declaração de identidade sem verificar a chave do supervisor, abrindo brecha para chamadores não autenticados criarem sessões válidas. | [`HumanOperationalAuthority.issue_session(owner_id, supervisor_key)`](file:///D:/ai-coordinator/src/ai_coordinator/manifest_auth.py#L345) agora exige obrigatoriamente a apresentação de `supervisor_key` válida, validada via `hmac.compare_digest()` em tempo constante contra `self.supervisor_key`. Chamadas com chave ausente, vazia ou divergente são rejeitadas com [`HumanOperationalAuthorizationError`](file:///D:/ai-coordinator/src/ai_coordinator/manifest_auth.py#L80). Adicionado método de classe [`HumanOperationalAuthority.from_workspace(workspace)`](file:///D:/ai-coordinator/src/ai_coordinator/manifest_auth.py#L337) integrando diretamente os segredos do [`HumanWorkspace`](file:///D:/ai-coordinator/src/ai_coordinator/human_workspace.py#L101). | `test_09` (4C.2.4) |
+| **2** | **P0** | **Validação Mandatória de Propósito Operacional:** A aprovação humana não verificava a finalidade da operação, permitindo que uma aprovação emitida para outro propósito (ex.: `"catalog:sync"`) autorizasse consumo de orçamento de inferência (`"dispatch:openrouter_free"`). | [`HumanOperationalAuthority.verify_approval()`](file:///D:/ai-coordinator/src/ai_coordinator/manifest_auth.py#L450) e [`TripartiteAuthorizationVerifier.verify()`](file:///D:/ai-coordinator/src/ai_coordinator/manifest_auth.py#L1030) agora validam obrigatoriamente `expected_purpose` (padrão: `PERMISSION_DISPATCH_OPENROUTER_FREE`). O método `issue_approval` rejeita propósitos vazios/espaços. Qualquer divergência entre o propósito da aprovação e a permissão requerida causa falha imediata fail-closed (`"purpose mismatch"`). | `test_09` (4C.2.4) |
+| **3** | **P1** | **Eliminação de Descarte de Locks com Proprietário Desconhecido:** Em `_InterProcessFileLock`, travas com JSON inválido ou PID ilegível eram removidas se o arquivo tivesse mais de 5.0 segundos (`mtime > 5.0s`), violando a exclusão mútua em casos de I/O lento ou corrupção. | Eliminada integralmente qualquer remoção baseada em idade do arquivo (`mtime`). Travas sem proprietário identificável são tratadas conservadoramente como `UNKNOWN`, mantendo o bloqueio ativo e disparando `TimeoutError` fail-closed após o esgotamento do tempo limite, sem jamais desvincular o arquivo. | `test_18` (4C.2.4) |
+| **4** | **P1** | **Identidade Estável de Processo com Criação no SO (`create_time_ns`):** A verificação de vivacidade baseada apenas em PID era vulnerável a reciclagem de PIDs pelo sistema operacional e corridas TOCTOU entre inspeção e remoção. | Ao criar a trava, [`_InterProcessFileLock`](file:///D:/ai-coordinator/src/ai_coordinator/openrouter/atomic_quota.py#L996) consulta o kernel do SO ([`WindowsProcessController.get_creation_time`](file:///D:/ai-coordinator/src/ai_coordinator/process.py#L328) ou [`PosixProcessController.get_creation_time`](file:///D:/ai-coordinator/src/ai_coordinator/process.py#L596)) e grava `create_time_ns` em nanossegundos no payload JSON com `os.fsync()`. A vivacidade é validada via [`safe_process_alive(owner_pid, expected_create_time_ns=owner_create_time_ns)`](file:///D:/ai-coordinator/src/ai_coordinator/process.py#L1042). Se o PID foi reciclado pelo SO, o timestamp não confere e o lock é seguramente recuperado; se o processo está vivo, o acesso é estritamente bloqueado. Antes da desvinculação, o conteúdo do arquivo é re-verificado contra corridas TOCTOU. | `test_18` (4C.2.4) |
 
 ---
 
 ## 2. Detalhamento Arquitetural das Correções
 
-### 2.1 Autoridade Operacional Humana (`HumanOperationalAuthority`) e Aprovação Criptográfica
-- **Segredo Privado:** [`HumanOperationalAuthority`](file:///D:/ai-coordinator/src/ai_coordinator/manifest_auth.py#L305) instancia ou recebe uma chave secreta privada (`authority_secret`) inacessível aos agentes em execução.
-- **Sessões Autenticadas:** Método `issue_session(owner_id)` emite tokens de sessão HMAC no padrão `hsess_<owner>_<digest>`, compatível com `HumanPrincipal`.
-- **Assinatura HMAC-SHA256:** Método `issue_approval(...)` calcula a assinatura criptográfica autenticando a mensagem canônica:
-  $$\text{HMAC-SHA256}_{K}(\text{auth\_id} \parallel \text{operator} \parallel \text{session\_token} \parallel \text{valid\_from} \parallel \text{valid\_until} \parallel \text{purpose})$$
-- **Bloqueio Incondicional de Workers:** Se a variável de ambiente `AI_COORDINATOR_ROLE == "worker"`, tanto `issue_session` quanto `issue_approval` abortam imediatamente com [`HumanOperationalAuthorizationError`](file:///D:/ai-coordinator/src/ai_coordinator/manifest_auth.py#L79).
-- **Validação Fail-Closed na Loja:** [`AtomicDispatchQuotaStore.register_budget_from_signed_manifest()`](file:///D:/ai-coordinator/src/ai_coordinator/openrouter/atomic_quota.py#L275) exige a aprovação válida, invoca `verify_approval()` para checar HMAC, conferir o `authorization_id` contra o manifesto, checar a identidade do autorizador e testar a janela de expiração temporal.
+### 2.1 Autenticação Mandatória do Supervisor na Emissão de Sessões
+- O método `issue_session(owner_id: str, supervisor_key: str, role: str = "human")` agora impõe dupla barreira:
+  1. **Bloqueio de Workers:** Se `AI_COORDINATOR_ROLE == "worker"`, aborta imediatamente.
+  2. **Validação Criptográfica do Supervisor:** Valida `supervisor_key` via `hmac.compare_digest(str(supervisor_key).strip(), self.supervisor_key)` em tempo constante.
+- O construtor `HumanOperationalAuthority.from_workspace(workspace)` liga automaticamente a autoridade ao segredo do workspace (`workspace.supervisor_secret`) e à chave do supervisor (`workspace.supervisor_key`), garantindo consistência operacional de ponta a ponta.
 
-### 2.2 Preservação Completa de Evidências no Ledger e Quarentena
-- **Backup Bruto Integral:** Antes de isolar linhas corruptas ou reescrever o arquivo JSONL de auditoria, [`recover_and_quarantine_corrupt_ledger()`](file:///D:/ai-coordinator/src/ai_coordinator/openrouter/atomic_quota.py#L1085) duplica 100% dos bytes originais para `pilot_audit.jsonl.full_backup_<timestamp>_<uuid>.bak` e sincroniza o descritor de arquivo via `os.fsync()`.
-- **Isolamento de Corrupção:** Linhas que não atendem à sintaxe JSON estruturada são gravadas em `pilot_audit.jsonl.corrupt_<timestamp>_<uuid>.bak` com `fsync()`.
-- **Substituição Atômica:** O arquivo corrigido é gerado temporariamente e ativado via `os.replace()`.
-- **Resultado Estruturado:** Retorna [`LedgerRecoveryResult`](file:///D:/ai-coordinator/src/ai_coordinator/openrouter/atomic_quota.py#L1045) informando contagens e caminhos de ambos os arquivos gerados.
+### 2.2 Vinculação Inequívoca de Propósito Operacional (`expected_purpose`)
+- Tanto a autoridade de aprovação quanto o verificador tripartite agora validam que o propósito declarado no consentimento humano corresponde exatamente à permissão requerida:
+  $$\text{approval.purpose.strip()} == \text{expected\_purpose.strip()}$$
+- Se uma aprovação for emitida para `"catalog:sync"` ou `"emergency:override"`, ela é sumariamente recusada ao tentar registrar ou despachar cotas para `PERMISSION_DISPATCH_OPENROUTER_FREE` (`"dispatch:openrouter_free"`).
+- O verificador tripartite propaga a rejeição para o Nível 3 (`tier3_human_authorized = False`), registrando a razão formal de rejeição no sumário de auditoria.
 
-### 2.3 Sincronização entre Processos com Verificação de Vivacidade (`safe_process_alive`)
-- **Proteção Completa da Projeção:** [`project_pending_events()`](file:///D:/ai-coordinator/src/ai_coordinator/openrouter/atomic_quota.py#L1145) adquire a trava [`_InterProcessFileLock`](file:///D:/ai-coordinator/src/ai_coordinator/openrouter/atomic_quota.py#L981) **antes** de chamar `verify_ledger_integrity()`. Isso impede que outro processo do SO altere ou insira linhas no ledger entre a verificação e a escrita.
-- **Checagem de Vivacidade de Processos:** Em colisão de arquivo de trava (`FileExistsError`), [`_InterProcessFileLock`](file:///D:/ai-coordinator/src/ai_coordinator/openrouter/atomic_quota.py#L981) lê o PID gravado e consulta [`safe_process_alive(owner_pid)`](file:///D:/ai-coordinator/src/ai_coordinator/process.py#L1042).
-  - Se o processo dono já encerrou (processo zumbi/morto), a trava órfã é desvinculada com segurança e re-adquirida.
-  - Se o processo dono permanece em execução, a trava **nunca** é removida por tempo decorrido, evitando corrupção durante I/O intenso ou coletas de lixo. Se exceder o tempo limite, lança `TimeoutError`.
+### 2.3 Trava Inter-Processos com Identidade de Kernel e Imunidade a TOCTOU
+- **Criação Atômica:** Usa `os.O_CREAT | os.O_EXCL | os.O_RDWR` gravando:
+  ```json
+  {"pid": <int>, "create_time_ns": <int>, "acquired_at_epoch": <float>}
+  ```
+- **Detecção de Reciclagem de PID:** Ao encontrar trava existente, lê `owner_pid` e `owner_create_time_ns`. Invoca `safe_process_alive(owner_pid, expected_create_time_ns=owner_create_time_ns)`. Se o processo dono encerrou ou o SO reutilizou o PID com outro timestamp de criação, `safe_process_alive` retorna `False`.
+- **Eliminação de Expurgo por Idade (`mtime`):** Travas ilegíveis, vazias ou sem PID válido não são desvinculadas por critério de tempo. Se o tempo limite expirar, gera `TimeoutError("held by unknown/indeterminate owner")`.
+- **Proteção Anti-TOCTOU:** Antes de efetuar `os.unlink()`, relê o arquivo para confirmar que o conteúdo coincide byte-a-byte com o estado inspecionado, evitando desvincular uma trava recém-adquirida por outro processo.
 
 ---
 
-## 3. Matriz Completa da Suíte Adversarial 4C.2.4 (18 Cenários)
+## 3. Matriz de Testes Adversariais da Revisão 14 (18 Cenários)
 
-A suíte [`tests/test_phase4c24_adversarial_recovery.py`](file:///D:/ai-coordinator/tests/test_phase4c24_adversarial_recovery.py) foi ampliada para **18 cenários rigorosos**:
+A suíte [`tests/test_phase4c24_adversarial_recovery.py`](file:///D:/ai-coordinator/tests/test_phase4c24_adversarial_recovery.py) cobre exaustivamente os 18 cenários:
 
 | # | Cenário Avaliado | Escopo de Garantia | Resultado |
 | :-: | :--- | :--- | :---: |
 | 1 | `test_01_real_concurrency_race_condition_max_dispatches_one` | Concorrência entre 10 threads disputando cota unitária via SQLite `BEGIN IMMEDIATE` | **APROVADO** |
 | 2 | `test_02_contention_for_final_unit_of_max_dispatches` | Disputa entre 8 threads pela última cota em orçamento de 2 unidades | **APROVADO** |
-| 3 | `test_03_crash_before_and_after_send_committed` | Simulação de crash abrupto antes e após PIC; recuperação para `UNKNOWN` | **APROVADO** |
+| 3 | `test_03_crash_before_and_after_send_committed` | Simulação de crash abrupto antes e após PIC; recuperação conservadora para `UNKNOWN` | **APROVADO** |
 | 4 | `test_04_socket_timeout_transitions_to_unknown_fail_closed` | Queda de rede/timeout pós-`SEND_COMMITTED` transita para `UNKNOWN` fail-closed | **APROVADO** |
 | 5 | `test_05_corrupted_ledger_detection_fail_closed_and_verified_quarantine` | Detecção de corrupção no JSONL, bloqueio fail-closed, preservação de backup bruto integral e quarentena | **APROVADO** |
 | 6 | `test_06_manifest_replay_and_reservation_reuse_blocked` | Bloqueio de replay de manifesto e reutilização indevida de reserva | **APROVADO** |
 | 7 | `test_07_key_revocation_between_reservation_and_send_pic_blocks_send` | Chave Ed25519 revogada após reserva e antes do PIC bloqueia envio com `FAILED` | **APROVADO** |
 | 8 | `test_08_manifest_expiration_between_reservation_and_send_pic_blocks_send` | Manifesto expirado entre reserva e PIC bloqueia envio com `FAILED` | **APROVADO** |
-| 9 | `test_09_consent_mandatory_no_default_and_imposter_rejection` | **Auditor P0:** 8 verificações: flag booleana isolada, consentimento `False`, token forjado sem autoridade, impostor, reuso entre manifestos, expiração temporal, lockout de workers e caminho dourado autêntico | **APROVADO** |
+| 9 | `test_09_consent_mandatory_no_default_and_imposter_rejection` | **Auditor P0:** 1) Exigência de `supervisor_key` na sessão; 2) Integração `from_workspace`; 3) Rejeição de booleano isolado; 4) Consentimento `False`; 5) Token forjado; 6) Impostor; 7) Reuso de manifesto; 8) Validação de `purpose` obrigatório e divergente; 9) Expiração temporal; 10) Lockout de workers | **APROVADO** |
 | 10 | `test_10_paid_model_and_stale_catalog_rejected_by_free_cost_guard` | Candidato pago ou catálogo defasado descartado por `FreeCostGuard` no fallback | **APROVADO** |
 | 11 | `test_11_fallback_rejected_without_proven_http_429` | Rejeição estrita de fallback em reservas `UNKNOWN`, HTTP 200, HTTP 400 ou sem status | **APROVADO** |
 | 12 | `test_12_idempotent_outbox_recovery_zero_duplicate_lines` | Recuperação pós-queda entre `fsync()` e commit no SQLite com zero linhas duplicadas | **APROVADO** |
@@ -70,13 +73,11 @@ A suíte [`tests/test_phase4c24_adversarial_recovery.py`](file:///D:/ai-coordina
 | 15 | `test_15_multiprocess_contention_for_final_unit_of_max_dispatches` | **Processos OS reais:** 4 processos concorrem pela última cota; exatamente 1 adquire | **APROVADO** |
 | 16 | `test_16_multiprocess_concurrent_outbox_projection_no_data_loss` | **Processos OS reais:** 4 processos projetam para o mesmo JSONL sob trava sem perdas ou erros | **APROVADO** |
 | 17 | `test_17_multiprocess_simultaneous_crash_recovery_scanner` | **Processos OS reais:** 3 processos executam recuperação simultânea sem conflito | **APROVADO** |
-| 18 | `test_18_inter_process_lock_dead_pid_reclamation_and_living_pid_contention` | **Auditor P1:** Reclamação imediata de lock de PID morto vs bloqueio fail-closed de PID vivo | **APROVADO** |
+| 18 | `test_18_inter_process_lock_dead_pid_reclamation_and_living_pid_contention` | **Auditor P1:** 1) Reclamação imediata de PID morto; 2) Imunidade a reciclagem de PID (timestamp divergente); 3) Bloqueio e timeout em PID vivo sem perda de trava; 4) Bloqueio fail-closed em trava indeterminada/corrompida sem expurgo por idade | **APROVADO** |
 
 ---
 
 ## 4. Consolidação Geral de Testes da Fase 4C.2 (58/58 Aprovados)
-
-Todas as suítes da Fase 4C.2 foram executadas conjuntamente:
 
 | Suíte de Teste | Foco de Verificação | Cenários | Status |
 | :--- | :--- | :---: | :---: |
@@ -85,7 +86,8 @@ Todas as suítes da Fase 4C.2 foram executadas conjuntamente:
 | [`test_phase4c24_adversarial_recovery.py`](file:///D:/ai-coordinator/tests/test_phase4c24_adversarial_recovery.py) | Testes Adversariais, Revalidações P0/P1, Concorrência Multi-Processo | 18 | **18/18 APROVADOS** |
 | **Total Consolidado Fase 4C.2** | **Garantias Criptográficas, Orçamentárias, Integridade e Concorrência** | **58** | **58/58 APROVADOS (100%)** |
 
-- **Tempo total de execução:** 43.89 segundos
+- **Tempo total de execução:** 44.01 segundos
 - **Ambiente:** Python 3.14.5 / pytest 9.1.1 (Windows)
 - **Isolamento de Rede:** **100% offline** (zero conexões, chamadas ou sockets externos abertos).
 - **Branch principal:** `main` intocada em `a2f8f65` (`v0.5.1`).
+- **Validação de Não-Regressão Adicional:** Suítes [`test_phase4b_human_workspace.py`](file:///D:/ai-coordinator/tests/test_phase4b_human_workspace.py) e [`test_phase4c1_openrouter_free.py`](file:///D:/ai-coordinator/tests/test_phase4c1_openrouter_free.py) (83/83 testes aprovados).
