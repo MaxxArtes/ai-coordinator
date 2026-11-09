@@ -145,10 +145,17 @@ class AtomicDispatchQuotaStore:
     persistent anti-replay protection, and crash-recovery to UNKNOWN state.
     """
 
-    def __init__(self, db_path: str = ":memory:"):
+    def __init__(
+        self,
+        db_path: str = ":memory:",
+        default_trust_store: Optional[TrustStore] = None,
+        expected_commit: Optional[str] = None,
+    ):
         self.db_path = db_path
         self._is_memory = db_path == ":memory:"
         self._conn: Optional[sqlite3.Connection] = None
+        self.default_trust_store = default_trust_store
+        self.expected_commit = expected_commit
         self._init_database()
 
     def _get_connection(self) -> sqlite3.Connection:
@@ -249,14 +256,26 @@ class AtomicDispatchQuotaStore:
         signed_manifest: SignedAuthorizationManifest,
         trust_store: TrustStore,
         expected_commit: str,
-        human_operator_consent: bool = True,
+        human_operator_consent: bool,
+        human_operator_identity: Optional[str] = None,
         check_time_utc: Optional[dt.datetime] = None,
     ) -> str:
         """Validate signed manifest using Tripartite Verifier and atomically register budget.
 
         Persists authorization_id in consumed_authorizations to guarantee cross-process,
         cross-restart anti-replay protection.
+        human_operator_consent is strictly mandatory with no default value.
         """
+        if human_operator_consent is not True:
+            raise HumanOperationalAuthorizationError(
+                "Human operational consent is missing or false: explicit consent (True) is mandatory by operator"
+            )
+        if human_operator_identity is not None and human_operator_identity.strip() != signed_manifest.manifest.authorizer_identity.strip():
+            raise HumanOperationalAuthorizationError(
+                f"Operator identity mismatch: operator identity '{human_operator_identity}' diverges from "
+                f"manifest authorizer '{signed_manifest.manifest.authorizer_identity}'"
+            )
+
         # 1. Enforce tripartite verification (Tiers 1, 2, and 3)
         verifier = TripartiteAuthorizationVerifier(trust_store=trust_store)
         res = verifier.verify(
@@ -470,13 +489,29 @@ class AtomicDispatchQuotaStore:
             if not self._is_memory:
                 conn.close()
 
-    def commit_send(self, reservation_id: str) -> None:
+    def commit_send(
+        self,
+        reservation_id: str,
+        trust_store: Optional[TrustStore] = None,
+        expected_commit: Optional[str] = None,
+        at_time_utc: Optional[dt.datetime] = None,
+    ) -> None:
         """Advance reservation from RESERVED to SEND_COMMITTED (Point of Irreversible Commitment - PIC).
+
+        Revalidates critical authorization invariants at the PIC:
+        1. Temporal validity: manifest valid_until_utc must not be expired.
+        2. Code commit: runtime HEAD must match manifest code_commit.
+        3. Key authority: authorizer public key in Trust Store must not be revoked or expired.
+        4. Model & scope: target_model must be in allowed_models.
 
         Persisted with fsync in SQLite BEFORE opening TLS socket.
         From this point onward, budget is permanently drained and cannot be returned.
         """
         now_epoch = time.time()
+        now_dt = at_time_utc or dt.datetime.now(dt.timezone.utc)
+        effective_trust_store = trust_store or self.default_trust_store
+        effective_commit = expected_commit or self.expected_commit
+
         conn = self._get_connection()
         in_tx = False
         try:
@@ -492,6 +527,69 @@ class AtomicDispatchQuotaStore:
                 raise IllegalStateTransitionError(
                     f"Cannot commit send on reservation '{reservation_id}' in state '{current_state}', expected '{STATE_RESERVED}'"
                 )
+
+            # Revalidate critical authorization invariants at PIC from SQLite budget record
+            cur = conn.execute("""
+            SELECT valid_until_utc, code_commit, authorizer_identity, allowed_models_json, manifest_id
+            FROM global_dispatch_budgets
+            WHERE budget_id = ?
+            """, (budget_id,))
+            b_row = cur.fetchone()
+            if b_row is None:
+                raise QuotaSecurityError(f"Budget '{budget_id}' not found at PIC")
+            valid_until_str, budget_code_commit, authorizer_id, allowed_models_raw, manifest_id = b_row[0], b_row[1], b_row[2], b_row[3], b_row[4]
+
+            # 1. Temporal revalidation
+            try:
+                exp_dt = dt.datetime.fromisoformat(valid_until_str.replace("Z", "+00:00"))
+                if now_dt > exp_dt:
+                    conn.execute("UPDATE dispatch_reservations SET state = ?, completed_at_epoch = ? WHERE reservation_id = ?;", (STATE_FAILED, now_epoch, reservation_id))
+                    conn.execute("INSERT INTO outbox_events (event_id, reservation_id, aggregate_id, event_type, payload_json, created_at_epoch, projected_at_epoch) VALUES (?, ?, ?, ?, ?, ?, NULL);",
+                                 (f"evt_pic_block_{uuid.uuid4().hex[:12]}", reservation_id, budget_id, "PIC_BLOCKED_MANIFEST_EXPIRED", json.dumps({"reason": f"Manifest expired at {valid_until_str}"}), now_epoch))
+                    conn.execute("COMMIT;")
+                    in_tx = False
+                    raise QuotaSecurityError(f"Commit send blocked at PIC: manifest authorization expired at {valid_until_str}")
+            except (ValueError, TypeError) as err:
+                raise QuotaSecurityError(f"Malformed valid_until timestamp at PIC: {err}") from err
+
+            # 2. Code commit revalidation
+            if effective_commit is not None and effective_commit.strip().lower() != budget_code_commit.strip().lower():
+                conn.execute("UPDATE dispatch_reservations SET state = ?, completed_at_epoch = ? WHERE reservation_id = ?;", (STATE_FAILED, now_epoch, reservation_id))
+                conn.execute("INSERT INTO outbox_events (event_id, reservation_id, aggregate_id, event_type, payload_json, created_at_epoch, projected_at_epoch) VALUES (?, ?, ?, ?, ?, ?, NULL);",
+                             (f"evt_pic_block_{uuid.uuid4().hex[:12]}", reservation_id, budget_id, "PIC_BLOCKED_COMMIT_MISMATCH", json.dumps({"reason": f"Commit divergence: {effective_commit} != {budget_code_commit}"}), now_epoch))
+                conn.execute("COMMIT;")
+                in_tx = False
+                raise QuotaSecurityError(f"Commit send blocked at PIC: runtime commit '{effective_commit}' diverges from manifest commit '{budget_code_commit}'")
+
+            # 3. Model revalidation
+            allowed_models = json.loads(allowed_models_raw)
+            if target_model not in allowed_models:
+                raise QuotaSecurityError(f"Commit send blocked at PIC: target model '{target_model}' not authorized in {allowed_models}")
+
+            # 4. Key revocation / validity revalidation in Trust Store
+            if effective_trust_store is not None:
+                cur = conn.execute("SELECT details_json FROM consumed_authorizations WHERE authorization_id = ?", (manifest_id,))
+                c_row = cur.fetchone()
+                key_id = None
+                if c_row:
+                    try:
+                        key_id = json.loads(c_row[0]).get("key_id")
+                    except Exception:
+                        pass
+                
+                if key_id:
+                    is_key_ok, key_reason = effective_trust_store.is_key_authorized(
+                        key_id=key_id,
+                        required_permission="dispatch:openrouter_free",
+                        at_time_utc=now_dt,
+                    )
+                    if not is_key_ok:
+                        conn.execute("UPDATE dispatch_reservations SET state = ?, completed_at_epoch = ? WHERE reservation_id = ?;", (STATE_FAILED, now_epoch, reservation_id))
+                        conn.execute("INSERT INTO outbox_events (event_id, reservation_id, aggregate_id, event_type, payload_json, created_at_epoch, projected_at_epoch) VALUES (?, ?, ?, ?, ?, ?, NULL);",
+                                     (f"evt_pic_block_{uuid.uuid4().hex[:12]}", reservation_id, budget_id, "PIC_BLOCKED_KEY_REVOKED", json.dumps({"key_id": key_id, "reason": key_reason}), now_epoch))
+                        conn.execute("COMMIT;")
+                        in_tx = False
+                        raise KeyAuthorityError(f"Commit send blocked at PIC: authorizer key '{key_id}' is revoked or expired: {key_reason}")
 
             # Update state to SEND_COMMITTED
             conn.execute("""
@@ -784,13 +882,35 @@ class TransactionalOutboxProjector:
         self.store = store
         self.ledger_path = ledger_path
 
+    def _read_existing_ledger_event_ids(self) -> Set[str]:
+        """Read existing event_id entries already committed to JSONL ledger."""
+        if not os.path.exists(self.ledger_path):
+            return set()
+        existing = set()
+        try:
+            with open(self.ledger_path, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        record = json.loads(line)
+                        if "event_id" in record:
+                            existing.add(str(record["event_id"]))
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+        return existing
+
     def project_pending_events(self) -> int:
-        """Read unprojected events, append to ledger file with fsync, and mark projected."""
+        """Read unprojected events, append to ledger file with fsync idempotently, and mark projected."""
         conn = self.store._get_connection()
         now_epoch = time.time()
-        projected_count = 0
+        in_tx = False
         try:
             conn.execute("BEGIN IMMEDIATE;")
+            in_tx = True
             cur = conn.execute("""
             SELECT event_id, reservation_id, aggregate_id, event_type, payload_json, created_at_epoch
             FROM outbox_events
@@ -800,29 +920,34 @@ class TransactionalOutboxProjector:
             pending = cur.fetchall()
 
             if not pending:
-                conn.execute("ROLLBACK;")
+                conn.execute("COMMIT;")
+                in_tx = False
                 return 0
 
             # Ensure parent directory exists
             os.makedirs(os.path.dirname(os.path.abspath(self.ledger_path)), exist_ok=True)
 
-            # Append to ledger with fsync
-            with open(self.ledger_path, "a", encoding="utf-8") as f:
-                for ev_id, res_id, agg_id, ev_type, payload_str, created_epoch in pending:
-                    record = {
-                        "event_id": ev_id,
-                        "reservation_id": res_id,
-                        "aggregate_id": agg_id,
-                        "event_type": ev_type,
-                        "payload": json.loads(payload_str),
-                        "created_at_epoch": created_epoch,
-                        "projected_at_epoch": now_epoch,
-                    }
-                    f.write(json.dumps(record) + "\n")
-                f.flush()
-                os.fsync(f.fileno())
+            # Deduplicate against already projected events in JSONL file (Crash recovery safety)
+            existing_ids = self._read_existing_ledger_event_ids()
+            new_events = [p for p in pending if p[0] not in existing_ids]
 
-            # Mark all as projected in SQLite
+            if new_events:
+                with open(self.ledger_path, "a", encoding="utf-8") as f:
+                    for ev_id, res_id, agg_id, ev_type, payload_str, created_epoch in new_events:
+                        record = {
+                            "event_id": ev_id,
+                            "reservation_id": res_id,
+                            "aggregate_id": agg_id,
+                            "event_type": ev_type,
+                            "payload": json.loads(payload_str),
+                            "created_at_epoch": created_epoch,
+                            "projected_at_epoch": now_epoch,
+                        }
+                        f.write(json.dumps(record) + "\n")
+                    f.flush()
+                    os.fsync(f.fileno())
+
+            # Mark all as projected in SQLite (both newly appended and previously flushed)
             for ev_id, _, _, _, _, _ in pending:
                 conn.execute("""
                 UPDATE outbox_events
@@ -831,11 +956,14 @@ class TransactionalOutboxProjector:
                 """, (now_epoch, ev_id))
 
             conn.execute("COMMIT;")
+            in_tx = False
             return len(pending)
-        except Exception:
-            conn.execute("ROLLBACK;")
-            raise
         finally:
+            if in_tx:
+                try:
+                    conn.execute("ROLLBACK;")
+                except Exception:
+                    pass
             if not self.store._is_memory:
                 conn.close()
 
@@ -883,21 +1011,52 @@ class GovernedFallbackEngine:
         - If max_dispatches > 1 and remaining budget > 0: Atomically acquire reservation #2, commit SEND_COMMITTED, and authorize physical dispatch.
         - If max_dispatches > 1 and budget exhausted: Block further dispatch fail-closed.
         """
+        # 1. Provenance and Correlation Verification
+        if failed_reservation.budget_id != budget_id:
+            raise QuotaSecurityError(
+                f"Fallback rejected: failed reservation budget_id '{failed_reservation.budget_id}' "
+                f"diverges from requested budget_id '{budget_id}'"
+            )
+        if failed_reservation.logical_attempt_id != logical_attempt_id:
+            raise QuotaSecurityError(
+                f"Fallback rejected: failed reservation logical_attempt_id '{failed_reservation.logical_attempt_id}' "
+                f"diverges from requested logical_attempt_id '{logical_attempt_id}'"
+            )
+
+        stored_res = self.store.get_reservation(failed_reservation.reservation_id)
+        if stored_res is None:
+            raise QuotaSecurityError(
+                f"Fallback rejected: failed reservation '{failed_reservation.reservation_id}' does not exist in store"
+            )
+        if stored_res.state not in (STATE_FAILED, STATE_UNKNOWN):
+            raise QuotaSecurityError(
+                f"Fallback rejected: reservation '{failed_reservation.reservation_id}' is in state '{stored_res.state}', "
+                f"must be '{STATE_FAILED}' or '{STATE_UNKNOWN}'"
+            )
+        if stored_res.http_status_code is not None and stored_res.http_status_code not in (429, 503):
+            raise QuotaSecurityError(
+                f"Fallback rejected: HTTP status {stored_res.http_status_code} is not an authorized fallback trigger "
+                f"(only HTTP 429 and 503 are eligible)"
+            )
+
         budget_status = self.store.get_budget_status(budget_id)
         max_dispatches = budget_status["max_dispatches"]
         consumed = budget_status["consumed_total"]
 
-        # 1. Identify contingency candidates from allowed_models excluding failed model
+        # 2. Identify contingency candidates from allowed_models excluding failed model
         failed_model = failed_reservation.target_model
         candidate_models = [m for m in allowed_models if m != failed_model]
 
         verified_candidates: List[str] = []
         for candidate in candidate_models:
-            # Check candidate model in cost guard and registry
-            if catalog_registry.is_model_free(candidate):
-                entry = catalog_registry.get_model(candidate)
-                if entry and any(m.value.upper() == "TEXT" for m in entry.modalities):
+            try:
+                # Enforce FreeCostGuard authorization with catalog freshness
+                entry = self.cost_guard.authorize_model_execution(candidate, verify_freshness=True)
+                if any(m.value.upper() == "TEXT" for m in entry.modalities):
                     verified_candidates.append(candidate)
+            except Exception:
+                # Candidate model is paid, unverified, stale, or lacks :free suffix
+                continue
 
         if not verified_candidates:
             return FallbackDecision(
@@ -911,13 +1070,15 @@ class GovernedFallbackEngine:
 
         selected_candidate = verified_candidates[0]
 
-        # 2. Case: max_dispatches == 1 (Single Dispatch Safety Ceiling)
+        # 3. Case: max_dispatches == 1 (Single Dispatch Safety Ceiling)
         if max_dispatches == 1:
             # Emit FALLBACK_PROPOSED_BLOCKED to outbox and project
             now_epoch = time.time()
             conn = self.store._get_connection()
+            in_tx = False
             try:
                 conn.execute("BEGIN IMMEDIATE;")
+                in_tx = True
                 outbox_id = f"evt_fb_prop_{uuid.uuid4().hex[:12]}"
                 conn.execute("""
                 INSERT INTO outbox_events (
@@ -939,7 +1100,13 @@ class GovernedFallbackEngine:
                     now_epoch,
                 ))
                 conn.execute("COMMIT;")
+                in_tx = False
             finally:
+                if in_tx:
+                    try:
+                        conn.execute("ROLLBACK;")
+                    except Exception:
+                        pass
                 if not self.store._is_memory:
                     conn.close()
 
@@ -958,13 +1125,15 @@ class GovernedFallbackEngine:
                 },
             )
 
-        # 3. Case: max_dispatches > 1
+        # 4. Case: max_dispatches > 1
         if consumed >= max_dispatches:
             # Budget exhausted
             now_epoch = time.time()
             conn = self.store._get_connection()
+            in_tx = False
             try:
                 conn.execute("BEGIN IMMEDIATE;")
+                in_tx = True
                 outbox_id = f"evt_fb_exh_{uuid.uuid4().hex[:12]}"
                 conn.execute("""
                 INSERT INTO outbox_events (
@@ -984,7 +1153,13 @@ class GovernedFallbackEngine:
                     now_epoch,
                 ))
                 conn.execute("COMMIT;")
+                in_tx = False
             finally:
+                if in_tx:
+                    try:
+                        conn.execute("ROLLBACK;")
+                    except Exception:
+                        pass
                 if not self.store._is_memory:
                     conn.close()
 
@@ -999,7 +1174,7 @@ class GovernedFallbackEngine:
                 details={"consumed": consumed, "max_dispatches": max_dispatches},
             )
 
-        # 4. Multi-dispatch permitted: acquire reservation and advance to SEND_COMMITTED
+        # 5. Multi-dispatch permitted: acquire reservation and advance to SEND_COMMITTED
         next_seq = failed_reservation.sequence_index + 1
         new_reservation = self.store.acquire_reservation(
             budget_id=budget_id,
@@ -1007,7 +1182,11 @@ class GovernedFallbackEngine:
             sequence_index=next_seq,
             target_model=selected_candidate,
         )
-        self.store.commit_send(new_reservation.reservation_id)
+        self.store.commit_send(
+            reservation_id=new_reservation.reservation_id,
+            trust_store=self.store.default_trust_store,
+            expected_commit=self.store.expected_commit,
+        )
         self.projector.project_pending_events()
 
         return FallbackDecision(
