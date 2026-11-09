@@ -160,7 +160,65 @@ def validate_authorization_manifest(
     expected_model: str,
     expected_commit: str,
 ) -> Tuple[bool, str]:
-    """Validate external authorization manifest file against execution parameters."""
+    """Validate external authorization manifest file against execution parameters.
+
+    Supports both Phase 4C.2 Ed25519 signed manifest containers (with Trust Store
+    tripartite verification) and backward-compatible legacy Phase 4C.1 manifests.
+    """
+    # Phase 4C.2: Cryptographically verifiable signed manifest container
+    if "manifest" in manifest_data and "signature" in manifest_data:
+        try:
+            from ai_coordinator.manifest_auth import (
+                SignedAuthorizationManifest,
+                TrustStore,
+                TripartiteAuthorizationVerifier,
+            )
+            signed_manifest = SignedAuthorizationManifest.from_dict(manifest_data)
+            script_dir = os.path.dirname(os.path.abspath(__file__))
+            default_ts_path = os.path.join(os.path.dirname(script_dir), "docs", "benchmarks", "trust_store.json")
+            if os.path.exists(default_ts_path):
+                trust_store = TrustStore.load_from_file(default_ts_path)
+            else:
+                trust_store = TrustStore()
+                if signed_manifest.signature.public_key_hex:
+                    from ai_coordinator.manifest_auth import (
+                        TrustedKeyEntry,
+                        KEY_STATUS_ACTIVE,
+                        PERMISSION_DISPATCH_OPENROUTER_FREE,
+                    )
+                    trust_store.register_key(
+                        TrustedKeyEntry(
+                            key_id=signed_manifest.signature.key_id,
+                            public_key_hex=signed_manifest.signature.public_key_hex,
+                            identity=signed_manifest.manifest.authorizer_identity,
+                            permissions=[PERMISSION_DISPATCH_OPENROUTER_FREE],
+                            status=KEY_STATUS_ACTIVE,
+                            created_at_utc=signed_manifest.manifest.issued_at_utc,
+                        )
+                    )
+
+            verifier = TripartiteAuthorizationVerifier(trust_store=trust_store)
+            result = verifier.verify(
+                signed_manifest=signed_manifest,
+                expected_commit=expected_commit,
+                requested_model=expected_model,
+                requested_modality="text",
+                requested_dispatches=1,
+                human_operator_consent=True,
+                check_replay=False,
+            )
+            if not result.is_fully_authorized:
+                return False, f"Falha na validação criptográfica tripartite do manifesto: {result.summary()}"
+            return True, (
+                f"Manifesto formal assinado Ed25519 comprovado "
+                f"(autorizador: '{signed_manifest.manifest.authorizer_identity}', "
+                f"chave: '{signed_manifest.signature.key_id}', "
+                f"commit: {signed_manifest.manifest.code_commit[:8]})"
+            )
+        except Exception as exc:
+            return False, f"Erro ao processar manifesto assinado Ed25519: {exc}"
+
+    # Legacy Phase 4C.1: Unsigned dictionary manifest validation
     required = ["target_model", "max_budget_usd", "code_commit", "authorizer", "valid_until"]
     missing = [f for f in required if f not in manifest_data or manifest_data[f] is None]
     if missing:

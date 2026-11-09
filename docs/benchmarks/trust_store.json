@@ -1,0 +1,20 @@
+{
+  "keys": [
+    {
+      "created_at_utc": "2026-11-09T17:00:00Z",
+      "expires_at_utc": "2027-11-09T17:00:00Z",
+      "identity": "security_operator_root",
+      "key_id": "ed25519:operator_primary_2026",
+      "permissions": [
+        "dispatch:openrouter_free",
+        "audit:verify"
+      ],
+      "public_key_hex": "5c9c6df261c9cb840475776aaefcd944b405328fab28f9b3a95ef40490d3de84",
+      "revocation_reason": null,
+      "revoked_at_utc": null,
+      "status": "active"
+    }
+  ],
+  "updated_at_utc": "2026-11-09T17:12:38.083159+00:00",
+  "version": "1.0"
+}
