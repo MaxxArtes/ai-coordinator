@@ -219,11 +219,12 @@ Os 5 artefatos de release candidate da versão `v0.6.0` foram gerados de forma d
 
 ## 8. Evidências do GitHub Actions CI e Conclusão
 
-1. **GitHub Actions CI (Run 42858709720):**
+1. **GitHub Actions CI (Run 42882107843 — Commit `cee6681`):**
    - 8/8 jobs aprovados com 100% de sucesso.
    - Matriz completa de sistemas operacionais: Windows (3.11, 3.14), Linux Ubuntu (3.11, 3.14), macOS (3.11, 3.14).
    - Validação automatizada de TypeScript do OpenCode V2.
    - Build de artefatos, instalação limpa em venv, CLI smoke, extra `[mcp]` e migração genuína da v0.4.0 aprovados.
+   - Pacote arquivado de auditoria: `release-artifacts-v0.6.0` (ID do artefato: `13793679597`, 789.139 bytes).
 2. **Encerramento Formal da Fase 4C.2:** Todas as 6 etapas planejadas (4C.2.1 a 4C.2.6) e todos os gates de segurança de transporte foram integralmente cumpridos no plano offline ($0.00 USD).
 3. **Branch Principal Intacta:** A branch `main` permanece rigorosamente preservada em `a2f8f65` (`v0.5.1`).
 4. **Prontidão de Release v0.6.0:** O pacote release candidate `v0.6.0` está consolidado e aguardando deliberação soberana do operador quanto ao teste operacional em staging e eventual publicação.
