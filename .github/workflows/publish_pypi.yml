@@ -1,0 +1,42 @@
+name: Publish to PyPI
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: "Release tag to publish to PyPI (e.g. v0.6.0)"
+        required: true
+        default: "v0.6.0"
+
+permissions:
+  contents: read
+
+jobs:
+  pypi-publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.release_tag }}
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Build distributions
+        run: |
+          python -m pip install --upgrade pip build twine
+          python -m build --outdir dist
+
+      - name: Verify package version
+        run: |
+          expected="${{ inputs.release_tag }}"
+          expected="${expected#v}"
+          python -c "import tomllib; from pathlib import Path; v=tomllib.loads(Path('pyproject.toml').read_text(encoding='utf-8'))['project']['version']; assert v == '$expected', f'Version mismatch: {v} != $expected'"
+
+      - name: Upload to PyPI
+        env:
+          TWINE_USERNAME: __token__
+          TWINE_PASSWORD: ${{ secrets.PYPI_API_TOKEN }}
+        run: |
+          twine upload --non-interactive dist/ai_coordinator-*.whl dist/ai_coordinator-*.tar.gz

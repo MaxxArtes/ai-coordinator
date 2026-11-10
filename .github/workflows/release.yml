@@ -112,3 +112,14 @@ jobs:
         env:
           NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: npm publish --ignore-scripts ./plugins/opencode
+
+      - name: Publish Python distribution to PyPI
+        if: |
+          !contains(inputs.release_tag || github.ref_name, '-rc') &&
+          (github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.confirm_publish == true))
+        env:
+          TWINE_USERNAME: __token__
+          TWINE_PASSWORD: ${{ secrets.PYPI_API_TOKEN }}
+        run: |
+          python -m pip install twine
+          twine upload --non-interactive dist/ai_coordinator-*.whl dist/ai_coordinator-*.tar.gz
