@@ -8,7 +8,8 @@
 **Status:** Execução Concluída com 100% de Sucesso Offline (Zero Violações Observadas)  
 **Repositório:** `D:\ai-coordinator`  
 **Branch de Trabalho:** `feature/phase4c-2-ed25519-truststore`  
-**Commit Ativo Auditado:** `7e81fa045dcdf4e82f043757b28094b398f467df`  
+**Commit Físico Medido (HEAD na Execução):** `7e81fa045dcdf4e82f043757b28094b398f467df` *(executado com modificações locais de instrumentação e Cenário A2 em working tree)*  
+**Commit de Consolidação e Entrega:** `70b5d4c5ce07a199df8fd6fb76b06f031a882b2f` *(versionamento dos relatórios e correções de versionamento/busy_timeout)*  
 **Commit HEAD Estável (main):** `a2f8f654b9f2e30897a9d3e8741029cba4837261` (v0.5.1)  
 **Commit Fixture de Autorização:** `a2f8f654b9f2e30897a9d3e8741029cba4837261`  
 

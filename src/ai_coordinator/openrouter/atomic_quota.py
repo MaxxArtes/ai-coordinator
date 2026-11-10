@@ -147,6 +147,11 @@ class FallbackDecision:
     reason: str
     details: Dict[str, Any]
 
+    def to_dict(self) -> Dict[str, Any]:
+        """Convert decision to dictionary representation."""
+        import dataclasses
+        return dataclasses.asdict(self)
+
 
 # ---------------------------------------------------------------------------
 # SQLite Atomic Quota Store & Transactional Outbox
@@ -492,6 +497,11 @@ class AtomicDispatchQuotaStore:
             # 1. Query budget configuration
             cur = conn.execute("SELECT max_dispatches, allowed_models_json FROM global_dispatch_budgets WHERE budget_id = ?", (budget_id,))
             b_row = cur.fetchone()
+            if b_row is None and not budget_id.startswith("budget_"):
+                cur = conn.execute("SELECT max_dispatches, allowed_models_json FROM global_dispatch_budgets WHERE budget_id = ?", (f"budget_{budget_id}",))
+                b_row = cur.fetchone()
+                if b_row is not None:
+                    budget_id = f"budget_{budget_id}"
             if b_row is None:
                 raise QuotaSecurityError(f"Budget '{budget_id}' not found")
             max_dispatches, allowed_models_raw = b_row[0], b_row[1]
@@ -857,6 +867,25 @@ class AtomicDispatchQuotaStore:
             if not self._is_memory:
                 conn.close()
 
+    def record_failure(
+        self,
+        reservation_id: str,
+        http_status_code: int,
+        details: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """Alias for record_completion with non-200 HTTP status code."""
+        self.record_completion(reservation_id=reservation_id, http_status_code=http_status_code, details=details)
+
+    def record_unknown(
+        self,
+        reservation_id: str,
+        details: Optional[Dict[str, Any]] = None,
+        reason: Optional[str] = None,
+    ) -> None:
+        """Alias for record_failure_unknown."""
+        reason_str = reason or (str(details) if details else "Ambiguous network error")
+        self.record_failure_unknown(reservation_id=reservation_id, reason=reason_str)
+
     def recover_interrupted_reservations(self) -> List[str]:
         """P0.3 Conservative Crash Recovery:
 
@@ -958,6 +987,13 @@ class AtomicDispatchQuotaStore:
             SELECT max_dispatches, allowed_models_json FROM global_dispatch_budgets WHERE budget_id = ?
             """, (budget_id,))
             b_row = cur.fetchone()
+            if not b_row and not budget_id.startswith("budget_"):
+                cur = conn.execute("""
+                SELECT max_dispatches, allowed_models_json FROM global_dispatch_budgets WHERE budget_id = ?
+                """, (f"budget_{budget_id}",))
+                b_row = cur.fetchone()
+                if b_row:
+                    budget_id = f"budget_{budget_id}"
             if not b_row:
                 raise QuotaSecurityError(f"Budget '{budget_id}' not found")
             max_dispatches, models_raw = b_row[0], b_row[1]

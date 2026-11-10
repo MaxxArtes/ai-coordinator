@@ -42,6 +42,7 @@ from .transport import (
     LiveNetworkDisabledError,
     IncompatibleModalityEndpointError,
     OpenRouterTransportSecurityError,
+    GovernedEgressRequiredError,
     StrictNoRedirectHandler,
     TransportError,
 )
@@ -115,6 +116,7 @@ __all__ = [
     "OpenRouterHttpTransport",
     "HttpResponse",
     "OpenRouterTransportSecurityError",
+    "GovernedEgressRequiredError",
     "StrictNoRedirectHandler",
     "LiveNetworkDisabledError",
     "IncompatibleModalityEndpointError",

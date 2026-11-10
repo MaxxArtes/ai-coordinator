@@ -8,6 +8,15 @@
     "machine": "AMD64",
     "processor": "Intel64 Family 6 Model 94 Stepping 3, GenuineIntel",
     "active_repo_commit": "7e81fa045dcdf4e82f043757b28094b398f467df",
+    "measured_execution_head_commit": "7e81fa045dcdf4e82f043757b28094b398f467df",
+    "consolidation_commit": "70b5d4c5ce07a199df8fd6fb76b06f031a882b2f",
+    "local_working_tree_state": "DIRTY_INSTRUMENTATION (Campanha física executada no commit 7e81fa0 com instrumentação de memória RSS e Cenário A2 em working tree, posteriormente consolidada no commit 70b5d4c)",
+    "uncommitted_files_during_run": [
+      "src/ai_coordinator/openrouter/benchmark_4c2.py",
+      "scripts/execute_phase4c25_benchmarks.py",
+      "tests/test_phase4c25_benchmarks.py",
+      "src/ai_coordinator/openrouter/atomic_quota.py"
+    ],
     "active_git_branch": "feature/phase4c-2-ed25519-truststore",
     "baseline_reference_commit": "a2f8f654b9f2e30897a9d3e8741029cba4837261",
     "auth_manifest_fixture_commit": "a2f8f654b9f2e30897a9d3e8741029cba4837261",
