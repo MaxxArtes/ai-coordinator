@@ -998,7 +998,18 @@ def _get_process_create_time_ns(pid: int) -> Optional[int]:
 
 
 class _InterProcessFileLock:
-    """Minimal, robust cross-process file lock using atomic OS file creation flags and PID liveness validation."""
+    """Robust cross-process file lock using native OS kernel locking on a permanent lock file.
+
+    Guarantees:
+    - Eliminates TOCTOU race conditions: no os.unlink() between inspection and deletion.
+    - Uses OS kernel-level byte/file locking (msvcrt.locking on Windows, fcntl.flock on POSIX).
+    - Automatic kernel-level release: when a process terminates or crashes unexpectedly, the
+      OS kernel immediately releases the file lock upon handle closure.
+    - Mutual exclusion is guaranteed at the kernel level: zero window where two processes can
+      both acquire or believe they own the lock.
+    - Writes owner metadata (PID, kernel create_time_ns, timestamp) for telemetry, diagnostics,
+      and fail-closed timeout reporting.
+    """
 
     def __init__(self, lock_path: str, timeout_sec: float = 10.0, retry_delay_sec: float = 0.02):
         self.lock_path = lock_path
@@ -1011,81 +1022,91 @@ class _InterProcessFileLock:
         start = time.time()
         my_pid = os.getpid()
         my_create_time_ns = _get_process_create_time_ns(my_pid)
-        while True:
-            try:
-                # O_CREAT | O_EXCL provides atomic creation semantics on Windows and POSIX
-                self._fd = os.open(self.lock_path, os.O_CREAT | os.O_EXCL | os.O_RDWR)
-                payload = json.dumps({
-                    "pid": my_pid,
-                    "create_time_ns": my_create_time_ns,
-                    "acquired_at_epoch": time.time(),
-                }).encode("utf-8")
-                os.write(self._fd, payload)
-                os.fsync(self._fd)
-                self._acquired = True
-                return self
-            except FileExistsError:
-                # Lock file already exists: inspect owning PID and OS creation timestamp
-                owner_pid: Optional[int] = None
-                owner_create_time_ns: Optional[int] = None
-                raw_content: Optional[str] = None
+
+        # Ensure parent directory exists
+        os.makedirs(os.path.dirname(os.path.abspath(self.lock_path)), exist_ok=True)
+        self._fd = os.open(self.lock_path, os.O_CREAT | os.O_RDWR)
+        try:
+            while True:
                 try:
-                    with open(self.lock_path, "r", encoding="utf-8") as f:
-                        raw_content = f.read().strip()
-                        if raw_content:
-                            data = json.loads(raw_content)
+                    os.lseek(self._fd, 0, os.SEEK_SET)
+                    if os.name == "nt":
+                        import msvcrt
+                        msvcrt.locking(self._fd, msvcrt.LK_NBLCK, 1)
+                    else:
+                        import fcntl
+                        fcntl.flock(self._fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+                    # Exclusive lock acquired via OS kernel!
+                    payload = json.dumps({
+                        "pid": my_pid,
+                        "create_time_ns": my_create_time_ns,
+                        "acquired_at_epoch": time.time(),
+                    }).encode("utf-8")
+                    os.lseek(self._fd, 1, os.SEEK_SET)
+                    os.write(self._fd, payload)
+                    os.ftruncate(self._fd, 1 + len(payload))
+                    os.fsync(self._fd)
+                    self._acquired = True
+                    return self
+                except (OSError, PermissionError):
+                    # Locked by another active process; inspect owner metadata
+                    owner_pid: Optional[int] = None
+                    owner_create_time_ns: Optional[int] = None
+                    try:
+                        os.lseek(self._fd, 1, os.SEEK_SET)
+                        raw = os.read(self._fd, 512).strip()
+                        if raw:
+                            data = json.loads(raw.decode("utf-8"))
                             if isinstance(data, dict):
                                 owner_pid = data.get("pid")
                                 owner_create_time_ns = data.get("create_time_ns")
-                except Exception:
-                    pass
+                    except Exception:
+                        pass
 
-                # If owner identity (PID) is known and integer:
-                if owner_pid is not None and isinstance(owner_pid, int):
-                    # Check if owner process is verifiably alive and matches creation time
-                    is_alive = safe_process_alive(owner_pid, expected_create_time_ns=owner_create_time_ns)
-                    if not is_alive:
-                        # Owner process is verifiably dead or PID was recycled!
-                        # Safely reclaim orphaned stale lock, guarded against TOCTOU race:
-                        # re-verify lock file still exists and still holds the same unliving owner payload
-                        try:
-                            with open(self.lock_path, "r", encoding="utf-8") as f:
-                                current_content = f.read().strip()
-                            if current_content == raw_content:
-                                os.unlink(self.lock_path)
-                                continue
-                        except OSError:
-                            pass
-
-                # Indeterminate or unreadable owner:
-                # DO NOT unlink! Completely eliminate mtime age-based unlinking.
-                # Treat indeterminate owners as UNKNOWN and block conservadoramente.
-
-                if time.time() - start > self.timeout_sec:
-                    if owner_pid is not None:
-                        owner_desc = f"active PID {owner_pid} (create_time_ns={owner_create_time_ns})"
-                    else:
-                        owner_desc = "unknown/indeterminate owner"
-                    raise TimeoutError(
-                        f"Timed out waiting for inter-process lock '{self.lock_path}' "
-                        f"(held by {owner_desc})"
-                    )
-
-                time.sleep(self.retry_delay_sec)
-
-    def __exit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
-        if self._acquired:
-            if self._fd is not None:
+                    if time.time() - start > self.timeout_sec:
+                        if owner_pid is not None and isinstance(owner_pid, int):
+                            owner_desc = f"active PID {owner_pid} (create_time_ns={owner_create_time_ns})"
+                        else:
+                            owner_desc = "unknown/indeterminate owner"
+                        raise TimeoutError(
+                            f"Timed out waiting for inter-process lock '{self.lock_path}' "
+                            f"(held by {owner_desc})"
+                        )
+                    time.sleep(self.retry_delay_sec)
+        except Exception:
+            if not self._acquired and self._fd is not None:
                 try:
                     os.close(self._fd)
                 except OSError:
                     pass
                 self._fd = None
+            raise
+
+    def __exit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
+        if self._acquired and self._fd is not None:
             try:
-                if os.path.exists(self.lock_path):
-                    os.unlink(self.lock_path)
+                # Truncate metadata
+                os.lseek(self._fd, 1, os.SEEK_SET)
+                os.ftruncate(self._fd, 1)
+                os.fsync(self._fd)
             except OSError:
                 pass
+            try:
+                os.lseek(self._fd, 0, os.SEEK_SET)
+                if os.name == "nt":
+                    import msvcrt
+                    msvcrt.locking(self._fd, msvcrt.LK_UNLCK, 1)
+                else:
+                    import fcntl
+                    fcntl.flock(self._fd, fcntl.LOCK_UN)
+            except OSError:
+                pass
+            try:
+                os.close(self._fd)
+            except OSError:
+                pass
+            self._fd = None
             self._acquired = False
 
 

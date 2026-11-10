@@ -69,3 +69,25 @@ def mp_recovery_scanner_worker(
         result_queue.put(("RECOVERED", len(recovered)))
     except Exception as exc:
         result_queue.put(("ERROR", f"{type(exc).__name__}: {exc}"))
+
+
+def mp_lock_contention_worker(
+    lock_path: str,
+    worker_id: str,
+    hold_duration_sec: float,
+    timeout_sec: float,
+    result_queue: Any,
+) -> None:
+    """Worker process acquiring native inter-process lock, holding it, and reporting status."""
+    import os
+    from ai_coordinator.openrouter.atomic_quota import _InterProcessFileLock
+    try:
+        with _InterProcessFileLock(lock_path, timeout_sec=timeout_sec):
+            result_queue.put(("ACQUIRED", worker_id, os.getpid()))
+            if hold_duration_sec > 0:
+                time.sleep(hold_duration_sec)
+            result_queue.put(("RELEASED", worker_id, os.getpid()))
+    except TimeoutError as exc:
+        result_queue.put(("TIMEOUT", worker_id, str(exc)))
+    except Exception as exc:
+        result_queue.put(("ERROR", worker_id, f"{type(exc).__name__}: {exc}"))

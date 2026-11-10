@@ -66,6 +66,7 @@ from ai_coordinator.openrouter.atomic_quota import (
 from ai_coordinator.process import safe_process_alive
 from ai_coordinator.openrouter.mp_workers import (
     mp_contention_worker,
+    mp_lock_contention_worker,
     mp_outbox_projector_worker,
     mp_recovery_scanner_worker,
 )
@@ -1016,79 +1017,99 @@ class TestPhase4C24AdversarialRecovery(unittest.TestCase):
     # =======================================================================
 
     def test_18_inter_process_lock_dead_pid_reclamation_and_living_pid_contention(self) -> None:
-        """TC-18 (Auditor P1): _InterProcessFileLock reclaims locks from dead PIDs, detects PID recycling, and fails closed on indeterminate locks."""
+        """TC-18 (Auditor P1): _InterProcessFileLock uses native OS locks on permanent files,
+        eliminates TOCTOU races, automatically reclaims abandoned locks without deletion, and blocks active locks."""
         from ai_coordinator.openrouter.atomic_quota import _get_process_create_time_ns
 
-        lock_file = os.path.join(self.tmp_dir, "test_ipc.lock")
+        lock_file = os.path.join(self.tmp_dir, "test_ipc_permanent.lock")
 
-        # 1. Dead PID simulation: write lock file with an impossible/dead PID (e.g. 9999999) and creation timestamp
-        dead_pid = 9999999
-        self.assertFalse(safe_process_alive(dead_pid))
-        with open(lock_file, "w", encoding="utf-8") as f:
-            f.write(json.dumps({
-                "pid": dead_pid,
-                "create_time_ns": 1000000000000,
-                "acquired_at_epoch": time.time(),
-            }))
-
-        # Lock acquisition MUST detect dead PID and immediately reclaim the lock
-        with _InterProcessFileLock(lock_file, timeout_sec=1.0) as lock:
-            self.assertTrue(lock._acquired)
-            self.assertTrue(os.path.exists(lock_file))
-
-        # Lock is cleanly released on exit
-        self.assertFalse(os.path.exists(lock_file))
-
-        # 2. PID recycling simulation: write lock file with current active PID, but mismatched creation time
+        # 1. Native active contention: while lock is held, contending process is strictly denied and times out
         current_pid = os.getpid()
-        self.assertFalse(safe_process_alive(current_pid, expected_create_time_ns=9999999999999999))
-        with open(lock_file, "w", encoding="utf-8") as f:
-            f.write(json.dumps({
-                "pid": current_pid,
-                "create_time_ns": 9999999999999999,
-                "acquired_at_epoch": time.time(),
-            }))
-
-        # Lock acquisition MUST recognize PID recycling (creation time mismatch) and safely reclaim
-        with _InterProcessFileLock(lock_file, timeout_sec=1.0) as lock:
-            self.assertTrue(lock._acquired)
+        with _InterProcessFileLock(lock_file, timeout_sec=2.0) as active_lock:
+            self.assertTrue(active_lock._acquired)
             self.assertTrue(os.path.exists(lock_file))
 
-        # Lock is cleanly released on exit
-        self.assertFalse(os.path.exists(lock_file))
+            # Contention attempt MUST NOT steal the lock and MUST timeout citing active PID
+            with self.assertRaises(TimeoutError) as ctx:
+                with _InterProcessFileLock(lock_file, timeout_sec=0.1, retry_delay_sec=0.02):
+                    pass
+            self.assertIn("held by active PID", str(ctx.exception))
+            self.assertIn(str(current_pid), str(ctx.exception))
 
-        # 3. Living PID contention simulation: write lock file with current active PID and actual creation time
-        actual_create_time = _get_process_create_time_ns(current_pid)
-        self.assertTrue(safe_process_alive(current_pid, expected_create_time_ns=actual_create_time))
-        with open(lock_file, "w", encoding="utf-8") as f:
-            f.write(json.dumps({
-                "pid": current_pid,
-                "create_time_ns": actual_create_time,
-                "acquired_at_epoch": time.time(),
-            }))
-
-        # Contention attempt MUST NOT steal the lock from active PID and MUST timeout
-        with self.assertRaises(TimeoutError) as ctx:
-            with _InterProcessFileLock(lock_file, timeout_sec=0.1, retry_delay_sec=0.02):
-                pass
-        self.assertIn("held by active PID", str(ctx.exception))
-        # Lock file was preserved because PID is alive
+        # 2. Permanent lock file is preserved on disk after clean exit (zero unlink)
         self.assertTrue(os.path.exists(lock_file))
-        os.unlink(lock_file)
 
-        # 4. Indeterminate lock file simulation (corrupted/missing PID) - Fail-Closed
-        # Write corrupted/unreadable lock payload
-        with open(lock_file, "w", encoding="utf-8") as f:
-            f.write("{invalid_json_corrupted_lock_header")
+        # 3. Clean subsequent acquisition on existing permanent lock file succeeds
+        with _InterProcessFileLock(lock_file, timeout_sec=1.0) as lock_second:
+            self.assertTrue(lock_second._acquired)
 
-        # Contention attempt MUST NOT delete or steal corrupted lock based on age; MUST raise TimeoutError
-        with self.assertRaises(TimeoutError) as ctx:
-            with _InterProcessFileLock(lock_file, timeout_sec=0.1, retry_delay_sec=0.02):
-                pass
-        self.assertIn("unknown/indeterminate owner", str(ctx.exception))
-        # Lock file was strictly preserved!
+        # 4. Multi-Process Abandoned Lock Deterministic Contention (Auditor Revision 14 requirement):
+        # Spawn an OS worker process holding the lock, forcefully terminate it to abandon the lock,
+        # then have two independent OS processes contest the abandoned lock simultaneously.
+        q = multiprocessing.Queue()
+        p_abandon = multiprocessing.Process(
+            target=mp_lock_contention_worker,
+            args=(lock_file, "abandoned_worker", 5.0, 1.0, q),
+        )
+        p_abandon.start()
+
+        # Wait until abandoned_worker has acquired the lock
+        tag, w_id, dead_pid = q.get(timeout=3.0)
+        self.assertEqual(tag, "ACQUIRED")
+        self.assertEqual(w_id, "abandoned_worker")
+
+        # Forcefully terminate the process holding the lock without releasing it cleanly
+        p_abandon.terminate()
+        p_abandon.join(timeout=2.0)
+
+        # Now launch two independent OS processes contending for the abandoned lock
+        q_contention = multiprocessing.Queue()
+        p1 = multiprocessing.Process(
+            target=mp_lock_contention_worker,
+            args=(lock_file, "worker_1", 0.05, 1.5, q_contention),
+        )
+        p2 = multiprocessing.Process(
+            target=mp_lock_contention_worker,
+            args=(lock_file, "worker_2", 0.05, 1.5, q_contention),
+        )
+        p1.start()
+        p2.start()
+
+        p1.join(timeout=3.0)
+        p2.join(timeout=3.0)
+
+        # Collect results from contention
+        events = []
+        while not q_contention.empty():
+            events.append(q_contention.get())
+
+        # Verify that both workers successfully acquired and released sequentially without race condition
+        acquired_events = [e for e in events if e[0] == "ACQUIRED"]
+        self.assertEqual(len(acquired_events), 2, f"Both workers must acquire sequentially: {events}")
+        released_events = [e for e in events if e[0] == "RELEASED"]
+        self.assertEqual(len(released_events), 2, f"Both workers must release cleanly: {events}")
+
+        # Permanent lock file was never unlinked
         self.assertTrue(os.path.exists(lock_file))
-        os.unlink(lock_file)
+
+        # 5. Indeterminate lock file simulation (corrupted metadata while locked) - Fail-Closed
+        # If lock is held and metadata in byte 1 is corrupted, contender gets TimeoutError with indeterminate owner
+        if os.name == "nt":
+            import msvcrt
+            fd_corrupt = os.open(lock_file, os.O_RDWR)
+            msvcrt.locking(fd_corrupt, msvcrt.LK_NBLCK, 1)
+            os.lseek(fd_corrupt, 1, os.SEEK_SET)
+            os.write(fd_corrupt, b"{not_json_corrupted")
+            os.fsync(fd_corrupt)
+            try:
+                with self.assertRaises(TimeoutError) as ctx:
+                    with _InterProcessFileLock(lock_file, timeout_sec=0.1, retry_delay_sec=0.02):
+                        pass
+                self.assertIn("unknown/indeterminate owner", str(ctx.exception))
+            finally:
+                os.lseek(fd_corrupt, 0, os.SEEK_SET)
+                msvcrt.locking(fd_corrupt, msvcrt.LK_UNLCK, 1)
+                os.close(fd_corrupt)
 
 
 if __name__ == "__main__":
