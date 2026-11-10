@@ -1,0 +1,402 @@
+{
+  "benchmark_version": "1.0.0",
+  "phase": "4C.2.5",
+  "campaign_timestamp_utc": "2026-11-10T13:10:35.179062+00:00",
+  "environment": {
+    "platform": "Windows-11-10.0.22000-SP0",
+    "python_version": "3.14.5",
+    "machine": "AMD64",
+    "processor": "Intel64 Family 6 Model 94 Stepping 3, GenuineIntel",
+    "commit_head": "a2f8f654b9f2e30897a9d3e8741029cba4837261",
+    "offline_network_calls": 0,
+    "financial_cost_usd": 0.0
+  },
+  "parameters": {
+    "iterations_per_scenario": 100,
+    "warmup_iterations": 10,
+    "total_comparative_samples": 500
+  },
+  "scenarios": {
+    "scenario_a_baseline": {
+      "scenario_id": "scenario_a_baseline",
+      "scenario_name": "Scenario A: Baseline Anterior \u00e0 Governan\u00e7a 4C.2",
+      "description": "Despacho mock direto sem criptografia Ed25519, SQLite WAL ou Transactional Outbox.",
+      "samples_count": 100,
+      "total_duration_sec": 0.0016,
+      "throughput_ops_sec": 64119.01,
+      "latency_stats_ms": {
+        "count": 100,
+        "mean": 0.012,
+        "median": 0.012,
+        "stddev": 0.0015,
+        "p95": 0.0137,
+        "p99": 0.0165,
+        "min_val": 0.0108,
+        "max_val": 0.0236
+      },
+      "cpu_time_stats_ms": {
+        "count": 100,
+        "mean": 0.0,
+        "median": 0.0,
+        "stddev": 0.0,
+        "p95": 0.0,
+        "p99": 0.0,
+        "min_val": 0.0,
+        "max_val": 0.0
+      },
+      "ram_delta_stats_kb": {
+        "count": 100,
+        "mean": 0.0005,
+        "median": 0.0,
+        "stddev": 0.0046,
+        "p95": 0.0,
+        "p99": 0.001,
+        "min_val": 0.0,
+        "max_val": 0.0459
+      },
+      "sub_latencies_ms": {},
+      "storage_growth_bytes": {
+        "sqlite_bytes": 0,
+        "jsonl_bytes": 0
+      },
+      "overhead_percent_vs_baseline_median": 0.0,
+      "overhead_percent_vs_baseline_mean": 0.0,
+      "simulated_transport_latency_ms": 0.0,
+      "invariant_violations": 0,
+      "invariant_violation_rate": 0.0
+    },
+    "scenario_b_crypto_only": {
+      "scenario_id": "scenario_b_crypto_only",
+      "scenario_name": "Scenario B: Governan\u00e7a Criptogr\u00e1fica Ed25519 + Trust Store + Autoridade Humana",
+      "description": "Assinatura RFC 8032 Ed25519, valida\u00e7\u00e3o de Trust Store e Verifica\u00e7\u00e3o Tripartite completa.",
+      "samples_count": 100,
+      "total_duration_sec": 0.0996,
+      "throughput_ops_sec": 1003.92,
+      "latency_stats_ms": {
+        "count": 100,
+        "mean": 0.985,
+        "median": 0.8914,
+        "stddev": 0.2178,
+        "p95": 1.3541,
+        "p99": 1.6862,
+        "min_val": 0.8621,
+        "max_val": 2.4116
+      },
+      "cpu_time_stats_ms": {
+        "count": 100,
+        "mean": 0.9375,
+        "median": 0.0,
+        "stddev": 3.7294,
+        "p95": 15.625,
+        "p99": 15.625,
+        "min_val": 0.0,
+        "max_val": 15.625
+      },
+      "ram_delta_stats_kb": {
+        "count": 100,
+        "mean": 0.2522,
+        "median": 0.144,
+        "stddev": 0.6843,
+        "p95": 0.3848,
+        "p99": 2.4316,
+        "min_val": 0.0,
+        "max_val": 6.3809
+      },
+      "sub_latencies_ms": {
+        "ed25519_sign_ms": {
+          "count": 100,
+          "mean": 0.2896,
+          "median": 0.2693,
+          "stddev": 0.0517,
+          "p95": 0.405,
+          "p99": 0.4866,
+          "min_val": 0.2587,
+          "max_val": 0.5455
+        },
+        "human_approval_issue_ms": {
+          "count": 100,
+          "mean": 0.1385,
+          "median": 0.1141,
+          "stddev": 0.1347,
+          "p95": 0.1788,
+          "p99": 0.3543,
+          "min_val": 0.1098,
+          "max_val": 1.4346
+        },
+        "tripartite_verify_ms": {
+          "count": 100,
+          "mean": 0.5272,
+          "median": 0.4829,
+          "stddev": 0.1123,
+          "p95": 0.7163,
+          "p99": 0.9383,
+          "min_val": 0.4709,
+          "max_val": 1.206
+        }
+      },
+      "storage_growth_bytes": {
+        "sqlite_bytes": 0,
+        "jsonl_bytes": 0
+      },
+      "overhead_percent_vs_baseline_median": 7328.33,
+      "overhead_percent_vs_baseline_mean": 8108.33,
+      "simulated_transport_latency_ms": 0.0,
+      "invariant_violations": 0,
+      "invariant_violation_rate": 0.0
+    },
+    "scenario_c_full_governance": {
+      "scenario_id": "scenario_c_full_governance",
+      "scenario_name": "Scenario C: Governan\u00e7a Completa com SQLite + PIC + Outbox fsync",
+      "description": "Ciclo completo com verifica\u00e7\u00e3o tripartite, or\u00e7amento at\u00f4mico SQLite, SEND_COMMITTED e proje\u00e7\u00e3o dur\u00e1vel com trava nativa.",
+      "samples_count": 100,
+      "total_duration_sec": 114.5809,
+      "throughput_ops_sec": 0.87,
+      "latency_stats_ms": {
+        "count": 100,
+        "mean": 1145.7935,
+        "median": 1133.2672,
+        "stddev": 96.7247,
+        "p95": 1299.9634,
+        "p99": 1358.1443,
+        "min_val": 966.6517,
+        "max_val": 1549.1912
+      },
+      "cpu_time_stats_ms": {
+        "count": 100,
+        "mean": 43.2812,
+        "median": 46.875,
+        "stddev": 19.3424,
+        "p95": 78.125,
+        "p99": 93.75,
+        "min_val": 15.625,
+        "max_val": 93.75
+      },
+      "ram_delta_stats_kb": {
+        "count": 100,
+        "mean": 0.369,
+        "median": 0.3281,
+        "stddev": 0.2885,
+        "p95": 0.6455,
+        "p99": 0.752,
+        "min_val": 0.0664,
+        "max_val": 2.9355
+      },
+      "sub_latencies_ms": {
+        "budget_registration_ms": {
+          "count": 100,
+          "mean": 237.2569,
+          "median": 230.4539,
+          "stddev": 29.3669,
+          "p95": 295.6914,
+          "p99": 319.4418,
+          "min_val": 185.6559,
+          "max_val": 326.2382
+        },
+        "reservation_acquire_ms": {
+          "count": 100,
+          "mean": 214.7749,
+          "median": 208.646,
+          "stddev": 32.7714,
+          "p95": 279.1716,
+          "p99": 292.539,
+          "min_val": 155.5669,
+          "max_val": 300.2436
+        },
+        "pic_and_completion_commit_ms": {
+          "count": 100,
+          "mean": 384.2366,
+          "median": 386.1834,
+          "stddev": 41.1481,
+          "p95": 457.1043,
+          "p99": 483.4236,
+          "min_val": 311.3151,
+          "max_val": 518.223
+        },
+        "outbox_projection_fsync_ms": {
+          "count": 100,
+          "mean": 308.8144,
+          "median": 296.374,
+          "stddev": 54.333,
+          "p95": 380.3673,
+          "p99": 411.2202,
+          "min_val": 247.0631,
+          "max_val": 689.2713
+        }
+      },
+      "storage_growth_bytes": {
+        "sqlite_bytes": 376832,
+        "jsonl_bytes": 192766
+      },
+      "overhead_percent_vs_baseline_median": 9443793.33,
+      "overhead_percent_vs_baseline_mean": 9548179.17,
+      "simulated_transport_latency_ms": 0.0,
+      "invariant_violations": 0,
+      "invariant_violation_rate": 0.0
+    },
+    "scenario_d_fallback_recommendation": {
+      "scenario_id": "scenario_d_fallback_recommendation",
+      "scenario_name": "Scenario D: Fallback Governado N\u00edvel 1 (max_dispatches=1, Recomenda\u00e7\u00e3o Exclusiva)",
+      "description": "Falha 429 comprovada no despacho prim\u00e1rio com max_dispatches=1; avalia\u00e7\u00e3o de custo e recomenda\u00e7\u00e3o sem despacho secund\u00e1rio.",
+      "samples_count": 100,
+      "total_duration_sec": 149.5585,
+      "throughput_ops_sec": 0.67,
+      "latency_stats_ms": {
+        "count": 100,
+        "mean": 1495.5685,
+        "median": 1455.5801,
+        "stddev": 207.1981,
+        "p95": 1866.6442,
+        "p99": 2344.5939,
+        "min_val": 1244.5721,
+        "max_val": 2440.2647
+      },
+      "cpu_time_stats_ms": {
+        "count": 100,
+        "mean": 71.875,
+        "median": 78.125,
+        "stddev": 27.0177,
+        "p95": 109.375,
+        "p99": 140.625,
+        "min_val": 15.625,
+        "max_val": 156.25
+      },
+      "ram_delta_stats_kb": {
+        "count": 100,
+        "mean": 0.2436,
+        "median": 0.2002,
+        "stddev": 0.2759,
+        "p95": 0.3691,
+        "p99": 0.6084,
+        "min_val": 0.0225,
+        "max_val": 2.835
+      },
+      "sub_latencies_ms": {
+        "fallback_evaluation_ms": {
+          "count": 100,
+          "mean": 518.8118,
+          "median": 499.8138,
+          "stddev": 96.69,
+          "p95": 669.8511,
+          "p99": 924.7812,
+          "min_val": 405.1073,
+          "max_val": 1084.4552
+        }
+      },
+      "storage_growth_bytes": {
+        "sqlite_bytes": 425984,
+        "jsonl_bytes": 256771
+      },
+      "overhead_percent_vs_baseline_median": 12129734.17,
+      "overhead_percent_vs_baseline_mean": 12462970.83,
+      "simulated_transport_latency_ms": 0.0,
+      "invariant_violations": 0,
+      "invariant_violation_rate": 0.0
+    },
+    "scenario_e_fallback_dispatch": {
+      "scenario_id": "scenario_e_fallback_dispatch",
+      "scenario_name": "Scenario E: Fallback Governado N\u00edvel 2 (max_dispatches=2, Consumo de Reserva Secund\u00e1ria)",
+      "description": "Falha 429 prim\u00e1ria com max_dispatches=2; autoriza\u00e7\u00e3o e consumo da cota secund\u00e1ria, PIC SEND_COMMITTED e proje\u00e7\u00e3o.",
+      "samples_count": 100,
+      "total_duration_sec": 223.355,
+      "throughput_ops_sec": 0.45,
+      "latency_stats_ms": {
+        "count": 100,
+        "mean": 2233.5258,
+        "median": 2194.433,
+        "stddev": 253.6297,
+        "p95": 2688.7484,
+        "p99": 3097.152,
+        "min_val": 1797.2762,
+        "max_val": 3400.3203
+      },
+      "cpu_time_stats_ms": {
+        "count": 100,
+        "mean": 96.25,
+        "median": 93.75,
+        "stddev": 31.3854,
+        "p95": 140.625,
+        "p99": 171.875,
+        "min_val": 15.625,
+        "max_val": 171.875
+      },
+      "ram_delta_stats_kb": {
+        "count": 100,
+        "mean": 0.3628,
+        "median": 0.3047,
+        "stddev": 0.3129,
+        "p95": 0.6152,
+        "p99": 0.6748,
+        "min_val": 0.0752,
+        "max_val": 3.1484
+      },
+      "sub_latencies_ms": {
+        "primary_dispatch_and_fail429_ms": {
+          "count": 100,
+          "mean": 634.9275,
+          "median": 617.1014,
+          "stddev": 86.3218,
+          "p95": 799.453,
+          "p99": 896.6742,
+          "min_val": 463.9809,
+          "max_val": 929.6526
+        },
+        "secondary_fallback_eval_and_reserve_ms": {
+          "count": 100,
+          "mean": 797.2032,
+          "median": 766.2194,
+          "stddev": 156.7306,
+          "p95": 1030.6429,
+          "p99": 1552.9037,
+          "min_val": 620.292,
+          "max_val": 1597.067
+        },
+        "secondary_pic_and_completion_ms": {
+          "count": 100,
+          "mean": 210.2615,
+          "median": 201.1907,
+          "stddev": 36.0217,
+          "p95": 280.0954,
+          "p99": 302.1953,
+          "min_val": 165.5973,
+          "max_val": 335.0164
+        }
+      },
+      "storage_growth_bytes": {
+        "sqlite_bytes": 544768,
+        "jsonl_bytes": 338206
+      },
+      "overhead_percent_vs_baseline_median": 18286841.67,
+      "overhead_percent_vs_baseline_mean": 18612615.0,
+      "simulated_transport_latency_ms": 50.0,
+      "invariant_violations": 0,
+      "invariant_violation_rate": 0.0
+    }
+  },
+  "concurrency_stress": {
+    "num_threads": 8,
+    "tasks_per_thread": 15,
+    "total_tasks": 120,
+    "successful_dispatches": 120,
+    "duration_sec": 27.0254,
+    "throughput_ops_sec": 4.44,
+    "latency_ms": {
+      "count": 120,
+      "mean": 1736.6157,
+      "median": 578.6562,
+      "stddev": 3262.5125,
+      "p95": 9452.2389,
+      "p99": 12516.9467,
+      "min_val": 93.0504,
+      "max_val": 19184.2327
+    },
+    "invariant_violations": 0,
+    "violation_rate": 0.0
+  },
+  "overall_invariants": {
+    "budget_overrun_violations": 0,
+    "replay_violations": 0,
+    "split_brain_double_allocations": 0,
+    "total_violations": 0,
+    "invariants_violation_rate": 0.0
+  }
+}

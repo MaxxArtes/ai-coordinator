@@ -195,14 +195,16 @@ class AtomicDispatchQuotaStore:
                     isolation_level=None,  # autocommit / manual transactions
                     check_same_thread=False,
                 )
+                self._conn.execute("PRAGMA busy_timeout = 30000;")
             return self._conn
         else:
             conn = sqlite3.connect(
                 self.db_path,
                 isolation_level=None,
-                timeout=5.0,
+                timeout=30.0,
                 check_same_thread=False,
             )
+            conn.execute("PRAGMA busy_timeout = 30000;")
             return conn
 
     def _init_database(self) -> None:
