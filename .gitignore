@@ -9,6 +9,18 @@ backups/
 .env.*
 !.env.example
 *.log
+.keys/
+*.secret
+*privkey*
+
+
+# Phase 4C.1 Pilot runtime files
+docs/benchmarks/pilot_quotas.db*
+docs/benchmarks/pilot_audit.jsonl
+docs/benchmarks/pilot_live_n1_result.json
+pilot_quotas.db*
+pilot_audit.jsonl
+pilot_live_n1_result.json
 
 # Python and package artifacts
 __pycache__/

@@ -1,0 +1,30 @@
+{
+  "manifest": {
+    "allowed_modalities": [
+      "text"
+    ],
+    "allowed_models": [
+      "liquid/lfm-3-1.7b:free",
+      "meta-llama/llama-3.2-3b-instruct:free"
+    ],
+    "authorization_id": "auth-pilot-4c2-reference-001",
+    "authorizer_identity": "security_operator_root",
+    "authorizer_permissions": [
+      "dispatch:openrouter_free"
+    ],
+    "code_commit": "1a0adb93ad5c4ebe755beb3d6b07dccfc43eeb92",
+    "execution_scope_id": "scope-pilot-run-4c2",
+    "issued_at_utc": "2026-11-09T17:00:00Z",
+    "max_budget_usd": 0.0,
+    "max_dispatches": 1,
+    "schema_version": "1.0",
+    "valid_until_utc": "2026-11-16T23:59:59Z"
+  },
+  "signature": {
+    "algorithm": "Ed25519",
+    "key_id": "ed25519:operator_primary_2026",
+    "public_key_hex": "5c9c6df261c9cb840475776aaefcd944b405328fab28f9b3a95ef40490d3de84",
+    "signature_hex": "ce0e40b24159796c1a8e673efae31da03d3c5427bda7ee7500f6c2752dd94153165966ab17d3872c51eccdc24c8f7c7f7008c74d0721efdf2bf8e4b2836dc902",
+    "signed_at_utc": "2026-11-09T17:00:05Z"
+  }
+}

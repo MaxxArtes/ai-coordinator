@@ -1,0 +1,9 @@
+{
+  "target_model": "liquid/lfm-3-1.7b:free",
+  "max_budget_usd": 0.0,
+  "code_commit": "1a0adb93ad5c4ebe755beb3d6b07dccfc43eeb92",
+  "authorizer": "operador",
+  "valid_until": "2026-11-10T23:59:59Z",
+  "scope": "N=1 single controlled pilot call (TEXT modality)",
+  "purpose": "Homologação experimental da Fase 4C.1 com custo estrito zero"
+}

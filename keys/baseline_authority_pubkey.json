@@ -1,0 +1,9 @@
+{
+  "authority": "AI Coordinator Benchmark Authority",
+  "key_id": "ai-coordinator-baseline-v0.5.1-authority",
+  "algorithm": "RSASSA-PKCS1-v1_5-SHA256",
+  "key_size_bits": 2048,
+  "public_exponent": 65537,
+  "modulus": "7a87b1d4badf4d94e2696a1595a5a6a4744d5a9ecb84a5211389ae5c60c403ceb72f71f02b9dd958fcb580e10ee5f2b5c20d4292fa48b705a47341c1fd0cddb1d6180f0dd1a8f7f8d17bdf7b5dfa17bf6575884dba9c4a4850eef22a8994b8ae2a8ceea8018ee1d7aabbfe39262da101917abe4bbacf6ffb8b62c9be6574a23c0d06118bb7e5b65ad4acd0c9155392693ac3020f1e918070d46d248b7670c818ac1324d597080a20192968cf0344656a10a3c3c7e1dea0fb76236b57fc056ed7df2866aea535503540eb99ab97ad010b20adfc6036574d3a1b7d353a8dee4b0fbc59939b8f473526f58467c5d2fbcad92f22893230110e8b67c4cfeb194a7a9d",
+  "fingerprint_sha256": "f0f3d377306e00092daf6dff94826e69d24c1174bc4b32ab81086419f4c995c6"
+}

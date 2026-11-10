@@ -120,7 +120,11 @@ def test_genuine_v0_4_0_migration_and_recovery(tmp_dir: Path, py_bin: Path):
     
     # Step A: Extract genuine v0.4.0 repository tree in memory from tag v0.4.0
     v040_stage = tmp_dir / "v040_stage"
-    res = subprocess.run(["git", "-C", str(ROOT), "archive", "v0.4.0"], capture_output=True, check=True)
+    try:
+        res = subprocess.run(["git", "-C", str(ROOT), "archive", "v0.4.0"], capture_output=True, check=True)
+    except subprocess.CalledProcessError:
+        subprocess.run(["git", "-C", str(ROOT), "fetch", "--tags", "origin"], capture_output=True)
+        res = subprocess.run(["git", "-C", str(ROOT), "archive", "v0.4.0"], capture_output=True, check=True)
     with tarfile.open(fileobj=io.BytesIO(res.stdout)) as tf:
         tf.extractall(v040_stage)
 
