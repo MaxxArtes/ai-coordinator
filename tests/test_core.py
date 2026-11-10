@@ -251,12 +251,16 @@ class CliVersionTests(unittest.TestCase):
         self.assertEqual(output, expected)
 
     def test_cli_entrypoint_version_flag(self):
-        import subprocess, sys
+        import subprocess, sys, os
         from ai_coordinator.cli import _get_version
+        repo_src = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "src"))
+        env = os.environ.copy()
+        env["PYTHONPATH"] = f"{repo_src}{os.pathsep}{env.get('PYTHONPATH', '')}"
         res = subprocess.run(
             [sys.executable, "-c", "from ai_coordinator.cli import main; main()", "--version"],
             capture_output=True,
             text=True,
+            env=env,
         )
         self.assertEqual(res.returncode, 0, f"Falha na execucao do CLI. Stderr: {res.stderr}")
         expected = f"ai-coordinator {_get_version()}"

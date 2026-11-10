@@ -19,6 +19,7 @@ Estado de tarefas compartilhado entre agentes de programação e operadores huma
 - **Agent Skill**: instruções para encontrar e retomar a tarefa adequada sem carregar históricos extensos.
 - **Plugin Claude Code**: skill e configuração integrada para conectar o servidor MCP.
 - **Plugin OpenCode V2**: tools para acessar o mesmo estado local pela CLI de forma determinística.
+- **Governança de Despacho Multi-Modelo e Fallback Governado**: Verificação tripartite com assinatura Ed25519 (RFC 8032), Trust Store com rotação e expiração de chaves, aprovação operacional humana autenticada (HMAC-SHA256 vinculada a propósito), cotas atômicas e anti-replay persistente em SQLite WAL (`AtomicDispatchQuotaStore`), Ponto de Compromisso Irreversível (PIC `SEND_COMMITTED`) e Transactional Outbox durável sincronizado sob trava nativa do kernel do SO (`msvcrt` / `fcntl`) sem vulnerabilidade TOCTOU.
 - **Avaliação de rotas**: executa casos fixos contra candidatos selecionados e registra saída, tempo e métricas para nota humana.
 
 O estado e a configuração ficam no diretório de dados do usuário. Na primeira execução, o programa copia `routes.example.json` e o protocolo compartilhado para esse diretório, sem substituir arquivos existentes. Defina `AI_COORDINATOR_HOME` para usar outro local. Credenciais e dados de execução não fazem parte do pacote.
@@ -52,8 +53,9 @@ O AI Coordinator executa workers sob política de menor privilégio e isolamento
 - **Protocolo de Inicialização em Duas Fases**: O worker é criado suspenso no SO, seu PID e identidade estável são registrados na trilha de auditoria e a execução só é liberada (`resume()`) após o commit durável da auditoria. Falhas na auditoria abortam o processo antes da execução de qualquer comando (*fail-closed*).
 - **Sandboxes de Filesystem**: Workers têm permissão de escrita restrita exclusivamente à sua própria pasta temporária de sandbox. Tentativas de ler chaves do coordenador (`auth/`), banco SQLite, credenciais de usuário (`.ssh`, `.aws`) ou tarefas irmãs são bloqueadas pelo kernel do SO.
 - **Tool Broker e Mailbox**: Workers não possuem acesso a rede ou IPC direto. Ferramentas são solicitadas via arquivos JSON na pasta `.broker/requests` assinados com token HMAC e mediadas pelo supervisor durante o streaming. Tentativas de spoofing de PID ou adulteração de token encerram imediatamente a árvore de processos do worker.
+- **Governança de Despacho e Custo Zero**: Despachos a modelos externos requerem autorização tripartite Ed25519 + HMAC de operador, validação de commit, cota atômica e avanço obrigatório ao PIC (`SEND_COMMITTED`) em SQLite WAL antes de qualquer transporte de rede, com auditoria durável em Transactional Outbox sob trava nativa de SO. Falhas indeterminadas (`UNKNOWN`) proíbem retransmissão para prevenir dupla cobrança.
 
-Consulte [`docs/security.md`](docs/security.md) e [`docs/architecture.md`](docs/architecture.md) para detalhes completos sobre limites, ameaças e garantias.
+Consulte [`docs/security.md`](docs/security.md), [`docs/security/governance_security_and_limitations.md`](docs/security/governance_security_and_limitations.md) e [`docs/architecture.md`](docs/architecture.md) para detalhes completos sobre limites, ameaças e garantias.
 
 ---
 

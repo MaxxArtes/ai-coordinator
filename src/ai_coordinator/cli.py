@@ -720,14 +720,14 @@ def export_context(store, config, ident, destination):
 
 def _get_version() -> str:
     try:
-        from importlib.metadata import version as package_version
-        return package_version("ai-coordinator")
+        from . import __version__
+        return __version__
     except Exception:
         try:
-            from . import __version__
-            return __version__
+            from importlib.metadata import version as package_version
+            return package_version("ai-coordinator")
         except Exception:
-            return "0.5.0"
+            return "0.5.1"
 
 def parser():
     p = argparse.ArgumentParser(prog="ai-coordinator", description=__doc__)

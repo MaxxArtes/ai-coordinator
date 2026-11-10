@@ -196,6 +196,7 @@ class AtomicDispatchQuotaStore:
                     check_same_thread=False,
                 )
                 self._conn.execute("PRAGMA busy_timeout = 30000;")
+                self._conn.execute("PRAGMA foreign_keys = ON;")
             return self._conn
         else:
             conn = sqlite3.connect(
@@ -205,6 +206,7 @@ class AtomicDispatchQuotaStore:
                 check_same_thread=False,
             )
             conn.execute("PRAGMA busy_timeout = 30000;")
+            conn.execute("PRAGMA foreign_keys = ON;")
             return conn
 
     def _init_database(self) -> None:

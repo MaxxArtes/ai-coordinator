@@ -7,6 +7,39 @@ e este projeto adere ao [Versionamento Semântico](https://semver.org/lang/pt-BR
 
 ---
 
+## [0.6.0] - Proposta / Homologação Fase 4C.2 (Aguardando Liberação Operacional)
+
+Versão proposta consolidando a implementação e homologação offline da **Fase 4C.2 (Fallback Multi-Modelo Governado e Especificação Técnica Offline)**.
+
+> [!NOTE]
+> Versão desenvolvida e testada 100% offline ($0.00 USD incorridos). A publicação oficial da tag e release no PyPI permanece pendente de autorização do operador e teste de staging com provedor real.
+
+### Adicionado
+
+#### Governança Criptográfica e Verificação Tripartite (Fase 4C.2.2)
+- **Assinatura Ed25519 RFC 8032**: `CanonicalAuthorizationManifest` e `Ed25519Signer` para assinatura determinística de manifestos de despacho contendo commit HEAD, modelos autorizados, cotas e validade temporal.
+- **Trust Store Local com Rotação**: `TrustStore` para gestão segura de chaves públicas autorizadas, status (`ACTIVE`, `REVOKED`, `EXPIRED`) e permissões estritas (`PERMISSION_DISPATCH_OPENROUTER_FREE`, `PERMISSION_AUDIT_VERIFY`).
+- **Autoridade Operacional Humana Autenticada**: `HumanOperationalAuthority` exigindo autenticação do supervisor via `supervisor_key` e emissão de tokens HMAC-SHA256 vinculados ao `authorization_id` e ao propósito estrito da execução.
+- **Verificador Tripartite**: `TripartiteAuthorizationVerifier` inspecionando simultaneamente a chave criptográfica, o commit HEAD de código e a autorização humana autenticada.
+
+#### Orçamento Atômico e Ponto de Compromisso Irreversível (Fase 4C.2.3)
+- **Store SQLite com BEGIN IMMEDIATE**: `AtomicDispatchQuotaStore` com isolamento estrito WAL, garantindo semântica local *at-most-once* e teto global inviolável (`max_dispatches`).
+- **Anti-Replay Persistente**: Tabela `consumed_authorizations` com restrição de unicidade em banco, impedindo reuso de manifestos através de reinicializações e falhas.
+- **Ponto de Compromisso Irreversível (PIC `SEND_COMMITTED`)**: Transição transacional atômica antes de qualquer transporte TLS com revalidação de todas as invariantes e persistência durável via `fsync`.
+- **Proibição de Retransmissão após UNKNOWN**: Estados indeterminados retêm o saldo consumido de forma fail-closed, impedindo dupla cobrança remota em caso de timeout de transporte.
+
+#### Transactional Outbox e Sincronização Nativa sem TOCTOU (Fase 4C.2.4)
+- **Projeção Atômica de Eventos**: `TransactionalOutboxProjector` projetando eventos do SQLite para JSONL canônico de auditoria de forma idempotente e recuperável.
+- **Travas Nativas de Kernel**: `_InterProcessFileLock` utilizando `msvcrt.locking` no Windows e `fcntl.flock` no POSIX sobre arquivo de trava permanente. Eliminação completa de `os.unlink()`, prevenindo corridas TOCTOU e garantindo liberação automática pelo kernel em caso de término abrupto de processos.
+
+#### Fallback Multi-Modelo e Benchmarks Comparativos (Fase 4C.2.5 / 4C.2.6)
+- **Mecanismo de Fallback em Dois Níveis**: `GovernedFallbackEngine` avaliando candidatos gratuitos sob `FreeCostGuard`:
+  - Nível 1 (`max_dispatches=1`): Emite recomendação governada sem despacho secundário.
+  - Nível 2 (`max_dispatches=2`): Autoriza e transiciona a cota secundária sob novo PIC.
+- **Campanha Quantitativa de Benchmarks**: Suíte comparativa em `benchmark_4c2.py` avaliando 6 cenários empíricos com separação de Heap Python e RSS do processo, proveniência de commits segregada e exportação de amostras brutas.
+
+---
+
 ## [0.5.1] - 2026-11-03
 
 Release de segurança prioritária e endurecimento de isolamento (*Security Hardening*), corrigindo os achados de auditoria identificados na revisão do PR #2 do Codex.

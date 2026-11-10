@@ -104,9 +104,37 @@ class TestPhase4C25Benchmarks(unittest.TestCase):
         """TC-08: Full benchmark campaign executes warmup and all scenarios end-to-end."""
         campaign = self.runner.run_full_campaign(iterations=5, warmup_iterations=2)
         self.assertIn("scenarios", campaign)
-        self.assertEqual(len(campaign["scenarios"]), 5)
+        self.assertEqual(len(campaign["scenarios"]), 6)
+        self.assertIn("active_repo_commit", campaign["environment"])
+        self.assertIn("baseline_reference_commit", campaign["environment"])
+        self.assertIn("auth_manifest_fixture_commit", campaign["environment"])
+        self.assertIn("raw_latency_samples_ms", campaign["scenarios"]["scenario_c_full_governance"])
+        self.assertIn("process_rss_delta_stats_kb", campaign["scenarios"]["scenario_c_full_governance"])
         self.assertEqual(campaign["overall_invariants"]["total_violations"], 0)
         self.assertEqual(campaign["overall_invariants"]["invariants_violation_rate"], 0.0)
+
+    def test_09_scenario_a2_legacy_cost_guard(self) -> None:
+        """TC-09: Scenario A2 pre-4C.2 FreeCostGuard baseline executes deterministically."""
+        res = self.runner.run_scenario_a2_legacy_cost_guard(iterations=10)
+        self.assertEqual(res.samples_count, 10)
+        self.assertEqual(res.invariant_violations, 0)
+        self.assertEqual(res.invariant_violation_rate, 0.0)
+        self.assertGreater(res.throughput_ops_sec, 0.0)
+        self.assertGreater(res.latency_stats_ms.median, 0.0)
+        self.assertEqual(len(res.raw_latency_samples_ms), 10)
+
+    def test_10_sqlite_and_outbox_invariants_auditor(self) -> None:
+        """TC-10: Invariants auditor verifies clean database and reports zero violations."""
+        res_c = self.runner.run_scenario_c_full_governance(iterations=5)
+        db_path = os.path.join(self.runner.tmp_dir, "bench_c.db")
+        ledger_path = os.path.join(self.runner.tmp_dir, "bench_c_audit.jsonl")
+        audit = self.runner.audit_sqlite_and_outbox_invariants(db_path, ledger_path)
+        self.assertEqual(audit["violations"], 0)
+        self.assertEqual(audit["budget_overrun_violations"], 0)
+        self.assertEqual(audit["replay_violations"], 0)
+        self.assertEqual(audit["split_brain_double_allocations"], 0)
+        self.assertEqual(audit["outbox_projection_mismatches"], 0)
+        self.assertGreater(audit["total_checks_evaluated"], 0)
 
 
 if __name__ == "__main__":
