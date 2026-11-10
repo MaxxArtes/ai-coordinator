@@ -6,7 +6,9 @@ import hashlib
 import hmac
 import json
 import os
+import shutil
 import sqlite3
+import stat
 import subprocess
 import sys
 import tempfile
@@ -35,6 +37,7 @@ class TestPhase4CBaselineExecution(unittest.TestCase):
     def setUp(self) -> None:
         self.test_dir = tempfile.mkdtemp(prefix="test_phase4c_baseline_")
         self.store = Store(self.test_dir)
+        # Synthetic test fixture for validating offline CLI verifier channels (--key-env, --key-file, --key-stdin)
         self.hmac_secret = "test_baseline_hmac_secret_key_2026"
 
     def tearDown(self) -> None:
@@ -43,6 +46,8 @@ class TestPhase4CBaselineExecution(unittest.TestCase):
                 self.store.db.close()
             except Exception:
                 pass
+        if hasattr(self, "test_dir") and os.path.exists(self.test_dir):
+            shutil.rmtree(self.test_dir, ignore_errors=True)
 
     def test_01_canonical_solvers_independent_accuracy(self) -> None:
         """Validate that independent solvers reproduce expected outputs without accessing expected_output."""
@@ -347,7 +352,11 @@ class TestPhase4CBaselineExecution(unittest.TestCase):
         with open(report_path, "w", encoding="utf-8") as f:
             json.dump(report_dict, f, indent=2)
 
-        with open(key_file_path, "w", encoding="utf-8") as f:
+        # Secure isolation: create synthetic fixture with restricted permissions (0o600 / owner read-write only).
+        # Note: self.hmac_secret is a non-production synthetic test fixture used strictly
+        # to validate the --key-file argument of the offline verification CLI.
+        fd = os.open(key_file_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, stat.S_IRUSR | stat.S_IWUSR)
+        with open(fd, "w", encoding="utf-8") as f:
             f.write(self.hmac_secret)
 
         script_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "scripts", "verify_baseline_integrity.py"))
@@ -432,6 +441,10 @@ class TestPhase4CBaselineExecution(unittest.TestCase):
         )
         self.assertEqual(res_empty.returncode, 1)
         self.assertIn("REPROVADO", res_empty.stderr)
+
+        # Secure cleanup: remove temporary synthetic test key file immediately after verification
+        if os.path.exists(key_file_path):
+            os.remove(key_file_path)
 
     def test_08_discontinuation_of_hmac_key_cli_argument(self) -> None:
         """Validate permanent discontinuation and fatal rejection of --hmac-key / -k arguments (CWE-214)."""

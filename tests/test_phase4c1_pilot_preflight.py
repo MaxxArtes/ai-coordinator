@@ -22,6 +22,7 @@ from __future__ import annotations
 import dataclasses
 import datetime as dt
 import inspect
+import io
 import json
 import os
 import shutil
@@ -30,6 +31,7 @@ import sys
 import tempfile
 import time
 import unittest
+from contextlib import redirect_stdout
 from unittest.mock import MagicMock, patch
 
 REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
@@ -64,6 +66,7 @@ from prepare_pilot_text_call import (
     evaluate_requirements,
     execute_live_pilot,
     prepare_offline_dry_run,
+    print_requirements_table,
     resolve_current_commit,
     validate_authorization_manifest,
 )
@@ -660,6 +663,74 @@ class TestPhase4C1PilotPreflight(unittest.TestCase):
         """Ajuste 5: O modo dry-run identifica explicitamente catálogo, latência, tokens e custo como sintéticos."""
         ret = prepare_offline_dry_run()
         self.assertEqual(ret, 0)
+
+    def test_17_api_key_sanitization_no_fragment_leak(self) -> None:
+        """CodeQL #3 Hardening: evaluate_requirements e print_requirements_table nunca expõem fragmentos de credenciais."""
+        synthetic_key = "sk-or-v1-supersecretkeypart1234567890abcdef"
+
+        reqs = evaluate_requirements(
+            api_key=synthetic_key,
+            spend_cap_confirmed=True,
+            auto_recharge_confirmed=True,
+            authorized_by_user=True,
+        )
+
+        # 1. API_KEY_PRESENT deve ser puramente booleano e conter apenas 'CONFIGURADA'
+        self.assertEqual(reqs["API_KEY_PRESENT"]["status"], RequirementStatus.VERIFIED)
+        self.assertEqual(reqs["API_KEY_PRESENT"]["details"], "Chave de API: CONFIGURADA")
+
+        # 2. Nenhum campo de reqs deve conter qualquer fragmento da chave (mesmo de 4 caracteres)
+        for req_name, info in reqs.items():
+            for k, val in info.items():
+                val_str = str(val)
+                self.assertNotIn(synthetic_key, val_str)
+                self.assertNotIn("supersecret", val_str)
+                self.assertNotIn("1234567890", val_str)
+
+        # 3. A tabela impressa nunca deve conter fragmentos da chave
+        out_buf = io.StringIO()
+        with redirect_stdout(out_buf):
+            print_requirements_table(reqs)
+        captured = out_buf.getvalue()
+        self.assertNotIn(synthetic_key, captured)
+        self.assertNotIn("supersecret", captured)
+        self.assertNotIn("1234567890", captured)
+        self.assertIn("Chave de API: CONFIGURADA", captured)
+
+    def test_18_execute_live_pilot_blocks_without_custom_transport(self) -> None:
+        """Governança Fail-Closed: execute_live_pilot com custom_transport=None deve abortar fail-closed sem criar transporte vivo não governado."""
+        manifest_file = self._create_valid_manifest_file("meta-llama/llama-3.2-3b-instruct:free")
+        mock_client = MagicMock(spec=OfficialOpenRouterCatalogClient)
+        mock_client.fetch_catalog.return_value = self.official_snapshot
+
+        mock_verifier = MagicMock(spec=OpenRouterAccountVerifier)
+        mock_verifier.verify_key_limits.return_value = {
+            "status": "OK",
+            "limit": 0.0,
+            "limit_is_zero": True,
+            "usage": 0.0,
+            "is_free_tier": True,
+        }
+
+        err_buf = io.StringIO()
+        with patch("sys.stderr", err_buf):
+            with patch("urllib.request.urlopen") as mock_urlopen:
+                exit_code = execute_live_pilot(
+                    api_key_override="sk-or-v1-fake-live-key",
+                    catalog_client=mock_client,
+                    account_verifier=mock_verifier,
+                    confirm_spend_cap_zero=True,
+                    confirm_no_auto_recharge=True,
+                    authorization_manifest_path=manifest_file,
+                    authorized_by_user=True,
+                    bench_dir=self.tmp_dir,
+                    custom_transport=None,  # Crucial: un-governed live transport is forbidden!
+                )
+
+        self.assertEqual(exit_code, 1, "execute_live_pilot com custom_transport=None deve falhar fail-closed com código 1")
+        mock_urlopen.assert_not_called()
+        self.assertIn("BLOQUEIO DE SEGURANÇA FAIL-CLOSED", err_buf.getvalue())
+        self.assertIn("transporte legado não governado está categoricamente desativada", err_buf.getvalue())
 
 
 if __name__ == "__main__":
