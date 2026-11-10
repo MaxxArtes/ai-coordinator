@@ -698,7 +698,7 @@ class TestPhase4C1PilotPreflight(unittest.TestCase):
         self.assertIn("Chave de API: CONFIGURADA", captured)
 
     def test_18_execute_live_pilot_blocks_without_custom_transport(self) -> None:
-        """Governança Fail-Closed: execute_live_pilot com custom_transport=None deve abortar fail-closed sem criar transporte vivo não governado."""
+        """Governança Fail-Closed: execute_live_pilot com custom_transport=None deve abortar fail-closed antes de consultas externas ou banco."""
         manifest_file = self._create_valid_manifest_file("meta-llama/llama-3.2-3b-instruct:free")
         mock_client = MagicMock(spec=OfficialOpenRouterCatalogClient)
         mock_client.fetch_catalog.return_value = self.official_snapshot
@@ -712,6 +712,7 @@ class TestPhase4C1PilotPreflight(unittest.TestCase):
             "is_free_tier": True,
         }
 
+        bench_dir = os.path.join(self.tmp_dir, "test_early_block_bench")
         err_buf = io.StringIO()
         with patch("sys.stderr", err_buf):
             with patch("urllib.request.urlopen") as mock_urlopen:
@@ -723,14 +724,50 @@ class TestPhase4C1PilotPreflight(unittest.TestCase):
                     confirm_no_auto_recharge=True,
                     authorization_manifest_path=manifest_file,
                     authorized_by_user=True,
-                    bench_dir=self.tmp_dir,
+                    bench_dir=bench_dir,
                     custom_transport=None,  # Crucial: un-governed live transport is forbidden!
                 )
 
         self.assertEqual(exit_code, 1, "execute_live_pilot com custom_transport=None deve falhar fail-closed com código 1")
+        # Assert that the fail-closed abort happened early BEFORE any external network or storage initialization
         mock_urlopen.assert_not_called()
+        mock_client.fetch_catalog.assert_not_called()
+        mock_verifier.verify_key_limits.assert_not_called()
+        self.assertFalse(os.path.exists(os.path.join(bench_dir, "pilot_quotas.db")), "Banco SQLite não deve ser criado quando live é abortado precocemente")
+        self.assertFalse(os.path.exists(os.path.join(bench_dir, "pilot_audit.jsonl")), "Ledger de auditoria não deve ser criado")
         self.assertIn("BLOQUEIO DE SEGURANÇA FAIL-CLOSED", err_buf.getvalue())
         self.assertIn("transporte legado não governado está categoricamente desativada", err_buf.getvalue())
+
+    def test_19_account_verifier_exception_sanitization_with_synthetic_key(self) -> None:
+        """Sanitização Defensiva: verify_key_limits nunca expõe credenciais em mensagens de erro ou exceções simuladas."""
+        synthetic_key = "sk-or-v1-uniquesecretsimulatedkey9876543210"
+        verifier = OpenRouterAccountVerifier()
+
+        # Cenário A: Exceção de segurança (OpenRouterAccountSecurityError) contendo a credencial no corpo
+        mock_opener_sec = MagicMock()
+        mock_opener_sec.open.side_effect = OpenRouterAccountSecurityError(
+            f"Security policy violated for bearer credential {synthetic_key}"
+        )
+        verifier.opener = mock_opener_sec
+        res_sec = verifier.verify_key_limits(synthetic_key)
+
+        self.assertEqual(res_sec["status"], "FAILED")
+        self.assertIn("[REDACTED]", res_sec["error"])
+        self.assertNotIn(synthetic_key, res_sec["error"], "Chave sintética não deve aparecer na mensagem de erro")
+        self.assertNotIn("uniquesecretsimulatedkey", res_sec["error"])
+
+        # Cenário B: Exceção genérica de rede / socket contendo a credencial
+        mock_opener_err = MagicMock()
+        mock_opener_err.open.side_effect = RuntimeError(
+            f"Failed to connect to host with header Authorization: Bearer {synthetic_key}"
+        )
+        verifier.opener = mock_opener_err
+        res_err = verifier.verify_key_limits(synthetic_key)
+
+        self.assertEqual(res_err["status"], "ERROR")
+        self.assertIn("[REDACTED]", res_err["error"])
+        self.assertNotIn(synthetic_key, res_err["error"], "Chave sintética não deve aparecer na mensagem de erro")
+        self.assertNotIn("uniquesecretsimulatedkey", res_err["error"])
 
 
 if __name__ == "__main__":

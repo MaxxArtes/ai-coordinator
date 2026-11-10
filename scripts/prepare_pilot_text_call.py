@@ -690,6 +690,22 @@ def execute_live_pilot(
         print("O piloto em ambiente real depende de autorização formal expressa do usuário.", file=sys.stderr)
         return 1
 
+    # Gate 0.1: Early fail-closed block against raw un-governed live execution.
+    # Production execution of the legacy pilot path is categorically disabled fail-closed.
+    # The 'custom_transport' parameter is strictly a test fixture injection mechanism for offline simulation suites,
+    # and does NOT constitute operational authorization for live production egress.
+    if custom_transport is None:
+        print("\n[BLOQUEIO DE SEGURANÇA FAIL-CLOSED]", file=sys.stderr)
+        print(
+            "A execução live via transporte legado não governado está categoricamente desativada fail-closed.\n"
+            "Exige-se integração formal com o transporte governado da Fase 4C.2 "
+            "(GovernedMultiModelTransport com tripartite manifest e AtomicDispatchQuotaStore).\n"
+            "Nenhuma chamada de rede, consulta de conta ou catálogo, ou criação de banco de dados foi executada.\n"
+            "Use '--dry-run' para validações offline ou forneça um transporte simulado via 'custom_transport' em testes.",
+            file=sys.stderr,
+        )
+        return 1
+
     # Resolve commit strictly
     try:
         commit_hash = resolve_current_commit()
@@ -821,19 +837,8 @@ def execute_live_pilot(
         details={"stage": "pilot_authorization_manifest", "authorization_manifest": auth_record.to_dict()},
     )
 
-    # Step 10: Fail-closed guard against raw un-governed live transport execution
-    if custom_transport is None:
-        print("\n[BLOQUEIO DE SEGURANÇA FAIL-CLOSED]", file=sys.stderr)
-        print(
-            "A execução live via transporte legado não governado está categoricamente desativada fail-closed.\n"
-            "Exige-se integração formal com o transporte governado da Fase 4C.2 "
-            "(GovernedMultiModelTransport com tripartite manifest e AtomicDispatchQuotaStore).\n"
-            "Use '--dry-run' para validações offline ou forneça um transporte simulado via 'custom_transport'.",
-            file=sys.stderr,
-        )
-        return 1
-
-    print("\n[Passo 5/6] Ativando transporte em modo controlado (tentativa única estrita N=1)...")
+    # Step 10: Configure test transport for simulation (STRICT SINGLE ATTEMPT, NO RETRIES)
+    print("\n[Passo 5/6] Ativando transporte simulado em modo controlado (tentativa única estrita N=1)...")
     transport = custom_transport
 
     strict_single_attempt_policy = RetryPolicy(max_attempts=1)
