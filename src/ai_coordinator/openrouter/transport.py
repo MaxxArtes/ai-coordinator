@@ -550,10 +550,15 @@ class OpenRouterHttpTransport:
 
         # Strict Provider Routing Restriction:
         # In governed dispatch, fallback is exclusively governed locally by GovernedFallbackEngine.
-        # Provider-side fallbacks or arbitrary routing options are strictly prohibited fail-closed.
+        # Remote fallback arrays ('models'), provider-side fallbacks ('provider.allow_fallbacks'), or
+        # arbitrary routing parameters ('route') are strictly prohibited fail-closed.
         if "route" in payload and payload["route"] is not None:
             raise CostGuardError(
                 "[FAIL-CLOSED] Parâmetro 'route' proibido em dispatch_governed: o roteamento é estritamente governado localmente."
+            )
+        if "models" in payload and payload["models"] is not None:
+            raise CostGuardError(
+                "[FAIL-CLOSED] Parâmetro 'models' proibido em dispatch_governed: o fallback entre modelos deve acontecer exclusivamente sob controle local do AI Coordinator."
             )
         provider_cfg = payload.get("provider")
         if isinstance(provider_cfg, dict):
@@ -564,17 +569,6 @@ class OpenRouterHttpTransport:
 
         # Mandatory CostGuard deep inspection of payload (models list, pricing, options)
         self.cost_guard.inspect_request_payload(payload)
-
-        if "models" in payload and payload["models"] is not None:
-            models_list = payload["models"]
-            if not isinstance(models_list, list):
-                raise CostGuardError("Parâmetro 'models' deve ser uma lista de identificadores de modelos.")
-            for m in models_list:
-                if budget_models and str(m) not in budget_models:
-                    raise UnauthorizedModelError(
-                        f"[FAIL-CLOSED] Modelo de contingência implícito '{m}' em 'models' não está autorizado pelo orçamento '{budget_id}': {budget_models}"
-                    )
-                self.cost_guard.authorize_model_execution(str(m), verify_freshness=True)
 
         model_id = payload.get("model")
         if not model_id:
@@ -650,7 +644,19 @@ class OpenRouterHttpTransport:
         if custom_headers:
             headers.update(custom_headers)
 
-        encoded_data = json.dumps(payload).encode("utf-8")
+        # Build sanitized outbound governed payload for Attempt #1:
+        # 1. Strip any remote fallback keys (models, route).
+        # 2. Exclusively bind model to the authorized reservation's target_model.
+        # 3. Explicitly define provider.allow_fallbacks=False (disabling provider-side fallback default).
+        outbound_payload = dict(payload)
+        outbound_payload.pop("models", None)
+        outbound_payload.pop("route", None)
+        outbound_payload["model"] = model_id_str
+        outbound_provider = dict(outbound_payload.get("provider") or {})
+        outbound_provider["allow_fallbacks"] = False
+        outbound_payload["provider"] = outbound_provider
+
+        encoded_data = json.dumps(outbound_payload).encode("utf-8")
         req = urllib.request.Request(url, data=encoded_data, headers=headers, method="POST")
 
         t0 = time.perf_counter()
@@ -784,7 +790,13 @@ class OpenRouterHttpTransport:
                     # Execute secondary dispatch for contingency model
                     contingency_model = fb_decision.target_model
                     contingency_payload = dict(payload)
+                    contingency_payload.pop("models", None)
+                    contingency_payload.pop("route", None)
                     contingency_payload["model"] = contingency_model
+                    contingency_provider = dict(contingency_payload.get("provider") or {})
+                    contingency_provider["allow_fallbacks"] = False
+                    contingency_payload["provider"] = contingency_provider
+
                     self.cost_guard.authorize_model_execution(contingency_model, verify_freshness=True)
 
                     headers_2 = dict(headers)

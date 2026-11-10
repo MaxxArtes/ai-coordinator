@@ -593,14 +593,14 @@ class TransportGovernanceIntegrationTests(unittest.TestCase):
         self.assertEqual(self.mock_opener.open.call_count, 0, "Zero HTTP calls when provider fallback is requested.")
 
     # -------------------------------------------------------------------------
-    # Test 13: Implicit models list with unmanifested model rejected
+    # Test 13: Passing models array in governed dispatch is strictly rejected
     # -------------------------------------------------------------------------
     def test_13_implicit_models_list_with_unauthorized_model_rejected(self) -> None:
-        """If 'models' array contains an unmanifested model, dispatch_governed fails closed."""
+        """Remote fallback arrays ('models') in payload violate local deterministic control and fail closed."""
         signed, approval = self._create_signed_manifest_and_approval(
             "auth-test-models-list",
             max_dispatches=1,
-            models=[self.primary_model],  # only primary model manifested
+            models=[self.primary_model, self.contingency_model],
         )
         transport = OpenRouterHttpTransport(
             cost_guard=self.cost_guard,
@@ -612,11 +612,11 @@ class TransportGovernanceIntegrationTests(unittest.TestCase):
         )
         payload = {
             "model": self.primary_model,
-            "models": [self.primary_model, self.contingency_model],  # contingency model not manifested!
+            "models": [self.primary_model, self.contingency_model],
             "messages": [{"role": "user", "content": "hi"}],
         }
 
-        with self.assertRaises(UnauthorizedModelError) as ctx:
+        with self.assertRaises(CostGuardError) as ctx:
             transport.dispatch_governed(
                 modality_str="text",
                 payload=payload,
@@ -625,8 +625,8 @@ class TransportGovernanceIntegrationTests(unittest.TestCase):
                 signed_manifest=signed,
                 human_approval=approval,
             )
-        self.assertIn("não está autorizado pelo orçamento", str(ctx.exception))
-        self.assertEqual(self.mock_opener.open.call_count, 0, "Zero HTTP calls when unmanifested model in models array.")
+        self.assertIn("Parâmetro 'models' proibido", str(ctx.exception))
+        self.assertEqual(self.mock_opener.open.call_count, 0, "Zero HTTP calls when models array is passed.")
 
     # -------------------------------------------------------------------------
     # Test 14: Omitted human consent fails closed (no automatic True conversion)
@@ -732,6 +732,96 @@ class TransportGovernanceIntegrationTests(unittest.TestCase):
             transport.dispatch("text", payload)
 
         self.assertEqual(self.mock_opener.open.call_count, 0, "Zero calls when legacy dispatch blocked by default.")
+
+    # -------------------------------------------------------------------------
+    # Test 17: Outbound payload transmits exclusively reserved model & allow_fallbacks=False
+    # -------------------------------------------------------------------------
+    def test_17_outbound_payload_transmits_exclusively_reserved_model_and_disables_remote_fallback(self) -> None:
+        """Governed egress MUST transmit exclusively the reserved model and force provider.allow_fallbacks=False."""
+        signed, approval = self._create_signed_manifest_and_approval("auth-test-outbound-inspected", max_dispatches=1)
+        self.mock_opener.open.return_value = self._create_mock_200_response("Inbound inspected response")
+
+        transport = OpenRouterHttpTransport(
+            cost_guard=self.cost_guard,
+            quota_store=self.store,
+            projector=self.projector,
+            trust_store=self.trust_store,
+            opener=self.mock_opener,
+            api_key="sk-test",
+        )
+        # Caller supplies payload WITHOUT provider field
+        payload = {
+            "model": self.primary_model,
+            "messages": [{"role": "user", "content": "inspect payload test"}],
+        }
+
+        resp = transport.dispatch_governed(
+            modality_str="text",
+            payload=payload,
+            budget_id=signed.manifest.authorization_id,
+            logical_attempt_id="att-test-outbound-inspect",
+            signed_manifest=signed,
+            human_approval=approval,
+        )
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(self.mock_opener.open.call_count, 1)
+
+        # Inspect the exact urllib Request sent to the opener
+        req = self.mock_opener.open.call_args[0][0]
+        sent_body = json.loads(req.data.decode("utf-8"))
+
+        self.assertEqual(sent_body["model"], self.primary_model, "Transmitted model must be exactly the reserved model.")
+        self.assertNotIn("models", sent_body, "Outbound payload MUST NOT contain 'models' fallback array.")
+        self.assertNotIn("route", sent_body, "Outbound payload MUST NOT contain 'route' parameter.")
+        self.assertIn("provider", sent_body, "Outbound payload MUST contain explicit 'provider' configuration.")
+        self.assertIs(sent_body["provider"]["allow_fallbacks"], False, "provider.allow_fallbacks MUST be explicitly False.")
+
+    # -------------------------------------------------------------------------
+    # Test 18: Contingency dispatch transmits exclusively contingency model & allow_fallbacks=False
+    # -------------------------------------------------------------------------
+    def test_18_contingency_dispatch_transmits_exclusively_contingency_model(self) -> None:
+        """When fallback occurs, secondary HTTP request transmits exclusively contingency model & allow_fallbacks=False."""
+        signed, approval = self._create_signed_manifest_and_approval("auth-test-outbound-contingency", max_dispatches=2)
+        mock_429 = self._create_mock_http_error(code=429, msg="Too Many Requests")
+        self.mock_opener.open.side_effect = [mock_429, self._create_mock_200_response("Contingency response")]
+
+        transport = OpenRouterHttpTransport(
+            cost_guard=self.cost_guard,
+            quota_store=self.store,
+            projector=self.projector,
+            trust_store=self.trust_store,
+            opener=self.mock_opener,
+            api_key="sk-test",
+        )
+        payload = {
+            "model": self.primary_model,
+            "messages": [{"role": "user", "content": "contingency test"}],
+        }
+
+        resp = transport.dispatch_governed(
+            modality_str="text",
+            payload=payload,
+            budget_id=signed.manifest.authorization_id,
+            logical_attempt_id="att-test-outbound-contingency",
+            signed_manifest=signed,
+            human_approval=approval,
+        )
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(self.mock_opener.open.call_count, 2)
+
+        # Inspect Attempt #1 request
+        req1 = self.mock_opener.open.call_args_list[0][0][0]
+        body1 = json.loads(req1.data.decode("utf-8"))
+        self.assertEqual(body1["model"], self.primary_model)
+        self.assertIs(body1["provider"]["allow_fallbacks"], False)
+
+        # Inspect Attempt #2 (contingency) request
+        req2 = self.mock_opener.open.call_args_list[1][0][0]
+        body2 = json.loads(req2.data.decode("utf-8"))
+        self.assertEqual(body2["model"], self.contingency_model, "Contingency dispatch must send exclusively contingency model.")
+        self.assertNotIn("models", body2, "Contingency outbound payload MUST NOT contain 'models' array.")
+        self.assertNotIn("route", body2, "Contingency outbound payload MUST NOT contain 'route'.")
+        self.assertIs(body2["provider"]["allow_fallbacks"], False, "Contingency provider.allow_fallbacks MUST be False.")
 
 
 if __name__ == "__main__":

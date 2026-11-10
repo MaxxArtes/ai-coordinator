@@ -1,7 +1,7 @@
 # AI Coordinator — Relatório Final de Prontidão e Consolidação (Fase 4C.2.6)
 
 **Documento:** Relatório Técnico Consolidado de Auditoria de Segurança, Regressão Geral e Prontidão de Release  
-**Versão:** 1.3.0 (Fase 4C.2.6 — Encerramento Completo com Fechamento dos 5 Critérios de Homologação)  
+**Versão:** 1.4.0 (Fase 4C.2.6 — Fechamento Integral do Gate de Release e Roteamento Remoto)  
 **Data:** 2026-11-10  
 **Fase:** 4C.2.6 — Auditoria Final, Consolidação e Prontidão de Release  
 **Tarefa ai-coordinator:** `1a52600ee41f4ccd`  
@@ -20,16 +20,18 @@
 
 ## 1. Resumo Executivo e Parecer de Prontidão
 
-A Fase 4C.2.6 conclui integralmente todo o planejamento técnico original da Fase 4C.2 (*Fallback Multi-Modelo Governado e Especificação Técnica Offline*), incorporando tanto a amarração mandante entre o transporte HTTP (`OpenRouterHttpTransport`) e todos os gates criptográficos e transacionais da 4C.2 quanto o fechamento dos 5 critérios objetivos de homologação levantados na Revisão 17.
+A Fase 4C.2.6 conclui integralmente todo o planejamento técnico original da Fase 4C.2 (*Fallback Multi-Modelo Governado e Especificação Técnica Offline*), incorporando a amarração mandante entre o transporte HTTP (`OpenRouterHttpTransport`) e todos os gates criptográficos e transacionais da 4C.2, bem como o fechamento dos dois itens residuais do gate de release identificados na Revisão 18:
+1. **Controle Estrito de Fallback Remoto:** Envio exclusivo do modelo vinculado à reserva autorizada, rejeição fail-closed de arrays `models` e fixação obrigatória de `provider.allow_fallbacks=False` (anulando o padrão permissivo da OpenRouter).
+2. **Resolução do Gate de Instalação e Migração:** Correção da ausência da dependência `cryptography>=41.0.0` no `pyproject.toml` e proteção resiliente dos imports estendidos em `src/ai_coordinator/__init__.py`, validando a instalação limpa em venv isolado, CLI smoke, MCP extra e migração genuína da v0.4.0.
 
 ### Tríade de Status Formal:
 1. **`READY_OFFLINE` (CONCLUÍDO E HOMOLOGADO OFFLINE)**:
    - Todos os componentes, gates e fluxos ponta a ponta foram implementados e rigorosamente validados com transporte mockado.
    - O transporte HTTP é agora obrigado a validar assinatura tripartite (Ed25519 + HMAC), `FreeCostGuard`, orçamento atômico no SQLite via `BEGIN IMMEDIATE`, transição irreversível para `SEND_COMMITTED` (PIC) e projeção durável da *Transactional Outbox* para disco (`fsync`) antes de qualquer emissão de tráfego.
    - Caso `require_governed_egress=True`, tentativas de despacho direto ungoverned falham fechadas com `GovernedEgressRequiredError`.
-   - **Zero violações de invariantes de segurança** observadas em 5.313 checagens empíricas e 16 testes de integração de transporte.
-   - **167/167 testes automatizados específicos de governança e não-regressão** aprovados com 100% de sucesso.
-   - **Suíte multiplataforma aprovada no GitHub Actions CI** em Windows, Linux (Ubuntu) e macOS em Python 3.11 e Python 3.14.
+   - **Zero violações de invariantes de segurança** observadas em 5.313 checagens empíricas e 18 testes de integração de transporte.
+   - **169/169 testes automatizados específicos de governança e não-regressão** aprovados com 100% de sucesso.
+   - **Suíte multiplataforma aprovada no GitHub Actions CI** em Windows, Linux (Ubuntu) e macOS em Python 3.11 e Python 3.14 (6/6 jobs aprovados com sucesso).
 
 2. **`OPERATIONAL_VALIDATION_PENDING` (HOMOLOGAÇÃO OPERACIONAL EM ABERTO)**:
    - Conforme diretriz soberana do operador, nenhuma chamada de rede real foi efetuada e nenhum centavo ($0.00 USD) foi despendido.
@@ -108,7 +110,7 @@ Para garantir que o transporte de rede não possa contornar os novos mecanismos 
 5. **Correção e Rastreabilidade do CI Multiplataforma:** Configurado `fetch-tags: true` e fallback de fetch no script de migração, assegurando execução e documentação transparente da matriz completa de runners (Windows, Linux, macOS) em Python 3.11 e 3.14.
 
 ### Evidências da Suíte de Integração de Transporte (`test_phase4c2_transport_governance.py`):
-Os 16 testes dedicados implementados em [tests/test_phase4c2_transport_governance.py](file:///D:/ai-coordinator/tests/test_phase4c2_transport_governance.py) foram executados e aprovados com 100% de sucesso:
+Os 18 testes dedicados implementados em [tests/test_phase4c2_transport_governance.py](file:///D:/ai-coordinator/tests/test_phase4c2_transport_governance.py) foram executados e aprovados com 100% de sucesso:
 - **TC-01:** Bloqueio imediato com `GovernedEgressRequiredError` ao chamar `dispatch()` com `require_governed_egress=True` (**0 chamadas HTTP**).
 - **TC-02:** Ausência de manifesto ou orçamento autorizado resulta em `QuotaSecurityError` (**0 chamadas HTTP**).
 - **TC-03:** Falha física simulada na projeção da outbox para disco aborta antes do envio (**0 chamadas HTTP**).
@@ -121,10 +123,12 @@ Os 16 testes dedicados implementados em [tests/test_phase4c2_transport_governanc
 - **TC-10:** Fluxo E2E completo com aprovação HMAC, assinatura Ed25519, PIC, projeção física e HTTP 200 concluído com sucesso.
 - **TC-11:** Presença do parâmetro `route` no payload rejeitada com `CostGuardError` fail-closed (**0 chamadas HTTP**).
 - **TC-12:** Presença de `provider.allow_fallbacks=True` no payload rejeitada com `CostGuardError` fail-closed (**0 chamadas HTTP**).
-- **TC-13:** Inclusão de modelo não autorizado na lista implícita `models` rejeitada com `UnauthorizedModelError` (**0 chamadas HTTP**).
+- **TC-13:** Tentativa de envio de array `models` no payload governado é estritamente rejeitada com `CostGuardError` fail-closed (**0 chamadas HTTP**).
 - **TC-14:** Omissão de consentimento humano rejeitada fail-closed com `HumanOperationalAuthorizationError` (**0 chamadas HTTP**).
 - **TC-15:** Timeout ou falha ambígua no modelo de contingência transiciona reserva secundária para `STATE_UNKNOWN`, retém a cota e impede retransmissão.
 - **TC-16:** Configuração operacional padrão define `require_governed_egress=True` quando `quota_store` é fornecido.
+- **TC-17:** Inspeção profunda do payload HTTP codificado e transmitido no despacho primário: envia exclusivamente o modelo reservado, omite arrays `models`/`route` e força `provider.allow_fallbacks=False`.
+- **TC-18:** Inspeção profunda do payload HTTP codificado e transmitido no despacho de contingência: envia exclusivamente o modelo de contingência, omite `models`/`route` e força `provider.allow_fallbacks=False`.
 
 ---
 
@@ -184,18 +188,18 @@ Na suíte global de 501 testes, exatamente 3 testes são ignorados condicionalme
 ## 6. Cobertura Consolidada de Testes
 
 - **Suíte Específica da Governança Fase 4C.2:**
-  - `test_phase4c2_transport_governance.py`: **16 testes (100% aprovados)**
+  - `test_phase4c2_transport_governance.py`: **18 testes (100% aprovados)**
   - `test_phase4c2_ed25519_truststore.py`: **28 testes (100% aprovados)**
   - `test_phase4c2_atomic_quota_fallback.py`: **12 testes (100% aprovados)**
   - `test_phase4c24_adversarial_recovery.py`: **18 testes (100% aprovados)**
   - `test_phase4c25_benchmarks.py`: **10 testes (100% aprovados)**
-  - **Subtotal Governança 4C.2:** **84 testes aprovados**.
+  - **Subtotal Governança 4C.2:** **86 testes aprovados**.
 - **Suítes de Não-Regressão:**
   - `test_phase4b_human_workspace.py`: **48 testes (100% aprovados)**
   - `test_phase4c1_openrouter_free.py`: **35 testes (100% aprovados)**
   - **Subtotal Não-Regressão:** **83 testes aprovados**.
-- **Total Consolidado da Governança:** **167/167 testes aprovados (100% de sucesso)**.
-- **Suíte Global do Repositório:** **504+ testes aprovados, 3 skipped, 0 falhas**.
+- **Total Consolidado da Governança:** **169/169 testes aprovados (100% de sucesso)**.
+- **Suíte Global do Repositório:** **506+ testes aprovados, 3 skipped, 0 falhas**.
 
 ---
 
