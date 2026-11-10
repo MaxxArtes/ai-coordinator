@@ -12,8 +12,8 @@
 
 **Repositório:** [D:\ai-coordinator](file:///D:/ai-coordinator)  
 **Branch de Trabalho:** `feature/phase4c-2-ed25519-truststore`  
-**Branch Estável (main):** Rigorosamente preservada e congelada em `a2f8f654b9f2e30897a9d3e8741029cba4837261` (`v0.5.1`)  
-**Commit Fixture de Autorização:** `a2f8f654b9f2e30897a9d3e8741029cba4837261`  
+**Branch Estável (main):** Rigorosamente preservada e congelada em `a2f8f65dbb470d0acba853b5036e6d9af841b0e5` (`v0.5.1`)  
+**Commit Fixture de Autorização:** `a2f8f65dbb470d0acba853b5036e6d9af841b0e5`  
 **Isolamento de Rede:** 100% Offline (Zero chamadas externas à OpenRouter, $0.00 USD incorridos)  
 
 ---
@@ -138,8 +138,8 @@ Conforme instrução da Revisão 16, a rastreabilidade da campanha de benchmarks
 
 | Dimensão | Hash do Commit | Descrição da Proveniência |
 | :--- | :--- | :--- |
-| **Commit HEAD Estável (main)** | `a2f8f654b9f2e30897a9d3e8741029cba4837261` | Versão `v0.5.1` em produção, congelada e preservada intacta. |
-| **Commit Fixture de Autorização** | `a2f8f654b9f2e30897a9d3e8741029cba4837261` | Ponto de ancoragem do HEAD exigido pelos manifestos criptográficos de teste. |
+| **Commit HEAD Estável (main)** | `a2f8f65dbb470d0acba853b5036e6d9af841b0e5` | Versão `v0.5.1` em produção, congelada e preservada intacta. |
+| **Commit Fixture de Autorização** | `a2f8f65dbb470d0acba853b5036e6d9af841b0e5` | Ponto de ancoragem do HEAD exigido pelos manifestos criptográficos de teste. |
 | **Commit Físico da Campanha (HEAD medido)** | `7e81fa045dcdf4e82f043757b28094b398f467df` | Commit que era o HEAD no momento da execução física dos benchmarks (executado com instrumentação de memória RSS e Cenário A2 em working tree). |
 | **Commit de Consolidação e Relatórios** | `70b5d4c5ce07a199df8fd6fb76b06f031a882b2f` | Commit que consolidou os relatórios de benchmarks, guia de segurança e ajustes de versão. |
 | **Commit de Fechamento Residual** | *(Branch atual)* | Integração do transporte egress governado, CI multiplataforma e fechamento da 4C.2.6. |
