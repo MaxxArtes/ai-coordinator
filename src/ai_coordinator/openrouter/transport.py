@@ -133,7 +133,7 @@ class OpenRouterHttpTransport:
         fallback_engine: Optional[Any] = None,
         trust_store: Optional[Any] = None,
         expected_commit: Optional[str] = None,
-        require_governed_egress: bool = False,
+        require_governed_egress: Optional[bool] = None,
     ) -> None:
         self.cost_guard = cost_guard
         self.rate_limiter = rate_limiter
@@ -149,7 +149,12 @@ class OpenRouterHttpTransport:
         self.fallback_engine = fallback_engine
         self.trust_store = trust_store or getattr(quota_store, "default_trust_store", None)
         self.expected_commit = expected_commit or getattr(quota_store, "expected_commit", None)
-        self.require_governed_egress = require_governed_egress
+        # When quota_store is configured, require_governed_egress defaults to True.
+        # This prevents any accidental or un-governed invocation of the legacy dispatch() path.
+        if require_governed_egress is not None:
+            self.require_governed_egress = require_governed_egress
+        else:
+            self.require_governed_egress = (quota_store is not None)
 
         # Fail-closed validation for live mode
         if self.live_network_enabled:
@@ -493,11 +498,12 @@ class OpenRouterHttpTransport:
 
         # Gate 2: Manifest & Human Authorization Registration (if provided)
         if signed_manifest is not None:
+            # Enforce authenticated human approval or explicit consent without default conversion to True
             registered_budget_id = self.quota_store.register_budget_from_signed_manifest(
                 signed_manifest=signed_manifest,
                 trust_store=self.trust_store,
                 expected_commit=self.expected_commit,
-                human_operator_consent=human_operator_consent if human_operator_consent is not None else True,
+                human_operator_consent=human_operator_consent,
                 human_operator_identity=human_operator_identity,
                 human_session_id=human_session_id,
                 human_approval=human_approval,
@@ -538,9 +544,38 @@ class OpenRouterHttpTransport:
         # Gate 6: Modality Endpoint Resolution
         url = self.get_endpoint_for_modality(modality_str)
 
-        # Gate 7: Primary Model Validation
+        # Gate 7: Primary Model Validation and Cost Guard Payload Inspection
         if not isinstance(payload, dict):
             raise CostGuardError("Payload de envio deve ser um dicionário.")
+
+        # Strict Provider Routing Restriction:
+        # In governed dispatch, fallback is exclusively governed locally by GovernedFallbackEngine.
+        # Provider-side fallbacks or arbitrary routing options are strictly prohibited fail-closed.
+        if "route" in payload and payload["route"] is not None:
+            raise CostGuardError(
+                "[FAIL-CLOSED] Parâmetro 'route' proibido em dispatch_governed: o roteamento é estritamente governado localmente."
+            )
+        provider_cfg = payload.get("provider")
+        if isinstance(provider_cfg, dict):
+            if provider_cfg.get("allow_fallbacks") is True:
+                raise CostGuardError(
+                    "[FAIL-CLOSED] provider.allow_fallbacks=True é proibido em dispatch_governed: fallback do provedor viola a governança local determinística."
+                )
+
+        # Mandatory CostGuard deep inspection of payload (models list, pricing, options)
+        self.cost_guard.inspect_request_payload(payload)
+
+        if "models" in payload and payload["models"] is not None:
+            models_list = payload["models"]
+            if not isinstance(models_list, list):
+                raise CostGuardError("Parâmetro 'models' deve ser uma lista de identificadores de modelos.")
+            for m in models_list:
+                if budget_models and str(m) not in budget_models:
+                    raise UnauthorizedModelError(
+                        f"[FAIL-CLOSED] Modelo de contingência implícito '{m}' em 'models' não está autorizado pelo orçamento '{budget_id}': {budget_models}"
+                    )
+                self.cost_guard.authorize_model_execution(str(m), verify_freshness=True)
+
         model_id = payload.get("model")
         if not model_id:
             raise UnauthorizedModelError("Payload de requisição sem campo obrigatório 'model'.")
@@ -790,24 +825,48 @@ class OpenRouterHttpTransport:
                                     "primary_status_code": status_code,
                                 },
                             )
-                    except Exception as fb_exc:
+                    except urllib.error.HTTPError as fb_http_err:
+                        # Confirmed HTTP error response from contingency model (e.g. 503, 429)
+                        status_code_2 = fb_http_err.code
                         self.quota_store.record_failure(
                             reservation_id=fb_decision.reservation_id,
-                            http_status_code=getattr(fb_exc, "code", 500),
-                            details={"contingency_error": str(fb_exc)},
+                            http_status_code=status_code_2,
+                            details={"contingency_error": str(fb_http_err)},
                         )
                         self.projector.project_pending_events()
                         return HttpResponse(
-                            status_code=getattr(fb_exc, "code", 500),
-                            data={"error": {"message": str(fb_exc)}},
+                            status_code=status_code_2,
+                            data={"error": {"message": str(fb_http_err)}},
                             latency_ms=elapsed_ms,
-                            raw_error=str(fb_exc),
+                            raw_error=str(fb_http_err),
                             governance_metadata={
                                 "reservation_id": fb_decision.reservation_id,
                                 "budget_id": budget_id,
                                 "sequence_index": fb_decision.sequence_index,
                                 "state": STATE_FAILED,
                                 "fallback_action": "DISPATCH_AUTHORIZED_FAILED",
+                            },
+                        )
+                    except Exception as fb_ambig_exc:
+                        # Ambiguous outcome on contingency attempt (timeout, socket reset, network loss):
+                        # MUST transition to UNKNOWN, permanently draining budget and strictly forbidding retries!
+                        self.quota_store.record_unknown(
+                            reservation_id=fb_decision.reservation_id,
+                            details={"contingency_ambiguous_error": str(fb_ambig_exc), "error_type": type(fb_ambig_exc).__name__},
+                            reason=f"Ambiguous contingency transport failure: {str(fb_ambig_exc)}",
+                        )
+                        self.projector.project_pending_events()
+                        return HttpResponse(
+                            status_code=500,
+                            data={"error": {"type": "AmbiguousContingencyOutcome", "message": str(fb_ambig_exc)}},
+                            latency_ms=elapsed_ms,
+                            raw_error=f"[AMBIGUOUS_CONTINGENCY_UNKNOWN] {str(fb_ambig_exc)}",
+                            governance_metadata={
+                                "reservation_id": fb_decision.reservation_id,
+                                "budget_id": budget_id,
+                                "sequence_index": fb_decision.sequence_index,
+                                "state": STATE_UNKNOWN,
+                                "fallback_action": "CONTINGENCY_BLOCKED_UNKNOWN",
                             },
                         )
 

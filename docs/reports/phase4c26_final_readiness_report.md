@@ -1,7 +1,7 @@
 # AI Coordinator — Relatório Final de Prontidão e Consolidação (Fase 4C.2.6)
 
 **Documento:** Relatório Técnico Consolidado de Auditoria de Segurança, Regressão Geral e Prontidão de Release  
-**Versão:** 1.2.0 (Fase 4C.2.6 — Encerramento do Planejamento Original com Integração E2E do Transporte)  
+**Versão:** 1.3.0 (Fase 4C.2.6 — Encerramento Completo com Fechamento dos 5 Critérios de Homologação)  
 **Data:** 2026-11-10  
 **Fase:** 4C.2.6 — Auditoria Final, Consolidação e Prontidão de Release  
 **Tarefa ai-coordinator:** `1a52600ee41f4ccd`  
@@ -20,15 +20,15 @@
 
 ## 1. Resumo Executivo e Parecer de Prontidão
 
-A Fase 4C.2.6 conclui integralmente todo o planejamento técnico original da Fase 4C.2 (*Fallback Multi-Modelo Governado e Especificação Técnica Offline*), incorporando a verificação residual obrigatória solicitada na Revisão 16: a amarração mandante entre o transporte HTTP (`OpenRouterHttpTransport`) e todos os gates criptográficos e transacionais da 4C.2.
+A Fase 4C.2.6 conclui integralmente todo o planejamento técnico original da Fase 4C.2 (*Fallback Multi-Modelo Governado e Especificação Técnica Offline*), incorporando tanto a amarração mandante entre o transporte HTTP (`OpenRouterHttpTransport`) e todos os gates criptográficos e transacionais da 4C.2 quanto o fechamento dos 5 critérios objetivos de homologação levantados na Revisão 17.
 
 ### Tríade de Status Formal:
 1. **`READY_OFFLINE` (CONCLUÍDO E HOMOLOGADO OFFLINE)**:
    - Todos os componentes, gates e fluxos ponta a ponta foram implementados e rigorosamente validados com transporte mockado.
    - O transporte HTTP é agora obrigado a validar assinatura tripartite (Ed25519 + HMAC), `FreeCostGuard`, orçamento atômico no SQLite via `BEGIN IMMEDIATE`, transição irreversível para `SEND_COMMITTED` (PIC) e projeção durável da *Transactional Outbox* para disco (`fsync`) antes de qualquer emissão de tráfego.
    - Caso `require_governed_egress=True`, tentativas de despacho direto ungoverned falham fechadas com `GovernedEgressRequiredError`.
-   - **Zero violações de invariantes de segurança** observadas em 5.313 checagens empíricas e 10 novos testes de integração de transporte.
-   - **161/161 testes automatizados específicos de governança e não-regressão** aprovados com 100% de sucesso.
+   - **Zero violações de invariantes de segurança** observadas em 5.313 checagens empíricas e 16 testes de integração de transporte.
+   - **167/167 testes automatizados específicos de governança e não-regressão** aprovados com 100% de sucesso.
    - **Suíte multiplataforma aprovada no GitHub Actions CI** em Windows, Linux (Ubuntu) e macOS em Python 3.11 e Python 3.14.
 
 2. **`OPERATIONAL_VALIDATION_PENDING` (HOMOLOGAÇÃO OPERACIONAL EM ABERTO)**:
@@ -100,18 +100,31 @@ Para garantir que o transporte de rede não possa contornar os novos mecanismos 
         └──► [Timeout / Erro de Rede] ──► record_unknown(UNKNOWN) ──► Retransmissão terminantemente proibida
 ```
 
+### Fechamento dos 5 Critérios de Homologação de Segurança (Revisão 17):
+1. **Inspeção Mandatória de Payload e Bloqueio de Roteamento:** `dispatch_governed()` aciona `FreeCostGuard.inspect_request_payload(payload)` e proíbe terminantemente `route` e `provider.allow_fallbacks: True` em modo governado, rejeitando desvios não-determinísticos do provedor. Qualquer array `models` é estritamente validado contra o catálogo gratuito e contra a lista autorizada no manifesto do orçamento.
+2. **Padrão Operacional Seguro de `require_governed_egress`:** Ao instanciar `OpenRouterHttpTransport` com `quota_store`, `require_governed_egress` passa a ser `True` por padrão caso omitido, prevenindo o uso involuntário da rota `dispatch()` desgovernada.
+3. **Eliminação de Conversão Automática de Consentimento Humano:** Removido qualquer fallback automático que convertia consentimento omitido em `True`. A chamada repassa o valor exato, exigindo aprovação HMAC via `HumanOperationalApproval` ou consentimento explícito autenticado por chave de supervisor.
+4. **Tratamento de Falhas Ambíguas no Fallback Secundário:** No despacho de contingência (tentativa 2), timeouts ou erros de soquete sem resposta HTTP confirmada acionam `record_unknown(reservation_id, ...)`, transicionando a reserva para `STATE_UNKNOWN`, retendo a cota e proibindo novas tentativas ou retransmissões.
+5. **Correção e Rastreabilidade do CI Multiplataforma:** Configurado `fetch-tags: true` e fallback de fetch no script de migração, assegurando execução e documentação transparente da matriz completa de runners (Windows, Linux, macOS) em Python 3.11 e 3.14.
+
 ### Evidências da Suíte de Integração de Transporte (`test_phase4c2_transport_governance.py`):
-Os 10 testes dedicados implementados em [tests/test_phase4c2_transport_governance.py](file:///D:/ai-coordinator/tests/test_phase4c2_transport_governance.py) foram executados e aprovados com 100% de sucesso:
+Os 16 testes dedicados implementados em [tests/test_phase4c2_transport_governance.py](file:///D:/ai-coordinator/tests/test_phase4c2_transport_governance.py) foram executados e aprovados com 100% de sucesso:
 - **TC-01:** Bloqueio imediato com `GovernedEgressRequiredError` ao chamar `dispatch()` com `require_governed_egress=True` (**0 chamadas HTTP**).
 - **TC-02:** Ausência de manifesto ou orçamento autorizado resulta em `QuotaSecurityError` (**0 chamadas HTTP**).
 - **TC-03:** Falha física simulada na projeção da outbox para disco aborta antes do envio (**0 chamadas HTTP**).
 - **TC-04:** Sob HTTP 429 com `max_dispatches=1`, emite evento `FALLBACK_PROPOSED_BLOCKED` e **bloqueia rigorosamente o segundo envio** (exatamente 1 chamada, 0 chamadas secundárias).
-- **TC-05:** Timeout de soquete / erro ambíguo coloca a reserva em estado `STATE_UNKNOWN` e **proíbe categoricamente qualquer retransmissão ou fallback automático** (exatamente 1 chamada).
+- **TC-05:** Timeout de soquete / erro ambíguo coloca a reserva primária em estado `STATE_UNKNOWN` e **proíbe categoricamente qualquer retransmissão ou fallback automático** (exatamente 1 chamada).
 - **TC-06:** Sob HTTP 429 com `max_dispatches=2`, autoriza e despacha exclusivamente o modelo de contingência homologado (exatamente 2 chamadas com os modelos corretos).
 - **TC-07:** Falha de banco antes do PIC (`commit_send`) aborta o envio preventivamente (**0 chamadas HTTP**).
 - **TC-08:** Modelo não constante na lista autorizada do manifesto é rejeitado com `UnauthorizedModelError` (**0 chamadas HTTP**).
 - **TC-09:** Tentativa de despacho após consumo total da cota falha com `BudgetExhaustedError` (**0 chamadas HTTP**).
 - **TC-10:** Fluxo E2E completo com aprovação HMAC, assinatura Ed25519, PIC, projeção física e HTTP 200 concluído com sucesso.
+- **TC-11:** Presença do parâmetro `route` no payload rejeitada com `CostGuardError` fail-closed (**0 chamadas HTTP**).
+- **TC-12:** Presença de `provider.allow_fallbacks=True` no payload rejeitada com `CostGuardError` fail-closed (**0 chamadas HTTP**).
+- **TC-13:** Inclusão de modelo não autorizado na lista implícita `models` rejeitada com `UnauthorizedModelError` (**0 chamadas HTTP**).
+- **TC-14:** Omissão de consentimento humano rejeitada fail-closed com `HumanOperationalAuthorizationError` (**0 chamadas HTTP**).
+- **TC-15:** Timeout ou falha ambígua no modelo de contingência transiciona reserva secundária para `STATE_UNKNOWN`, retém a cota e impede retransmissão.
+- **TC-16:** Configuração operacional padrão define `require_governed_egress=True` quando `quota_store` é fornecido.
 
 ---
 
@@ -171,18 +184,18 @@ Na suíte global de 501 testes, exatamente 3 testes são ignorados condicionalme
 ## 6. Cobertura Consolidada de Testes
 
 - **Suíte Específica da Governança Fase 4C.2:**
-  - `test_phase4c2_transport_governance.py`: **10 testes (100% aprovados)**
+  - `test_phase4c2_transport_governance.py`: **16 testes (100% aprovados)**
   - `test_phase4c2_ed25519_truststore.py`: **28 testes (100% aprovados)**
   - `test_phase4c2_atomic_quota_fallback.py`: **12 testes (100% aprovados)**
   - `test_phase4c24_adversarial_recovery.py`: **18 testes (100% aprovados)**
   - `test_phase4c25_benchmarks.py`: **10 testes (100% aprovados)**
-  - **Subtotal Governança 4C.2:** **78 testes aprovados**.
+  - **Subtotal Governança 4C.2:** **84 testes aprovados**.
 - **Suítes de Não-Regressão:**
   - `test_phase4b_human_workspace.py`: **48 testes (100% aprovados)**
   - `test_phase4c1_openrouter_free.py`: **35 testes (100% aprovados)**
   - **Subtotal Não-Regressão:** **83 testes aprovados**.
-- **Total Consolidado da Governança:** **161/161 testes aprovados (100% de sucesso)**.
-- **Suíte Global do Repositório:** **498+ testes aprovados, 3 skipped, 0 falhas**.
+- **Total Consolidado da Governança:** **167/167 testes aprovados (100% de sucesso)**.
+- **Suíte Global do Repositório:** **504+ testes aprovados, 3 skipped, 0 falhas**.
 
 ---
 
