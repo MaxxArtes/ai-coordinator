@@ -7,12 +7,12 @@ e este projeto adere ao [Versionamento Semântico](https://semver.org/lang/pt-BR
 
 ---
 
-## [0.6.0] - Proposta / Homologação Fase 4C.2 (Aguardando Liberação Operacional)
+## [0.6.0] - 2026-11-10
 
-Versão proposta consolidando a implementação e homologação offline da **Fase 4C.2 (Fallback Multi-Modelo Governado e Especificação Técnica Offline)**.
+Release Candidate consolidando a implementação, endurecimento e homologação offline da **Fase 4C.2 (Fallback Multi-Modelo Governado e Especificação Técnica Offline)**.
 
 > [!NOTE]
-> Versão desenvolvida e testada 100% offline ($0.00 USD incorridos). A publicação oficial da tag e release no PyPI permanece pendente de autorização do operador e teste de staging com provedor real.
+> Versão desenvolvida e testada 100% offline ($0.00 USD incorridos). A publicação oficial da tag e release no PyPI permanece pendente de autorização do operador e teste de staging com provedor real. A branch `main` permanece rigorosamente congelada em `v0.5.1` (`a2f8f65`).
 
 ### Adicionado
 
@@ -32,11 +32,22 @@ Versão proposta consolidando a implementação e homologação offline da **Fas
 - **Projeção Atômica de Eventos**: `TransactionalOutboxProjector` projetando eventos do SQLite para JSONL canônico de auditoria de forma idempotente e recuperável.
 - **Travas Nativas de Kernel**: `_InterProcessFileLock` utilizando `msvcrt.locking` no Windows e `fcntl.flock` no POSIX sobre arquivo de trava permanente. Eliminação completa de `os.unlink()`, prevenindo corridas TOCTOU e garantindo liberação automática pelo kernel em caso de término abrupto de processos.
 
-#### Fallback Multi-Modelo e Benchmarks Comparativos (Fase 4C.2.5 / 4C.2.6)
+#### Fallback Multi-Modelo e Benchmarks Comparativos (Fase 4C.2.5)
 - **Mecanismo de Fallback em Dois Níveis**: `GovernedFallbackEngine` avaliando candidatos gratuitos sob `FreeCostGuard`:
   - Nível 1 (`max_dispatches=1`): Emite recomendação governada sem despacho secundário.
   - Nível 2 (`max_dispatches=2`): Autoriza e transiciona a cota secundária sob novo PIC.
 - **Campanha Quantitativa de Benchmarks**: Suíte comparativa em `benchmark_4c2.py` avaliando 6 cenários empíricos com separação de Heap Python e RSS do processo, proveniência de commits segregada e exportação de amostras brutas.
+
+#### Governança Estrita de Egress e Bloqueio de Fallback Remoto (Fase 4C.2.6)
+- **Envio Exclusivo do Modelo Vinculado**: Envio estrito e exclusivo do modelo vinculado à reserva autorizada (`model_id_str` na tentativa inicial e `contingency_model` na contingência).
+- **Proibição Fail-Closed de Arrays `models` e Rota**: Rejeição sumária com `CostGuardError` de qualquer payload contendo múltiplos modelos em array ou parâmetro `route="fallback"`.
+- **Forçamento de `provider.allow_fallbacks=False`**: Fixação mandatória do parâmetro para impedir que o provedor OpenRouter execute fallback remoto silencioso fora da governança do Coordinator.
+- **Inspeção de Payload Transmitido**: 18 testes de integração em transporte inspecionando o payload efetivamente enviado em mock TLS para tentativa 1 e contingência.
+
+#### Instalação Limpa e Migração Genuína
+- **Dependência `cryptography>=41.0.0` Declarada**: Suporte robusto a assinaturas Ed25519 e inicialização limpa via wheel em venvs sem dependências pré-instaladas.
+- **Imports Resilientes no Core**: Proteção contra falha catastrófica de comandos informativos (`--help`, `--version`) em runtimes mínimos.
+- **Compatibilidade Integral de Migração**: Migração idempotente e determinística validada contra bancos genuínos da tag `v0.4.0`.
 
 ---
 

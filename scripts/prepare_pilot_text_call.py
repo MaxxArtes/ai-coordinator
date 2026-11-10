@@ -284,7 +284,7 @@ class OpenRouterAccountVerifier:
             self.endpoint_url,
             headers={
                 "Authorization": f"Bearer {api_key}",
-                "User-Agent": "AI-Coordinator/0.5.1 (Financial Verification Gate)",
+                "User-Agent": "AI-Coordinator/0.6.0 (Financial Verification Gate)",
                 "Accept": "application/json",
             },
             method="GET",

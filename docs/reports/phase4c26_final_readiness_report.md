@@ -1,14 +1,14 @@
 # AI Coordinator — Relatório Final de Prontidão e Consolidação (Fase 4C.2.6)
 
 **Documento:** Relatório Técnico Consolidado de Auditoria de Segurança, Regressão Geral e Prontidão de Release  
-**Versão:** 1.4.0 (Fase 4C.2.6 — Fechamento Integral do Gate de Release e Roteamento Remoto)  
+**Versão:** 1.5.0 (Release Candidate v0.6.0 Preparado, Empacotado e Validado)  
 **Data:** 2026-11-10  
-**Fase:** 4C.2.6 — Auditoria Final, Consolidação e Prontidão de Release  
+**Fase:** 4C.2.6 — Auditoria Final, Consolidação e Prontidão de Release Candidate v0.6.0  
 **Tarefa ai-coordinator:** `1a52600ee41f4ccd`  
 **Classificação Formal:**
 - **`READY_OFFLINE`**: Componentes e fluxo governado ponta a ponta validados com transporte simulado.
 - **`OPERATIONAL_VALIDATION_PENDING`**: Homologação com provedor real OpenRouter ainda pendente (mantendo política de $0.00 USD).
-- **`RELEASE_READY`**: Avaliação separada, dependente de autorização formal do operador.
+- **`RELEASE_READY`**: Release Candidate v0.6.0 integralmente empacotado e validado em ambiente limpo; publicação final dependente de autorização formal do operador.
 
 **Repositório:** [D:\ai-coordinator](file:///D:/ai-coordinator)  
 **Branch de Trabalho:** `feature/phase4c-2-ed25519-truststore`  
@@ -203,9 +203,27 @@ Na suíte global de 501 testes, exatamente 3 testes são ignorados condicionalme
 
 ---
 
-## 7. Conclusão da Fase 4C.2 e Próximos Passos
+## 7. Artefatos de Distribuição Release Candidate v0.6.0
 
-1. **Encerramento da Fase 4C.2:** Todas as seis etapas planejadas (4C.2.1 a 4C.2.6), incluindo a amarração do transporte egress, estão integralmente concluídas no plano offline.
-2. **Congelamento da Branch:** A branch experimental `feature/phase4c-2-ed25519-truststore` fica congelada e protegida, aguardando as deliberações estratégicas do operador.
+Os 5 artefatos de release candidate da versão `v0.6.0` foram gerados de forma determinística e validados em ambiente limpo:
+
+| Artefato de Distribuição | Tamanho (Bytes) | SHA-256 Checksum | Finalidade |
+| :--- | :---: | :--- | :--- |
+| `ai_coordinator-0.6.0-py3-none-any.whl` | 306.282 | `300e57f360565634624d983dbe8dec05e050b57deba043b9fdcaac878dd1e6a9` | Python Wheel universal |
+| `ai_coordinator-0.6.0.tar.gz` | 473.142 | `0d410d289f8ea00810829eefc8474107603f4bde68da137dd2d52f2a6616162c` | Source Distribution (sdist) |
+| `ai-coordinator-skill-0.6.0.zip` | 2.933 | `9c2daa49aed5970777a0450336160c8ed352c2fe2e43d3e5f2722fff64f57645` | Agent Skill universal |
+| `ai-coordinator-claude-plugin-0.6.0.zip` | 3.475 | `f43c301734f1b5da03d5be015a9bfda15b820c37e88d7dcb4196eb23a6301695` | Plugin Claude Code + MCP |
+| `maxxartes-ai-coordinator-opencode-0.6.0.tgz` | 6.720 | `05b9b4d16d770a128c3eef5541ca53b45181a658477f4493ff4ef431f5f920bf` | Plugin OpenCode V2 (npm) |
+
+---
+
+## 8. Evidências do GitHub Actions CI e Conclusão
+
+1. **GitHub Actions CI (Run 42858709720):**
+   - 8/8 jobs aprovados com 100% de sucesso.
+   - Matriz completa de sistemas operacionais: Windows (3.11, 3.14), Linux Ubuntu (3.11, 3.14), macOS (3.11, 3.14).
+   - Validação automatizada de TypeScript do OpenCode V2.
+   - Build de artefatos, instalação limpa em venv, CLI smoke, extra `[mcp]` e migração genuína da v0.4.0 aprovados.
+2. **Encerramento Formal da Fase 4C.2:** Todas as 6 etapas planejadas (4C.2.1 a 4C.2.6) e todos os gates de segurança de transporte foram integralmente cumpridos no plano offline ($0.00 USD).
 3. **Branch Principal Intacta:** A branch `main` permanece rigorosamente preservada em `a2f8f65` (`v0.5.1`).
-4. **Fase 4D e Futuro do Projeto:** O planejamento da interface gráfica (Fase 4D), instaladores e novos harnesses permanece no backlog futuro para discussão oportuna com o operador.
+4. **Prontidão de Release v0.6.0:** O pacote release candidate `v0.6.0` está consolidado e aguardando deliberação soberana do operador quanto ao teste operacional em staging e eventual publicação.

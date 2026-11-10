@@ -727,7 +727,7 @@ def _get_version() -> str:
             from importlib.metadata import version as package_version
             return package_version("ai-coordinator")
         except Exception:
-            return "0.5.1"
+            return "0.6.0"
 
 def parser():
     p = argparse.ArgumentParser(prog="ai-coordinator", description=__doc__)

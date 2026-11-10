@@ -379,7 +379,7 @@ class OfficialOpenRouterCatalogClient:
         req = urllib.request.Request(
             self.endpoint_url,
             headers={
-                "User-Agent": "AI-Coordinator/0.5.1 (Scientific Benchmark Suite)",
+                "User-Agent": "AI-Coordinator/0.6.0 (Scientific Benchmark Suite)",
                 "Accept": "application/json",
             },
             method="GET",
