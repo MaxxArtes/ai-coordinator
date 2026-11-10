@@ -339,9 +339,11 @@ class OpenRouterAccountVerifier:
                     "label": label,
                 }
         except OpenRouterAccountSecurityError as sec_err:
-            return {"status": "FAILED", "error": str(sec_err)}
+            sanitized_err = str(sec_err).replace(api_key, "[REDACTED]") if api_key else str(sec_err)
+            return {"status": "FAILED", "error": sanitized_err}
         except Exception as e:
-            return {"status": "ERROR", "error": str(e)}
+            sanitized_err = str(e).replace(api_key, "[REDACTED]") if api_key else str(e)
+            return {"status": "ERROR", "error": sanitized_err}
 
 
 def evaluate_requirements(
@@ -361,13 +363,13 @@ def evaluate_requirements(
     """Evaluate and classify all financial and operational requirements with explicit evidence provenance."""
     reqs: Dict[str, Dict[str, Any]] = {}
 
-    # 1. API_KEY_PRESENT
+    # 1. API_KEY_PRESENT (estritamente booleano; nenhum fragmento da chave é exibido ou persistido)
     has_key = bool(api_key.strip())
-    masked_key = f"{api_key[:6]}...{api_key[-4:]}" if len(api_key) > 10 else ("CONFIGURADA" if has_key else "NÃO CONFIGURADA")
+    key_status = "CONFIGURADA" if has_key else "NÃO CONFIGURADA"
     reqs["API_KEY_PRESENT"] = {
         "status": RequirementStatus.VERIFIED if has_key else RequirementStatus.FAILED,
         "evidence_source": EvidenceSource.LOCAL_INVARIANT if has_key else EvidenceSource.PENDING,
-        "details": f"Chave de API: {masked_key}",
+        "details": f"Chave de API: {key_status}",
     }
 
     # 2. SPEND_CAP_ENFORCED
@@ -688,6 +690,22 @@ def execute_live_pilot(
         print("O piloto em ambiente real depende de autorização formal expressa do usuário.", file=sys.stderr)
         return 1
 
+    # Gate 0.1: Early fail-closed block against raw un-governed live execution.
+    # Production execution of the legacy pilot path is categorically disabled fail-closed.
+    # The 'custom_transport' parameter is strictly a test fixture injection mechanism for offline simulation suites,
+    # and does NOT constitute operational authorization for live production egress.
+    if custom_transport is None:
+        print("\n[BLOQUEIO DE SEGURANÇA FAIL-CLOSED]", file=sys.stderr)
+        print(
+            "A execução live via transporte legado não governado está categoricamente desativada fail-closed.\n"
+            "Exige-se integração formal com o transporte governado da Fase 4C.2 "
+            "(GovernedMultiModelTransport com tripartite manifest e AtomicDispatchQuotaStore).\n"
+            "Nenhuma chamada de rede, consulta de conta ou catálogo, ou criação de banco de dados foi executada.\n"
+            "Use '--dry-run' para validações offline ou forneça um transporte simulado via 'custom_transport' em testes.",
+            file=sys.stderr,
+        )
+        return 1
+
     # Resolve commit strictly
     try:
         commit_hash = resolve_current_commit()
@@ -819,15 +837,9 @@ def execute_live_pilot(
         details={"stage": "pilot_authorization_manifest", "authorization_manifest": auth_record.to_dict()},
     )
 
-    # Step 10: Configure live transport with STRICT SINGLE ATTEMPT (NO RETRIES)
-    print("\n[Passo 5/6] Ativando OpenRouterHttpTransport em modo LIVE (tentativa única estrita N=1)...")
-    transport = custom_transport or OpenRouterHttpTransport(
-        cost_guard=guard,
-        rate_limiter=limiter,
-        ledger=ledger,
-        api_key=api_key,
-        live_network_enabled=True,  # LIVE OPT-IN
-    )
+    # Step 10: Configure test transport for simulation (STRICT SINGLE ATTEMPT, NO RETRIES)
+    print("\n[Passo 5/6] Ativando transporte simulado em modo controlado (tentativa única estrita N=1)...")
+    transport = custom_transport
 
     strict_single_attempt_policy = RetryPolicy(max_attempts=1)
     runner = ModelBenchmarkRunner(
