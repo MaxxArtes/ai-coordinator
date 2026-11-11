@@ -19,11 +19,14 @@ interface RuntimeStatus {
 
 export const App: React.FC = () => {
   const [isTauri, setIsTauri] = useState<boolean>(false);
-  const [connectionStatus, setConnectionStatus] = useState<"connecting" | "connected" | "failed">("connecting");
+  const [connectionStatus, setConnectionStatus] = useState<"connecting" | "authorizing" | "connected" | "failed">("connecting");
   const [status, setStatus] = useState<RuntimeStatus | null>(null);
   const [metrics, setMetrics] = useState<RuntimeMetrics | null>(null);
   const [activeTab, setActiveTab] = useState<string>("tab-main");
-  const [projectPath, setProjectPath] = useState<string>("D:\\ai-coordinator");
+  const [projectPath, setProjectPath] = useState<string>("");
+  const [authorizedProjects, setAuthorizedProjects] = useState<string[]>([]);
+  const [isAuthorizing, setIsAuthorizing] = useState<boolean>(false);
+  const [inputPath, setInputPath] = useState<string>("");
   const [panes, setPanes] = useState<TerminalPaneProps[]>([]);
   const [notice, setNotice] = useState<string>("");
 
@@ -123,7 +126,7 @@ export const App: React.FC = () => {
     [isTauri, callTauri]
   );
 
-  // Add new pane (Problem 6: Defaults strictly to human_terminal)
+  // Add new pane (Defaults strictly to human_terminal)
   const handleAddPane = useCallback(
     async (tabId: string) => {
       if (panes.length >= 4) {
@@ -174,7 +177,77 @@ export const App: React.FC = () => {
     [panes.length, isTauri, projectPath, ensureTabCreated, callTauri, handleWrite, handleResize, handleClosePane, handleMount]
   );
 
-  // Initialize runtime connection and first pane
+  // Authorize project directory and start session
+  const handleAuthorizeAndStart = useCallback(
+    async (dirToAuthorize: string) => {
+      if (!dirToAuthorize.trim()) {
+        setNotice("Informe um caminho de diretório válido.");
+        return;
+      }
+      try {
+        setNotice("");
+        if (isTauri) {
+          const res = await callTauri("profile_authorize_project", { projectPath: dirToAuthorize.trim() });
+          if (!res || !res.success) {
+            throw new Error("Resposta inesperada do autorizador.");
+          }
+          const canonical = res.project_path;
+          setAuthorizedProjects(res.authorized_projects);
+          setProjectPath(canonical);
+          setIsAuthorizing(false);
+          setConnectionStatus("connecting");
+
+          // Step 1: Create tab in Core
+          await callTauri("terminal_create_tab", {
+            tabId: activeTab,
+            projectPath: canonical,
+          });
+          createdTabsRef.current.add(activeTab);
+
+          // Step 2: Create initial session
+          const sess = await callTauri("terminal_create_session", {
+            tabId: activeTab,
+            paneId: 0,
+            kind: "human_terminal",
+            cwd: canonical,
+            cols: 80,
+            rows: 24,
+          });
+
+          if (sess && sess.session_id) {
+            const firstPane: TerminalPaneProps = {
+              sessionId: sess.session_id,
+              tabId: activeTab,
+              paneId: 0,
+              kind: "human_terminal",
+              title: "Terminal Interativo 1",
+              onWrite: handleWrite,
+              onResize: handleResize,
+              onClose: handleClosePane,
+              onMount: handleMount,
+            };
+            setPanes([firstPane]);
+            setConnectionStatus("connected");
+          } else {
+            throw new Error("Sessão inicial não retornou session_id válido");
+          }
+        } else {
+          // Preview mode fallback
+          setAuthorizedProjects([dirToAuthorize.trim()]);
+          setProjectPath(dirToAuthorize.trim());
+          setIsAuthorizing(false);
+          setConnectionStatus("connected");
+        }
+      } catch (err: any) {
+        const msg = err?.message || String(err);
+        setNotice(`Falha na autorização do projeto: ${msg}`);
+        setConnectionStatus("authorizing");
+      }
+    },
+    [isTauri, activeTab, callTauri, handleWrite, handleResize, handleClosePane, handleMount]
+  );
+
+  // Initialize runtime connection and check project authorization
   useEffect(() => {
     let mounted = true;
 
@@ -195,40 +268,58 @@ export const App: React.FC = () => {
           const st = await callTauri("get_runtime_status");
           if (mounted && st) setStatus(st);
 
-          // Step 1 & 2: Ensure Tab is created in Core before creating session
-          await callTauri("terminal_create_tab", {
-            tabId: activeTab,
-            projectPath: projectPath,
-          });
-          createdTabsRef.current.add(activeTab);
+          // Query active profile and authorized projects
+          const profInfo = await callTauri("profile_get_active");
+          const authList: string[] = Array.isArray(profInfo?.authorized_projects)
+            ? profInfo.authorized_projects
+            : [];
+          if (mounted) setAuthorizedProjects(authList);
 
-          // Step 3: Create initial session and obtain real backend session_id
-          const sess = await callTauri("terminal_create_session", {
-            tabId: activeTab,
-            paneId: 0,
-            kind: "human_terminal",
-            cwd: projectPath,
-            cols: 80,
-            rows: 24,
-          });
+          if (authList.length > 0) {
+            // Already has authorized project, select first
+            const activeDir = authList[0];
+            if (mounted) setProjectPath(activeDir);
 
-          if (!mounted) return;
-          if (sess && sess.session_id) {
-            const firstPane: TerminalPaneProps = {
-              sessionId: sess.session_id,
+            // Step 1: Ensure Tab is created in Core before creating session
+            await callTauri("terminal_create_tab", {
+              tabId: activeTab,
+              projectPath: activeDir,
+            });
+            createdTabsRef.current.add(activeTab);
+
+            // Step 2: Create initial session
+            const sess = await callTauri("terminal_create_session", {
               tabId: activeTab,
               paneId: 0,
               kind: "human_terminal",
-              title: "Terminal Interativo 1",
-              onWrite: handleWrite,
-              onResize: handleResize,
-              onClose: handleClosePane,
-              onMount: handleMount,
-            };
-            setPanes([firstPane]);
-            setConnectionStatus("connected");
+              cwd: activeDir,
+              cols: 80,
+              rows: 24,
+            });
+
+            if (!mounted) return;
+            if (sess && sess.session_id) {
+              const firstPane: TerminalPaneProps = {
+                sessionId: sess.session_id,
+                tabId: activeTab,
+                paneId: 0,
+                kind: "human_terminal",
+                title: "Terminal Interativo 1",
+                onWrite: handleWrite,
+                onResize: handleResize,
+                onClose: handleClosePane,
+                onMount: handleMount,
+              };
+              setPanes([firstPane]);
+              setConnectionStatus("connected");
+            } else {
+              throw new Error("Sessão inicial não retornou session_id válido");
+            }
           } else {
-            throw new Error("Sessão inicial não retornou session_id válido");
+            // Clean install: no authorized project yet. Prompt operator explicitly
+            if (!mounted) return;
+            setIsAuthorizing(true);
+            setConnectionStatus("authorizing");
           }
         } else {
           // Preview mode in standard browser
@@ -239,6 +330,9 @@ export const App: React.FC = () => {
             is_isolated: true,
             python_path: "desktop/runtime/python_spec.json (preview)",
           });
+          const mockDir = "D:\\ai-coordinator";
+          setAuthorizedProjects([mockDir]);
+          setProjectPath(mockDir);
           const mockSessionId = `preview-sess-0`;
           setPanes([
             {
@@ -284,7 +378,7 @@ export const App: React.FC = () => {
     return () => clearInterval(interval);
   }, [isTauri, callTauri]);
 
-  // Output polling loop with monotonic sequence tracking (Problem 7)
+  // Output polling loop with raw chunk stream preservation for xterm.js
   useEffect(() => {
     if (!isTauri || panes.length === 0) return;
 
@@ -297,11 +391,16 @@ export const App: React.FC = () => {
             sinceSeq,
           });
 
-          if (out && Array.isArray(out.lines) && out.lines.length > 0) {
+          if (out) {
             const term = termsRef.current.get(pane.sessionId);
             if (term) {
-              for (const line of out.lines) {
-                term.writeln(line);
+              // Raw PTY chunk stream preserves exact CR, LF, ANSI escapes, prompts
+              if (typeof out.raw === "string" && out.raw.length > 0) {
+                term.write(out.raw);
+              } else if (Array.isArray(out.lines) && out.lines.length > 0) {
+                for (const line of out.lines) {
+                  term.writeln(line);
+                }
               }
             }
             if (typeof out.next_seq === "number") {
@@ -312,7 +411,7 @@ export const App: React.FC = () => {
           // Polling errors for closing sessions are swallowed
         }
       }
-    }, 100);
+    }, 80);
 
     return () => clearInterval(interval);
   }, [isTauri, panes, callTauri]);
@@ -366,12 +465,24 @@ export const App: React.FC = () => {
             Supervisão ConPTY:{" "}
             {connectionStatus === "connected" ? (
               <strong className="text-emerald-400">Ativa</strong>
+            ) : connectionStatus === "authorizing" ? (
+              <strong className="text-blue-400">Aguardando Autorização</strong>
             ) : connectionStatus === "connecting" ? (
               <strong className="text-amber-400">Conectando...</strong>
             ) : (
               <strong className="text-red-400">Falha</strong>
             )}
           </span>
+
+          {/* Direct verification of Python runtime path */}
+          {status?.python_path && (
+            <span
+              className="text-xs px-2 py-0.5 rounded bg-gray-800 text-gray-300 font-mono truncate max-w-xs"
+              title={`Caminho efetivo do runtime Python no host: ${status.python_path}`}
+            >
+              Python: {status.python_path.replace(/\\/g, "/").split("/").pop()} ({status.is_isolated ? "Isolado" : "Host"})
+            </span>
+          )}
         </div>
 
         {/* Telemetry metrics */}
@@ -399,9 +510,45 @@ export const App: React.FC = () => {
         </div>
       )}
 
-      {/* Main Terminal Quad Grid */}
+      {/* Main Terminal Area */}
       <main className="flex-1 w-full h-full min-h-0 overflow-hidden">
-        {connectionStatus === "connecting" && panes.length === 0 ? (
+        {isAuthorizing || connectionStatus === "authorizing" ? (
+          <div className="flex flex-col items-center justify-center h-full p-6 max-w-xl mx-auto">
+            <div className="bg-[#1e1e2e] border border-blue-500/40 rounded-lg p-6 shadow-2xl w-full">
+              <div className="flex items-center space-x-2 mb-3">
+                <span className="text-xl">🛡️</span>
+                <h2 className="text-sm font-bold text-white uppercase tracking-wider">
+                  Autorização de Projeto Obrigatória
+                </h2>
+              </div>
+              <p className="text-xs text-gray-300 mb-4 leading-relaxed">
+                Nenhum projeto está autorizado para o perfil ativo (<code className="text-blue-300">default</code>).
+                Para assegurar a contenção atômica do ConPTY e proteger o sistema de arquivos do host, informe e
+                autorize explicitamente o diretório de trabalho antes de iniciar o terminal.
+              </p>
+              <div className="mb-4">
+                <label className="block text-xs font-mono text-gray-400 mb-1">
+                  Caminho do Projeto no Host:
+                </label>
+                <input
+                  type="text"
+                  value={inputPath}
+                  onChange={(e) => setInputPath(e.target.value)}
+                  placeholder="Ex: C:\Users\10864 ou D:\meu-projeto"
+                  className="w-full bg-[#11111b] border border-gray-600 rounded px-3 py-2 text-xs font-mono text-white focus:outline-none focus:border-blue-500"
+                />
+              </div>
+              <div className="flex items-center justify-end space-x-3">
+                <button
+                  onClick={() => handleAuthorizeAndStart(inputPath)}
+                  className="px-4 py-2 bg-blue-600 hover:bg-blue-500 text-white rounded text-xs font-semibold tracking-wide transition-colors"
+                >
+                  Autorizar Diretório e Iniciar Terminal
+                </button>
+              </div>
+            </div>
+          </div>
+        ) : connectionStatus === "connecting" && panes.length === 0 ? (
           <div className="flex items-center justify-center h-full text-gray-400 font-mono text-sm">
             Inicializando runtime do Core e conectando ponte ConPTY...
           </div>

@@ -131,6 +131,9 @@ class SecureIPCServer:
     def _register_default_handlers(self) -> None:
         self.register("system.ping", self._handle_ping)
         self.register("system.status", self._handle_status)
+        self.register("profile.get_active", self._handle_profile_get_active)
+        self.register("profile.authorize_project", self._handle_profile_authorize_project)
+        self.register("profile.list_authorized_projects", self._handle_profile_list_authorized_projects)
         self.register("terminal.create_tab", self._handle_terminal_create_tab)
         self.register("terminal.create_session", self._handle_terminal_create_session)
         self.register("terminal.write", self._handle_terminal_write)
@@ -191,14 +194,57 @@ class SecureIPCServer:
         ok = mgr.resize_terminal(params["session_id"], params["cols"], params["rows"])
         return {"resized": ok}
 
+    def _handle_profile_get_active(self, _params: Dict[str, Any]) -> Dict[str, Any]:
+        mgr = self._get_terminal_manager()
+        prof_mgr = mgr.authorizer.profile_manager
+        active = prof_mgr.get_active_profile()
+        return {
+            "name": active.name,
+            "display_name": active.display_name,
+            "authorized_projects": active.authorized_projects,
+            "data_dir": active.data_dir,
+        }
+
+    def _handle_profile_authorize_project(self, params: Dict[str, Any], _token: Optional[str] = None) -> Dict[str, Any]:
+        mgr = self._get_terminal_manager()
+        prof_mgr = mgr.authorizer.profile_manager
+        active = prof_mgr.get_active_profile()
+        project_path = params.get("project_path")
+        if not project_path or not isinstance(project_path, str):
+            raise ValueError("Parameter 'project_path' must be a non-empty string")
+
+        path_obj = Path(project_path).resolve()
+        if not path_obj.exists() or not path_obj.is_dir():
+            raise ValueError(f"Project directory does not exist or is not a directory: {project_path}")
+
+        prof_mgr.authorize_project(active.name, str(path_obj))
+        active = prof_mgr.get_active_profile()
+        return {
+            "success": True,
+            "profile_name": active.name,
+            "project_path": str(path_obj),
+            "authorized_projects": active.authorized_projects,
+        }
+
+    def _handle_profile_list_authorized_projects(self, _params: Dict[str, Any]) -> Dict[str, Any]:
+        mgr = self._get_terminal_manager()
+        prof_mgr = mgr.authorizer.profile_manager
+        active = prof_mgr.get_active_profile()
+        return {"authorized_projects": active.authorized_projects}
+
     def _handle_terminal_get_output(self, params: Dict[str, Any]) -> Dict[str, Any]:
         mgr = self._get_terminal_manager()
         sess = mgr.get_session(params["session_id"])
         if not sess:
             raise ValueError(f"Session '{params['session_id']}' not found")
         since_seq = int(params.get("since_seq", 0))
-        lines, next_seq = sess.get_new_output(since_seq)
-        return {"session_id": sess.session_id, "lines": lines, "next_seq": next_seq}
+        raw_text, lines, next_seq = sess.get_new_output(since_seq)
+        return {
+            "session_id": sess.session_id,
+            "raw": raw_text,
+            "lines": lines,
+            "next_seq": next_seq,
+        }
 
     def _handle_terminal_close_session(self, params: Dict[str, Any]) -> Dict[str, Any]:
         mgr = self._get_terminal_manager()

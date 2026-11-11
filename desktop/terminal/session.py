@@ -99,7 +99,14 @@ class TerminalSession:
     def get_output(self) -> List[str]:
         return self.buffer.get_lines()
 
-    def get_new_output(self, since_seq: int = 0) -> tuple[List[str], int]:
+    def get_new_output(self, since_seq: int = 0) -> tuple[str, List[str], int]:
+        """Return raw stream text, structured audit lines, and next sequence number."""
+        return self.buffer.get_new_output(since_seq)
+
+    def get_new_raw(self, since_seq: int = 0) -> tuple[str, int]:
+        return self.buffer.get_new_raw(since_seq)
+
+    def get_new_lines(self, since_seq: int = 0) -> tuple[List[str], int]:
         return self.buffer.get_new_lines(since_seq)
 
     def get_sanitized_export(self) -> List[str]:

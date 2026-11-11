@@ -128,10 +128,16 @@ class TerminalManager:
             rows=rows,
         )
 
+        # Build sanitized child process environment
+        # Critical hygiene: NEVER propagate COORDINATOR_IPC_TOKEN or internal supervisor credentials
+        env = dict(os.environ)
+        for k in list(env.keys()):
+            kl = k.lower()
+            if kl in ("coordinator_ipc_token", "coordinator_supervisor_secret") or "supervisor_secret" in kl:
+                env.pop(k, None)
+
         # If governed agent, enforce worker environment sanitization
-        env = None
         if kind == SessionKind.GOVERNED_AGENT:
-            env = dict(os.environ)
             env["AI_COORDINATOR_ROLE"] = "worker"
             # Strip sensitive secrets from agent environment
             for k in list(env.keys()):
@@ -140,6 +146,11 @@ class TerminalManager:
                     env.pop(k, None)
 
         session.start(env=env)
+
+        # Core ProcessSupervisor integration: capture identity & bind
+        if session.pid:
+            proc_identity = ProcessSupervisor.capture_identity(session.pid)
+            session.identity = proc_identity
 
         tab.panes[pane_id] = session
         self.sessions[session.session_id] = session

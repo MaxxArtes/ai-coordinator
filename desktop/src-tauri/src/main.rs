@@ -310,6 +310,29 @@ fn get_process_tree_metrics() -> ProcessTreeMetrics {
 }
 
 #[tauri::command]
+fn profile_get_active(bridge: State<Arc<IpcBridge>>) -> Result<Value, String> {
+    bridge.call("profile.get_active", json!({}))
+}
+
+#[tauri::command]
+fn profile_authorize_project(
+    project_path: String,
+    bridge: State<Arc<IpcBridge>>,
+) -> Result<Value, String> {
+    bridge.call(
+        "profile.authorize_project",
+        json!({
+            "project_path": project_path
+        }),
+    )
+}
+
+#[tauri::command]
+fn profile_list_authorized_projects(bridge: State<Arc<IpcBridge>>) -> Result<Value, String> {
+    bridge.call("profile.list_authorized_projects", json!({}))
+}
+
+#[tauri::command]
 fn terminal_create_tab(
     tab_id: String,
     project_path: String,
@@ -437,6 +460,9 @@ fn main() {
             ping,
             get_runtime_status,
             get_process_tree_metrics,
+            profile_get_active,
+            profile_authorize_project,
+            profile_list_authorized_projects,
             terminal_create_tab,
             terminal_create_session,
             terminal_write,

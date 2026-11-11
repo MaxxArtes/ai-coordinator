@@ -109,6 +109,12 @@ if os.name == "nt":
         ]
         k32.CreateProcessW.restype = w.BOOL
 
+        k32.ResumeThread.argtypes = [w.HANDLE]
+        k32.ResumeThread.restype = w.DWORD
+
+        k32.TerminateProcess.argtypes = [w.HANDLE, w.UINT]
+        k32.TerminateProcess.restype = w.BOOL
+
 
 class BasePtyBackend(abc.ABC):
     """Abstract base class for PTY session drivers."""
@@ -194,6 +200,12 @@ class WindowsConPtyBackend(BasePtyBackend):
             kill_on_close=True,
             resource_limits=ResourceLimits(max_memory_bytes=max_memory_mb * 1024 * 1024),
         )
+        if not self._job_handle:
+            k32.CloseHandle(h_in_read)
+            k32.CloseHandle(h_in_write)
+            k32.CloseHandle(h_out_read)
+            k32.CloseHandle(h_out_write)
+            raise RuntimeError("Failed to create Windows Job Object containment for ConPTY")
 
         # 3. Create PseudoConsole
         h_pc = HPCON()
@@ -225,19 +237,26 @@ class WindowsConPtyBackend(BasePtyBackend):
             None,
         )
 
-        # 5. Setup STARTUPINFOEXW and spawn
+        # 5. Setup STARTUPINFOEXW and spawn suspended
         si = STARTUPINFOEXW()
         si.StartupInfo.cb = ctypes.sizeof(STARTUPINFOEXW)
         si.lpAttributeList = self._p_attr
         self._pi = PROCESS_INFORMATION()
 
-        flags = 0x00080000  # EXTENDED_STARTUPINFO_PRESENT
-        env_block = None
-        if env is not None:
-            # Build double-null terminated unicode environment block
-            env_str = "".join(f"{k}={v}\0" for k, v in env.items()) + "\0"
-            env_block = ctypes.cast(ctypes.create_unicode_buffer(env_str), ctypes.c_void_p)
-            flags |= 0x00000400  # CREATE_UNICODE_ENVIRONMENT
+        # Flags: EXTENDED_STARTUPINFO_PRESENT (0x80000) | CREATE_SUSPENDED (0x4)
+        CREATE_SUSPENDED = 0x00000004
+        EXTENDED_STARTUPINFO_PRESENT = 0x00080000
+        flags = EXTENDED_STARTUPINFO_PRESENT | CREATE_SUSPENDED
+
+        # Construct explicit, sanitized child environment
+        # Strip COORDINATOR_IPC_TOKEN and internal host secrets so child never inherits them
+        clean_env = dict(env) if env is not None else dict(os.environ)
+        for secret_k in ("COORDINATOR_IPC_TOKEN", "COORDINATOR_SUPERVISOR_SECRET"):
+            clean_env.pop(secret_k, None)
+
+        env_str = "".join(f"{k}={v}\0" for k, v in clean_env.items()) + "\0"
+        env_block = ctypes.cast(ctypes.create_unicode_buffer(env_str), ctypes.c_void_p)
+        flags |= 0x00000400  # CREATE_UNICODE_ENVIRONMENT
 
         cmd_line = subprocess.list2cmdline(cmd)
         cmd_buf = ctypes.create_unicode_buffer(cmd_line)
@@ -265,15 +284,31 @@ class WindowsConPtyBackend(BasePtyBackend):
             self.terminate()
             raise RuntimeError(f"CreateProcessW failed with Win32 error code {err}")
 
-        # 6. Assign child process to Job Object
-        if self._job_handle and self._pi:
-            WindowsProcessController.assign_to_job(
-                self._job_handle, self._pi.dwProcessId, proc_handle=self._pi.hProcess
+        # 6. Containment: Assign suspended child process to Job Object BEFORE execution
+        assigned = WindowsProcessController.assign_to_job(
+            self._job_handle, self._pi.dwProcessId, proc_handle=self._pi.hProcess
+        )
+        if not assigned:
+            k32.TerminateProcess(self._pi.hProcess, 1)
+            self.terminate()
+            raise RuntimeError(
+                f"Atomic containment failed: unable to assign PID {self._pi.dwProcessId} to Job Object. "
+                "Child process terminated immediately before execution."
+            )
+
+        # 7. Safe Resumption: Process is confirmed contained inside Job Object
+        resume_count = k32.ResumeThread(self._pi.hThread)
+        if resume_count == 0xFFFFFFFF or resume_count < 0:
+            k32.TerminateProcess(self._pi.hProcess, 1)
+            self.terminate()
+            raise RuntimeError(
+                f"Failed to resume suspended ConPTY thread for PID {self._pi.dwProcessId}. "
+                "Child process terminated for safety."
             )
 
         self._running = True
 
-        # 7. Start reader thread
+        # 8. Start reader thread
         self._reader_thread = threading.Thread(target=self._read_loop, daemon=True)
         self._reader_thread.start()
 
@@ -283,6 +318,9 @@ class WindowsConPtyBackend(BasePtyBackend):
         return ProcessIdentity(pid=pid, create_time_ns=create_ns, system="windows", start_iso=now_iso)
 
     def _read_loop(self) -> None:
+        import codecs
+
+        decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
         buf = (ctypes.c_char * 4096)()
         bread = w.DWORD()
         while self._running and self._h_out_read:
@@ -290,8 +328,8 @@ class WindowsConPtyBackend(BasePtyBackend):
             if not ok or bread.value == 0:
                 break
             raw_bytes = bytes(buf[: bread.value])
-            text = raw_bytes.decode("utf-8", errors="replace")
-            if self._on_output_callback:
+            text = decoder.decode(raw_bytes, final=False)
+            if text and self._on_output_callback:
                 try:
                     self._on_output_callback(text)
                 except Exception:
@@ -404,10 +442,14 @@ class SubprocessPipeBackend(BasePtyBackend):
         max_memory_mb: int = 256,
     ) -> ProcessIdentity:
         working_dir = str(cwd.resolve())
+        clean_env = dict(env) if env is not None else dict(os.environ)
+        for secret_k in ("COORDINATOR_IPC_TOKEN", "COORDINATOR_SUPERVISOR_SECRET"):
+            clean_env.pop(secret_k, None)
+
         self.process = subprocess.Popen(
             cmd,
             cwd=working_dir,
-            env=env,
+            env=clean_env,
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
@@ -440,13 +482,16 @@ class SubprocessPipeBackend(BasePtyBackend):
         return ProcessIdentity(pid=pid, create_time_ns=create_ns, system=system, start_iso=now_iso)
 
     def _read_loop(self) -> None:
+        import codecs
+
+        decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
         while self._running and self.process and self.process.stdout:
             try:
                 chunk = self.process.stdout.read(1024)
                 if not chunk:
                     break
-                text = chunk.decode("utf-8", errors="replace")
-                if self._on_output_callback:
+                text = decoder.decode(chunk, final=False)
+                if text and self._on_output_callback:
                     self._on_output_callback(text)
             except Exception:
                 break
