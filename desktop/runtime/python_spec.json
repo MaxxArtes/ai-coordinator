@@ -1,0 +1,37 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "name": "ai-coordinator-desktop-python-runtime",
+  "description": "Fixed specifications, target platform definitions, and cryptographic checksums for Python Build Standalone",
+  "target_version": "3.11.9",
+  "release_tag": "20240415",
+  "runtime_flags": {
+    "isolated": "-I",
+    "description": "Isolated mode: ignore PYTHONPATH, PYTHONHOME, and user site-packages, but allow private bundled site-packages."
+  },
+  "platforms": {
+    "windows-x86_64": {
+      "filename": "cpython-3.11.9+20240415-x86_64-pc-windows-msvc-shared-install_only.tar.gz",
+      "url": "https://github.com/indygreg/python-build-standalone/releases/download/20240415/cpython-3.11.9+20240415-x86_64-pc-windows-msvc-shared-install_only.tar.gz",
+      "sha256": "3cb49a42533ba129f121bbffbb67a9cf96b42b6a7a0b35c02936a282f45ea2e6",
+      "executable_relpath": "python/python.exe"
+    },
+    "linux-x86_64": {
+      "filename": "cpython-3.11.9+20240415-x86_64-unknown-linux-gnu-install_only.tar.gz",
+      "url": "https://github.com/indygreg/python-build-standalone/releases/download/20240415/cpython-3.11.9+20240415-x86_64-unknown-linux-gnu-install_only.tar.gz",
+      "sha256": "4b68e7b9be897efba837b27be636d405ebbc5e4bb00fb30831a238ce58b877ea",
+      "executable_relpath": "python/bin/python3"
+    },
+    "macos-aarch64": {
+      "filename": "cpython-3.11.9+20240415-aarch64-apple-darwin-install_only.tar.gz",
+      "url": "https://github.com/indygreg/python-build-standalone/releases/download/20240415/cpython-3.11.9+20240415-aarch64-apple-darwin-install_only.tar.gz",
+      "sha256": "a34659b48c48a73724c965eb45781a8b9e6fa45d045d6582a7f539446d51bbcf",
+      "executable_relpath": "python/bin/python3"
+    },
+    "macos-x86_64": {
+      "filename": "cpython-3.11.9+20240415-x86_64-apple-darwin-install_only.tar.gz",
+      "url": "https://github.com/indygreg/python-build-standalone/releases/download/20240415/cpython-3.11.9+20240415-x86_64-apple-darwin-install_only.tar.gz",
+      "sha256": "6d123e4b7b2ce8f4118f673858cceeb3f2832961d56e72b0c53842c94968565b",
+      "executable_relpath": "python/bin/python3"
+    }
+  }
+}
