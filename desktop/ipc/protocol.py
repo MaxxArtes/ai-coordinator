@@ -30,6 +30,18 @@ class RPCErrorCode(int, Enum):
     SECURITY_VIOLATION = -32003
 
 
+class MetricProvenance(str, Enum):
+    MEASURED = "measured"
+    ESTIMATED = "estimated"
+    UNKNOWN = "unknown"
+
+
+class DataOrigin(str, Enum):
+    LIVE_NETWORK = "live_network"
+    TEST_FIXTURE = "test_fixture"
+    OFFLINE_CACHE = "offline_cache"
+
+
 @dataclass
 class RPCRequest:
     method: str
