@@ -1,0 +1,9 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "Default capabilities for AI Coordinator Desktop",
+  "windows": ["main"],
+  "permissions": [
+    "core:default"
+  ]
+}
