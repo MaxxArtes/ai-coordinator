@@ -36,11 +36,7 @@
       "icons/icon.ico"
     ],
     "resources": [
-      "../runtime/**",
-      "../ipc/**",
-      "../auth/**",
-      "../terminal/**",
-      "../../src/**"
+      "resources/**/*"
     ]
   }
 }

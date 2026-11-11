@@ -63,11 +63,18 @@ jobs:
           }
           Write-Host "SHA256 verified successfully: $actualHash"
 
-          Write-Host "Extracting Python Standalone to desktop/runtime/..."
-          tar -xzf $tarPath -C desktop/runtime/
+          # Extract to desktop/src-tauri/resources/runtime/
+          $resRuntime = "desktop/src-tauri/resources/runtime"
+          New-Item -ItemType Directory -Force -Path $resRuntime
+          Write-Host "Extracting Python Standalone to $resRuntime..."
+          tar -xzf $tarPath -C $resRuntime
           Remove-Item $tarPath
 
-          $bundledPy = "desktop/runtime/python/python.exe"
+          # Also mirror to desktop/runtime/python
+          New-Item -ItemType Directory -Force -Path "desktop/runtime"
+          Copy-Item "$resRuntime/python" -Destination "desktop/runtime/" -Recurse -Force
+
+          $bundledPy = "$resRuntime/python/python.exe"
           if (-not (Test-Path $bundledPy)) {
               Write-Error "Bundled Python executable not found at $bundledPy"
               exit 1
@@ -79,6 +86,21 @@ jobs:
           Write-Host "Installing Core dependencies into bundled Python..."
           & $bundledPy -m pip install --upgrade pip
           & $bundledPy -m pip install -e .
+
+          # Populate remaining application resources inside desktop/src-tauri/resources/
+          Write-Host "Populating application resources into desktop/src-tauri/resources/..."
+          $resDesktop = "desktop/src-tauri/resources/desktop"
+          $resSrc = "desktop/src-tauri/resources/src"
+          New-Item -ItemType Directory -Force -Path $resDesktop
+          New-Item -ItemType Directory -Force -Path $resSrc
+
+          Copy-Item "desktop/ipc" -Destination "$resDesktop/" -Recurse -Force
+          Copy-Item "desktop/auth" -Destination "$resDesktop/" -Recurse -Force
+          Copy-Item "desktop/terminal" -Destination "$resDesktop/" -Recurse -Force
+          Copy-Item "src/*" -Destination "$resSrc/" -Recurse -Force
+
+          Write-Host "Resources directory populated successfully:"
+          Get-ChildItem -Path "desktop/src-tauri/resources" | Select-Object Name
 
       - name: Install Desktop Frontend Dependencies
         working-directory: desktop
@@ -97,16 +119,10 @@ jobs:
         run: |
           Write-Host "=== Preparing Portable Alpha Directory ==="
           $portableDir = "desktop/src-tauri/target/debug/portable"
-          New-Item -ItemType Directory -Force -Path "$portableDir/resources/runtime"
-          New-Item -ItemType Directory -Force -Path "$portableDir/resources/desktop"
-          New-Item -ItemType Directory -Force -Path "$portableDir/resources/src"
+          New-Item -ItemType Directory -Force -Path "$portableDir/resources"
 
           Copy-Item "desktop/src-tauri/target/debug/ai-coordinator-desktop.exe" -Destination "$portableDir/" -Force
-          Copy-Item "desktop/runtime/*" -Destination "$portableDir/resources/runtime" -Recurse -Force
-          Copy-Item "desktop/ipc" -Destination "$portableDir/resources/desktop" -Recurse -Force
-          Copy-Item "desktop/auth" -Destination "$portableDir/resources/desktop" -Recurse -Force
-          Copy-Item "desktop/terminal" -Destination "$portableDir/resources/desktop" -Recurse -Force
-          Copy-Item "src/*" -Destination "$portableDir/resources/src" -Recurse -Force
+          Copy-Item "desktop/src-tauri/resources/*" -Destination "$portableDir/resources/" -Recurse -Force
 
           Compress-Archive -Path "$portableDir/*" -DestinationPath "desktop/src-tauri/target/debug/ai-coordinator-desktop-alpha-portable.zip" -Force
           Write-Host "Portable package created at desktop/src-tauri/target/debug/ai-coordinator-desktop-alpha-portable.zip"
