@@ -12,7 +12,7 @@
     "windows-x86_64": {
       "filename": "cpython-3.11.9+20240415-x86_64-pc-windows-msvc-shared-install_only.tar.gz",
       "url": "https://github.com/indygreg/python-build-standalone/releases/download/20240415/cpython-3.11.9+20240415-x86_64-pc-windows-msvc-shared-install_only.tar.gz",
-      "sha256": "3cb49a42533ba129f121bbffbb67a9cf96b42b6a7a0b35c02936a282f45ea2e6",
+      "sha256": "368474c69f476e7de4adaf50b61d9fcf6ec8b4db88cc43c5f71c860b3cd29c69",
       "executable_relpath": "python/python.exe"
     },
     "linux-x86_64": {

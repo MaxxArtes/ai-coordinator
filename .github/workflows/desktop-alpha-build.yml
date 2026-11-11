@@ -44,6 +44,7 @@ jobs:
       - name: Provision Bundled Python Build Standalone Runtime
         shell: powershell
         run: |
+          $ProgressPreference = 'SilentlyContinue'
           Write-Host "=== Provisioning Python Build Standalone for Windows x86_64 ==="
           $specFile = "desktop/runtime/python_spec.json"
           $spec = Get-Content $specFile | ConvertFrom-Json
