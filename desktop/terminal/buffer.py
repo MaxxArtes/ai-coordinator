@@ -23,6 +23,7 @@ SENSITIVE_PATTERNS = [
 
 @dataclass
 class TerminalLine:
+    seq: int
     text: str
     byte_length: int
 
@@ -35,12 +36,14 @@ class BoundedTerminalBuffer:
         self.max_bytes = max_bytes
         self.lines: Deque[TerminalLine] = collections.deque()
         self.total_bytes: int = 0
+        self._next_seq: int = 0
 
     def append(self, text: str) -> None:
         """Append raw line/chunk, evicting oldest lines if exceeding limits."""
         for raw_line in text.splitlines(keepends=False):
             line_bytes = len(raw_line.encode("utf-8", errors="replace"))
-            entry = TerminalLine(text=raw_line, byte_length=line_bytes)
+            self._next_seq += 1
+            entry = TerminalLine(seq=self._next_seq, text=raw_line, byte_length=line_bytes)
             self.lines.append(entry)
             self.total_bytes += line_bytes
 
@@ -57,12 +60,19 @@ class BoundedTerminalBuffer:
     def get_lines(self) -> List[str]:
         return [line.text for line in self.lines]
 
+    def get_new_lines(self, since_seq: int = 0) -> tuple[List[str], int]:
+        """Return all lines with seq > since_seq and the latest sequence number."""
+        if since_seq <= 0:
+            return [line.text for line in self.lines], self._next_seq
+        return [line.text for line in self.lines if line.seq > since_seq], self._next_seq
+
     def get_raw_text(self) -> str:
         return "\n".join(self.get_lines())
 
     def clear(self) -> None:
         self.lines.clear()
         self.total_bytes = 0
+        self._next_seq = 0
 
     @property
     def line_count(self) -> int:

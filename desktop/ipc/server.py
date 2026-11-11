@@ -196,7 +196,9 @@ class SecureIPCServer:
         sess = mgr.get_session(params["session_id"])
         if not sess:
             raise ValueError(f"Session '{params['session_id']}' not found")
-        return {"session_id": sess.session_id, "lines": sess.get_output()}
+        since_seq = int(params.get("since_seq", 0))
+        lines, next_seq = sess.get_new_output(since_seq)
+        return {"session_id": sess.session_id, "lines": lines, "next_seq": next_seq}
 
     def _handle_terminal_close_session(self, params: Dict[str, Any]) -> Dict[str, Any]:
         mgr = self._get_terminal_manager()

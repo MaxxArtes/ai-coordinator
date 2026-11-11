@@ -99,6 +99,9 @@ class TerminalSession:
     def get_output(self) -> List[str]:
         return self.buffer.get_lines()
 
+    def get_new_output(self, since_seq: int = 0) -> tuple[List[str], int]:
+        return self.buffer.get_new_lines(since_seq)
+
     def get_sanitized_export(self) -> List[str]:
         return self.buffer.export_sanitized()
 

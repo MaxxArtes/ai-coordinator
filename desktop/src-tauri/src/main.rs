@@ -122,25 +122,15 @@ impl IpcBridge {
 
             if let Some(found) = candidates.into_iter().find(|p| p.exists()) {
                 found
+            } else if std::env::var("COORDINATOR_DEV_MODE").as_deref() == Ok("1") {
+                eprintln!(
+                    "[TAURI_IPC_WARN] Bundled Python runtime not found. Falling back to host PATH 'python' (explicit COORDINATOR_DEV_MODE=1)."
+                );
+                PathBuf::from("python")
             } else {
-                #[cfg(debug_assertions)]
-                {
-                    if std::env::var("COORDINATOR_STRICT_RUNTIME").is_ok() {
-                        return Err(
-                            "Fail-closed: Bundled Python runtime not found and COORDINATOR_STRICT_RUNTIME is set.".to_string(),
-                        );
-                    }
-                    eprintln!(
-                        "[TAURI_IPC_WARN] Bundled Python runtime not found. Falling back to host PATH 'python' (debug/dev mode only)."
-                    );
-                    PathBuf::from("python")
-                }
-                #[cfg(not(debug_assertions))]
-                {
-                    return Err(
-                        "Fail-closed: Private bundled Python runtime not found in application resources, and COORDINATOR_PYTHON not set. Refusing to run in release mode without verified private runtime.".to_string(),
-                    );
-                }
+                return Err(
+                    "Fail-closed: Private bundled Python runtime not found in application resources, and COORDINATOR_PYTHON not set. Refusing to fallback to host PATH python.".to_string(),
+                );
             }
         };
 
@@ -394,12 +384,14 @@ fn terminal_resize(
 #[tauri::command]
 fn terminal_get_output(
     session_id: String,
+    since_seq: Option<u64>,
     bridge: State<Arc<IpcBridge>>,
 ) -> Result<Value, String> {
     bridge.call(
         "terminal.get_output",
         json!({
-            "session_id": session_id
+            "session_id": session_id,
+            "since_seq": since_seq.unwrap_or(0)
         }),
     )
 }

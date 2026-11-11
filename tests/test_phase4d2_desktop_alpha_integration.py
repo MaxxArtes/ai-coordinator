@@ -194,6 +194,62 @@ class TestDesktopAlphaIntegration(unittest.TestCase):
         # Teardown
         term_mgr.terminate_all()
 
+    def test_06_ring_buffer_monotonic_polling_never_freezes_at_limit(self) -> None:
+        """Verifies buffer polling with since_seq continues streaming after 1000-line limit (Problem 7)."""
+        from desktop.terminal.buffer import BoundedTerminalBuffer
+
+        buf = BoundedTerminalBuffer(max_lines=10, max_bytes=1024 * 1024)
+        # 1. Fill buffer with 10 lines
+        for i in range(10):
+            buf.append(f"initial-line-{i}")
+
+        lines, seq1 = buf.get_new_lines(0)
+        self.assertEqual(len(lines), 10)
+        self.assertEqual(seq1, 10)
+
+        # 2. Add 5 more lines (evicting oldest 5)
+        for i in range(10, 15):
+            buf.append(f"overflow-line-{i}")
+
+        # Total buffer still capped at 10
+        self.assertEqual(buf.line_count, 10)
+
+        # Polling with since_seq=seq1 (10) returns the 5 new lines, NOT empty!
+        new_lines, seq2 = buf.get_new_lines(seq1)
+        self.assertEqual(len(new_lines), 5)
+        self.assertEqual(new_lines[0], "overflow-line-10")
+        self.assertEqual(new_lines[-1], "overflow-line-14")
+        self.assertEqual(seq2, 15)
+
+    def test_07_tab_prerequisite_enforced_fail_closed(self) -> None:
+        """Verifies session creation strictly fails if tab was not created first (Problem 2)."""
+        token = "test-alpha-token-tab"
+        transport = InMemoryTransport()
+        prof_mgr = DesktopProfileManager()
+        prof_mgr.authorize_project(prof_mgr.get_active_profile().name, str(_repo_root))
+        authorizer = DesktopAuthorizer(profile_manager=prof_mgr)
+        authorizer._active_sessions[token] = prof_mgr.get_active_profile().name
+        term_mgr = TerminalManager(authorizer=authorizer)
+        server = SecureIPCServer(transport=transport, session_token=token, terminal_manager=term_mgr)
+
+        # Attempt to create session without creating tab first
+        transport.inbox.append(json.dumps({
+            "jsonrpc": "2.0",
+            "id": "1",
+            "method": "terminal.create_session",
+            "params": {
+                "tab_id": "non-existent-tab",
+                "pane_id": 0,
+                "kind": "human_terminal",
+                "cwd": str(_repo_root)
+            },
+            "session_token": token
+        }))
+        self.assertTrue(server.process_one())
+        res = json.loads(transport.outbox.pop(0))
+        self.assertIn("error", res)
+        self.assertIn("does not exist", res["error"]["message"])
+
 
 if __name__ == "__main__":
     unittest.main()
