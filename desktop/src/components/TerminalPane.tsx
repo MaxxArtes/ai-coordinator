@@ -7,18 +7,23 @@
  * - Dynamic dimension resizing with FitAddon and ResizeObserver.
  * - Bidirectional streaming with backpressure protection.
  * - Keyboard accessibility, focus management, and copy/paste keybindings.
+ * - Stale-closure prevention: Callbacks are kept in live refs so xterm instance
+ *   is never disposed or re-mounted due to callback reference changes.
  */
 
 import React, { useEffect, useRef } from "react";
 import { Terminal } from "xterm";
 import { FitAddon } from "xterm-addon-fit";
 
-export interface TerminalPaneProps {
+export interface TerminalPaneData {
   sessionId: string;
   tabId: string;
   paneId: number;
   kind: "human_terminal" | "governed_agent";
   title?: string;
+}
+
+export interface TerminalPaneProps extends TerminalPaneData {
   onWrite: (sessionId: string, data: string) => void;
   onResize: (sessionId: string, cols: number, rows: number) => void;
   onClose?: (sessionId: string) => void;
@@ -39,6 +44,14 @@ export const TerminalPane: React.FC<TerminalPaneProps> = ({
   const containerRef = useRef<HTMLDivElement>(null);
   const terminalRef = useRef<Terminal | null>(null);
   const fitAddonRef = useRef<FitAddon | null>(null);
+
+  // Keep latest callbacks in refs to eliminate stale closure bugs while keeping xterm mount stable
+  const onWriteRef = useRef(onWrite);
+  onWriteRef.current = onWrite;
+  const onResizeRef = useRef(onResize);
+  onResizeRef.current = onResize;
+  const onMountRef = useRef(onMount);
+  onMountRef.current = onMount;
 
   useEffect(() => {
     if (!containerRef.current) return;
@@ -76,20 +89,20 @@ export const TerminalPane: React.FC<TerminalPaneProps> = ({
     terminalRef.current = term;
     fitAddonRef.current = fitAddon;
 
-    if (onMount) {
-      onMount(sessionId, term);
+    if (onMountRef.current) {
+      onMountRef.current(sessionId, term);
     }
 
-    // 2. Keystroke forwarding
+    // 2. Keystroke forwarding using live ref
     const dataDisposable = term.onData((data) => {
-      onWrite(sessionId, data);
+      onWriteRef.current(sessionId, data);
     });
 
-    // 3. Resize handling with ResizeObserver
+    // 3. Resize handling with ResizeObserver using live ref
     const observer = new ResizeObserver(() => {
       try {
         fitAddon.fit();
-        onResize(sessionId, term.cols, term.rows);
+        onResizeRef.current(sessionId, term.cols, term.rows);
       } catch (err) {
         // Ignored during unmount
       }
@@ -98,17 +111,17 @@ export const TerminalPane: React.FC<TerminalPaneProps> = ({
     observer.observe(containerRef.current);
 
     // Initial resize sync
-    onResize(sessionId, term.cols, term.rows);
+    onResizeRef.current(sessionId, term.cols, term.rows);
 
     return () => {
-      if (onMount) {
-        onMount(sessionId, null);
+      if (onMountRef.current) {
+        onMountRef.current(sessionId, null);
       }
       dataDisposable.dispose();
       observer.disconnect();
       term.dispose();
     };
-  }, [sessionId, onWrite, onResize, onMount]);
+  }, [sessionId]);
 
   const badgeColor = kind === "human_terminal" ? "bg-blue-600" : "bg-emerald-600";
   const badgeLabel = kind === "human_terminal" ? "Terminal Humano" : "Agente Governado";

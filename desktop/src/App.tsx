@@ -1,6 +1,6 @@
 import React, { useEffect, useRef, useState, useCallback } from "react";
 import { TerminalGrid } from "./components/TerminalGrid";
-import { TerminalPaneProps } from "./components/TerminalPane";
+import { TerminalPaneData } from "./components/TerminalPane";
 import { Terminal } from "xterm";
 
 interface RuntimeMetrics {
@@ -19,6 +19,8 @@ interface RuntimeStatus {
 
 export const App: React.FC = () => {
   const [isTauri, setIsTauri] = useState<boolean>(false);
+  const isTauriRef = useRef<boolean>(false);
+
   const [connectionStatus, setConnectionStatus] = useState<"connecting" | "authorizing" | "connected" | "failed">("connecting");
   const [status, setStatus] = useState<RuntimeStatus | null>(null);
   const [metrics, setMetrics] = useState<RuntimeMetrics | null>(null);
@@ -27,7 +29,7 @@ export const App: React.FC = () => {
   const [authorizedProjects, setAuthorizedProjects] = useState<string[]>([]);
   const [isAuthorizing, setIsAuthorizing] = useState<boolean>(false);
   const [inputPath, setInputPath] = useState<string>("");
-  const [panes, setPanes] = useState<TerminalPaneProps[]>([]);
+  const [panes, setPanes] = useState<TerminalPaneData[]>([]);
   const [notice, setNotice] = useState<string>("");
 
   const termsRef = useRef<Map<string, Terminal>>(new Map());
@@ -43,12 +45,12 @@ export const App: React.FC = () => {
   const ensureTabCreated = useCallback(
     async (tabId: string, path: string) => {
       if (createdTabsRef.current.has(tabId)) return;
-      if (isTauri) {
+      if (isTauriRef.current) {
         await callTauri("terminal_create_tab", { tabId, projectPath: path });
       }
       createdTabsRef.current.add(tabId);
     },
-    [isTauri, callTauri]
+    [callTauri]
   );
 
   // Terminal mount callback
@@ -67,10 +69,10 @@ export const App: React.FC = () => {
     }
   }, []);
 
-  // Write keystroke to backend
+  // Write keystroke to backend with zero stale closure bugs
   const handleWrite = useCallback(
     async (sessionId: string, data: string) => {
-      if (isTauri) {
+      if (isTauriRef.current) {
         try {
           await callTauri("terminal_write", { sessionId, data });
         } catch (err: any) {
@@ -92,27 +94,27 @@ export const App: React.FC = () => {
         }
       }
     },
-    [isTauri, callTauri]
+    [callTauri]
   );
 
-  // Resize handler
+  // Resize handler with live ref
   const handleResize = useCallback(
     async (sessionId: string, cols: number, rows: number) => {
-      if (isTauri) {
+      if (isTauriRef.current) {
         try {
           await callTauri("terminal_resize", { sessionId, cols, rows });
-        } catch (err) {
+        } catch {
           // Resize errors can be safely ignored during pane disposal
         }
       }
     },
-    [isTauri, callTauri]
+    [callTauri]
   );
 
-  // Close pane handler
+  // Close pane handler with live ref
   const handleClosePane = useCallback(
     async (sessionId: string) => {
-      if (isTauri) {
+      if (isTauriRef.current) {
         try {
           await callTauri("terminal_close_session", { sessionId });
         } catch (err: any) {
@@ -123,7 +125,7 @@ export const App: React.FC = () => {
       termsRef.current.delete(sessionId);
       lastSeqRef.current.delete(sessionId);
     },
-    [isTauri, callTauri]
+    [callTauri]
   );
 
   // Add new pane (Defaults strictly to human_terminal)
@@ -139,7 +141,7 @@ export const App: React.FC = () => {
       try {
         let realSessionId = `preview-sess-${Date.now().toString(36)}-${newPaneId}`;
 
-        if (isTauri) {
+        if (isTauriRef.current) {
           await ensureTabCreated(tabId, projectPath);
           const sess = await callTauri("terminal_create_session", {
             tabId,
@@ -156,16 +158,12 @@ export const App: React.FC = () => {
           realSessionId = sess.session_id;
         }
 
-        const newPane: TerminalPaneProps = {
+        const newPane: TerminalPaneData = {
           sessionId: realSessionId,
           tabId,
           paneId: newPaneId,
           kind,
           title: `Terminal Interativo ${newPaneId + 1}`,
-          onWrite: handleWrite,
-          onResize: handleResize,
-          onClose: handleClosePane,
-          onMount: handleMount,
         };
 
         setPanes((prev) => [...prev, newPane]);
@@ -174,7 +172,7 @@ export const App: React.FC = () => {
         setNotice(`Falha ao criar terminal no painel ${newPaneId + 1}: ${msg}`);
       }
     },
-    [panes.length, isTauri, projectPath, ensureTabCreated, callTauri, handleWrite, handleResize, handleClosePane, handleMount]
+    [panes.length, projectPath, ensureTabCreated, callTauri]
   );
 
   // Authorize project directory and start session
@@ -186,7 +184,7 @@ export const App: React.FC = () => {
       }
       try {
         setNotice("");
-        if (isTauri) {
+        if (isTauriRef.current) {
           const res = await callTauri("profile_authorize_project", { projectPath: dirToAuthorize.trim() });
           if (!res || !res.success) {
             throw new Error("Resposta inesperada do autorizador.");
@@ -215,16 +213,12 @@ export const App: React.FC = () => {
           });
 
           if (sess && sess.session_id) {
-            const firstPane: TerminalPaneProps = {
+            const firstPane: TerminalPaneData = {
               sessionId: sess.session_id,
               tabId: activeTab,
               paneId: 0,
               kind: "human_terminal",
               title: "Terminal Interativo 1",
-              onWrite: handleWrite,
-              onResize: handleResize,
-              onClose: handleClosePane,
-              onMount: handleMount,
             };
             setPanes([firstPane]);
             setConnectionStatus("connected");
@@ -244,7 +238,7 @@ export const App: React.FC = () => {
         setConnectionStatus("authorizing");
       }
     },
-    [isTauri, activeTab, callTauri, handleWrite, handleResize, handleClosePane, handleMount]
+    [activeTab, callTauri]
   );
 
   // Initialize runtime connection and check project authorization
@@ -264,7 +258,9 @@ export const App: React.FC = () => {
         if (!mounted) return;
 
         if (pingRes === "pong") {
+          isTauriRef.current = true;
           setIsTauri(true);
+
           const st = await callTauri("get_runtime_status");
           if (mounted && st) setStatus(st);
 
@@ -299,16 +295,12 @@ export const App: React.FC = () => {
 
             if (!mounted) return;
             if (sess && sess.session_id) {
-              const firstPane: TerminalPaneProps = {
+              const firstPane: TerminalPaneData = {
                 sessionId: sess.session_id,
                 tabId: activeTab,
                 paneId: 0,
                 kind: "human_terminal",
                 title: "Terminal Interativo 1",
-                onWrite: handleWrite,
-                onResize: handleResize,
-                onClose: handleClosePane,
-                onMount: handleMount,
               };
               setPanes([firstPane]);
               setConnectionStatus("connected");
@@ -323,6 +315,7 @@ export const App: React.FC = () => {
           }
         } else {
           // Preview mode in standard browser
+          isTauriRef.current = false;
           setIsTauri(false);
           setStatus({
             core_version: "0.6.0",
@@ -341,10 +334,6 @@ export const App: React.FC = () => {
               paneId: 0,
               kind: "human_terminal",
               title: "Terminal Interativo (Preview)",
-              onWrite: handleWrite,
-              onResize: handleResize,
-              onClose: handleClosePane,
-              onMount: handleMount,
             },
           ]);
           setConnectionStatus("connected");
@@ -362,7 +351,7 @@ export const App: React.FC = () => {
     return () => {
       mounted = false;
     };
-  }, []);
+  }, [activeTab, callTauri]);
 
   // Periodic metrics refresh
   useEffect(() => {
@@ -419,7 +408,7 @@ export const App: React.FC = () => {
   // Save session layout
   const handleSaveSessions = useCallback(
     async (tabId: string) => {
-      if (isTauri) {
+      if (isTauriRef.current) {
         try {
           const res = await callTauri("terminal_save_sessions", { tabId });
           setNotice(`Sessão salva com sucesso: ${res?.total_sessions || panes.length} terminais arquivados.`);
@@ -431,7 +420,7 @@ export const App: React.FC = () => {
       }
       setTimeout(() => setNotice(""), 4000);
     },
-    [isTauri, panes.length, callTauri]
+    [panes.length, callTauri]
   );
 
   const formatBytes = (bytes: number) => {
@@ -564,6 +553,10 @@ export const App: React.FC = () => {
             panes={panes}
             onAddPane={handleAddPane}
             onSaveSessions={handleSaveSessions}
+            onWrite={handleWrite}
+            onResize={handleResize}
+            onClose={handleClosePane}
+            onMount={handleMount}
           />
         )}
       </main>

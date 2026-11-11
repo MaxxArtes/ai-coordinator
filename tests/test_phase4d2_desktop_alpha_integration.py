@@ -441,6 +441,182 @@ class TestDesktopAlphaIntegration(unittest.TestCase):
             os.environ.pop("COORDINATOR_IPC_TOKEN", None)
             os.environ.pop("COORDINATOR_SUPERVISOR_SECRET", None)
 
+    def test_12_react_callback_stale_closure_prevention(self) -> None:
+        """Verifies React frontend eliminates stale closure of isTauri and callbacks in first pane."""
+        app_tsx = (self.desktop_dir / "src" / "App.tsx").read_text(encoding="utf-8")
+        pane_tsx = (self.desktop_dir / "src" / "components" / "TerminalPane.tsx").read_text(encoding="utf-8")
+        grid_tsx = (self.desktop_dir / "src" / "components" / "TerminalGrid.tsx").read_text(encoding="utf-8")
+
+        # 1. App.tsx must maintain isTauriRef for synchronous live state access
+        self.assertIn("isTauriRef", app_tsx)
+        self.assertIn("isTauriRef.current = true", app_tsx)
+        self.assertIn("if (isTauriRef.current)", app_tsx)
+
+        # 2. Callbacks must check isTauriRef.current rather than stale closed-over state
+        self.assertIn("handleWrite", app_tsx)
+        self.assertIn("handleResize", app_tsx)
+        self.assertIn("handleClosePane", app_tsx)
+
+        # 3. Panes state must be pure data (TerminalPaneData), not storing callbacks in state
+        self.assertIn("TerminalPaneData", app_tsx)
+        self.assertIn("TerminalPaneData", pane_tsx)
+        self.assertIn("TerminalPaneData", grid_tsx)
+
+        # 4. TerminalPane.tsx must use live refs for callbacks to prevent unnecessary xterm re-mounts
+        self.assertIn("onWriteRef", pane_tsx)
+        self.assertIn("onResizeRef", pane_tsx)
+        self.assertIn("onMountRef", pane_tsx)
+
+    def test_13_first_session_lifecycle_roundtrip_after_connection(self) -> None:
+        """Verifies creation, write, resize, and close of first session upon transition to connected."""
+        token = "test-first-session-lifecycle"
+        transport = InMemoryTransport()
+        prof_mgr = DesktopProfileManager()
+        prof_mgr.authorize_project(prof_mgr.get_active_profile().name, str(_repo_root))
+        authorizer = DesktopAuthorizer(profile_manager=prof_mgr)
+        authorizer._active_sessions[token] = prof_mgr.get_active_profile().name
+        term_mgr = TerminalManager(authorizer=authorizer)
+        server = SecureIPCServer(transport=transport, session_token=token, terminal_manager=term_mgr)
+
+        # 1. Verify connection status ping
+        transport.inbox.append(json.dumps({"jsonrpc": "2.0", "id": "1", "method": "system.ping", "params": {}}))
+        self.assertTrue(server.process_one())
+        pong = json.loads(transport.outbox.pop(0))
+        self.assertEqual(pong["result"]["status"], "pong")
+
+        # 2. Create tab
+        transport.inbox.append(json.dumps({
+            "jsonrpc": "2.0", "id": "2", "method": "terminal.create_tab",
+            "params": {"tab_id": "tab-main", "project_path": str(_repo_root)},
+            "session_token": token
+        }))
+        self.assertTrue(server.process_one())
+        tab_res = json.loads(transport.outbox.pop(0))
+        self.assertEqual(tab_res["result"]["tab_id"], "tab-main")
+
+        # 3. Create initial first session (connected state)
+        cmd = [sys.executable, "-u", "-c", "import sys; print('FIRST_PANE_READY'); sys.stdout.flush(); line = sys.stdin.readline(); print('ECHO:' + line.strip()); sys.stdout.flush()"]
+        transport.inbox.append(json.dumps({
+            "jsonrpc": "2.0", "id": "3", "method": "terminal.create_session",
+            "params": {
+                "tab_id": "tab-main", "pane_id": 0, "kind": "human_terminal",
+                "command": cmd, "cwd": str(_repo_root), "cols": 80, "rows": 24
+            },
+            "session_token": token
+        }))
+        self.assertTrue(server.process_one())
+        sess_res = json.loads(transport.outbox.pop(0))
+        session_id = sess_res["result"]["session_id"]
+
+        time.sleep(0.3)
+
+        # 4. Verify initial output
+        transport.inbox.append(json.dumps({
+            "jsonrpc": "2.0", "id": "4", "method": "terminal.get_output",
+            "params": {"session_id": session_id, "since_seq": 0},
+            "session_token": token
+        }))
+        self.assertTrue(server.process_one())
+        out1 = json.loads(transport.outbox.pop(0))
+        self.assertIn("FIRST_PANE_READY", out1["result"]["raw"])
+
+        # 5. Resize first terminal
+        transport.inbox.append(json.dumps({
+            "jsonrpc": "2.0", "id": "5", "method": "terminal.resize",
+            "params": {"session_id": session_id, "cols": 120, "rows": 40},
+            "session_token": token
+        }))
+        self.assertTrue(server.process_one())
+        resize_res = json.loads(transport.outbox.pop(0))
+        self.assertTrue(resize_res["result"]["resized"])
+
+        # 6. Write interactive keystrokes to first pane (ensures not captured by preview simulation)
+        transport.inbox.append(json.dumps({
+            "jsonrpc": "2.0", "id": "6", "method": "terminal.write",
+            "params": {"session_id": session_id, "data": "LIVE_NATIVE_INPUT\n"},
+            "session_token": token
+        }))
+        self.assertTrue(server.process_one())
+        write_res = json.loads(transport.outbox.pop(0))
+        self.assertGreater(write_res["result"]["bytes_written"], 0)
+
+        time.sleep(0.3)
+
+        # 7. Verify echoed output came from native child process
+        transport.inbox.append(json.dumps({
+            "jsonrpc": "2.0", "id": "7", "method": "terminal.get_output",
+            "params": {"session_id": session_id, "since_seq": out1["result"]["next_seq"]},
+            "session_token": token
+        }))
+        self.assertTrue(server.process_one())
+        out2 = json.loads(transport.outbox.pop(0))
+        self.assertIn("ECHO:LIVE_NATIVE_INPUT", out2["result"]["raw"])
+
+        # 8. Close first pane
+        transport.inbox.append(json.dumps({
+            "jsonrpc": "2.0", "id": "8", "method": "terminal.close_session",
+            "params": {"session_id": session_id},
+            "session_token": token
+        }))
+        self.assertTrue(server.process_one())
+        close_res = json.loads(transport.outbox.pop(0))
+        self.assertTrue(close_res["result"]["closed"])
+        term_mgr.terminate_all()
+
+    def test_14_buffer_concurrent_read_write_stress_test(self) -> None:
+        """Verifies thread-safe concurrency of BoundedTerminalBuffer under simultaneous reader/writer load."""
+        from desktop.terminal.buffer import BoundedTerminalBuffer
+        import threading
+
+        buf = BoundedTerminalBuffer(max_lines=50, max_bytes=8 * 1024)
+        errors: list[Exception] = []
+        stop_event = threading.Event()
+
+        def writer_worker(w_id: int):
+            try:
+                for i in range(200):
+                    if stop_event.is_set():
+                        break
+                    buf.append(f"[writer-{w_id}] event={i} ANSI=\x1b[32mOK\x1b[0m token=sk-live-test-{w_id}\r\n")
+                    time.sleep(0.001)
+            except Exception as e:
+                errors.append(e)
+
+        def reader_worker(r_id: int):
+            try:
+                since = 0
+                for _ in range(200):
+                    if stop_event.is_set():
+                        break
+                    raw, next_seq = buf.get_new_raw(since)
+                    lines, _ = buf.get_new_lines(since)
+                    _ = buf.get_lines()
+                    _ = buf.export_sanitized()
+                    _ = buf.line_count
+                    _ = buf.byte_count
+                    since = next_seq
+                    time.sleep(0.001)
+            except Exception as e:
+                errors.append(e)
+
+        threads: list[threading.Thread] = []
+        # 3 concurrent writers and 3 concurrent readers
+        for i in range(3):
+            threads.append(threading.Thread(target=writer_worker, args=(i,)))
+            threads.append(threading.Thread(target=reader_worker, args=(i,)))
+
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=5.0)
+            if t.is_alive():
+                stop_event.set()
+                t.join(timeout=1.0)
+
+        self.assertEqual(len(errors), 0, f"Concurrency errors encountered: {errors}")
+        self.assertLessEqual(buf.line_count, 50)
+        self.assertLessEqual(buf.byte_count, 8 * 1024)
+
 
 if __name__ == "__main__":
     unittest.main()

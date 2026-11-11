@@ -5,17 +5,23 @@
  * - 1 Pane: Full width/height.
  * - 2 Panes: 50% / 50% split.
  * - 3-4 Panes: 2x2 grid view with independent focus and streaming.
+ * - Pure data binding: panes contain metadata only; handlers are dynamically bound at render.
  */
 
 import React from "react";
-import { TerminalPane, TerminalPaneProps } from "./TerminalPane";
+import { Terminal } from "xterm";
+import { TerminalPane, TerminalPaneData } from "./TerminalPane";
 
 export interface TerminalGridProps {
   tabId: string;
   projectPath: string;
-  panes: TerminalPaneProps[];
+  panes: TerminalPaneData[];
   onAddPane?: (tabId: string) => void;
   onSaveSessions?: (tabId: string) => void;
+  onWrite: (sessionId: string, data: string) => void;
+  onResize: (sessionId: string, cols: number, rows: number) => void;
+  onClose?: (sessionId: string) => void;
+  onMount?: (sessionId: string, term: Terminal | null) => void;
 }
 
 export const TerminalGrid: React.FC<TerminalGridProps> = ({
@@ -24,6 +30,10 @@ export const TerminalGrid: React.FC<TerminalGridProps> = ({
   panes,
   onAddPane,
   onSaveSessions,
+  onWrite,
+  onResize,
+  onClose,
+  onMount,
 }) => {
   const getGridClass = (count: number) => {
     switch (count) {
@@ -77,7 +87,13 @@ export const TerminalGrid: React.FC<TerminalGridProps> = ({
       <div className={`grid flex-1 p-2 gap-2 h-full overflow-hidden ${getGridClass(panes.length)}`}>
         {panes.map((pane) => (
           <div key={pane.sessionId} className="h-full w-full min-h-0 min-w-0">
-            <TerminalPane {...pane} />
+            <TerminalPane
+              {...pane}
+              onWrite={onWrite}
+              onResize={onResize}
+              onClose={onClose}
+              onMount={onMount}
+            />
           </div>
         ))}
       </div>
