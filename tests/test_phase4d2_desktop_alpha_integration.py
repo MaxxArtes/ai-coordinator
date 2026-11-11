@@ -100,6 +100,8 @@ class TestDesktopAlphaIntegration(unittest.TestCase):
         self.assertIn("npm run build", text)
         self.assertIn("@tauri-apps/cli build", text)
         self.assertIn("upload-artifact", text)
+        self.assertIn("Python Build Standalone", text)
+        self.assertIn("python_spec.json", text)
 
     def test_05_e2e_live_terminal_lifecycle_emulation(self) -> None:
         """Emulates the exact React UI -> Tauri Host -> Core IPC sequence for Alpha terminal."""

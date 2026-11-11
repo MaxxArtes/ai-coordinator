@@ -5,13 +5,9 @@ on:
     branches:
       - 'feature/**'
       - 'desktop/**'
-    paths:
-      - 'desktop/**'
-      - '.github/workflows/desktop-alpha-build.yml'
   pull_request:
-    paths:
-      - 'desktop/**'
-      - '.github/workflows/desktop-alpha-build.yml'
+    branches:
+      - 'feature/**'
   workflow_dispatch:
 
 permissions:
@@ -40,10 +36,48 @@ jobs:
         with:
           workspaces: desktop/src-tauri
 
-      - name: Setup Python Runtime for Embedded Core
+      - name: Setup Host Python for Build Tooling
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+
+      - name: Provision Bundled Python Build Standalone Runtime
+        shell: powershell
+        run: |
+          Write-Host "=== Provisioning Python Build Standalone for Windows x86_64 ==="
+          $specFile = "desktop/runtime/python_spec.json"
+          $spec = Get-Content $specFile | ConvertFrom-Json
+          $winSpec = $spec.platforms.'windows-x86_64'
+          $url = $winSpec.url
+          $expectedHash = $winSpec.sha256
+          $tarPath = "desktop/runtime/python_standalone.tar.gz"
+
+          Write-Host "Downloading PBS from: $url"
+          Invoke-WebRequest -Uri $url -OutFile $tarPath
+
+          $actualHash = (Get-FileHash $tarPath -Algorithm SHA256).Hash.ToLower()
+          if ($actualHash -ne $expectedHash.ToLower()) {
+              Write-Error "SHA256 mismatch! Expected $expectedHash, got $actualHash"
+              exit 1
+          }
+          Write-Host "SHA256 verified successfully: $actualHash"
+
+          Write-Host "Extracting Python Standalone to desktop/runtime/..."
+          tar -xzf $tarPath -C desktop/runtime/
+          Remove-Item $tarPath
+
+          $bundledPy = "desktop/runtime/python/python.exe"
+          if (-not (Test-Path $bundledPy)) {
+              Write-Error "Bundled Python executable not found at $bundledPy"
+              exit 1
+          }
+
+          Write-Host "Verifying bundled Python executable:"
+          & $bundledPy --version
+
+          Write-Host "Installing Core dependencies into bundled Python..."
+          & $bundledPy -m pip install --upgrade pip
+          & $bundledPy -m pip install -e .
 
       - name: Install Desktop Frontend Dependencies
         working-directory: desktop
@@ -53,9 +87,26 @@ jobs:
         working-directory: desktop
         run: npm run build
 
-      - name: Build Tauri 2 Native Executable (Alpha Debug & Bundle)
+      - name: Build Tauri 2 Native Executable & Windows Bundles
         working-directory: desktop
         run: npx @tauri-apps/cli build --debug
+
+      - name: Compute Checksums and Export Step Summary
+        shell: powershell
+        run: |
+          Write-Host "=== Computing SHA-256 Checksums for Windows Alpha Artifacts ==="
+          "### AI Coordinator Desktop — Windows Alpha Artifacts" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
+          "" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
+          "| Arquivo | SHA-256 Checksum | Tamanho |" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
+          "|---|---|---|" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
+
+          $artifacts = Get-ChildItem -Path "desktop/src-tauri/target/debug" -Include "*.exe", "*.msi" -Recurse | Where-Object { $_.FullName -notmatch "build|deps|incremental|\.fingerprint" }
+          foreach ($item in $artifacts) {
+              $hash = (Get-FileHash $item.FullName -Algorithm SHA256).Hash
+              $size = "{0:N0} bytes" -f $item.Length
+              Write-Host "$($item.Name) : $hash ($size)"
+              "| `$($item.Name)` | `$hash` | $size |" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
+          }
 
       - name: Archive Desktop Alpha Windows Executable Artifact
         uses: actions/upload-artifact@v4

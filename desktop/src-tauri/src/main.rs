@@ -83,28 +83,39 @@ impl IpcBridge {
     }
 
     fn resolve_paths() -> (PathBuf, PathBuf) {
+        let exe_dir = std::env::current_exe()
+            .ok()
+            .and_then(|p| p.parent().map(|p| p.to_path_buf()))
+            .unwrap_or_else(|| PathBuf::from("."));
+
+        // 1. Resolve Python executable
         let py_path = if let Ok(custom) = std::env::var("COORDINATOR_PYTHON") {
             PathBuf::from(custom)
-        } else if let Ok(exe) = std::env::current_exe() {
-            let bundled = exe
-                .parent()
-                .unwrap_or(&PathBuf::from("."))
-                .join("runtime")
-                .join("python")
-                .join("python.exe");
-            if bundled.exists() {
-                bundled
-            } else {
-                PathBuf::from("python")
-            }
         } else {
-            PathBuf::from("python")
+            let candidates = [
+                exe_dir.join("runtime").join("python").join("python.exe"),
+                exe_dir.join("python").join("python.exe"),
+                exe_dir.join("resources").join("runtime").join("python").join("python.exe"),
+                exe_dir.join("resources").join("python").join("python.exe"),
+                exe_dir.join("..").join("runtime").join("python").join("python.exe"),
+                exe_dir.join("..").join("desktop").join("runtime").join("python").join("python.exe"),
+            ];
+            candidates
+                .into_iter()
+                .find(|p| p.exists())
+                .unwrap_or_else(|| PathBuf::from("python"))
         };
 
+        // 2. Resolve Server script
         let script_path = if let Ok(custom_script) = std::env::var("COORDINATOR_SERVER_SCRIPT") {
             PathBuf::from(custom_script)
         } else {
             let candidates = [
+                exe_dir.join("resources").join("desktop").join("ipc").join("server.py"),
+                exe_dir.join("resources").join("ipc").join("server.py"),
+                exe_dir.join("desktop").join("ipc").join("server.py"),
+                exe_dir.join("ipc").join("server.py"),
+                exe_dir.join("..").join("desktop").join("ipc").join("server.py"),
                 PathBuf::from("desktop/ipc/server.py"),
                 PathBuf::from("../desktop/ipc/server.py"),
                 PathBuf::from("server.py"),
@@ -176,6 +187,13 @@ impl Drop for IpcBridge {
     fn drop(&mut self) {
         if let Ok(mut guard) = self.child.lock() {
             if let Some(mut child) = guard.take() {
+                let pid = child.id();
+                #[cfg(target_os = "windows")]
+                {
+                    let _ = Command::new("taskkill")
+                        .args(["/F", "/T", "/PID", &pid.to_string()])
+                        .spawn();
+                }
                 let _ = child.kill();
             }
         }

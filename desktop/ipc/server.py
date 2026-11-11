@@ -19,13 +19,18 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Optional, Set
 
 # In isolated mode (-I), Python enables -P (safe path) which strips the script's directory.
-# Explicitly ensure the module and repo paths are in sys.path.
+# Explicitly ensure the module, desktop, and repo/src paths are in sys.path.
 _here = Path(__file__).resolve().parent
-if str(_here) not in sys.path:
-    sys.path.insert(0, str(_here))
-_repo_root = _here.parent.parent
-if str(_repo_root) not in sys.path:
-    sys.path.insert(0, str(_repo_root))
+_candidates = [
+    _here,
+    _here.parent,
+    _here.parent.parent,
+    _here.parent.parent / "src",
+    _here.parent / "src",
+]
+for c in _candidates:
+    if c.exists() and str(c) not in sys.path:
+        sys.path.insert(0, str(c))
 
 try:
     from .protocol import (
