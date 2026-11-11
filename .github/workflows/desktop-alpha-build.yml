@@ -131,18 +131,20 @@ jobs:
         shell: powershell
         run: |
           Write-Host "=== Computing SHA-256 Checksums for Windows Alpha Artifacts ==="
-          "### AI Coordinator Desktop — Windows Alpha Artifacts" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
-          "" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
-          "| Arquivo | SHA-256 Checksum | Tamanho |" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
-          "|---|---|---|" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
-
+          $summary = @(
+              "### AI Coordinator Desktop - Windows Alpha Artifacts",
+              "",
+              "| Arquivo | SHA-256 Checksum | Tamanho |",
+              "|---|---|---|"
+          )
           $artifacts = Get-ChildItem -Path "desktop/src-tauri/target/debug" -Include "*.exe", "*.msi", "*.zip" -Recurse | Where-Object { $_.FullName -notmatch "build|deps|incremental|\.fingerprint" }
           foreach ($item in $artifacts) {
               $hash = (Get-FileHash $item.FullName -Algorithm SHA256).Hash
               $size = "{0:N0} bytes" -f $item.Length
               Write-Host "$($item.Name) : $hash ($size)"
-              "| `$($item.Name)` | `$hash` | $size |" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
+              $summary += "| $($item.Name) | $hash | $size |"
           }
+          $summary | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
 
       - name: Archive Desktop Alpha Windows Executable Artifact
         uses: actions/upload-artifact@v4
