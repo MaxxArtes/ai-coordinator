@@ -110,16 +110,102 @@ class SecureIPCServer:
 
     PUBLIC_METHODS: Set[str] = {"system.ping"}
 
-    def __init__(self, transport: BaseTransport, session_token: str) -> None:
+    def __init__(
+        self,
+        transport: BaseTransport,
+        session_token: str,
+        terminal_manager: Optional[Any] = None,
+    ) -> None:
         self.transport = transport
         self.session_token = session_token
-        self.handlers: Dict[str, Callable[[Dict[str, Any]], Any]] = {}
+        self.terminal_manager = terminal_manager
+        self.handlers: Dict[str, Callable[..., Any]] = {}
         self.is_running = True
         self._register_default_handlers()
 
     def _register_default_handlers(self) -> None:
         self.register("system.ping", self._handle_ping)
         self.register("system.status", self._handle_status)
+        self.register("terminal.create_tab", self._handle_terminal_create_tab)
+        self.register("terminal.create_session", self._handle_terminal_create_session)
+        self.register("terminal.write", self._handle_terminal_write)
+        self.register("terminal.resize", self._handle_terminal_resize)
+        self.register("terminal.get_output", self._handle_terminal_get_output)
+        self.register("terminal.close_session", self._handle_terminal_close_session)
+        self.register("terminal.save_sessions", self._handle_terminal_save_sessions)
+        self.register("terminal.list_tabs", self._handle_terminal_list_tabs)
+
+    def _get_terminal_manager(self) -> Any:
+        if self.terminal_manager is None:
+            from desktop.auth.authorizer import DesktopAuthorizer
+            from desktop.auth.profile import DesktopProfileManager
+            from desktop.terminal.manager import TerminalManager
+
+            prof_mgr = DesktopProfileManager()
+            authorizer = DesktopAuthorizer(profile_manager=prof_mgr)
+            if self.session_token:
+                authorizer._active_sessions[self.session_token] = prof_mgr.get_active_profile().name
+            self.terminal_manager = TerminalManager(authorizer=authorizer)
+        return self.terminal_manager
+
+    def _handle_terminal_create_tab(self, params: Dict[str, Any], token: Optional[str] = None) -> Dict[str, Any]:
+        mgr = self._get_terminal_manager()
+        tab = mgr.create_tab(
+            token=token or self.session_token,
+            tab_id=params["tab_id"],
+            title=params.get("title", params["tab_id"]),
+            project_path=params["project_path"],
+        )
+        return tab.to_dict()
+
+    def _handle_terminal_create_session(self, params: Dict[str, Any], token: Optional[str] = None) -> Dict[str, Any]:
+        mgr = self._get_terminal_manager()
+        from desktop.terminal.session import SessionKind
+
+        kind_str = params.get("kind", "human_terminal")
+        kind = SessionKind(kind_str)
+        sess = mgr.create_terminal(
+            token=token or self.session_token,
+            tab_id=params["tab_id"],
+            pane_id=params["pane_id"],
+            kind=kind,
+            command=params.get("command"),
+            cwd=params.get("cwd"),
+            cols=params.get("cols", 80),
+            rows=params.get("rows", 24),
+        )
+        return sess.to_dict()
+
+    def _handle_terminal_write(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        mgr = self._get_terminal_manager()
+        written = mgr.write_to_terminal(params["session_id"], params["data"])
+        return {"bytes_written": written}
+
+    def _handle_terminal_resize(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        mgr = self._get_terminal_manager()
+        ok = mgr.resize_terminal(params["session_id"], params["cols"], params["rows"])
+        return {"resized": ok}
+
+    def _handle_terminal_get_output(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        mgr = self._get_terminal_manager()
+        sess = mgr.get_session(params["session_id"])
+        if not sess:
+            raise ValueError(f"Session '{params['session_id']}' not found")
+        return {"session_id": sess.session_id, "lines": sess.get_output()}
+
+    def _handle_terminal_close_session(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        mgr = self._get_terminal_manager()
+        ok = mgr.close_terminal(params["session_id"])
+        return {"closed": ok}
+
+    def _handle_terminal_save_sessions(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        mgr = self._get_terminal_manager()
+        export = mgr.save_tab_sessions(params["tab_id"])
+        return export.to_dict()
+
+    def _handle_terminal_list_tabs(self, _params: Dict[str, Any]) -> Dict[str, Any]:
+        mgr = self._get_terminal_manager()
+        return {"tabs": [t.to_dict() for t in mgr.list_tabs()]}
 
     def _handle_ping(self, _params: Dict[str, Any]) -> Dict[str, Any]:
         return {"status": "pong", "protocol": PROTOCOL_VERSION}
@@ -187,7 +273,13 @@ class SecureIPCServer:
             )
 
         try:
-            res = self.handlers[req.method](req.params)
+            handler = self.handlers[req.method]
+            import inspect
+            sig = inspect.signature(handler)
+            if len(sig.parameters) >= 2:
+                res = handler(req.params, req.session_token)
+            else:
+                res = handler(req.params)
             return RPCResponse(id=req.id, result=res)
         except Exception as e:
             self.transport.log_diagnostic(f"Handler error in {req.method}: {e}")
