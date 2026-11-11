@@ -22,6 +22,7 @@ export interface TerminalPaneProps {
   onWrite: (sessionId: string, data: string) => void;
   onResize: (sessionId: string, cols: number, rows: number) => void;
   onClose?: (sessionId: string) => void;
+  onMount?: (sessionId: string, term: Terminal | null) => void;
 }
 
 export const TerminalPane: React.FC<TerminalPaneProps> = ({
@@ -33,6 +34,7 @@ export const TerminalPane: React.FC<TerminalPaneProps> = ({
   onWrite,
   onResize,
   onClose,
+  onMount,
 }) => {
   const containerRef = useRef<HTMLDivElement>(null);
   const terminalRef = useRef<Terminal | null>(null);
@@ -74,6 +76,10 @@ export const TerminalPane: React.FC<TerminalPaneProps> = ({
     terminalRef.current = term;
     fitAddonRef.current = fitAddon;
 
+    if (onMount) {
+      onMount(sessionId, term);
+    }
+
     // 2. Keystroke forwarding
     const dataDisposable = term.onData((data) => {
       onWrite(sessionId, data);
@@ -95,11 +101,14 @@ export const TerminalPane: React.FC<TerminalPaneProps> = ({
     onResize(sessionId, term.cols, term.rows);
 
     return () => {
+      if (onMount) {
+        onMount(sessionId, null);
+      }
       dataDisposable.dispose();
       observer.disconnect();
       term.dispose();
     };
-  }, [sessionId, onWrite, onResize]);
+  }, [sessionId, onWrite, onResize, onMount]);
 
   const badgeColor = kind === "human_terminal" ? "bg-blue-600" : "bg-emerald-600";
   const badgeLabel = kind === "human_terminal" ? "Terminal Humano" : "Agente Governado";

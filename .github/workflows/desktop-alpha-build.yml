@@ -1,0 +1,68 @@
+name: Build Desktop Alpha (Windows)
+
+on:
+  push:
+    branches:
+      - 'feature/**'
+      - 'desktop/**'
+    paths:
+      - 'desktop/**'
+      - '.github/workflows/desktop-alpha-build.yml'
+  pull_request:
+    paths:
+      - 'desktop/**'
+      - '.github/workflows/desktop-alpha-build.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-tauri-windows:
+    name: Build Tauri 2 Windows Executable (Alpha)
+    runs-on: windows-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Setup Rust Stable Toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Setup Rust Cache
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: desktop/src-tauri
+
+      - name: Setup Python Runtime for Embedded Core
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Desktop Frontend Dependencies
+        working-directory: desktop
+        run: npm install
+
+      - name: Verify Frontend Compilation (TypeCheck + Vite Build)
+        working-directory: desktop
+        run: npm run build
+
+      - name: Build Tauri 2 Native Executable (Alpha Debug & Bundle)
+        working-directory: desktop
+        run: npx @tauri-apps/cli build --debug
+
+      - name: Archive Desktop Alpha Windows Executable Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ai-coordinator-desktop-alpha-windows
+          path: |
+            desktop/src-tauri/target/debug/ai-coordinator-desktop.exe
+            desktop/src-tauri/target/debug/bundle/msi/*.msi
+            desktop/src-tauri/target/debug/bundle/nsis/*.exe
+          if-no-files-found: warn
