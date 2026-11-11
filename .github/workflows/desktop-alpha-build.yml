@@ -92,6 +92,25 @@ jobs:
         working-directory: desktop
         run: npx @tauri-apps/cli build --debug
 
+      - name: Package Portable Standalone Distribution
+        shell: powershell
+        run: |
+          Write-Host "=== Preparing Portable Alpha Directory ==="
+          $portableDir = "desktop/src-tauri/target/debug/portable"
+          New-Item -ItemType Directory -Force -Path "$portableDir/resources/runtime"
+          New-Item -ItemType Directory -Force -Path "$portableDir/resources/desktop"
+          New-Item -ItemType Directory -Force -Path "$portableDir/resources/src"
+
+          Copy-Item "desktop/src-tauri/target/debug/ai-coordinator-desktop.exe" -Destination "$portableDir/" -Force
+          Copy-Item "desktop/runtime/*" -Destination "$portableDir/resources/runtime" -Recurse -Force
+          Copy-Item "desktop/ipc" -Destination "$portableDir/resources/desktop" -Recurse -Force
+          Copy-Item "desktop/auth" -Destination "$portableDir/resources/desktop" -Recurse -Force
+          Copy-Item "desktop/terminal" -Destination "$portableDir/resources/desktop" -Recurse -Force
+          Copy-Item "src/*" -Destination "$portableDir/resources/src" -Recurse -Force
+
+          Compress-Archive -Path "$portableDir/*" -DestinationPath "desktop/src-tauri/target/debug/ai-coordinator-desktop-alpha-portable.zip" -Force
+          Write-Host "Portable package created at desktop/src-tauri/target/debug/ai-coordinator-desktop-alpha-portable.zip"
+
       - name: Compute Checksums and Export Step Summary
         shell: powershell
         run: |
@@ -101,7 +120,7 @@ jobs:
           "| Arquivo | SHA-256 Checksum | Tamanho |" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
           "|---|---|---|" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
 
-          $artifacts = Get-ChildItem -Path "desktop/src-tauri/target/debug" -Include "*.exe", "*.msi" -Recurse | Where-Object { $_.FullName -notmatch "build|deps|incremental|\.fingerprint" }
+          $artifacts = Get-ChildItem -Path "desktop/src-tauri/target/debug" -Include "*.exe", "*.msi", "*.zip" -Recurse | Where-Object { $_.FullName -notmatch "build|deps|incremental|\.fingerprint" }
           foreach ($item in $artifacts) {
               $hash = (Get-FileHash $item.FullName -Algorithm SHA256).Hash
               $size = "{0:N0} bytes" -f $item.Length
@@ -115,6 +134,7 @@ jobs:
           name: ai-coordinator-desktop-alpha-windows
           path: |
             desktop/src-tauri/target/debug/ai-coordinator-desktop.exe
+            desktop/src-tauri/target/debug/ai-coordinator-desktop-alpha-portable.zip
             desktop/src-tauri/target/debug/bundle/msi/*.msi
             desktop/src-tauri/target/debug/bundle/nsis/*.exe
           if-no-files-found: warn

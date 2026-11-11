@@ -7,6 +7,7 @@
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use std::collections::HashSet;
 use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
@@ -42,35 +43,44 @@ pub struct IpcBridge {
 
 impl IpcBridge {
     pub fn new() -> Self {
-        let token = format!("desktop-token-{}", std::process::id());
-        let (py_path, script_path) = Self::resolve_paths();
+        // Issue A: Ephemeral CSPRNG token generated via uuid v4
+        let token = format!("desktop-token-{}", uuid::Uuid::new_v4());
+        let (py_path_str, child_proc, child_in, child_out) = match Self::resolve_paths() {
+            Ok((py_path, script_path)) => {
+                let mut cmd = Command::new(&py_path);
+                cmd.arg("-I")
+                    .arg(&script_path)
+                    .env("COORDINATOR_IPC_TOKEN", &token)
+                    .stdin(Stdio::piped())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::inherit());
 
-        let mut child_proc = None;
-        let mut child_in = None;
-        let mut child_out = None;
+                let mut proc = None;
+                let mut cin = None;
+                let mut cout = None;
 
-        let mut cmd = Command::new(&py_path);
-        cmd.arg("-I")
-            .arg(&script_path)
-            .env("COORDINATOR_IPC_TOKEN", &token)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::inherit());
-
-        match cmd.spawn() {
-            Ok(mut child) => {
-                if let Some(cin) = child.stdin.take() {
-                    child_in = Some(cin);
+                match cmd.spawn() {
+                    Ok(mut child) => {
+                        if let Some(cin_handle) = child.stdin.take() {
+                            cin = Some(cin_handle);
+                        }
+                        if let Some(cout_handle) = child.stdout.take() {
+                            cout = Some(BufReader::new(cout_handle));
+                        }
+                        proc = Some(child);
+                    }
+                    Err(e) => {
+                        eprintln!("[TAURI_IPC_WARN] Failed to spawn Python IPC server: {}", e);
+                    }
                 }
-                if let Some(cout) = child.stdout.take() {
-                    child_out = Some(BufReader::new(cout));
-                }
-                child_proc = Some(child);
+                (py_path.to_string_lossy().to_string(), proc, cin, cout)
             }
             Err(e) => {
-                eprintln!("[TAURI_IPC_WARN] Failed to spawn Python IPC server: {}", e);
+                // Issue B: Fail-closed logging when private runtime resolution fails
+                eprintln!("[TAURI_IPC_FATAL] {}", e);
+                (format!("UNAVAILABLE: {}", e), None, None, None)
             }
-        }
+        };
 
         IpcBridge {
             child: Mutex::new(child_proc),
@@ -78,19 +88,23 @@ impl IpcBridge {
             reader: Mutex::new(child_out),
             token,
             seq: AtomicU64::new(1),
-            resolved_python: py_path.to_string_lossy().to_string(),
+            resolved_python: py_path_str,
         }
     }
 
-    fn resolve_paths() -> (PathBuf, PathBuf) {
+    fn resolve_paths() -> Result<(PathBuf, PathBuf), String> {
         let exe_dir = std::env::current_exe()
             .ok()
             .and_then(|p| p.parent().map(|p| p.to_path_buf()))
             .unwrap_or_else(|| PathBuf::from("."));
 
-        // 1. Resolve Python executable
+        // 1. Resolve Python executable (Issue B: Fail-closed in release mode)
         let py_path = if let Ok(custom) = std::env::var("COORDINATOR_PYTHON") {
-            PathBuf::from(custom)
+            let p = PathBuf::from(custom);
+            if !p.exists() {
+                return Err(format!("COORDINATOR_PYTHON path does not exist: {}", p.display()));
+            }
+            p
         } else {
             let candidates = [
                 exe_dir.join("runtime").join("python").join("python.exe"),
@@ -99,16 +113,44 @@ impl IpcBridge {
                 exe_dir.join("resources").join("python").join("python.exe"),
                 exe_dir.join("..").join("runtime").join("python").join("python.exe"),
                 exe_dir.join("..").join("desktop").join("runtime").join("python").join("python.exe"),
+                exe_dir.join("..").join("..").join("runtime").join("python").join("python.exe"),
+                exe_dir.join("..").join("..").join("..").join("runtime").join("python").join("python.exe"),
+                exe_dir.join("..").join("..").join("..").join("desktop").join("runtime").join("python").join("python.exe"),
+                PathBuf::from("desktop/runtime/python/python.exe"),
+                PathBuf::from("runtime/python/python.exe"),
             ];
-            candidates
-                .into_iter()
-                .find(|p| p.exists())
-                .unwrap_or_else(|| PathBuf::from("python"))
+
+            if let Some(found) = candidates.into_iter().find(|p| p.exists()) {
+                found
+            } else {
+                #[cfg(debug_assertions)]
+                {
+                    if std::env::var("COORDINATOR_STRICT_RUNTIME").is_ok() {
+                        return Err(
+                            "Fail-closed: Bundled Python runtime not found and COORDINATOR_STRICT_RUNTIME is set.".to_string(),
+                        );
+                    }
+                    eprintln!(
+                        "[TAURI_IPC_WARN] Bundled Python runtime not found. Falling back to host PATH 'python' (debug/dev mode only)."
+                    );
+                    PathBuf::from("python")
+                }
+                #[cfg(not(debug_assertions))]
+                {
+                    return Err(
+                        "Fail-closed: Private bundled Python runtime not found in application resources, and COORDINATOR_PYTHON not set. Refusing to run in release mode without verified private runtime.".to_string(),
+                    );
+                }
+            }
         };
 
         // 2. Resolve Server script
         let script_path = if let Ok(custom_script) = std::env::var("COORDINATOR_SERVER_SCRIPT") {
-            PathBuf::from(custom_script)
+            let p = PathBuf::from(custom_script);
+            if !p.exists() {
+                return Err(format!("COORDINATOR_SERVER_SCRIPT path does not exist: {}", p.display()));
+            }
+            p
         } else {
             let candidates = [
                 exe_dir.join("resources").join("desktop").join("ipc").join("server.py"),
@@ -116,8 +158,11 @@ impl IpcBridge {
                 exe_dir.join("desktop").join("ipc").join("server.py"),
                 exe_dir.join("ipc").join("server.py"),
                 exe_dir.join("..").join("desktop").join("ipc").join("server.py"),
+                exe_dir.join("..").join("..").join("desktop").join("ipc").join("server.py"),
+                exe_dir.join("..").join("..").join("..").join("desktop").join("ipc").join("server.py"),
                 PathBuf::from("desktop/ipc/server.py"),
                 PathBuf::from("../desktop/ipc/server.py"),
+                PathBuf::from("ipc/server.py"),
                 PathBuf::from("server.py"),
             ];
             candidates
@@ -126,7 +171,7 @@ impl IpcBridge {
                 .unwrap_or_else(|| PathBuf::from("desktop/ipc/server.py"))
         };
 
-        (py_path, script_path)
+        Ok((py_path, script_path))
     }
 
     pub fn call(&self, method: &str, params: Value) -> Result<Value, String> {
@@ -149,7 +194,7 @@ impl IpcBridge {
                 stdin.write_all(b"\n").map_err(|e| e.to_string())?;
                 stdin.flush().map_err(|e| e.to_string())?;
             } else {
-                return Err("IPC child stdin is not available".to_string());
+                return Err("IPC child stdin is not available: runtime is not initialized".to_string());
             }
         }
 
@@ -160,7 +205,7 @@ impl IpcBridge {
             if let Some(reader) = reader_guard.as_mut() {
                 reader.read_line(&mut resp_line).map_err(|e| e.to_string())?;
             } else {
-                return Err("IPC child stdout is not available".to_string());
+                return Err("IPC child stdout is not available: runtime is not initialized".to_string());
             }
         }
 
@@ -183,6 +228,7 @@ impl IpcBridge {
     }
 }
 
+// Issue C: Synchronized process tree termination on window close
 impl Drop for IpcBridge {
     fn drop(&mut self) {
         if let Ok(mut guard) = self.child.lock() {
@@ -190,11 +236,18 @@ impl Drop for IpcBridge {
                 let pid = child.id();
                 #[cfg(target_os = "windows")]
                 {
-                    let _ = Command::new("taskkill")
+                    // Synchronously kill the entire process tree using taskkill /F /T /PID
+                    if let Ok(mut kill_cmd) = Command::new("taskkill")
                         .args(["/F", "/T", "/PID", &pid.to_string()])
-                        .spawn();
+                        .stdout(Stdio::null())
+                        .stderr(Stdio::null())
+                        .spawn()
+                    {
+                        let _ = kill_cmd.wait();
+                    }
                 }
                 let _ = child.kill();
+                let _ = child.wait();
             }
         }
     }
@@ -207,14 +260,16 @@ fn ping() -> &'static str {
 
 #[tauri::command]
 fn get_runtime_status(bridge: State<Arc<IpcBridge>>) -> RuntimeStatus {
+    let is_isolated = !bridge.resolved_python.starts_with("UNAVAILABLE");
     RuntimeStatus {
         core_version: "0.6.0".into(),
         host_os: std::env::consts::OS.into(),
-        is_isolated: true,
+        is_isolated,
         python_path: bridge.resolved_python.clone(),
     }
 }
 
+// Issue D: Recursively measure all process tree descendants (children, grandchildren, WebView2 renderers)
 #[tauri::command]
 fn get_process_tree_metrics() -> ProcessTreeMetrics {
     let mut sys = System::new();
@@ -226,21 +281,37 @@ fn get_process_tree_metrics() -> ProcessTreeMetrics {
         ProcessRefreshKind::everything(),
     );
 
-    let mut total_ram: u64 = 0;
-    let mut host_ram: u64 = 0;
-    let mut cpu: f32 = 0.0;
+    let mut tree_pids = HashSet::new();
+    tree_pids.insert(current_pid);
 
-    if let Some(proc) = sys.process(current_pid) {
-        host_ram = proc.memory();
-        total_ram += host_ram;
-        cpu = proc.cpu_usage();
+    // Iteratively collect all descendant PIDs until fixed point
+    let mut added = true;
+    while added {
+        added = false;
+        for (pid, proc) in sys.processes() {
+            if !tree_pids.contains(pid) {
+                if let Some(parent) = proc.parent() {
+                    if tree_pids.contains(&parent) {
+                        tree_pids.insert(*pid);
+                        added = true;
+                    }
+                }
+            }
+        }
     }
 
-    for (_pid, proc) in sys.processes() {
-        if let Some(parent) = proc.parent() {
-            if parent == current_pid {
-                total_ram += proc.memory();
-            }
+    let mut total_ram: u64 = 0;
+    let mut host_ram: u64 = 0;
+    let mut total_cpu: f32 = 0.0;
+
+    if let Some(host_proc) = sys.process(current_pid) {
+        host_ram = host_proc.memory();
+    }
+
+    for pid in &tree_pids {
+        if let Some(proc) = sys.process(*pid) {
+            total_ram += proc.memory();
+            total_cpu += proc.cpu_usage();
         }
     }
 
@@ -248,7 +319,7 @@ fn get_process_tree_metrics() -> ProcessTreeMetrics {
         host_pid: std::process::id(),
         host_ram_bytes: host_ram,
         total_tree_ram_bytes: total_ram,
-        cpu_usage_percent: cpu,
+        cpu_usage_percent: total_cpu,
     }
 }
 
