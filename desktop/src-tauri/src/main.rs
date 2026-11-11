@@ -13,7 +13,7 @@ use std::path::PathBuf;
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System};
+use sysinfo::{Pid, ProcessRefreshKind, System};
 use tauri::State;
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -275,11 +275,7 @@ fn get_process_tree_metrics() -> ProcessTreeMetrics {
     let mut sys = System::new();
     let current_pid = Pid::from_u32(std::process::id());
 
-    sys.refresh_processes_specifics(
-        ProcessesToUpdate::All,
-        true,
-        ProcessRefreshKind::everything(),
-    );
+    sys.refresh_processes_specifics(ProcessRefreshKind::everything());
 
     let mut tree_pids = HashSet::new();
     tree_pids.insert(current_pid);
