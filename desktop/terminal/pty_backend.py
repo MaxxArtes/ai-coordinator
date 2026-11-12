@@ -28,7 +28,26 @@ if os.name == "nt":
     import ctypes
     import ctypes.wintypes as w
 
-    k32 = ctypes.windll.kernel32
+    # Isolated WinDLL instance prevents mutating argtypes on shared ctypes.windll.kernel32
+    # (which breaks src/ai_coordinator/process.py STARTUPINFOW pointer checks in same-process runs).
+    # use_last_error: ctypes saves GetLastError right after each call (read via ctypes.get_last_error()),
+    # so the value cannot be clobbered by the interpreter between the failing call and the read.
+    k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+
+    # The private instance does not inherit prototypes declared elsewhere on ctypes.windll.kernel32,
+    # so every handle-taking function used here is typed explicitly (64-bit HANDLE, not C int).
+    k32.CreatePipe.argtypes = [ctypes.POINTER(w.HANDLE), ctypes.POINTER(w.HANDLE), ctypes.c_void_p, w.DWORD]
+    k32.CreatePipe.restype = w.BOOL
+    k32.CloseHandle.argtypes = [w.HANDLE]
+    k32.CloseHandle.restype = w.BOOL
+    k32.ReadFile.argtypes = [w.HANDLE, ctypes.c_void_p, w.DWORD, ctypes.POINTER(w.DWORD), ctypes.c_void_p]
+    k32.ReadFile.restype = w.BOOL
+    k32.WriteFile.argtypes = [w.HANDLE, ctypes.c_void_p, w.DWORD, ctypes.POINTER(w.DWORD), ctypes.c_void_p]
+    k32.WriteFile.restype = w.BOOL
+    k32.GetExitCodeProcess.argtypes = [w.HANDLE, ctypes.POINTER(w.DWORD)]
+    k32.GetExitCodeProcess.restype = w.BOOL
+    k32.WaitForSingleObject.argtypes = [w.HANDLE, w.DWORD]
+    k32.WaitForSingleObject.restype = w.DWORD
 
     class COORD(ctypes.Structure):
         _fields_ = [("X", w.SHORT), ("Y", w.SHORT)]
@@ -237,7 +256,7 @@ class WindowsConPtyBackend(BasePtyBackend):
             None,
         )
         if not upd_ok:
-            err = k32.GetLastError()
+            err = ctypes.get_last_error()
             k32.CloseHandle(h_in_read)
             k32.CloseHandle(h_in_write)
             k32.CloseHandle(h_out_read)
@@ -295,7 +314,7 @@ class WindowsConPtyBackend(BasePtyBackend):
         k32.CloseHandle(h_out_write)
 
         if not ok:
-            err = k32.GetLastError()
+            err = ctypes.get_last_error()
             self.terminate()
             raise RuntimeError(f"CreateProcessW failed with Win32 error code {err}")
 
