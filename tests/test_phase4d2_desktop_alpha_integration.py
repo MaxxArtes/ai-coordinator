@@ -86,6 +86,7 @@ class TestDesktopAlphaIntegration(unittest.TestCase):
             "updater_get_channel_info",
             "updater_check",
             "updater_download_and_install",
+            "updater_restart_app",
         ]
         for handler in required_handlers:
             self.assertIn(handler, code, f"Handler '{handler}' must be present in main.rs")

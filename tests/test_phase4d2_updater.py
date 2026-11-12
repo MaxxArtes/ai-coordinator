@@ -195,8 +195,47 @@ class TestDesktopUpdater(unittest.TestCase):
         # Verify config directory is in APPDATA, not inside executable path
         self.assertTrue(str(dirs["desktop_config"]).endswith("ai-coordinator-desktop"))
 
+    @staticmethod
+    def _synthetic_pe(subsystem: int, magic: int, pe_offset: int = 0x40) -> bytes:
+        """Builds a minimal MZ/PE image: DOS header, PE signature, COFF header, optional header."""
+        import struct
+
+        dos = bytearray(pe_offset)
+        dos[0:2] = b"MZ"
+        dos[0x3C:0x40] = struct.pack("<I", pe_offset)
+        coff = bytes(20)
+        optional = bytearray(240)
+        optional[0:2] = struct.pack("<H", magic)
+        optional[68:70] = struct.pack("<H", subsystem)
+        return bytes(dos) + b"PE\x00\x00" + coff + bytes(optional)
+
     def test_09_pe_subsystem_inspector_detects_gui_and_console(self) -> None:
-        """Verifies verify_subsystem detects GUI (subsystem 2) vs Console (subsystem 3)."""
+        """Verifies verify_subsystem detects GUI (2) vs Console (3) on synthetic PE images (all OSes)."""
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            cases = [
+                (2, 0x10B, 0x40),  # PE32 GUI
+                (3, 0x10B, 0x40),  # PE32 CUI
+                (2, 0x20B, 0x40),  # PE32+ GUI
+                (3, 0x20B, 0x40),  # PE32+ CUI
+                (2, 0x20B, 0x400),  # PE header beyond first 1024-byte read
+                (3, 0x20B, 0x400),
+            ]
+            for subsystem, magic, pe_offset in cases:
+                exe = Path(tmp) / f"synthetic_{subsystem}_{magic:x}_{pe_offset:x}.exe"
+                exe.write_bytes(self._synthetic_pe(subsystem, magic, pe_offset))
+                with self.subTest(subsystem=subsystem, magic=hex(magic), pe_offset=hex(pe_offset)):
+                    self.assertEqual(inspect_pe_subsystem(exe), subsystem)
+
+            not_pe = Path(tmp) / "not_pe.bin"
+            not_pe.write_bytes(b"\x7fELF" + bytes(60))
+            with self.assertRaises(ValueError):
+                inspect_pe_subsystem(not_pe)
+
+    @unittest.skipUnless(sys.platform == "win32", "Real PE interpreter binaries exist only on Windows")
+    def test_09b_pe_subsystem_of_real_windows_interpreters(self) -> None:
+        """On Windows, python.exe must be CUI (3) and pythonw.exe GUI (2)."""
         py_exe = Path(sys.executable)
         self.assertTrue(py_exe.exists())
         subsystem = inspect_pe_subsystem(py_exe)
@@ -464,6 +503,171 @@ class TestDesktopUpdater(unittest.TestCase):
                 os.environ.pop("COORDINATOR_PTY_BACKEND", None)
             else:
                 os.environ["COORDINATOR_PTY_BACKEND"] = old_backend
+
+    def test_16_pre_shutdown_failure_keeps_live_terminals_operational(self) -> None:
+        """Core side of an aborted (pre-shutdown) update: freeze followed by the host's unfreeze keeps the
+        live session running and usable, and session creation resumes. The host issuing that unfreeze on
+        every pre-shutdown failure is covered by the static contract in test_17 (Rust is compiled only
+        by the Windows desktop build)."""
+        import tempfile
+        import time
+        from desktop.auth.authorizer import DesktopAuthorizer
+        from desktop.auth.profile import DesktopProfileManager
+        from desktop.terminal.manager import TerminalManager, TerminalManagerError
+        from desktop.terminal.session import SessionKind
+
+        old_backend = os.environ.get("COORDINATOR_PTY_BACKEND")
+        os.environ["COORDINATOR_PTY_BACKEND"] = "pipe"
+        try:
+            with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmpdir:
+                tmp_path = Path(tmpdir)
+                prof_mgr = DesktopProfileManager(root_dir=tmp_path / "profiles")
+                authorizer = DesktopAuthorizer(profile_manager=prof_mgr)
+                token = authorizer.issue_session("default")
+                proj_dir = tmp_path / "proj"
+                proj_dir.mkdir(parents=True, exist_ok=True)
+                prof_mgr.authorize_project("default", proj_dir)
+
+                mgr = TerminalManager(authorizer=authorizer)
+                echo_cmd = [
+                    sys.executable,
+                    "-u",
+                    "-c",
+                    "import sys\nfor line in sys.stdin:\n    print('ECHO:' + line.strip(), flush=True)",
+                ]
+                try:
+                    mgr.create_tab(token=token, tab_id="tab-live", title="Live", project_path=proj_dir)
+                    sess = mgr.create_terminal(
+                        token=token,
+                        tab_id="tab-live",
+                        pane_id=0,
+                        kind=SessionKind.HUMAN_TERMINAL,
+                        command=echo_cmd,
+                    )
+                    self.assertTrue(sess.is_alive)
+
+                    snapshot = mgr.freeze_for_update()
+                    self.assertTrue(snapshot["frozen"])
+                    self.assertEqual(snapshot["active_sessions_total"], 1)
+                    with self.assertRaises(TerminalManagerError):
+                        mgr.create_tab(token=token, tab_id="tab-frozen", title="X", project_path=proj_dir)
+
+                    # Host gate blocks (e.g. sessions_changed) -> UpdateFreezeGuard::drop -> unfreeze.
+                    self.assertFalse(mgr.unfreeze_update()["frozen"])
+
+                    # The pre-existing session survived the aborted update and still round-trips input.
+                    self.assertTrue(sess.is_alive)
+                    mgr.write_to_terminal(sess.session_id, "PING_AFTER_ABORTED_UPDATE\n")
+                    deadline = time.monotonic() + 15
+                    echoed = False
+                    while time.monotonic() < deadline and not echoed:
+                        echoed = any("ECHO:PING_AFTER_ABORTED_UPDATE" in line for line in sess.get_output())
+                        if not echoed:
+                            time.sleep(0.1)
+                    self.assertTrue(echoed, "Live session must keep working after an aborted (pre-shutdown) update")
+
+                    # Creation resumes after the freeze is released.
+                    mgr.create_tab(token=token, tab_id="tab-after", title="After", project_path=proj_dir)
+                    sess2 = mgr.create_terminal(
+                        token=token,
+                        tab_id="tab-after",
+                        pane_id=0,
+                        kind=SessionKind.HUMAN_TERMINAL,
+                        command=echo_cmd,
+                    )
+                    self.assertTrue(sess2.is_alive)
+                finally:
+                    mgr.terminate_all()
+        finally:
+            if old_backend is None:
+                os.environ.pop("COORDINATOR_PTY_BACKEND", None)
+            else:
+                os.environ["COORDINATOR_PTY_BACKEND"] = old_backend
+
+    def test_17_host_update_recovery_contract_pre_and_post_shutdown(self) -> None:
+        """Static contract of the Tauri host and UpdateModal for update-failure recovery.
+
+        Single install at a time (atomic compare-and-swap in the host). Before shutdown, failures use
+        before_shutdown(), whose runtime_stopped reflects the real Core state; after the runtime is shut
+        down, an installer failure uses after_shutdown() (runtime_stopped=true). The restart command is
+        refused while an update runs or while the Core is alive, so it cannot bypass the session fence.
+        Text-level contract only: Verify does not compile Rust (the Windows desktop build does).
+        """
+        import re
+
+        main_rs = (_repo_root / "desktop" / "src-tauri" / "src" / "main.rs").read_text(encoding="utf-8")
+        modal = (_repo_root / "desktop" / "src" / "components" / "UpdateModal.tsx").read_text(encoding="utf-8")
+
+        start = main_rs.index("async fn updater_download_and_install(")
+        end = main_rs.index("fn updater_restart_app(")
+        body = main_rs[start:end]
+
+        steps = [
+            "bridge.begin_update()",
+            "runtime_stopped_for_update.load(",
+            "evaluate_gate(pre_insp",
+            ".download(",  # signature verified before freezing/stopping the runtime
+            "acquire_update_freeze()",
+            "evaluate_gate(post_insp",
+            "freeze_guard.release()",
+            "freeze_guard.commit()",
+            "runtime_stopped_for_update.store(true",  # mark set before shutdown
+            "bridge.shutdown()",
+            "update.install(",
+        ]
+        positions = [body.index(s) for s in steps]
+        self.assertEqual(positions, sorted(positions), f"Install steps out of order: {steps}")
+        idx_pre_gate, idx_shutdown, idx_install = positions[2], positions[9], positions[10]
+
+        # Host-side mutual exclusion is an atomic compare-and-swap released by a guard.
+        self.assertIn("compare_exchange(false, true", main_rs)
+        self.assertIn("update_in_progress.store(false", main_rs)
+
+        # Pre-shutdown failures report the real Core state; none claims the updater stopped it.
+        pre_shutdown = body[idx_pre_gate:idx_shutdown]
+        self.assertNotIn("after_shutdown(", pre_shutdown)
+        for code in (
+            "SESSIONS_GATE_BLOCKED",
+            "UPDATER_UNAVAILABLE",
+            "CHECK_FAILED",
+            "DOWNLOAD_OR_SIGNATURE_FAILED",
+            "PRE_INSTALL_GATE_BLOCKED",
+        ):
+            self.assertRegex(pre_shutdown, r"before_shutdown\(\s*&bridge,\s*\"" + code + '"')
+        ctor = main_rs[main_rs.index("fn before_shutdown(") : main_rs.index("fn after_shutdown(")]
+        self.assertIn("runtime_stopped: bridge.core_runtime_down()", ctor)
+
+        # Post-shutdown: no silent '?' propagation; installer failure flags the stopped runtime.
+        self.assertNotIn("?;", body[idx_shutdown:])
+        self.assertRegex(body[idx_shutdown:], r"if let Err\(e\) = update\.install\(")
+        self.assertRegex(body[idx_install:], r'after_shutdown\(\s*"INSTALL_FAILED_RUNTIME_STOPPED"')
+
+        # Restart: refused during an update and while the Core is alive; registered as a command.
+        restart_body = main_rs[end : main_rs.index("fn main()")]
+        idx_restart = restart_body.index("app.restart()")
+        self.assertLess(restart_body.index("update_in_progress.load("), idx_restart)
+        self.assertLess(restart_body.index("core_runtime_down()"), idx_restart)
+        self.assertEqual(restart_body[:idx_restart].count("return Err("), 2)
+        self.assertIn("updater_restart_app", main_rs[main_rs.index("generate_handler![") :])
+
+        # updater_check reports the runtime state on every result path (survives a webview reload).
+        check_body = main_rs[main_rs.index("async fn updater_check(") : start]
+        self.assertIn("let runtime_stopped = bridge.core_runtime_down();", check_body)
+        self.assertEqual(len(re.findall(r"^\s+runtime_stopped,$", check_body, re.MULTILINE)), 4)
+
+        # Frontend: install errors are kept out of the state handleCheckUpdates() clears; a stopped
+        # runtime is never re-checked and only the restart is offered.
+        check_fn = modal[modal.index("const handleCheckUpdates = useCallback") :]
+        check_fn = check_fn[: check_fn.index("}, [isTauri, callTauri")]
+        self.assertNotIn("setInstallError", check_fn)
+        self.assertIn("res.runtime_stopped === true", check_fn)
+        self.assertNotIn("setErrorMessage(`Erro ao instalar", modal)
+        branch = modal[modal.index("err?.runtime_stopped === true") :]
+        branch = branch[: branch.index("handleCheckUpdates();")]
+        self.assertIn("setRuntimeStopped(true);", branch)
+        self.assertIn("return;", branch)
+        self.assertIn('callTauri("updater_restart_app")', modal)
+        self.assertIn("disabled={isUpdating || runtimeStopped}", modal)
 
 
 if __name__ == "__main__":

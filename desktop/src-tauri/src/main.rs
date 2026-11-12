@@ -44,6 +44,11 @@ pub struct IpcBridge {
     reader: Mutex<Option<BufReader<ChildStdout>>>,
     io_lock: Mutex<()>,
     update_frozen: AtomicBool,
+    // Set once the Core Python runtime was deliberately stopped for installation.
+    // From then on the only valid recovery is restarting the app (see updater_restart_app).
+    runtime_stopped_for_update: AtomicBool,
+    // Host-side mutual exclusion: at most one updater_download_and_install runs at a time.
+    update_in_progress: AtomicBool,
     token: String,
     seq: AtomicU64,
     resolved_python: String,
@@ -109,6 +114,8 @@ impl IpcBridge {
             reader: Mutex::new(child_out),
             io_lock: Mutex::new(()),
             update_frozen: AtomicBool::new(false),
+            runtime_stopped_for_update: AtomicBool::new(false),
+            update_in_progress: AtomicBool::new(false),
             token,
             seq: AtomicU64::new(1),
             resolved_python: py_path_str,
@@ -331,6 +338,29 @@ impl IpcBridge {
         }
     }
 
+    /// True when the Core runtime can no longer serve terminal sessions: stopped for an update,
+    /// never started, or the owned child process has exited. Unknown states (poisoned lock,
+    /// try_wait error) report false, so the restart path stays refused (fail-closed).
+    fn core_runtime_down(&self) -> bool {
+        if self.runtime_stopped_for_update.load(Ordering::SeqCst) {
+            return true;
+        }
+        match self.child.lock() {
+            Ok(mut guard) => match guard.as_mut() {
+                None => true,
+                Some(child) => matches!(child.try_wait(), Ok(Some(_))),
+            },
+            Err(_) => false,
+        }
+    }
+
+    fn begin_update(&self) -> Option<UpdateInProgressGuard<'_>> {
+        self.update_in_progress
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .ok()
+            .map(|_| UpdateInProgressGuard { bridge: self })
+    }
+
     pub fn shutdown(&self) {
         // Step 1: Drop stdin handle to send EOF to the Python IPC server
         if let Ok(mut stdin_guard) = self.stdin.lock() {
@@ -367,6 +397,24 @@ struct UpdateFreezeGuard<'a> {
 impl<'a> UpdateFreezeGuard<'a> {
     fn commit(mut self) {
         self.committed = true;
+    }
+
+    /// Explicit release for gate failures: the unfreeze result is returned to the caller
+    /// (Drop can only log it, and logs go nowhere in a windows-subsystem app).
+    fn release(mut self) -> Result<(), String> {
+        self.committed = true;
+        self.bridge.update_frozen.store(false, Ordering::SeqCst);
+        self.bridge.call("system.unfreeze_update", json!({})).map(|_| ())
+    }
+}
+
+struct UpdateInProgressGuard<'a> {
+    bridge: &'a IpcBridge,
+}
+
+impl<'a> Drop for UpdateInProgressGuard<'a> {
+    fn drop(&mut self) {
+        self.bridge.update_in_progress.store(false, Ordering::SeqCst);
     }
 }
 
@@ -607,6 +655,8 @@ pub struct UpdateCheckResult {
     pub sessions_error: Option<String>,
     pub offline: bool,
     pub error: Option<String>,
+    // Core runtime is down (stopped for an update or exited): the UI must offer only the restart path.
+    pub runtime_stopped: bool,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -730,6 +780,7 @@ async fn updater_check(app: tauri::AppHandle, bridge: State<'_, Arc<IpcBridge>>)
         SessionInspection::Known(n) => (true, n, None),
         SessionInspection::Unknown(why) => (false, 0, Some(why)),
     };
+    let runtime_stopped = bridge.core_runtime_down();
 
     let updater = match app.updater() {
         Ok(u) => u,
@@ -743,6 +794,7 @@ async fn updater_check(app: tauri::AppHandle, bridge: State<'_, Arc<IpcBridge>>)
                 active_sessions_count,
                 sessions_known,
                 sessions_error,
+                runtime_stopped,
                 offline: true,
                 error: Some(format!("Falha ao inicializar verificador: {}", e)),
             });
@@ -760,6 +812,7 @@ async fn updater_check(app: tauri::AppHandle, bridge: State<'_, Arc<IpcBridge>>)
                 active_sessions_count,
                 sessions_known,
                 sessions_error,
+                runtime_stopped,
                 offline: false,
                 error: None,
             })
@@ -774,6 +827,7 @@ async fn updater_check(app: tauri::AppHandle, bridge: State<'_, Arc<IpcBridge>>)
                 active_sessions_count,
                 sessions_known,
                 sessions_error,
+                runtime_stopped,
                 offline: false,
                 error: None,
             })
@@ -789,9 +843,42 @@ async fn updater_check(app: tauri::AppHandle, bridge: State<'_, Arc<IpcBridge>>)
                 active_sessions_count,
                 sessions_known,
                 sessions_error,
+                runtime_stopped,
                 offline: true,
                 error: Some(format!("Servidor de atualização inacessível (modo offline): {}", e)),
             })
+        }
+    }
+}
+
+/// Structured updater failure, serialized as the invoke rejection payload.
+/// `runtime_stopped` tells the UI whether the Core Python runtime and terminals are still operational.
+/// When true, the only safe recovery is `updater_restart_app`.
+#[derive(Serialize, Debug, Clone)]
+pub struct UpdaterError {
+    pub code: &'static str,
+    pub message: String,
+    pub runtime_stopped: bool,
+}
+
+impl UpdaterError {
+    /// Failure raised before this command stopped the runtime (nothing was terminated by the updater).
+    /// `runtime_stopped` still reflects the real Core state: a Core that died on its own is reported,
+    /// so the UI offers the restart path instead of a dead "retry".
+    fn before_shutdown(bridge: &IpcBridge, code: &'static str, message: impl Into<String>) -> Self {
+        UpdaterError {
+            code,
+            message: message.into(),
+            runtime_stopped: bridge.core_runtime_down(),
+        }
+    }
+
+    /// Failure after the Core runtime was deliberately stopped for installation.
+    fn after_shutdown(code: &'static str, message: impl Into<String>) -> Self {
+        UpdaterError {
+            code,
+            message: message.into(),
+            runtime_stopped: true,
         }
     }
 }
@@ -802,19 +889,44 @@ async fn updater_download_and_install(
     bridge: State<'_, Arc<IpcBridge>>,
     force: Option<bool>,
     expected_active_sessions: Option<usize>,
-) -> Result<bool, String> {
+) -> Result<bool, UpdaterError> {
     use tauri_plugin_updater::UpdaterExt;
+
+    // Exclusão mútua no host: uma única instalação por vez, mesmo com invocações concorrentes
+    // (o botão desabilitado na UI não impede um segundo invoke). Liberada ao sair da função.
+    let _in_progress = match bridge.begin_update() {
+        Some(guard) => guard,
+        None => {
+            return Err(UpdaterError::before_shutdown(
+                &bridge,
+                "UPDATE_IN_PROGRESS",
+                "Já existe uma atualização em andamento. Aguarde a conclusão antes de tentar novamente.",
+            ))
+        }
+    };
+
+    // Uma instalação anterior já encerrou o runtime: nunca presumir Python ativo nem tentar de novo.
+    if bridge.runtime_stopped_for_update.load(Ordering::SeqCst) {
+        return Err(UpdaterError::after_shutdown(
+            "RUNTIME_STOPPED",
+            "O runtime Core foi encerrado por uma tentativa de instalação anterior. Reinicie o aplicativo antes de tentar novamente.",
+        ));
+    }
 
     let force_update = force.unwrap_or(false);
 
     // ETAPA 1 (Fail-Closed Pré-Download): Verificar se sessões estão ativas ou se inspeção falhou
     let pre_insp = count_active_sessions(&bridge);
     if let InstallGate::Block(reason) = evaluate_gate(pre_insp, force_update, expected_active_sessions) {
-        return Err(reason);
+        return Err(UpdaterError::before_shutdown(&bridge, "SESSIONS_GATE_BLOCKED", reason));
     }
 
-    let updater = app.updater().map_err(|e| e.to_string())?;
-    let update = updater.check().await.map_err(|e| format!("Falha ao consultar atualizações: {}", e))?;
+    let updater = app.updater().map_err(|e| {
+        UpdaterError::before_shutdown(&bridge, "UPDATER_UNAVAILABLE", format!("Falha ao inicializar o atualizador: {}", e))
+    })?;
+    let update = updater.check().await.map_err(|e| {
+        UpdaterError::before_shutdown(&bridge, "CHECK_FAILED", format!("Falha ao consultar atualizações: {}", e))
+    })?;
 
     if let Some(update) = update {
         // ETAPA 2 (Segurança): Baixar e validar a assinatura Ed25519 ANTES de congelar/desligar o runtime Python
@@ -837,14 +949,28 @@ async fn updater_download_and_install(
                 || {},
             )
             .await
-            .map_err(|e| format!("Falha no download/validação da atualização: {}. O aplicativo e seus terminais continuam operacionais.", e))?;
+            .map_err(|e| {
+                UpdaterError::before_shutdown(
+                    &bridge,
+                    "DOWNLOAD_OR_SIGNATURE_FAILED",
+                    format!("Falha no download/validação da atualização: {}. O aplicativo e seus terminais continuam operacionais.", e),
+                )
+            })?;
 
         // ETAPA 3 (Exclusão Mútua / Freeze + Revalidação Pré-Instalação):
         // Congela criação de novas abas/sessões no Rust e no Core Python (sob RLock) antes de contar.
-        // Se a validação falhar, UpdateFreezeGuard::drop descongela automaticamente o sistema.
+        // Se a validação falhar, o congelamento é liberado explicitamente e uma falha ao descongelar
+        // é informada ao usuário; UpdateFreezeGuard::drop permanece como rede de segurança.
         let (freeze_guard, post_insp) = bridge.acquire_update_freeze();
         if let InstallGate::Block(reason) = evaluate_gate(post_insp, force_update, expected_active_sessions) {
-            return Err(format!("Revalidação pré-instalação bloqueada: {}", reason));
+            let mut message = format!("Revalidação pré-instalação bloqueada: {}", reason);
+            if let Err(e) = freeze_guard.release() {
+                message.push_str(&format!(
+                    " Atenção: o Core não confirmou o descongelamento ({}). Se a criação de terminais continuar bloqueada, feche e reabra o aplicativo.",
+                    e
+                ));
+            }
+            return Err(UpdaterError::before_shutdown(&bridge, "PRE_INSTALL_GATE_BLOCKED", message));
         }
 
         // Confirma permanência no estado congelado até o shutdown imediato
@@ -855,19 +981,53 @@ async fn updater_download_and_install(
             "percent": 100.0
         }));
 
-        // ETAPA 4: Apenas após validação sob exclusão mútua passar, encerra o Python e Job Objects
+        // ETAPA 4: Apenas após validação sob exclusão mútua passar, encerra o Python e Job Objects.
+        // A marca é gravada antes do shutdown: a partir daqui nenhum caminho pode presumir Python ativo.
+        bridge.runtime_stopped_for_update.store(true, Ordering::SeqCst);
         bridge.shutdown();
 
-        // ETAPA 5: Instala o payload validado
-        update.install(downloaded_bytes)
-            .map_err(|e| format!("Falha ao executar o instalador da atualização: {}", e))?;
+        // ETAPA 5: Instala o payload validado. No Windows, sucesso entrega o controle ao instalador NSIS
+        // e encerra este processo; um retorno com erro significa que o instalador não foi iniciado
+        // (ex.: falha ao gravar o pacote temporário ou ao iniciar o processo do instalador).
+        if let Err(e) = update.install(downloaded_bytes) {
+            eprintln!("[UPDATER_INSTALL_FAIL] Falha pós-shutdown: {}", e);
+            return Err(UpdaterError::after_shutdown(
+                "INSTALL_FAILED_RUNTIME_STOPPED",
+                format!(
+                    "Falha ao executar o instalador da atualização: {}. O runtime Core e os terminais já haviam sido encerrados com segurança; reinicie o aplicativo para restaurá-los na versão atual.",
+                    e
+                ),
+            ));
+        }
 
         // ETAPA 6: Reinicia o aplicativo preservando configurações e perfis
         app.restart();
         Ok(true)
     } else {
-        Err("Nenhuma atualização pendente encontrada para instalação.".into())
+        Err(UpdaterError::before_shutdown(
+            &bridge,
+            "NO_UPDATE",
+            "Nenhuma atualização pendente encontrada para instalação.",
+        ))
     }
+}
+
+/// Recuperação: reinicia a versão instalada, que sobe um novo runtime Core Python. Só é aceito quando o
+/// Core já não atende sessões (encerrado para instalação ou processo filho finalizado) e nenhuma
+/// instalação está em andamento; com o Core ativo é recusado, para nunca contornar a cerca de sessões.
+#[tauri::command]
+fn updater_restart_app(app: tauri::AppHandle, bridge: State<Arc<IpcBridge>>) -> Result<(), String> {
+    if bridge.update_in_progress.load(Ordering::SeqCst) {
+        return Err("Reinício recusado: há uma atualização em andamento.".into());
+    }
+    if !bridge.core_runtime_down() {
+        return Err(
+            "Reinício recusado: o runtime Core está ativo. Use o fluxo de atualização, que verifica as sessões de terminal."
+                .into(),
+        );
+    }
+    app.restart();
+    Ok(())
 }
 
 fn main() {
@@ -900,7 +1060,8 @@ fn main() {
             terminal_list_tabs,
             updater_get_channel_info,
             updater_check,
-            updater_download_and_install
+            updater_download_and_install,
+            updater_restart_app
         ])
         .run(tauri::generate_context!())
         .expect("error while running AI Coordinator Desktop");

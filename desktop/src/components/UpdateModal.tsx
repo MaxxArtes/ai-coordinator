@@ -11,6 +11,7 @@ export interface UpdateCheckResult {
   sessions_error?: string | null;
   offline: boolean;
   error?: string | null;
+  runtime_stopped?: boolean;
 }
 
 interface UpdateModalProps {
@@ -38,8 +39,14 @@ export const UpdateModal: React.FC<UpdateModalProps> = ({
   const [downloadedBytes, setDownloadedBytes] = useState<number>(0);
   const [totalBytes, setTotalBytes] = useState<number>(0);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
+  // Install failures live in their own state: handleCheckUpdates() clears errorMessage synchronously.
+  const [installError, setInstallError] = useState<string | null>(null);
   const [forceAuthorized, setForceAuthorized] = useState<boolean>(false);
   const [authorizedCount, setAuthorizedCount] = useState<number | null>(null);
+  // Set when the installer failed AFTER the Core runtime was shut down (runtime_stopped from the host).
+  // In that state terminals are gone and the only safe action is restarting the current version.
+  const [runtimeStopped, setRuntimeStopped] = useState<boolean>(false);
+  const [isRestarting, setIsRestarting] = useState<boolean>(false);
 
   const checkSeqRef = useRef<number>(0);
   const prevVisiblePanesRef = useRef<number>(activePanesCount);
@@ -59,6 +66,10 @@ export const UpdateModal: React.FC<UpdateModalProps> = ({
         const res: UpdateCheckResult = await callTauri("updater_check");
         if (seq !== checkSeqRef.current) return;
         setCheckResult(res);
+        if (res.runtime_stopped === true) {
+          // Host reports the Core runtime is down (also survives a webview reload).
+          setRuntimeStopped(true);
+        }
         if (res.error) {
           setErrorMessage(res.error);
         }
@@ -94,6 +105,7 @@ export const UpdateModal: React.FC<UpdateModalProps> = ({
   useEffect(() => {
     if (!isOpen) {
       invalidateAuthorization();
+      setInstallError(null);
       return;
     }
 
@@ -147,13 +159,13 @@ export const UpdateModal: React.FC<UpdateModalProps> = ({
 
   // Invalidate prior authorization and refresh authoritative count if visible panes change while modal is open
   useEffect(() => {
-    if (!isOpen || isUpdating) return;
+    if (!isOpen || isUpdating || runtimeStopped) return;
     if (activePanesCount !== prevVisiblePanesRef.current) {
       prevVisiblePanesRef.current = activePanesCount;
       invalidateAuthorization();
       handleCheckUpdates();
     }
-  }, [activePanesCount, isOpen, isUpdating, invalidateAuthorization, handleCheckUpdates]);
+  }, [activePanesCount, isOpen, isUpdating, runtimeStopped, invalidateAuthorization, handleCheckUpdates]);
 
   // Invalidate prior authorization if checkResult state or count changed
   useEffect(() => {
@@ -189,6 +201,7 @@ export const UpdateModal: React.FC<UpdateModalProps> = ({
 
     setIsUpdating(true);
     setErrorMessage(null);
+    setInstallError(null);
     setUpdateStatus("Baixando atualização assinada e verificando autenticidade...");
 
     try {
@@ -209,11 +222,26 @@ export const UpdateModal: React.FC<UpdateModalProps> = ({
     } catch (err: any) {
       setIsUpdating(false);
       invalidateAuthorization();
-      setErrorMessage(`Erro ao instalar atualização: ${err?.message || err}`);
       setUpdateStatus("");
+      setInstallError(`Erro ao instalar atualização: ${err?.message || err}`);
+      if (err?.runtime_stopped === true) {
+        // Core runtime is down (stopped for install or exited): a re-check could only report an unknown state.
+        setRuntimeStopped(true);
+        return;
+      }
       handleCheckUpdates();
     }
   }, [checkResult, forceAuthorized, authorizedCount, isTauri, callTauri, invalidateAuthorization, handleCheckUpdates]);
+
+  const handleRestartApp = useCallback(async () => {
+    setIsRestarting(true);
+    try {
+      await callTauri("updater_restart_app");
+    } catch (err: any) {
+      setIsRestarting(false);
+      setInstallError(`Falha ao reiniciar o aplicativo: ${err?.message || err}. Feche e abra o AI Coordinator Desktop manualmente.`);
+    }
+  }, [callTauri]);
 
   if (!isOpen) return null;
 
@@ -230,7 +258,7 @@ export const UpdateModal: React.FC<UpdateModalProps> = ({
           </div>
           <button
             onClick={onClose}
-            disabled={isUpdating}
+            disabled={isUpdating || runtimeStopped}
             className="text-gray-400 hover:text-white text-sm font-bold disabled:opacity-50"
           >
             ✕
@@ -256,7 +284,7 @@ export const UpdateModal: React.FC<UpdateModalProps> = ({
             <span className="text-gray-400">Verifique novas versões no canal {channel}:</span>
             <button
               onClick={handleCheckUpdates}
-              disabled={isChecking || isUpdating}
+              disabled={isChecking || isUpdating || runtimeStopped}
               className="px-3 py-1.5 bg-blue-600 hover:bg-blue-500 text-white rounded font-medium disabled:opacity-50 flex items-center space-x-1.5 transition-colors"
             >
               {isChecking ? (
@@ -275,6 +303,38 @@ export const UpdateModal: React.FC<UpdateModalProps> = ({
             <div className="bg-red-950/80 border border-red-800 p-3 rounded text-red-200">
               <div className="font-semibold mb-1">Aviso do Atualizador:</div>
               <div className="text-[11px] font-mono leading-relaxed">{errorMessage}</div>
+            </div>
+          )}
+
+          {installError && (
+            <div className="bg-red-950/80 border border-red-800 p-3 rounded text-red-200">
+              <div className="font-semibold mb-1">Falha na instalação:</div>
+              <div className="text-[11px] font-mono leading-relaxed">{installError}</div>
+            </div>
+          )}
+
+          {/* Post-shutdown install failure: runtime and terminals already stopped; only restart is safe */}
+          {runtimeStopped && (
+            <div className="bg-red-950/60 border border-red-600/70 p-3 rounded space-y-2">
+              <div className="text-red-300 font-semibold flex items-center space-x-1">
+                <span>🛑</span>
+                <span>Runtime Core encerrado — reinício necessário</span>
+              </div>
+              <p className="text-[11px] text-red-200 leading-tight">
+                O runtime Core não está ativo (encerrado para a instalação, que não pôde ser iniciada, ou
+                finalizado inesperadamente), e os terminais não podem ser usados neste estado. A versão atual
+                ({currentVersion}) continua instalada. Reinicie o aplicativo para restaurar o runtime; a
+                atualização poderá ser tentada novamente depois.
+              </p>
+              <div className="flex justify-end">
+                <button
+                  onClick={handleRestartApp}
+                  disabled={isRestarting || !isTauri}
+                  className="px-4 py-1.5 bg-red-700 hover:bg-red-600 text-white rounded text-xs font-semibold disabled:opacity-50"
+                >
+                  {isRestarting ? "Reiniciando..." : "Reiniciar aplicativo"}
+                </button>
+              </div>
             </div>
           )}
 
@@ -357,7 +417,7 @@ export const UpdateModal: React.FC<UpdateModalProps> = ({
                   <div className="pt-2 flex items-center justify-end space-x-3">
                     <button
                       onClick={onClose}
-                      disabled={isUpdating}
+                      disabled={isUpdating || runtimeStopped}
                       className="px-3 py-1.5 bg-gray-800 hover:bg-gray-700 text-gray-300 rounded text-xs font-medium"
                     >
                       Adiar
@@ -367,6 +427,7 @@ export const UpdateModal: React.FC<UpdateModalProps> = ({
                       disabled={
                         isUpdating ||
                         isChecking ||
+                        runtimeStopped ||
                         !sessionsKnown ||
                         (authoritativeSessionsCount > 0 &&
                           (!forceAuthorized || authorizedCount !== authoritativeSessionsCount))
