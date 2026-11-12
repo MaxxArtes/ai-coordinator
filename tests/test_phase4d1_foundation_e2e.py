@@ -53,6 +53,41 @@ def test_e2e_live_ipc_and_tree_memory():
         assert mem["within_budget"] is True
 
 
+def test_process_memory_is_measured_per_pid():
+    """Each pid is measured on its own (regression: POSIX used the caller's rusage for every pid)."""
+    import subprocess
+    import sys
+
+    from desktop.runner.verify_foundation import get_process_memory_bytes
+
+    alloc_mb = 64
+    child = subprocess.Popen(
+        [
+            sys.executable,
+            "-u",
+            "-c",
+            # Touch every page so the allocation is resident on every OS, then report and wait.
+            f"import sys, time; b = bytearray(b'\\x01') * ({alloc_mb} * 1024 * 1024); "
+            "print('READY', flush=True); sys.stdin.readline()",
+        ],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        assert child.stdout.readline().strip() == "READY"
+        child_bytes = get_process_memory_bytes(child.pid)
+        self_bytes = get_process_memory_bytes(os.getpid())
+        assert self_bytes > 0
+        # The child holds >= 64 MB resident; it must be reported for the child's pid itself.
+        assert child_bytes >= (alloc_mb - 8) * 1024 * 1024
+        # Plausible magnitude (bytes, not kB*1024 of bytes as macOS ru_maxrss would give).
+        assert child_bytes < 4 * 1024 * 1024 * 1024
+    finally:
+        child.stdin.close()
+        child.wait(timeout=30)
+
+
 def test_e2e_full_foundation_gate_runner():
     res = run_full_foundation_verification()
     assert res["gate"] == "Gate 4D.1 - Fundação do Desktop"

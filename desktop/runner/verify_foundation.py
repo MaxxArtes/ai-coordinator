@@ -64,12 +64,36 @@ def get_process_memory_bytes(pid: int) -> int:
         finally:
             ctypes.windll.kernel32.CloseHandle(handle)
     else:
-        try:
-            import resource
+        return _posix_resident_bytes(pid)
 
-            return int(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss * 1024)
-        except Exception:
-            return 0
+
+def _posix_resident_bytes(pid: int) -> int:
+    """Current resident set size of the given pid (same meaning as WorkingSetSize on Windows).
+
+    Linux reads /proc/<pid>/status (VmRSS, in kB); other POSIX systems (macOS) use `ps -o rss=` (kB).
+    Returns 0 when the process cannot be inspected. Never falls back to the caller's own rusage,
+    which would ignore the pid (and on macOS report bytes, not kB).
+    """
+    status_file = Path(f"/proc/{pid}/status")
+    if status_file.exists():
+        try:
+            for line in status_file.read_text(encoding="ascii", errors="ignore").splitlines():
+                if line.startswith("VmRSS:"):
+                    return int(line.split()[1]) * 1024
+        except (OSError, ValueError, IndexError):
+            pass
+        return 0
+    try:
+        res = subprocess.run(
+            ["ps", "-o", "rss=", "-p", str(int(pid))],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        value = res.stdout.strip()
+        return int(value) * 1024 if res.returncode == 0 and value else 0
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return 0
 
 
 def get_process_tree_memory(
