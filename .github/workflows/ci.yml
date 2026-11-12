@@ -33,9 +33,10 @@ jobs:
       - name: Install package, optional MCP dependency and test runner
         run: |
           python -m pip install --upgrade pip
-          python -m pip install -e ".[mcp]" build pytest
+          python -m pip install -e ".[mcp]" build pytest pytest-github-actions-annotate-failures
       - name: Run full test suite (unittest classes and pytest functions)
-        run: python -m pytest tests -v
+        # Failures are also emitted as check-run annotations (visible on the PR checks page).
+        run: python -m pytest tests -v -rfE
       - name: Check support claims and packaged assets
         run: python scripts/check_support_matrix.py
       - name: Smoke-check CLI and MCP server construction
