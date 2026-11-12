@@ -83,6 +83,9 @@ class TestDesktopAlphaIntegration(unittest.TestCase):
             "terminal_close_session",
             "terminal_save_sessions",
             "terminal_list_tabs",
+            "updater_get_channel_info",
+            "updater_check",
+            "updater_download_and_install",
         ]
         for handler in required_handlers:
             self.assertIn(handler, code, f"Handler '{handler}' must be present in main.rs")
@@ -102,6 +105,9 @@ class TestDesktopAlphaIntegration(unittest.TestCase):
         self.assertIn("rust-toolchain", text)
         self.assertIn("npm run build", text)
         self.assertIn("@tauri-apps/cli build", text)
+        self.assertNotIn("--debug", text)
+        self.assertIn("target/release", text)
+        self.assertIn("verify_subsystem.py", text)
         self.assertIn("upload-artifact", text)
         self.assertIn("Python Build Standalone", text)
         self.assertIn("python_spec.json", text)
@@ -732,6 +738,10 @@ class TestDesktopAlphaIntegration(unittest.TestCase):
         main_rs = self.tauri_dir / "src" / "main.rs"
         self.assertTrue(main_rs.exists(), "src-tauri/src/main.rs must exist")
         code = main_rs.read_text(encoding="utf-8")
+
+        # 0. Unconditional GUI subsystem eliminating black console window
+        self.assertIn('#![windows_subsystem = "windows"]', code)
+        self.assertNotIn("cfg_attr(not(debug_assertions), windows_subsystem", code)
 
         # 1. CREATE_NO_WINDOW flag present and applied
         self.assertIn("CREATE_NO_WINDOW", code)

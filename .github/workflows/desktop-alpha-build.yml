@@ -97,6 +97,8 @@ jobs:
           Copy-Item "desktop/ipc" -Destination "$resDesktop/" -Recurse -Force
           Copy-Item "desktop/auth" -Destination "$resDesktop/" -Recurse -Force
           Copy-Item "desktop/terminal" -Destination "$resDesktop/" -Recurse -Force
+          Copy-Item "desktop/updater" -Destination "$resDesktop/" -Recurse -Force
+          Copy-Item "desktop/updates" -Destination "$resDesktop/" -Recurse -Force
           Copy-Item "src/*" -Destination "$resSrc/" -Recurse -Force
 
           Write-Host "Resources directory populated successfully:"
@@ -110,34 +112,42 @@ jobs:
         working-directory: desktop
         run: npm run build
 
-      - name: Build Tauri 2 Native Executable & Windows Bundles
+      - name: Build Tauri 2 Native Executable & Windows Bundles (Release)
         working-directory: desktop
-        run: npx @tauri-apps/cli build --debug
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+        run: npx @tauri-apps/cli build
+
+      - name: Verify Windows Subsystem is GUI (Subsystem 2)
+        shell: powershell
+        run: |
+          Write-Host "=== Inspecting PE Subsystem for ai-coordinator-desktop.exe ==="
+          python desktop/scripts/verify_subsystem.py desktop/src-tauri/target/release/ai-coordinator-desktop.exe
 
       - name: Package Portable Standalone Distribution
         shell: powershell
         run: |
           Write-Host "=== Preparing Portable Alpha Directory ==="
-          $portableDir = "desktop/src-tauri/target/debug/portable"
+          $portableDir = "desktop/src-tauri/target/release/portable"
           New-Item -ItemType Directory -Force -Path "$portableDir/resources"
 
-          Copy-Item "desktop/src-tauri/target/debug/ai-coordinator-desktop.exe" -Destination "$portableDir/" -Force
+          Copy-Item "desktop/src-tauri/target/release/ai-coordinator-desktop.exe" -Destination "$portableDir/" -Force
           Copy-Item "desktop/src-tauri/resources/*" -Destination "$portableDir/resources/" -Recurse -Force
 
-          Compress-Archive -Path "$portableDir/*" -DestinationPath "desktop/src-tauri/target/debug/ai-coordinator-desktop-alpha-portable.zip" -Force
-          Write-Host "Portable package created at desktop/src-tauri/target/debug/ai-coordinator-desktop-alpha-portable.zip"
+          Compress-Archive -Path "$portableDir/*" -DestinationPath "desktop/src-tauri/target/release/ai-coordinator-desktop-alpha-portable.zip" -Force
+          Write-Host "Portable package created at desktop/src-tauri/target/release/ai-coordinator-desktop-alpha-portable.zip"
 
       - name: Compute Checksums and Export Step Summary
         shell: powershell
         run: |
           Write-Host "=== Computing SHA-256 Checksums for Windows Alpha Artifacts ==="
           $summary = @(
-              "### AI Coordinator Desktop - Windows Alpha Artifacts",
+              "### AI Coordinator Desktop - Windows Alpha Artifacts (Release)",
               "",
               "| Arquivo | SHA-256 Checksum | Tamanho |",
               "|---|---|---|"
           )
-          $artifacts = Get-ChildItem -Path "desktop/src-tauri/target/debug" -Include "*.exe", "*.msi", "*.zip" -Recurse | Where-Object { $_.FullName -notmatch "build|deps|incremental|\.fingerprint" }
+          $artifacts = Get-ChildItem -Path "desktop/src-tauri/target/release" -Include "*.exe", "*.msi", "*.zip", "*.sig" -Recurse | Where-Object { $_.FullName -notmatch "build|deps|incremental|\.fingerprint" }
           foreach ($item in $artifacts) {
               $hash = (Get-FileHash $item.FullName -Algorithm SHA256).Hash
               $size = "{0:N0} bytes" -f $item.Length
@@ -151,8 +161,10 @@ jobs:
         with:
           name: ai-coordinator-desktop-alpha-windows
           path: |
-            desktop/src-tauri/target/debug/ai-coordinator-desktop.exe
-            desktop/src-tauri/target/debug/ai-coordinator-desktop-alpha-portable.zip
-            desktop/src-tauri/target/debug/bundle/msi/*.msi
-            desktop/src-tauri/target/debug/bundle/nsis/*.exe
+            desktop/src-tauri/target/release/ai-coordinator-desktop.exe
+            desktop/src-tauri/target/release/ai-coordinator-desktop-alpha-portable.zip
+            desktop/src-tauri/target/release/bundle/msi/*.msi
+            desktop/src-tauri/target/release/bundle/nsis/*.exe
+            desktop/src-tauri/target/release/bundle/nsis/*.zip
+            desktop/src-tauri/target/release/bundle/nsis/*.sig
           if-no-files-found: warn

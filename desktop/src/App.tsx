@@ -2,6 +2,7 @@ import React, { useEffect, useRef, useState, useCallback } from "react";
 import { TerminalGrid } from "./components/TerminalGrid";
 import { TerminalPaneData } from "./components/TerminalPane";
 import { Terminal } from "xterm";
+import { UpdateModal } from "./components/UpdateModal";
 
 interface RuntimeMetrics {
   host_pid: number;
@@ -31,6 +32,9 @@ export const App: React.FC = () => {
   const [inputPath, setInputPath] = useState<string>("");
   const [panes, setPanes] = useState<TerminalPaneData[]>([]);
   const [notice, setNotice] = useState<string>("");
+  const [isUpdateModalOpen, setIsUpdateModalOpen] = useState<boolean>(false);
+  const [hasUpdateAvailable, setHasUpdateAvailable] = useState<boolean>(false);
+  const [latestAvailableVersion, setLatestAvailableVersion] = useState<string>("");
 
   const termsRef = useRef<Map<string, Terminal>>(new Map());
   const lastSeqRef = useRef<Map<string, number>>(new Map());
@@ -405,6 +409,22 @@ export const App: React.FC = () => {
     return () => clearInterval(interval);
   }, [isTauri, panes, callTauri]);
 
+  // Silent background check for updates upon connection
+  useEffect(() => {
+    if (isTauri && connectionStatus === "connected") {
+      callTauri("updater_check")
+        .then((res: any) => {
+          if (res && res.available) {
+            setHasUpdateAvailable(true);
+            setLatestAvailableVersion(res.latest_version);
+          }
+        })
+        .catch(() => {
+          // Gracefully ignore network/offline issues
+        });
+    }
+  }, [isTauri, connectionStatus, callTauri]);
+
   // Save session layout
   const handleSaveSessions = useCallback(
     async (tabId: string) => {
@@ -474,8 +494,8 @@ export const App: React.FC = () => {
           )}
         </div>
 
-        {/* Telemetry metrics */}
-        <div className="flex items-center space-x-4 text-xs font-mono text-gray-300">
+        {/* Telemetry metrics & Updates button */}
+        <div className="flex items-center space-x-3 text-xs font-mono text-gray-300">
           {metrics ? (
             <>
               <span>PID: {metrics.host_pid}</span>
@@ -486,6 +506,19 @@ export const App: React.FC = () => {
           ) : (
             <span className="text-gray-500">Métricas em Espera</span>
           )}
+
+          <button
+            onClick={() => setIsUpdateModalOpen(true)}
+            className={`px-2.5 py-1 rounded text-xs font-sans font-medium flex items-center space-x-1.5 transition-all ${
+              hasUpdateAvailable
+                ? "bg-purple-600 hover:bg-purple-500 text-white shadow-md animate-pulse"
+                : "bg-gray-800 hover:bg-gray-700 text-gray-300"
+            }`}
+            title="Configurações e Atualizações do AI Coordinator Desktop"
+          >
+            <span>{hasUpdateAvailable ? "✨" : "🔄"}</span>
+            <span>{hasUpdateAvailable ? `Atualização v${latestAvailableVersion}` : "Atualizações"}</span>
+          </button>
         </div>
       </header>
 
@@ -560,6 +593,15 @@ export const App: React.FC = () => {
           />
         )}
       </main>
+
+      {/* Update Modal */}
+      <UpdateModal
+        isOpen={isUpdateModalOpen}
+        onClose={() => setIsUpdateModalOpen(false)}
+        activePanesCount={panes.length}
+        isTauri={isTauri}
+        callTauri={callTauri}
+      />
     </div>
   );
 };

@@ -1,0 +1,11 @@
+{
+  "version": "0.6.1-alpha.48",
+  "notes": "AI Coordinator Desktop Alpha — Revisão 48. Janela de console eliminada definitivamente e sistema de auto-atualização integrado.",
+  "pub_date": "2026-11-12T12:00:00Z",
+  "platforms": {
+    "windows-x86_64": {
+      "signature": "",
+      "url": "https://github.com/MaxxArtes/ai-coordinator/releases/download/v0.6.1-alpha.48/AI-Coordinator-Desktop_0.6.1-alpha.48_x64-setup.nsis.zip"
+    }
+  }
+}

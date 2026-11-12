@@ -3,7 +3,7 @@
 // Sole authority of execution and governance remains with the Core Python runtime.
 // The Rust host manages window lifecycle, native PTY bridging, and process tree telemetries.
 
-#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+#![windows_subsystem = "windows"]
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -478,6 +478,150 @@ fn terminal_list_tabs(bridge: State<Arc<IpcBridge>>) -> Result<Value, String> {
     bridge.call("terminal.list_tabs", json!({}))
 }
 
+#[derive(Serialize, Deserialize, Clone)]
+pub struct UpdateCheckResult {
+    pub available: bool,
+    pub current_version: String,
+    pub latest_version: String,
+    pub notes: String,
+    pub date: String,
+    pub active_sessions_count: usize,
+    pub offline: bool,
+    pub error: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+pub struct UpdaterChannelInfo {
+    pub current_version: String,
+    pub channel: String,
+    pub endpoint: String,
+}
+
+#[tauri::command]
+async fn updater_get_channel_info() -> UpdaterChannelInfo {
+    UpdaterChannelInfo {
+        current_version: "0.6.0".into(),
+        channel: "alpha".into(),
+        endpoint: "https://raw.githubusercontent.com/MaxxArtes/ai-coordinator/feature/phase4d-m2-terminals/desktop/updates/alpha.json".into(),
+    }
+}
+
+#[tauri::command]
+async fn updater_check(app: tauri::AppHandle, bridge: State<'_, Arc<IpcBridge>>) -> Result<UpdateCheckResult, String> {
+    use tauri_plugin_updater::UpdaterExt;
+
+    // Check active sessions count from Core IPC
+    let active_sessions_count = match bridge.call("terminal.list_tabs", json!({})) {
+        Ok(val) => {
+            if let Some(tabs) = val.get("tabs").and_then(|t| t.as_array()) {
+                tabs.iter().map(|t| t.get("panes_count").and_then(|p| p.as_u64()).unwrap_or(0) as usize).sum()
+            } else {
+                0
+            }
+        }
+        Err(_) => 0,
+    };
+
+    let updater = match app.updater() {
+        Ok(u) => u,
+        Err(e) => {
+            return Ok(UpdateCheckResult {
+                available: false,
+                current_version: "0.6.0".into(),
+                latest_version: "0.6.0".into(),
+                notes: String::new(),
+                date: String::new(),
+                active_sessions_count,
+                offline: true,
+                error: Some(format!("Falha ao inicializar verificador: {}", e)),
+            });
+        }
+    };
+
+    match updater.check().await {
+        Ok(Some(update)) => {
+            Ok(UpdateCheckResult {
+                available: true,
+                current_version: "0.6.0".into(),
+                latest_version: update.version.clone(),
+                notes: update.body.clone().unwrap_or_else(|| "Notas de lançamento da versão Alpha.".into()),
+                date: update.date.map(|d| d.to_string()).unwrap_or_default(),
+                active_sessions_count,
+                offline: false,
+                error: None,
+            })
+        }
+        Ok(None) => {
+            Ok(UpdateCheckResult {
+                available: false,
+                current_version: "0.6.0".into(),
+                latest_version: "0.6.0".into(),
+                notes: String::new(),
+                date: String::new(),
+                active_sessions_count,
+                offline: false,
+                error: None,
+            })
+        }
+        Err(e) => {
+            // Graceful offline tolerance
+            Ok(UpdateCheckResult {
+                available: false,
+                current_version: "0.6.0".into(),
+                latest_version: "0.6.0".into(),
+                notes: String::new(),
+                date: String::new(),
+                active_sessions_count,
+                offline: true,
+                error: Some(format!("Servidor de atualização inacessível (modo offline): {}", e)),
+            })
+        }
+    }
+}
+
+#[tauri::command]
+async fn updater_download_and_install(
+    app: tauri::AppHandle,
+    bridge: State<'_, Arc<IpcBridge>>,
+    force: Option<bool>,
+) -> Result<bool, String> {
+    use tauri_plugin_updater::UpdaterExt;
+
+    let force_update = force.unwrap_or(false);
+
+    // Safety fence: do not update with active sessions unless explicitly authorized by user
+    if !force_update {
+        if let Ok(val) = bridge.call("terminal.list_tabs", json!({})) {
+            if let Some(tabs) = val.get("tabs").and_then(|t| t.as_array()) {
+                let count: usize = tabs.iter().map(|t| t.get("panes_count").and_then(|p| p.as_u64()).unwrap_or(0) as usize).sum();
+                if count > 0 {
+                    return Err(format!("Existem {} terminais ativos em execução. Confirme o encerramento antes de atualizar.", count));
+                }
+            }
+        }
+    }
+
+    let updater = app.updater().map_err(|e| e.to_string())?;
+    let update = updater.check().await.map_err(|e| e.to_string())?;
+
+    if let Some(update) = update {
+        // Step 1: Cleanly and atomically shut down Python runtime and all Job Objects
+        bridge.shutdown();
+
+        // Step 2: Download and install with cryptographic signature verification
+        update
+            .download_and_install(|_chunk, _total| {}, || {})
+            .await
+            .map_err(|e| format!("Falha no download/instalação da atualização: {}", e))?;
+
+        // Step 3: Restart app preserving user profile and settings
+        app.restart();
+        Ok(true)
+    } else {
+        Err("Nenhuma atualização pendente encontrada para instalação.".into())
+    }
+}
+
 fn main() {
     let bridge = Arc::new(IpcBridge::new());
     let bridge_window = bridge.clone();
@@ -485,6 +629,7 @@ fn main() {
     tauri::Builder::default()
         .manage(bridge)
         .plugin(tauri_plugin_shell::init())
+        .plugin(tauri_plugin_updater::Builder::new().build())
         .on_window_event(move |_window, event| {
             if let tauri::WindowEvent::Destroyed = event {
                 bridge_window.shutdown();
@@ -504,7 +649,10 @@ fn main() {
             terminal_get_output,
             terminal_close_session,
             terminal_save_sessions,
-            terminal_list_tabs
+            terminal_list_tabs,
+            updater_get_channel_info,
+            updater_check,
+            updater_download_and_install
         ])
         .run(tauri::generate_context!())
         .expect("error while running AI Coordinator Desktop");

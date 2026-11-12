@@ -4,6 +4,7 @@
   "description": "Default capabilities for AI Coordinator Desktop",
   "windows": ["main"],
   "permissions": [
-    "core:default"
+    "core:default",
+    "updater:default"
   ]
 }
