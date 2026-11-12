@@ -224,8 +224,8 @@ class TestDesktopUpdater(unittest.TestCase):
         )
         self.assertTrue(len(result.signature) > 64)
 
-        # Test cryptographic verification of real signature if staging binary is present
-        staging_exe = _repo_root / "desktop" / "test_release_staging" / "AI-Coordinator-Desktop_0.6.1-alpha.49_x64-setup.exe"
+        # Test cryptographic verification of real signature if matching staging binary is present
+        staging_exe = _repo_root / "desktop" / "test_release_staging" / f"AI-Coordinator-Desktop_{result.latest_version}_x64-setup.exe"
         if staging_exe.exists():
             data_bytes = staging_exe.read_bytes()
             # 1. Real binary with real signature must verify True
