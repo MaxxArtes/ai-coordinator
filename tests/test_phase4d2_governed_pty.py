@@ -176,7 +176,10 @@ def test_windows_conpty_direct(auth_setup):
     from desktop.terminal.pty_backend import WindowsConPtyBackend
 
     backend = WindowsConPtyBackend(cols=80, rows=24)
-    cmd = [sys.executable, "-u", "-c", "import sys, time; time.sleep(0.5); print('CONPTY_NATIVE_OK'); sys.stdout.flush()"]
+    received = []
+    backend.set_output_callback(lambda txt: received.append(txt))
+
+    cmd = [sys.executable, "-u", "-c", "import sys, time; time.sleep(0.3); print('CONPTY_NATIVE_OK'); sys.stdout.flush()"]
     identity = backend.spawn(cmd=cmd, cwd=auth_setup["project_path"])
 
     assert identity.pid > 0
@@ -185,13 +188,75 @@ def test_windows_conpty_direct(auth_setup):
     # Test resize
     assert backend.resize(100, 30) is True
 
+    # Allow output to arrive
+    time.sleep(0.5)
+    combined = "".join(received)
+    assert "CONPTY_NATIVE_OK" in combined
+
     # Terminate cleanly
     assert backend.terminate() is True
     assert backend.is_alive() is False
 
 
+@pytest.mark.skipif(sys.platform != "win32", reason="ConPTY is Windows-specific")
+def test_windows_conpty_cmd_interactive_stdio_isolation(auth_setup):
+    """Test 7: Native ConPTY runs interactive cmd.exe, isolates stdio, echoes commands, and prevents JSON/syntax leaks."""
+    mgr = TerminalManager(authorizer=auth_setup["authorizer"])
+    token = auth_setup["token"]
+    proj_path = auth_setup["project_path"]
+
+    mgr.create_tab(token=token, tab_id="interactive-tab", title="Interactive Shell", project_path=proj_path)
+    # Default command is ["cmd.exe"]
+    sess = mgr.create_terminal(
+        token=token,
+        tab_id="interactive-tab",
+        pane_id=0,
+        kind=SessionKind.HUMAN_TERMINAL,
+    )
+
+    assert sess.is_alive is True
+    assert sess.pid is not None
+    assert sess.pid > 0
+
+    # Wait for startup banner
+    time.sleep(0.6)
+    raw_banner, lines, seq = sess.get_new_output(0)
+    assert ("Microsoft Windows" in raw_banner or "Windows" in raw_banner)
+    assert "{" not in raw_banner
+    assert "não é reconhecido" not in raw_banner
+
+    # 1. Test 'echo AI Coordinator funcionando'
+    sess.write("echo AI Coordinator funcionando\r\n")
+    time.sleep(0.4)
+    raw_cmd1, _, seq = sess.get_new_output(seq)
+    assert "AI Coordinator funcionando" in raw_cmd1
+    assert "{" not in raw_cmd1
+    assert "não é reconhecido" not in raw_cmd1
+
+    # 2. Test 'dir'
+    sess.write("dir\r\n")
+    time.sleep(0.4)
+    raw_dir, _, seq = sess.get_new_output(seq)
+    assert ("Diretório de" in raw_dir or "Directory of" in raw_dir or "bytes" in raw_dir or "<DIR>" in raw_dir or "Volume" in raw_dir)
+    assert "{" not in raw_dir
+    assert "não é reconhecido" not in raw_dir
+
+    # 3. Test 'echo %COORDINATOR_IPC_TOKEN%' (must not leak secrets)
+    sess.write("echo %COORDINATOR_IPC_TOKEN%\r\n")
+    time.sleep(0.3)
+    raw_tok, _, seq = sess.get_new_output(seq)
+    assert "%COORDINATOR_IPC_TOKEN%" in raw_tok
+
+    # 4. Terminate via exit
+    sess.write("exit\r\n")
+    time.sleep(0.5)
+
+    assert mgr.close_terminal(sess.session_id) is True
+    assert sess.is_alive is False
+
+
 def test_clean_termination_and_orphan_prevention(auth_setup):
-    """Test 6: Terminating session leaves no orphan processes and cleans state."""
+    """Test 8: Terminating session leaves no orphan processes and cleans state."""
     mgr = TerminalManager(authorizer=auth_setup["authorizer"])
     token = auth_setup["token"]
     proj_path = auth_setup["project_path"]

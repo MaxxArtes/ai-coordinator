@@ -227,7 +227,7 @@ class WindowsConPtyBackend(BasePtyBackend):
         k32.InitializeProcThreadAttributeList(self._p_attr, 1, 0, ctypes.byref(attr_size))
 
         PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE = 0x00020016
-        k32.UpdateProcThreadAttribute(
+        upd_ok = k32.UpdateProcThreadAttribute(
             self._p_attr,
             0,
             PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE,
@@ -236,11 +236,26 @@ class WindowsConPtyBackend(BasePtyBackend):
             None,
             None,
         )
+        if not upd_ok:
+            err = k32.GetLastError()
+            k32.CloseHandle(h_in_read)
+            k32.CloseHandle(h_in_write)
+            k32.CloseHandle(h_out_read)
+            k32.CloseHandle(h_out_write)
+            self.terminate()
+            raise RuntimeError(f"UpdateProcThreadAttribute failed with Win32 error code {err}")
 
         # 5. Setup STARTUPINFOEXW and spawn suspended
         si = STARTUPINFOEXW()
         si.StartupInfo.cb = ctypes.sizeof(STARTUPINFOEXW)
         si.lpAttributeList = self._p_attr
+        # Explicit stdio isolation: bind child stdio directly to ConPTY pipe ends,
+        # preventing child console processes from inheriting parent Python/IPC stdio.
+        STARTF_USESTDHANDLES = 0x00000100
+        si.StartupInfo.dwFlags = STARTF_USESTDHANDLES
+        si.StartupInfo.hStdInput = h_in_read
+        si.StartupInfo.hStdOutput = h_out_write
+        si.StartupInfo.hStdError = h_out_write
         self._pi = PROCESS_INFORMATION()
 
         # Flags: EXTENDED_STARTUPINFO_PRESENT (0x80000) | CREATE_SUSPENDED (0x4)

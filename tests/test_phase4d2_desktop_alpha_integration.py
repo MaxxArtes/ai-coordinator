@@ -617,6 +617,116 @@ class TestDesktopAlphaIntegration(unittest.TestCase):
         self.assertLessEqual(buf.line_count, 50)
         self.assertLessEqual(buf.byte_count, 8 * 1024)
 
+    def test_15_windows_conpty_cmd_stdio_isolation_no_ipc_cross_talk(self) -> None:
+        """Verifies that spawning interactive cmd.exe in ConPTY isolates stdio from parent IPC."""
+        if sys.platform != "win32":
+            self.skipTest("Windows ConPTY is Windows-specific")
+
+        # Force native ConPTY backend
+        os.environ["COORDINATOR_PTY_BACKEND"] = "conpty"
+        token = "test-alpha-token-stdio-isolation"
+        transport = InMemoryTransport()
+
+        prof_mgr = DesktopProfileManager()
+        prof_mgr.authorize_project(prof_mgr.get_active_profile().name, str(_repo_root))
+        authorizer = DesktopAuthorizer(profile_manager=prof_mgr)
+        authorizer._active_sessions[token] = prof_mgr.get_active_profile().name
+        term_mgr = TerminalManager(authorizer=authorizer)
+
+        server = SecureIPCServer(transport=transport, session_token=token, terminal_manager=term_mgr)
+
+        # 1. Create Tab
+        transport.inbox.append(json.dumps({
+            "jsonrpc": "2.0",
+            "id": "1",
+            "method": "terminal.create_tab",
+            "params": {"tab_id": "tab-isolation", "project_path": str(_repo_root)},
+            "session_token": token
+        }))
+        self.assertTrue(server.process_one())
+        res1 = json.loads(transport.outbox.pop(0))
+        self.assertEqual(res1["result"]["tab_id"], "tab-isolation")
+
+        # 2. Create Session with default cmd.exe
+        transport.inbox.append(json.dumps({
+            "jsonrpc": "2.0",
+            "id": "2",
+            "method": "terminal.create_session",
+            "params": {
+                "tab_id": "tab-isolation",
+                "pane_id": 0,
+                "kind": "human_terminal",
+                "cwd": str(_repo_root),
+                "cols": 80,
+                "rows": 24
+            },
+            "session_token": token
+        }))
+        self.assertTrue(server.process_one())
+        res2 = json.loads(transport.outbox.pop(0))
+        session_id = res2["result"]["session_id"]
+
+        # Wait for cmd.exe banner in ConPTY
+        time.sleep(0.6)
+
+        # 3. Poll output - verify banner arrived and contains NO syntax errors
+        transport.inbox.append(json.dumps({
+            "jsonrpc": "2.0",
+            "id": "3",
+            "method": "terminal.get_output",
+            "params": {"session_id": session_id, "since_seq": 0},
+            "session_token": token
+        }))
+        self.assertTrue(server.process_one())
+        res3 = json.loads(transport.outbox.pop(0))
+        raw_out = res3["result"]["raw"]
+        next_seq = res3["result"]["next_seq"]
+        self.assertTrue("Windows" in raw_out or "Microsoft" in raw_out)
+        self.assertNotIn("{", raw_out)
+        self.assertNotIn("não é reconhecido", raw_out)
+
+        # 4. Write 'echo TESTE_DESKTOP_ALPHA\r\n'
+        transport.inbox.append(json.dumps({
+            "jsonrpc": "2.0",
+            "id": "4",
+            "method": "terminal.write",
+            "params": {"session_id": session_id, "data": "echo TESTE_DESKTOP_ALPHA\r\n"},
+            "session_token": token
+        }))
+        self.assertTrue(server.process_one())
+        transport.outbox.pop(0)
+
+        time.sleep(0.4)
+
+        # 5. Poll output again
+        transport.inbox.append(json.dumps({
+            "jsonrpc": "2.0",
+            "id": "5",
+            "method": "terminal.get_output",
+            "params": {"session_id": session_id, "since_seq": next_seq},
+            "session_token": token
+        }))
+        self.assertTrue(server.process_one())
+        res5 = json.loads(transport.outbox.pop(0))
+        raw_cmd = res5["result"]["raw"]
+        self.assertIn("TESTE_DESKTOP_ALPHA", raw_cmd)
+        self.assertNotIn("{", raw_cmd)
+        self.assertNotIn("não é reconhecido", raw_cmd)
+
+        # 6. Close session cleanly
+        transport.inbox.append(json.dumps({
+            "jsonrpc": "2.0",
+            "id": "6",
+            "method": "terminal.close_session",
+            "params": {"session_id": session_id},
+            "session_token": token
+        }))
+        self.assertTrue(server.process_one())
+        res6 = json.loads(transport.outbox.pop(0))
+        self.assertTrue(res6["result"]["closed"])
+
+        term_mgr.terminate_all()
+
 
 if __name__ == "__main__":
     unittest.main()
