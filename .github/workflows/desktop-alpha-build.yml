@@ -116,7 +116,15 @@ jobs:
         working-directory: desktop
         env:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
-        run: npx @tauri-apps/cli build
+        shell: powershell
+        run: |
+          if ($env:TAURI_SIGNING_PRIVATE_KEY) {
+              Write-Host "=== Building with Updater Artifacts and Signing ==="
+              npx @tauri-apps/cli build -- -c '{\"bundle\": {\"createUpdaterArtifacts\": true}}'
+          } else {
+              Write-Host "=== Building Release Binaries, Portable ZIP, and NSIS/MSI Bundles ==="
+              npx @tauri-apps/cli build
+          }
 
       - name: Verify Windows Subsystem is GUI (Subsystem 2)
         shell: powershell
