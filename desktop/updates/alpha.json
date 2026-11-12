@@ -1,11 +1,11 @@
 {
-  "version": "0.6.1-alpha.49",
-  "notes": "AI Coordinator Desktop Alpha Release com auto-atualizador e terminais ConPTY.",
-  "pub_date": "2026-11-12T17:00:50Z",
+  "version": "0.6.1-alpha.50",
+  "notes": "AI Coordinator Desktop Alpha v0.6.1-alpha.50 (R52): exclusao mutua Rust/Python (UpdateFreezeGuard), contagem autoritativa multi-aba, invalidacao automatica de autorizacao e CI Run 43301672945.",
+  "pub_date": "2026-11-12T20:45:47Z",
   "platforms": {
     "windows-x86_64": {
-      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVUb1gyWXRrZmlmU2QzZERKVTFmZmtWck1DWU42THpBUndybUVwZXh2cGRPSVhiTjFIS0Y0STJzekxzbXdJODljS0QyQlVDMTFFaHFVR3lUc2IveEI2YlZpVERPNXRhZVE4PQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzk0NTAyNzg1CWZpbGU6QUktQ29vcmRpbmF0b3ItRGVza3RvcF8wLjYuMS1hbHBoYS40OV94NjQtc2V0dXAuZXhlCXZlcnNpb246MC42LjEtYWxwaGEuNDkKYnk0bDNXUkRxVTNGZGNaclBZVHErVHF2SWk1TjNSRmg0V21GYUVJdi9oelc5UFJkcGRKV0h1N2FINU5iUENCYWg0eWVFUHFKQ0ZqOFA4ZUR2a0lNQXc9PQo=",
-      "url": "https://github.com/MaxxArtes/ai-coordinator/releases/download/v0.6.1-alpha.49/AI-Coordinator-Desktop_0.6.1-alpha.49_x64-setup.exe"
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVUb1gyWXRrZmlmU1o1ejBQV3IvMm5DS3AxQUxXTU5yWFNMdGRVSmx4RlVLU2xzcml1ZUJaK2hra2RuQkJzM1lNdEkyUTkvMDRQa09nK3pEaXZCQUw2cDZOcFNwY2c1a2c4PQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzk0NTE2MDQxCWZpbGU6QUkgQ29vcmRpbmF0b3IgRGVza3RvcF8wLjYuMS1hbHBoYS41MF94NjQtc2V0dXAuZXhlCXZlcnNpb246MC42LjEtYWxwaGEuNTAKVVQzVEpwUFVlVFp1eUw2ZWI3T1ZPK0JrOXpvYkNjYzNwa0loTEowTitJRllkQXJRdTd1WUNCOW5aazNoTDA3ZGlManhGWlpSNlk4WVJ4cjRzNHpDQkE9PQo=",
+      "url": "https://github.com/MaxxArtes/ai-coordinator/releases/download/v0.6.1-alpha.50/AI-Coordinator-Desktop_0.6.1-alpha.50_x64-setup.exe"
     }
   }
 }
