@@ -32,25 +32,60 @@ export const UpdateModal: React.FC<UpdateModalProps> = ({
   const [checkResult, setCheckResult] = useState<UpdateCheckResult | null>(null);
   const [isUpdating, setIsUpdating] = useState<boolean>(false);
   const [updateStatus, setUpdateStatus] = useState<string>("");
+  const [downloadPercent, setDownloadPercent] = useState<number>(0);
+  const [downloadedBytes, setDownloadedBytes] = useState<number>(0);
+  const [totalBytes, setTotalBytes] = useState<number>(0);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [forceAuthorized, setForceAuthorized] = useState<boolean>(false);
 
-  // Load channel info on mount or open
+  // Load channel info and listen for real-time download progress
   useEffect(() => {
     if (!isOpen) return;
+
+    let unlistenFn: (() => void) | null = null;
 
     if (isTauri) {
       callTauri("updater_get_channel_info")
         .then((info) => {
           if (info) {
-            setCurrentVersion(info.current_version || "0.6.0");
+            setCurrentVersion(info.current_version || "0.6.1-alpha.48");
             setChannel(info.channel || "alpha");
           }
         })
         .catch(() => {
           // Fallback
         });
+
+      import("@tauri-apps/api/event").then(({ listen }) => {
+        listen("updater-progress", (event: any) => {
+          const payload = event.payload;
+          if (payload) {
+            if (typeof payload.percent === "number") {
+              setDownloadPercent(payload.percent);
+            }
+            if (typeof payload.downloaded === "number") {
+              setDownloadedBytes(payload.downloaded);
+            }
+            if (typeof payload.total === "number") {
+              setTotalBytes(payload.total);
+            }
+            if (payload.status === "downloading") {
+              const dlMb = (payload.downloaded / (1024 * 1024)).toFixed(1);
+              const totMb = (payload.total / (1024 * 1024)).toFixed(1);
+              setUpdateStatus(`Baixando: ${dlMb} MB de ${totMb} MB (${payload.percent.toFixed(0)}%)`);
+            } else if (payload.status === "installing") {
+              setUpdateStatus("Assinatura Ed25519 validada. Executando o instalador...");
+            }
+          }
+        }).then((unlisten) => {
+          unlistenFn = unlisten;
+        }).catch(() => {});
+      }).catch(() => {});
     }
+
+    return () => {
+      if (unlistenFn) unlistenFn();
+    };
   }, [isOpen, isTauri, callTauri]);
 
   const handleCheckUpdates = useCallback(async () => {
@@ -256,16 +291,28 @@ export const UpdateModal: React.FC<UpdateModalProps> = ({
             </div>
           )}
 
-          {/* Update Progress In-flight */}
+          {/* Update Progress In-flight with Real Progress */}
           {isUpdating && (
-            <div className="bg-blue-950/60 border border-blue-800 p-3 rounded text-blue-200 space-y-2">
-              <div className="flex items-center space-x-2 text-xs font-semibold">
-                <span className="animate-spin">⚙️</span>
-                <span>{updateStatus}</span>
+            <div className="bg-blue-950/60 border border-blue-800 p-3.5 rounded text-blue-200 space-y-2.5">
+              <div className="flex items-center justify-between text-xs font-semibold">
+                <span className="flex items-center space-x-1.5">
+                  <span className="animate-spin">⚙️</span>
+                  <span>{updateStatus}</span>
+                </span>
+                <span className="font-mono text-emerald-400">{downloadPercent.toFixed(0)}%</span>
               </div>
-              <div className="w-full bg-blue-900/50 rounded-full h-1.5 overflow-hidden">
-                <div className="bg-blue-400 h-1.5 rounded-full animate-pulse w-3/4"></div>
+              <div className="w-full bg-[#11111b] border border-blue-900 rounded-full h-2 overflow-hidden">
+                <div
+                  className="bg-emerald-500 h-2 rounded-full transition-all duration-300 shadow-sm"
+                  style={{ width: `${Math.max(5, Math.min(100, downloadPercent))}%` }}
+                ></div>
               </div>
+              {totalBytes > 0 && (
+                <div className="flex justify-between text-[10px] text-gray-400 font-mono">
+                  <span>Transferido: {(downloadedBytes / (1024 * 1024)).toFixed(1)} MB</span>
+                  <span>Total: {(totalBytes / (1024 * 1024)).toFixed(1)} MB</span>
+                </div>
+              )}
             </div>
           )}
         </div>

@@ -1,6 +1,6 @@
 {
   "name": "ai-coordinator-desktop",
-  "version": "0.6.0",
+  "version": "0.6.1-alpha.48",
   "description": "AI Coordinator Desktop Application (Tauri 2 + Core v0.6.0)",
   "private": true,
   "type": "module",

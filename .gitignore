@@ -32,6 +32,10 @@ __pycache__/
 build/
 dist/
 
+# Desktop test and staging artifacts
+desktop/test_release_staging/
+checkpoint_*.json
+
 # Node and editor artifacts
 node_modules/
 .DS_Store

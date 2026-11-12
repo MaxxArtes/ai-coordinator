@@ -35,6 +35,7 @@ export const App: React.FC = () => {
   const [isUpdateModalOpen, setIsUpdateModalOpen] = useState<boolean>(false);
   const [hasUpdateAvailable, setHasUpdateAvailable] = useState<boolean>(false);
   const [latestAvailableVersion, setLatestAvailableVersion] = useState<string>("");
+  const [appVersion, setAppVersion] = useState<string>("0.6.1-alpha.48");
 
   const termsRef = useRef<Map<string, Terminal>>(new Map());
   const lastSeqRef = useRef<Map<string, number>>(new Map());
@@ -412,6 +413,12 @@ export const App: React.FC = () => {
   // Silent background check for updates upon connection
   useEffect(() => {
     if (isTauri && connectionStatus === "connected") {
+      callTauri("updater_get_channel_info")
+        .then((info: any) => {
+          if (info?.current_version) setAppVersion(info.current_version);
+        })
+        .catch(() => {});
+
       callTauri("updater_check")
         .then((res: any) => {
           if (res && res.available) {
@@ -457,6 +464,9 @@ export const App: React.FC = () => {
           <span className="font-bold text-sm tracking-wide text-white">AI Coordinator Desktop</span>
           <span className="text-xs px-2 py-0.5 rounded bg-gray-800 text-gray-300">
             Core v{status?.core_version || "0.6.0"}
+          </span>
+          <span className="text-xs px-2 py-0.5 rounded bg-purple-900/60 text-purple-200 border border-purple-700/60 font-mono">
+            Alpha v{appVersion}
           </span>
           {isTauri ? (
             <span className="text-xs px-2 py-0.5 rounded bg-emerald-600 text-white font-medium">

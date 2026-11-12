@@ -10,6 +10,7 @@ Governance:
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
 import os
 import re
@@ -128,24 +129,41 @@ def extract_ed25519_pubkey(pub_str: str) -> ed25519.Ed25519PublicKey:
     raise ValueError(f"Invalid public key length: {len(raw)} (expected 32 or 42 bytes)")
 
 
-def extract_ed25519_signature(sig_str: str) -> bytes:
-    """Extract raw 64-byte Ed25519 signature from Minisign or raw base64 string."""
+def extract_ed25519_signature(sig_str: str) -> Tuple[bytes, bool]:
+    """Extract raw 64-byte Ed25519 signature and prehash flag from Minisign or raw base64 string.
+
+    Returns:
+        (sig_bytes, is_prehashed_blake2b)
+    """
     clean = sig_str.strip()
+
+    # Case 1: Minisign multiline text wrapped in base64 (Tauri Updater format)
+    try:
+        decoded_text = base64.b64decode(clean).decode("utf-8", errors="ignore")
+        if "untrusted comment" in decoded_text:
+            lines = [line.strip() for line in decoded_text.splitlines() if line.strip()]
+            if len(lines) >= 2:
+                sig_raw = base64.b64decode(lines[1])
+                is_prehashed = sig_raw[:2] == b"ED"
+                return (sig_raw[10:74], is_prehashed)
+    except Exception:
+        pass
+
+    # Case 2: Minisign multiline plain text
     if "untrusted comment" in clean:
         lines = [line.strip() for line in clean.splitlines() if line.strip()]
         if len(lines) >= 2:
             sig_raw = base64.b64decode(lines[1])
-            if len(sig_raw) == 74:
-                # 2 bytes 'Ed' + 8 bytes key ID + 64 bytes signature
-                return sig_raw[10:74]
-            elif len(sig_raw) == 64:
-                return sig_raw
+            is_prehashed = sig_raw[:2] == b"ED"
+            return (sig_raw[10:74], is_prehashed)
 
+    # Case 3: Raw base64 of 64 or 74 bytes
     raw = base64.b64decode(clean)
     if len(raw) == 64:
-        return raw
+        return (raw, False)
     elif len(raw) == 74:
-        return raw[10:74]
+        is_prehashed = raw[:2] == b"ED"
+        return (raw[10:74], is_prehashed)
 
     raise ValueError(f"Invalid signature length: {len(raw)} (expected 64 or 74 bytes)")
 
@@ -297,12 +315,17 @@ class DesktopUpdaterController:
         signature_str: str,
         custom_pubkey: Optional[str] = None,
     ) -> bool:
-        """Cryptographically verify Ed25519 signature over binary payload."""
+        """Cryptographically verify Ed25519 / Minisign signature over binary payload."""
         pubkey_to_use = custom_pubkey or self.pubkey
         try:
             pk = extract_ed25519_pubkey(pubkey_to_use)
-            sig_bytes = extract_ed25519_signature(signature_str)
-            pk.verify(sig_bytes, data_bytes)
+            sig_bytes, is_prehashed = extract_ed25519_signature(signature_str)
+
+            if is_prehashed:
+                digest = hashlib.blake2b(data_bytes, digest_size=64).digest()
+                pk.verify(sig_bytes, digest)
+            else:
+                pk.verify(sig_bytes, data_bytes)
             return True
         except (InvalidSignature, ValueError, Exception):
             return False
@@ -312,7 +335,19 @@ class DesktopUpdaterController:
         active_sessions_count: int,
         force: bool = False,
     ) -> Tuple[bool, str]:
-        """Safety fence: prevents updating when active terminal sessions or workers are running."""
+        """Safety fence: prevents updating when active terminal sessions or workers are running.
+
+        Fail-closed: if the count is negative, non-integer, or indicates an error, block unless forced.
+        """
+        if not isinstance(active_sessions_count, int) or active_sessions_count < 0:
+            if not force:
+                return (
+                    False,
+                    "Não foi possível verificar com segurança o estado dos terminais ativos (fail-closed). "
+                    "A atualização requer verificação bem-sucedida ou autorização explícita (force=True).",
+                )
+            return (True, "Atualização forçada autorizada pelo operador apesar de contagem de sessões indefinida.")
+
         if active_sessions_count > 0 and not force:
             return (
                 False,

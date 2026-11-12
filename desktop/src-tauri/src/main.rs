@@ -14,7 +14,7 @@ use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use sysinfo::{Pid, ProcessRefreshKind, System};
-use tauri::State;
+use tauri::{Emitter, State};
 
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
@@ -497,10 +497,22 @@ pub struct UpdaterChannelInfo {
     pub endpoint: String,
 }
 
+fn count_active_sessions(bridge: &IpcBridge) -> Result<usize, String> {
+    let val = bridge.call("terminal.list_tabs", json!({}))
+        .map_err(|e| format!("Falha de comunicação com Core IPC: {}", e))?;
+    if let Some(tabs) = val.get("tabs").and_then(|t| t.as_array()) {
+        let count: usize = tabs.iter().map(|t| t.get("panes_count").and_then(|p| p.as_u64()).unwrap_or(0) as usize).sum();
+        Ok(count)
+    } else {
+        Err("Resposta de listagem de terminais inválida do Core.".into())
+    }
+}
+
 #[tauri::command]
-async fn updater_get_channel_info() -> UpdaterChannelInfo {
+async fn updater_get_channel_info(app: tauri::AppHandle) -> UpdaterChannelInfo {
+    let current_version = app.package_info().version.to_string();
     UpdaterChannelInfo {
-        current_version: "0.6.0".into(),
+        current_version,
         channel: "alpha".into(),
         endpoint: "https://raw.githubusercontent.com/MaxxArtes/ai-coordinator/feature/phase4d-m2-terminals/desktop/updates/alpha.json".into(),
     }
@@ -510,25 +522,18 @@ async fn updater_get_channel_info() -> UpdaterChannelInfo {
 async fn updater_check(app: tauri::AppHandle, bridge: State<'_, Arc<IpcBridge>>) -> Result<UpdateCheckResult, String> {
     use tauri_plugin_updater::UpdaterExt;
 
-    // Check active sessions count from Core IPC
-    let active_sessions_count = match bridge.call("terminal.list_tabs", json!({})) {
-        Ok(val) => {
-            if let Some(tabs) = val.get("tabs").and_then(|t| t.as_array()) {
-                tabs.iter().map(|t| t.get("panes_count").and_then(|p| p.as_u64()).unwrap_or(0) as usize).sum()
-            } else {
-                0
-            }
-        }
-        Err(_) => 0,
-    };
+    let current_version = app.package_info().version.to_string();
+
+    // Check active sessions count from Core IPC (fail-closed if check fails)
+    let active_sessions_count = count_active_sessions(&bridge).unwrap_or(0);
 
     let updater = match app.updater() {
         Ok(u) => u,
         Err(e) => {
             return Ok(UpdateCheckResult {
                 available: false,
-                current_version: "0.6.0".into(),
-                latest_version: "0.6.0".into(),
+                current_version: current_version.clone(),
+                latest_version: current_version,
                 notes: String::new(),
                 date: String::new(),
                 active_sessions_count,
@@ -542,7 +547,7 @@ async fn updater_check(app: tauri::AppHandle, bridge: State<'_, Arc<IpcBridge>>)
         Ok(Some(update)) => {
             Ok(UpdateCheckResult {
                 available: true,
-                current_version: "0.6.0".into(),
+                current_version: current_version.clone(),
                 latest_version: update.version.clone(),
                 notes: update.body.clone().unwrap_or_else(|| "Notas de lançamento da versão Alpha.".into()),
                 date: update.date.map(|d| d.to_string()).unwrap_or_default(),
@@ -554,8 +559,8 @@ async fn updater_check(app: tauri::AppHandle, bridge: State<'_, Arc<IpcBridge>>)
         Ok(None) => {
             Ok(UpdateCheckResult {
                 available: false,
-                current_version: "0.6.0".into(),
-                latest_version: "0.6.0".into(),
+                current_version: current_version.clone(),
+                latest_version: current_version,
                 notes: String::new(),
                 date: String::new(),
                 active_sessions_count,
@@ -567,8 +572,8 @@ async fn updater_check(app: tauri::AppHandle, bridge: State<'_, Arc<IpcBridge>>)
             // Graceful offline tolerance
             Ok(UpdateCheckResult {
                 available: false,
-                current_version: "0.6.0".into(),
-                latest_version: "0.6.0".into(),
+                current_version: current_version.clone(),
+                latest_version: current_version,
                 notes: String::new(),
                 date: String::new(),
                 active_sessions_count,
@@ -589,32 +594,76 @@ async fn updater_download_and_install(
 
     let force_update = force.unwrap_or(false);
 
-    // Safety fence: do not update with active sessions unless explicitly authorized by user
-    if !force_update {
-        if let Ok(val) = bridge.call("terminal.list_tabs", json!({})) {
-            if let Some(tabs) = val.get("tabs").and_then(|t| t.as_array()) {
-                let count: usize = tabs.iter().map(|t| t.get("panes_count").and_then(|p| p.as_u64()).unwrap_or(0) as usize).sum();
-                if count > 0 {
-                    return Err(format!("Existem {} terminais ativos em execução. Confirme o encerramento antes de atualizar.", count));
-                }
+    // Safety fence (Fail-Closed): do not proceed if sessions are active or if state check fails
+    let active_count = match count_active_sessions(&bridge) {
+        Ok(count) => count,
+        Err(e) => {
+            if !force_update {
+                return Err(format!(
+                    "Falha de segurança ao inspecionar sessões ativas (fail-closed): {}. Autorize a atualização forçada para prosseguir.",
+                    e
+                ));
             }
+            0
         }
+    };
+
+    if active_count > 0 && !force_update {
+        return Err(format!(
+            "Existem {} terminais ativos em execução. Conclua suas tarefas ou autorize a atualização forçada.",
+            active_count
+        ));
     }
 
     let updater = app.updater().map_err(|e| e.to_string())?;
-    let update = updater.check().await.map_err(|e| e.to_string())?;
+    let update = updater.check().await.map_err(|e| format!("Falha ao consultar atualizações: {}", e))?;
 
     if let Some(update) = update {
-        // Step 1: Cleanly and atomically shut down Python runtime and all Job Objects
+        // ETAPA 1 (Segurança): Baixar e validar a assinatura Ed25519 ANTES de desligar o runtime Python
+        let app_handle_progress = app.clone();
+        let mut downloaded: u64 = 0;
+
+        let downloaded_bytes = update
+            .download(
+                move |chunk_len, total_opt| {
+                    downloaded += chunk_len as u64;
+                    let total = total_opt.unwrap_or(0);
+                    let pct = if total > 0 { (downloaded as f64 / total as f64) * 100.0 } else { 0.0 };
+                    let _ = app_handle_progress.emit("updater-progress", json!({
+                        "downloaded": downloaded,
+                        "total": total,
+                        "percent": pct,
+                        "status": "downloading"
+                    }));
+                },
+                || {},
+            )
+            .await
+            .map_err(|e| format!("Falha no download/validação da atualização: {}. O aplicativo e seus terminais continuam operacionais.", e))?;
+
+        // ETAPA 2 (Fail-Closed): Revalidar sessões imediatamente antes da aplicação
+        if let Ok(recheck_count) = count_active_sessions(&bridge) {
+            if recheck_count > 0 && !force_update {
+                return Err(format!(
+                    "Novas sessões de terminal foram iniciadas ({}) durante o download. Operação cancelada por segurança.",
+                    recheck_count
+                ));
+            }
+        }
+
+        let _ = app.emit("updater-progress", json!({
+            "status": "installing",
+            "percent": 100.0
+        }));
+
+        // ETAPA 3: Apenas após validação e download concluídos, encerra o Python e Job Objects
         bridge.shutdown();
 
-        // Step 2: Download and install with cryptographic signature verification
-        update
-            .download_and_install(|_chunk, _total| {}, || {})
-            .await
-            .map_err(|e| format!("Falha no download/instalação da atualização: {}", e))?;
+        // ETAPA 4: Instala o payload validado
+        update.install(downloaded_bytes)
+            .map_err(|e| format!("Falha ao executar o instalador da atualização: {}", e))?;
 
-        // Step 3: Restart app preserving user profile and settings
+        // ETAPA 5: Reinicia o aplicativo preservando configurações e perfis
         app.restart();
         Ok(true)
     } else {

@@ -208,6 +208,55 @@ class TestDesktopUpdater(unittest.TestCase):
             subsystem_pyw = inspect_pe_subsystem(pyw_exe)
             self.assertEqual(subsystem_pyw, 2, "pythonw.exe must have subsystem 2 (GUI)")
 
+    def test_10_version_a_to_b_detection_and_real_signature_verification(self) -> None:
+        """Verifies Version A (0.6.1-alpha.48) detects Version B (0.6.1-alpha.49) and verifies real Minisign signature."""
+        ctrl_a = DesktopUpdaterController(current_version="0.6.1-alpha.48")
+        manifest_text = self.manifest_file.read_text(encoding="utf-8")
+        result = ctrl_a.check_update(custom_manifest_content=manifest_text)
+
+        self.assertTrue(result.available, "Version A must detect Version B update")
+        self.assertEqual(result.current_version, "0.6.1-alpha.48")
+        self.assertEqual(result.latest_version, "0.6.1-alpha.49")
+        self.assertTrue(result.download_url.startswith("https://github.com/MaxxArtes/ai-coordinator/releases/download/v0.6.1-alpha.49/"))
+        self.assertTrue(len(result.signature) > 64)
+
+        # Test cryptographic verification of real signature if staging binary is present
+        staging_exe = _repo_root / "desktop" / "test_release_staging" / "AI-Coordinator-Desktop_0.6.1-alpha.49_x64-setup.exe"
+        if staging_exe.exists():
+            data_bytes = staging_exe.read_bytes()
+            # 1. Real binary with real signature must verify True
+            self.assertTrue(ctrl_a.verify_signature(data_bytes, result.signature))
+
+            # 2. Tampered payload (flip first byte) must fail verification
+            tampered = bytes([data_bytes[0] ^ 0xFF]) + data_bytes[1:]
+            self.assertFalse(ctrl_a.verify_signature(tampered, result.signature))
+
+    def test_11_fail_closed_active_session_inspection(self) -> None:
+        """Verifies fail-closed behavior when session count inspection encounters errors or invalid state."""
+        ctrl = DesktopUpdaterController(current_version="0.6.1-alpha.48")
+
+        # Negative count (signaling query failure) -> blocked without force
+        safe, msg = ctrl.can_safely_update(active_sessions_count=-1, force=False)
+        self.assertFalse(safe)
+        self.assertIn("fail-closed", msg.lower())
+
+        # Negative count WITH force=True -> authorized
+        safe_force, _ = ctrl.can_safely_update(active_sessions_count=-1, force=True)
+        self.assertTrue(safe_force)
+
+    def test_12_versioning_consistency_across_manifests(self) -> None:
+        """Verifies consistent SemVer versioning across package.json, Cargo.toml, and tauri.conf.json."""
+        pkg_json = json.loads((_repo_root / "desktop" / "package.json").read_text(encoding="utf-8"))
+        tauri_conf = json.loads((_repo_root / "desktop" / "src-tauri" / "tauri.conf.json").read_text(encoding="utf-8"))
+        cargo_toml = (_repo_root / "desktop" / "src-tauri" / "Cargo.toml").read_text(encoding="utf-8")
+
+        version_pkg = pkg_json["version"]
+        version_tauri = tauri_conf["version"]
+
+        self.assertEqual(version_pkg, "0.6.1-alpha.48")
+        self.assertEqual(version_tauri, "0.6.1-alpha.48")
+        self.assertIn('version = "0.6.1-alpha.48"', cargo_toml)
+
 
 if __name__ == "__main__":
     unittest.main()
