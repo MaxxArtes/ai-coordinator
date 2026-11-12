@@ -28,6 +28,16 @@ from desktop.terminal.manager import TerminalManager
 from desktop.terminal.session import SessionKind
 
 
+def _wait_until(predicate, timeout: float = 15.0, interval: float = 0.05) -> bool:
+    """Polls predicate until true or timeout (avoids fixed sleeps on slow CI runners)."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if predicate():
+            return True
+        time.sleep(interval)
+    return bool(predicate())
+
+
 @pytest.fixture
 def lifecycle_fixture():
     with tempfile.TemporaryDirectory() as tmpdir:
@@ -87,8 +97,8 @@ def test_abnormal_child_process_exit_reporting(lifecycle_fixture, monkeypatch):
     cmd = [sys.executable, "-u", "-c", "import sys; print('BEFORE_CRASH'); sys.stdout.flush(); sys.exit(42)"]
     sess = mgr.create_terminal(token=token, tab_id="crash-tab", pane_id=0, command=cmd)
 
-    # Wait for child to exit
-    time.sleep(0.5)
+    # Wait for child to exit and for its output to be drained
+    _wait_until(lambda: not sess.is_alive and "BEFORE_CRASH" in "".join(sess.get_output()))
 
     assert sess.is_alive is False
     assert sess.exit_code == 42
@@ -111,9 +121,9 @@ def test_session_layout_save_and_restore_serialization(lifecycle_fixture, monkey
     mgr.create_tab(token=token, tab_id="save-tab", title="Saveable Tab", project_path=proj_path)
 
     cmd = [sys.executable, "-u", "-c", "import sys; print('key=sk-secret-token-1234567890'); sys.stdout.flush()"]
-    mgr.create_terminal(token=token, tab_id="save-tab", pane_id=0, command=cmd)
+    sess = mgr.create_terminal(token=token, tab_id="save-tab", pane_id=0, command=cmd)
 
-    time.sleep(0.4)
+    _wait_until(lambda: "key=" in "".join(sess.get_output()))
 
     export = mgr.save_tab_sessions("save-tab")
     assert isinstance(export, SessionLayoutExport)

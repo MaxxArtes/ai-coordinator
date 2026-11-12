@@ -27,6 +27,16 @@ from desktop.terminal.buffer import BoundedTerminalBuffer
 from desktop.terminal.manager import TerminalManager
 
 
+def _wait_until(predicate, timeout: float = 15.0, interval: float = 0.05) -> bool:
+    """Polls predicate until true or timeout (avoids fixed sleeps on slow CI runners)."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if predicate():
+            return True
+        time.sleep(interval)
+    return bool(predicate())
+
+
 class MemoryTransport(BaseTransport):
     """In-memory transport for deterministic IPC handler verification."""
 
@@ -141,10 +151,13 @@ def test_ipc_terminal_lifecycle_roundtrip(terminal_ipc_fixture, monkeypatch):
     assert resp.result["resized"] is True
 
     # 4. Wait for initial output and read via terminal.get_output
-    time.sleep(0.4)
-    resp = server.handle_raw_payload(
-        f'{{"jsonrpc":"2.0","id":4,"method":"terminal.get_output","session_token":"{token}","params":{{"session_id":"{session_id}"}}}}'
-    )
+    def _read_output():
+        return server.handle_raw_payload(
+            f'{{"jsonrpc":"2.0","id":4,"method":"terminal.get_output","session_token":"{token}","params":{{"session_id":"{session_id}"}}}}'
+        )
+
+    _wait_until(lambda: "READY_FOR_INPUT" in "".join((_read_output().result or {}).get("lines", [])))
+    resp = _read_output()
     assert resp.error is None
     lines = "".join(resp.result["lines"])
     assert "READY_FOR_INPUT" in lines
@@ -196,7 +209,9 @@ def test_four_panes_simultaneous_streaming(terminal_ipc_fixture, monkeypatch):
 
     assert len(tab.panes) == 4
 
-    time.sleep(0.4)
+    _wait_until(
+        lambda: all(f"PANE_{i}_ONLINE" in "".join(s.get_output()) for i, s in enumerate(sessions))
+    )
     for i, sess in enumerate(sessions):
         out = "".join(sess.get_output())
         assert f"PANE_{i}_ONLINE" in out

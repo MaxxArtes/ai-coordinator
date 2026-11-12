@@ -26,6 +26,16 @@ from desktop.terminal.manager import MAX_PANES_PER_TAB, TerminalManager, Termina
 from desktop.terminal.session import SessionKind
 
 
+def _wait_until(predicate, timeout: float = 15.0, interval: float = 0.05) -> bool:
+    """Polls predicate until true or timeout (avoids fixed sleeps on slow CI runners)."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if predicate():
+            return True
+        time.sleep(interval)
+    return bool(predicate())
+
+
 @pytest.fixture
 def auth_setup():
     with tempfile.TemporaryDirectory() as tmpdir:
@@ -72,7 +82,7 @@ def test_pty_creation_human_terminal_authorized_cwd(auth_setup, monkeypatch):
     assert sess.principal.owner_id == "default"
 
     # Wait for process output and clean close
-    time.sleep(0.4)
+    _wait_until(lambda: "TERMINAL_ACTIVE" in "".join(sess.get_output()))
     out = "".join(sess.get_output())
     assert "TERMINAL_ACTIVE" in out
 
@@ -134,7 +144,7 @@ def test_governed_agent_session_sanitization(auth_setup, monkeypatch):
         command=cmd,
     )
 
-    time.sleep(0.4)
+    _wait_until(lambda: "SECRET_PRESENT:" in "".join(sess.get_output()))
     out = "".join(sess.get_output())
     assert "SECRET_PRESENT: False" in out
     mgr.close_tab("agent-tab")

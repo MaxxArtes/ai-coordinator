@@ -29,6 +29,16 @@ from desktop.terminal.manager import TerminalManager
 from desktop.terminal.session import SessionKind
 
 
+def _wait_until(predicate, timeout: float = 20.0, interval: float = 0.05) -> bool:
+    """Polls predicate until true or timeout (avoids fixed sleeps on slow CI runners)."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if predicate():
+            return True
+        time.sleep(interval)
+    return bool(predicate())
+
+
 @pytest.fixture
 def adversarial_fixture():
     with tempfile.TemporaryDirectory() as tmpdir:
@@ -106,8 +116,12 @@ def test_high_concurrency_4_panes_output_flood(adversarial_fixture, monkeypatch)
         sess = mgr.create_terminal(token=token, tab_id="flood-tab", pane_id=i, command=cmd)
         sessions.append(sess)
 
-    # Allow burst to complete
-    time.sleep(1.0)
+    # Allow burst to complete: every child exited and its tag reached its own buffer
+    _wait_until(
+        lambda: all(
+            not s.is_alive and f"BURST_P{i}" in "\n".join(s.get_output()) for i, s in enumerate(sessions)
+        )
+    )
 
     for i, sess in enumerate(sessions):
         lines = sess.get_output()
