@@ -74,10 +74,20 @@ class StreamTransport(BaseTransport):
         reader: Optional[io.TextIOBase] = None,
         writer: Optional[io.TextIOBase] = None,
         diag: Optional[io.TextIOBase] = None,
+        log_file: Optional[Path] = None,
     ) -> None:
         self.reader = reader or sys.stdin
         self.writer = writer or sys.stdout
         self.diag = diag or sys.stderr
+        self._log_file_handle: Optional[io.TextIOBase] = None
+
+        target_log = log_file or (Path(os.environ["COORDINATOR_IPC_LOG_FILE"]) if "COORDINATOR_IPC_LOG_FILE" in os.environ else None)
+        if target_log:
+            try:
+                target_log.parent.mkdir(parents=True, exist_ok=True)
+                self._log_file_handle = open(target_log, "a", encoding="utf-8", errors="replace")
+            except Exception:
+                self._log_file_handle = None
 
     def read_message(self) -> Optional[str]:
         try:
@@ -104,10 +114,29 @@ class StreamTransport(BaseTransport):
 
     def log_diagnostic(self, text: str) -> None:
         try:
-            self.diag.write(f"[IPC_DIAG] {text}\n")
-            self.diag.flush()
+            clean_text = text
+            token = os.environ.get("COORDINATOR_IPC_TOKEN")
+            if token and token in clean_text:
+                clean_text = clean_text.replace(token, "[REDACTED_TOKEN]")
+
+            entry = f"[IPC_DIAG] {clean_text}\n"
+            if self.diag:
+                self.diag.write(entry)
+                self.diag.flush()
+
+            if self._log_file_handle:
+                self._log_file_handle.write(entry)
+                self._log_file_handle.flush()
         except Exception:
             pass
+
+    def close(self) -> None:
+        if self._log_file_handle:
+            try:
+                self._log_file_handle.close()
+            except Exception:
+                pass
+            self._log_file_handle = None
 
 
 class SecureIPCServer:
@@ -359,14 +388,30 @@ class SecureIPCServer:
 
     def serve_forever(self) -> None:
         self.transport.log_diagnostic("SecureIPCServer entering event loop")
-        while self.is_running:
-            if not self.process_one():
-                self.transport.log_diagnostic("SecureIPCServer EOF or broken pipe detected, exiting cleanly")
-                break
+        try:
+            while self.is_running:
+                if not self.process_one():
+                    self.transport.log_diagnostic("SecureIPCServer EOF or broken pipe detected, exiting cleanly")
+                    break
+        finally:
+            if self.terminal_manager:
+                try:
+                    self.transport.log_diagnostic("Shutting down active terminal sessions cleanly")
+                    self.terminal_manager.terminate_all()
+                except Exception as e:
+                    self.transport.log_diagnostic(f"Error terminating terminals on shutdown: {e}")
 
 
 if __name__ == "__main__":
     token = os.environ.get("COORDINATOR_IPC_TOKEN", "default-dev-token")
     transport = StreamTransport()
     server = SecureIPCServer(transport=transport, session_token=token)
-    server.serve_forever()
+    try:
+        server.serve_forever()
+    finally:
+        if server.terminal_manager:
+            try:
+                server.terminal_manager.terminate_all()
+            except Exception:
+                pass
+        transport.close()

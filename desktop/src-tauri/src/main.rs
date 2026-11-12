@@ -16,6 +16,12 @@ use std::sync::{Arc, Mutex};
 use sysinfo::{Pid, ProcessRefreshKind, System};
 use tauri::State;
 
+#[cfg(windows)]
+use std::os::windows::process::CommandExt;
+
+#[cfg(windows)]
+const CREATE_NO_WINDOW: u32 = 0x08000000;
+
 #[derive(Serialize, Deserialize, Clone)]
 pub struct RuntimeStatus {
     pub core_version: String,
@@ -53,7 +59,10 @@ impl IpcBridge {
                     .env("COORDINATOR_IPC_TOKEN", &token)
                     .stdin(Stdio::piped())
                     .stdout(Stdio::piped())
-                    .stderr(Stdio::inherit());
+                    .stderr(Stdio::piped());
+
+                #[cfg(windows)]
+                cmd.creation_flags(CREATE_NO_WINDOW);
 
                 let mut proc = None;
                 let mut cin = None;
@@ -66,6 +75,16 @@ impl IpcBridge {
                         }
                         if let Some(cout_handle) = child.stdout.take() {
                             cout = Some(BufReader::new(cout_handle));
+                        }
+                        if let Some(cerr_handle) = child.stderr.take() {
+                            std::thread::spawn(move || {
+                                let reader = BufReader::new(cerr_handle);
+                                for line in reader.lines() {
+                                    if let Ok(l) = line {
+                                        eprintln!("[PY_IPC_DIAG] {}", l);
+                                    }
+                                }
+                            });
                         }
                         proc = Some(child);
                     }
@@ -216,30 +235,39 @@ impl IpcBridge {
 
         Ok(resp.get("result").cloned().unwrap_or(Value::Null))
     }
+
+    pub fn shutdown(&self) {
+        // Step 1: Drop stdin handle to send EOF to the Python IPC server
+        if let Ok(mut stdin_guard) = self.stdin.lock() {
+            let _ = stdin_guard.take();
+        }
+
+        // Step 2: Gracefully wait for Python process to terminate its sessions via finally block
+        if let Ok(mut guard) = self.child.lock() {
+            if let Some(mut child) = guard.take() {
+                let mut exited = false;
+                for _ in 0..10 {
+                    if let Ok(Some(_)) = child.try_wait() {
+                        exited = true;
+                        break;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                }
+                if !exited {
+                    // Safe termination: terminates only the specific child process handle owned by this host,
+                    // avoiding generic external process kill commands by numeric PID which could risk killing an unrelated reused PID.
+                    let _ = child.kill();
+                    let _ = child.wait();
+                }
+            }
+        }
+    }
 }
 
 // Issue C: Synchronized process tree termination on window close
 impl Drop for IpcBridge {
     fn drop(&mut self) {
-        if let Ok(mut guard) = self.child.lock() {
-            if let Some(mut child) = guard.take() {
-                let pid = child.id();
-                #[cfg(target_os = "windows")]
-                {
-                    // Synchronously kill the entire process tree using taskkill /F /T /PID
-                    if let Ok(mut kill_cmd) = Command::new("taskkill")
-                        .args(["/F", "/T", "/PID", &pid.to_string()])
-                        .stdout(Stdio::null())
-                        .stderr(Stdio::null())
-                        .spawn()
-                    {
-                        let _ = kill_cmd.wait();
-                    }
-                }
-                let _ = child.kill();
-                let _ = child.wait();
-            }
-        }
+        self.shutdown();
     }
 }
 
@@ -452,10 +480,16 @@ fn terminal_list_tabs(bridge: State<Arc<IpcBridge>>) -> Result<Value, String> {
 
 fn main() {
     let bridge = Arc::new(IpcBridge::new());
+    let bridge_window = bridge.clone();
 
     tauri::Builder::default()
         .manage(bridge)
         .plugin(tauri_plugin_shell::init())
+        .on_window_event(move |_window, event| {
+            if let tauri::WindowEvent::Destroyed = event {
+                bridge_window.shutdown();
+            }
+        })
         .invoke_handler(tauri::generate_handler![
             ping,
             get_runtime_status,

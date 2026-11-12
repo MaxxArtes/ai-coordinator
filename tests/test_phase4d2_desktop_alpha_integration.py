@@ -727,6 +727,119 @@ class TestDesktopAlphaIntegration(unittest.TestCase):
 
         term_mgr.terminate_all()
 
+    def test_16_windows_no_window_creation_flag_and_stderr_piping_in_host(self) -> None:
+        """Verifies Tauri main.rs configures CREATE_NO_WINDOW, drains stderr, and avoids taskkill by PID."""
+        main_rs = self.tauri_dir / "src" / "main.rs"
+        self.assertTrue(main_rs.exists(), "src-tauri/src/main.rs must exist")
+        code = main_rs.read_text(encoding="utf-8")
+
+        # 1. CREATE_NO_WINDOW flag present and applied
+        self.assertIn("CREATE_NO_WINDOW", code)
+        self.assertIn("0x08000000", code)
+        self.assertIn("cmd.creation_flags(CREATE_NO_WINDOW)", code)
+
+        # 2. Stderr piped and drained in background thread (no popup window)
+        self.assertIn("stderr(Stdio::piped())", code)
+        self.assertIn("std::thread::spawn", code)
+        self.assertIn("[PY_IPC_DIAG]", code)
+
+        # 3. Shutdown method and window event handler
+        self.assertIn("pub fn shutdown(&self)", code)
+        self.assertIn("on_window_event", code)
+        self.assertIn("tauri::WindowEvent::Destroyed", code)
+
+        # 4. Zero taskkill /PID calls (safe handle-based termination)
+        self.assertNotIn("taskkill", code)
+        self.assertIn("child.kill()", code)
+
+    def test_17_secure_ipc_server_shutdown_cleanup_and_diagnostic_redaction(self) -> None:
+        """Verifies SecureIPCServer redacts secrets from diagnostics and cleans up terminals on EOF."""
+        import tempfile
+        import io
+        from unittest.mock import MagicMock
+        from desktop.ipc.server import StreamTransport
+
+        test_token = "secret-token-super-confidential-999"
+        os.environ["COORDINATOR_IPC_TOKEN"] = test_token
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            log_file = Path(tmpdir) / "ipc_diag.log"
+            diag_capture = io.StringIO()
+            input_stream = io.StringIO("")  # Immediate EOF
+            output_stream = io.StringIO()
+
+            transport = StreamTransport(
+                reader=input_stream,
+                writer=output_stream,
+                diag=diag_capture,
+                log_file=log_file,
+            )
+
+            try:
+                # Test diagnostic redaction
+                transport.log_diagnostic(f"Server started with token: {test_token}")
+                logged_diag = diag_capture.getvalue()
+                self.assertNotIn(test_token, logged_diag)
+                self.assertIn("[REDACTED_TOKEN]", logged_diag)
+
+                # Test file output matches redaction
+                self.assertTrue(log_file.exists())
+                file_content = log_file.read_text(encoding="utf-8")
+                self.assertNotIn(test_token, file_content)
+                self.assertIn("[REDACTED_TOKEN]", file_content)
+
+                # Test server EOF shutdown calling terminate_all
+                mock_mgr = MagicMock()
+                server = SecureIPCServer(
+                    transport=transport,
+                    session_token=test_token,
+                    terminal_manager=mock_mgr,
+                )
+
+                server.serve_forever()
+                mock_mgr.terminate_all.assert_called_once()
+            finally:
+                transport.close()
+
+    def test_18_process_tree_clean_termination_no_orphan_jobs(self) -> None:
+        """Verifies 4 concurrent terminals terminate atomically without orphan processes or PID reuse risks."""
+        token = "test-token-multi-cleanup"
+        prof_mgr = DesktopProfileManager()
+        prof_mgr.authorize_project(prof_mgr.get_active_profile().name, str(_repo_root))
+        authorizer = DesktopAuthorizer(profile_manager=prof_mgr)
+        authorizer._active_sessions[token] = prof_mgr.get_active_profile().name
+        term_mgr = TerminalManager(authorizer=authorizer)
+
+        tab = term_mgr.create_tab(token=token, tab_id="quad-tab", title="Quad Shell", project_path=str(_repo_root))
+
+        # Launch 4 real child processes
+        cmd = [sys.executable, "-u", "-c", "import time; time.sleep(15)"]
+        sessions = []
+        for i in range(4):
+            sess = term_mgr.create_terminal(
+                token=token,
+                tab_id="quad-tab",
+                pane_id=i,
+                command=cmd,
+                cwd=str(_repo_root),
+            )
+            self.assertTrue(sess.is_alive)
+            self.assertIsNotNone(sess.pid)
+            self.assertGreater(sess.pid, 0)
+            self.assertIsNotNone(sess.identity)
+            sessions.append(sess)
+
+        # Terminate all atomically
+        term_mgr.terminate_all()
+        time.sleep(0.3)
+
+        # Confirm all 4 are dead
+        for sess in sessions:
+            self.assertFalse(sess.is_alive)
+
+        self.assertEqual(len(term_mgr.sessions), 0)
+        self.assertEqual(len(term_mgr.tabs), 0)
+
 
 if __name__ == "__main__":
     unittest.main()
