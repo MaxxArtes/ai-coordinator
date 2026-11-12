@@ -39,6 +39,9 @@ def test_e2e_clean_installation():
 
 
 def test_e2e_live_ipc_and_tree_memory():
+    import json
+    import subprocess
+
     with tempfile.TemporaryDirectory() as tmpdir:
         res = verify_ipc_handshake_and_isolation(Path(tmpdir))
         assert res["status"] == "passed"
@@ -49,8 +52,25 @@ def test_e2e_live_ipc_and_tree_memory():
         mem = res["process_tree_memory"]
         assert mem["provenance"] == CoreProvenance.MEASURED
         assert mem["data_origin"] == DataOrigin.TEST_FIXTURE.value
-        assert mem["total_tree_working_set_mb"] < 100.0
-        assert mem["within_budget"] is True
+
+    # The 100 MB budget is checked from a fresh verification runner, as the gate runs it: in-process,
+    # the "parent" would be this test session, whose memory depends on every module the suite imported
+    # (102-120 MB observed on CI) rather than on the desktop foundation under test.
+    proc = subprocess.run(
+        [sys.executable, str(ROOT_DIR / "desktop" / "runner" / "verify_foundation.py")],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        timeout=180,
+        cwd=str(ROOT_DIR),
+    )
+    assert proc.returncode == 0, f"stdout:\n{proc.stdout}\nstderr:\n{proc.stderr}"
+    gate_mem = json.loads(proc.stdout)["live_ipc"]["process_tree_memory"]
+    # Both processes must really be measured: a zero would make the budget pass trivially.
+    assert gate_mem["parent_working_set_mb"] > 0
+    assert gate_mem["child_working_set_mb"] > 0
+    assert gate_mem["total_tree_working_set_mb"] < 100.0, gate_mem
+    assert gate_mem["within_budget"] is True
 
 
 def test_process_memory_is_measured_per_pid():
@@ -61,9 +81,12 @@ def test_process_memory_is_measured_per_pid():
     from desktop.runner.verify_foundation import get_process_memory_bytes
 
     alloc_mb = 64
+    # Real interpreter: on Windows a venv's python.exe is a launcher that runs the interpreter as its
+    # own child, so the launcher's pid would not hold the allocation. The script needs no packages.
+    interpreter = getattr(sys, "_base_executable", None) or sys.executable
     child = subprocess.Popen(
         [
-            sys.executable,
+            interpreter,
             "-u",
             "-c",
             # Touch every page so the allocation is resident on every OS, then report and wait.
