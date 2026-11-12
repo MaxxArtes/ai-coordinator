@@ -287,7 +287,14 @@ class SecureIPCServer:
 
     def _handle_terminal_list_tabs(self, _params: Dict[str, Any]) -> Dict[str, Any]:
         mgr = self._get_terminal_manager()
-        return {"tabs": [t.to_dict() for t in mgr.list_tabs()]}
+        tabs_dicts = [t.to_dict() for t in mgr.list_tabs()]
+        total_active = sum(t.get("active_panes_count", 0) for t in tabs_dicts)
+        total_panes = sum(t.get("panes_count", 0) for t in tabs_dicts)
+        return {
+            "tabs": tabs_dicts,
+            "panes_total": total_panes,
+            "active_sessions_total": total_active,
+        }
 
     def _handle_ping(self, _params: Dict[str, Any]) -> Dict[str, Any]:
         return {"status": "pong", "protocol": PROTOCOL_VERSION}

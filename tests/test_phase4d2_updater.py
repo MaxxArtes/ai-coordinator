@@ -232,17 +232,33 @@ class TestDesktopUpdater(unittest.TestCase):
             self.assertFalse(ctrl_a.verify_signature(tampered, result.signature))
 
     def test_11_fail_closed_active_session_inspection(self) -> None:
-        """Verifies fail-closed behavior when session count inspection encounters errors or invalid state."""
+        """Verifies strict fail-closed behavior when session count inspection encounters errors or invalid state.
+        
+        Security rule: Unknown/invalid states MUST NEVER be bypassable by force.
+        """
         ctrl = DesktopUpdaterController(current_version="0.6.1-alpha.48")
 
-        # Negative count (signaling query failure) -> blocked without force
+        # Negative count (signaling query failure or error) -> unconditionally blocked even with force=True
         safe, msg = ctrl.can_safely_update(active_sessions_count=-1, force=False)
         self.assertFalse(safe)
         self.assertIn("fail-closed", msg.lower())
 
-        # Negative count WITH force=True -> authorized
-        safe_force, _ = ctrl.can_safely_update(active_sessions_count=-1, force=True)
-        self.assertTrue(safe_force)
+        safe_force, msg_force = ctrl.can_safely_update(active_sessions_count=-1, force=True)
+        self.assertFalse(safe_force)
+        self.assertIn("fail-closed", msg_force.lower())
+
+        # Non-integer / invalid type -> unconditionally blocked
+        safe_invalid, _ = ctrl.can_safely_update(active_sessions_count=None, force=True)  # type: ignore
+        self.assertFalse(safe_invalid)
+
+        # Known active sessions (> 0): blocked without force, permitted with explicit force
+        safe_active, msg_act = ctrl.can_safely_update(active_sessions_count=4, force=False)
+        self.assertFalse(safe_active)
+        self.assertIn("4 terminais", msg_act)
+
+        safe_active_forced, msg_act_forced = ctrl.can_safely_update(active_sessions_count=4, force=True)
+        self.assertTrue(safe_active_forced)
+        self.assertIn("4 terminais", msg_act_forced)
 
     def test_12_versioning_consistency_across_manifests(self) -> None:
         """Verifies consistent SemVer versioning across package.json, Cargo.toml, and tauri.conf.json."""
@@ -256,6 +272,54 @@ class TestDesktopUpdater(unittest.TestCase):
         self.assertEqual(version_pkg, "0.6.1-alpha.48")
         self.assertEqual(version_tauri, "0.6.1-alpha.48")
         self.assertIn('version = "0.6.1-alpha.48"', cargo_toml)
+
+    def test_13_tab_info_ipc_contract_panes_and_active_counts(self) -> None:
+        """Verifies TabInfo IPC contract exposes panes dict, panes_count, and active_panes_count."""
+        from unittest.mock import MagicMock
+        from desktop.terminal.manager import TabInfo
+
+        # Tab with 0 panes
+        t0 = TabInfo(tab_id="tab-0", title="Test 0", project_path="/test")
+        d0 = t0.to_dict()
+        self.assertEqual(d0["panes"], {})
+        self.assertEqual(d0["panes_count"], 0)
+        self.assertEqual(d0["active_panes_count"], 0)
+
+        # Tab with 1 active pane
+        mock_sess1 = MagicMock()
+        mock_sess1.to_dict.return_value = {"session_id": "s-1", "is_alive": True}
+        mock_sess1.is_alive.return_value = True
+
+        t1 = TabInfo(tab_id="tab-1", title="Test 1", project_path="/test", panes={0: mock_sess1})
+        d1 = t1.to_dict()
+        self.assertEqual(len(d1["panes"]), 1)
+        self.assertEqual(d1["panes_count"], 1)
+        self.assertEqual(d1["active_panes_count"], 1)
+
+        # Tab with 4 panes (3 alive, 1 exited)
+        mock_sess_dead = MagicMock()
+        mock_sess_dead.to_dict.return_value = {"session_id": "s-dead", "is_alive": False}
+        mock_sess_dead.is_alive.return_value = False
+
+        mock_sess2 = MagicMock()
+        mock_sess2.to_dict.return_value = {"session_id": "s-2", "is_alive": True}
+        mock_sess2.is_alive.return_value = True
+
+        mock_sess3 = MagicMock()
+        mock_sess3.to_dict.return_value = {"session_id": "s-3", "is_alive": True}
+        mock_sess3.is_alive.return_value = True
+
+        t4 = TabInfo(
+            tab_id="tab-4",
+            title="Test 4",
+            project_path="/test",
+            panes={0: mock_sess1, 1: mock_sess2, 2: mock_sess3, 3: mock_sess_dead},
+        )
+        d4 = t4.to_dict()
+        self.assertEqual(d4["panes_count"], 4)
+        self.assertEqual(d4["active_panes_count"], 3)
+        self.assertIn("0", d4["panes"])
+        self.assertIn("3", d4["panes"])
 
 
 if __name__ == "__main__":

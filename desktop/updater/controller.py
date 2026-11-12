@@ -340,19 +340,22 @@ class DesktopUpdaterController:
         Fail-closed: if the count is negative, non-integer, or indicates an error, block unless forced.
         """
         if not isinstance(active_sessions_count, int) or active_sessions_count < 0:
+            return (
+                False,
+                "Não foi possível verificar com segurança o estado dos terminais ativos (fail-closed). "
+                "A atualização foi cancelada por segurança: autorização forçada não se aplica a estados desconhecidos.",
+            )
+
+        if active_sessions_count > 0:
             if not force:
                 return (
                     False,
-                    "Não foi possível verificar com segurança o estado dos terminais ativos (fail-closed). "
-                    "A atualização requer verificação bem-sucedida ou autorização explícita (force=True).",
+                    f"Existem {active_sessions_count} terminais ou processos ativos em execução. "
+                    "Conclua suas tarefas ou autorize a reinicialização forçada.",
                 )
-            return (True, "Atualização forçada autorizada pelo operador apesar de contagem de sessões indefinida.")
-
-        if active_sessions_count > 0 and not force:
             return (
-                False,
-                f"Existem {active_sessions_count} terminais ou processos ativos em execução. "
-                "Conclua suas tarefas ou autorize a reinicialização forçada.",
+                True,
+                f"Atualização forçada autorizada pelo operador com {active_sessions_count} terminais ativos.",
             )
         return (True, "Pronto para atualização segura.")
 

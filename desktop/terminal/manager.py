@@ -37,11 +37,15 @@ class TabInfo:
     panes: Dict[int, TerminalSession] = field(default_factory=dict)
 
     def to_dict(self) -> Dict[str, Any]:
+        panes_dict = {str(pane_id): sess.to_dict() for pane_id, sess in self.panes.items()}
+        active_count = sum(1 for s in self.panes.values() if s.is_alive())
         return {
             "tab_id": self.tab_id,
             "title": self.title,
             "project_path": self.project_path,
-            "panes": {pane_id: sess.to_dict() for pane_id, sess in self.panes.items()},
+            "panes": panes_dict,
+            "panes_count": len(self.panes),
+            "active_panes_count": active_count,
         }
 
 

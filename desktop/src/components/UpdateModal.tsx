@@ -7,6 +7,8 @@ export interface UpdateCheckResult {
   notes: string;
   date: string;
   active_sessions_count: number;
+  sessions_known?: boolean;
+  sessions_error?: string | null;
   offline: boolean;
   error?: string | null;
 }
@@ -122,6 +124,11 @@ export const UpdateModal: React.FC<UpdateModalProps> = ({
   }, [isTauri, callTauri, activePanesCount]);
 
   const handleDownloadAndInstall = useCallback(async () => {
+    if (checkResult?.sessions_known === false) {
+      setErrorMessage("Atualização bloqueada: estado das sessões é indefinido/desconhecido (fail-closed).");
+      return;
+    }
+
     if (activePanesCount > 0 && !forceAuthorized) {
       setErrorMessage(
         `Existem ${activePanesCount} terminais ativos em execução. Marque a caixa de confirmação para autorizar o encerramento seguro antes de prosseguir.`
@@ -239,8 +246,22 @@ export const UpdateModal: React.FC<UpdateModalProps> = ({
                     </div>
                   )}
 
+                  {/* Fail-closed notice when session inspection is unknown */}
+                  {checkResult.sessions_known === false && (
+                    <div className="bg-red-950/60 border border-red-600/70 p-3 rounded space-y-1 mt-3">
+                      <div className="text-red-300 font-semibold flex items-center space-x-1">
+                        <span>🛑</span>
+                        <span>Segurança Fail-Closed</span>
+                      </div>
+                      <p className="text-[11px] text-red-200 leading-tight">
+                        Não foi possível verificar com segurança o estado dos terminais ativos ({checkResult.sessions_error || "Erro no Core IPC"}).
+                        A atualização está bloqueada preventivamente para proteger seus processos.
+                      </p>
+                    </div>
+                  )}
+
                   {/* Active sessions safety fence */}
-                  {activePanesCount > 0 && (
+                  {activePanesCount > 0 && checkResult.sessions_known !== false && (
                     <div className="bg-amber-950/50 border border-amber-600/60 p-3 rounded space-y-2 mt-3">
                       <div className="text-amber-300 font-semibold flex items-center space-x-1">
                         <span>⚠️</span>
@@ -275,7 +296,7 @@ export const UpdateModal: React.FC<UpdateModalProps> = ({
                     </button>
                     <button
                       onClick={handleDownloadAndInstall}
-                      disabled={isUpdating || (activePanesCount > 0 && !forceAuthorized)}
+                      disabled={isUpdating || checkResult.sessions_known === false || (activePanesCount > 0 && !forceAuthorized)}
                       className="px-4 py-1.5 bg-emerald-600 hover:bg-emerald-500 text-white rounded text-xs font-semibold shadow-md disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
                     >
                       {isUpdating ? "Atualizando..." : "Atualizar e Reiniciar"}

@@ -107,7 +107,7 @@ def github_api_call(url: str, token: str, method: str = "GET", data: bytes | Non
         return json.loads(resp.read().decode("utf-8"))
 
 
-def create_or_get_release(repo: str, tag: str, name: str, body: str, token: str) -> dict:
+def create_or_get_release(repo: str, tag: str, name: str, body: str, token: str, target_commitish: Optional[str] = None) -> dict:
     url = f"https://api.github.com/repos/{repo}/releases/tags/{tag}"
     try:
         release = github_api_call(url, token, method="GET")
@@ -119,13 +119,16 @@ def create_or_get_release(repo: str, tag: str, name: str, body: str, token: str)
     # Create new release
     print(f"Creating new GitHub Pre-Release: {tag} ({name})...")
     create_url = f"https://api.github.com/repos/{repo}/releases"
-    payload = json.dumps({
+    payload_dict = {
         "tag_name": tag,
         "name": name,
         "body": body,
         "draft": False,
         "prerelease": True,
-    }).encode("utf-8")
+    }
+    if target_commitish:
+        payload_dict["target_commitish"] = target_commitish
+    payload = json.dumps(payload_dict).encode("utf-8")
     return github_api_call(create_url, token, method="POST", data=payload)
 
 
@@ -180,13 +183,19 @@ def main() -> int:
     tag = f"v{version}"
     token = get_github_token()
 
-    print(f"=== Publishing AI Coordinator Desktop Alpha: {version} ===")
+    try:
+        target_sha = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True, cwd=str(_repo_root)).strip()
+    except Exception:
+        target_sha = None
+
+    print(f"=== Publishing AI Coordinator Desktop Alpha: {version} (target: {target_sha}) ===")
     release = create_or_get_release(
         repo=args.repo,
         tag=tag,
         name=f"AI Coordinator Desktop Alpha v{version}",
         body=args.notes,
         token=token,
+        target_commitish=target_sha,
     )
     release_id = release["id"]
 

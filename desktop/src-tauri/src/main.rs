@@ -478,7 +478,7 @@ fn terminal_list_tabs(bridge: State<Arc<IpcBridge>>) -> Result<Value, String> {
     bridge.call("terminal.list_tabs", json!({}))
 }
 
-#[derive(Serialize, Deserialize, Clone)]
+#[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct UpdateCheckResult {
     pub available: bool,
     pub current_version: String,
@@ -486,25 +486,79 @@ pub struct UpdateCheckResult {
     pub notes: String,
     pub date: String,
     pub active_sessions_count: usize,
+    pub sessions_known: bool,
+    pub sessions_error: Option<String>,
     pub offline: bool,
     pub error: Option<String>,
 }
 
-#[derive(Serialize, Deserialize, Clone)]
+#[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct UpdaterChannelInfo {
     pub current_version: String,
     pub channel: String,
     pub endpoint: String,
 }
 
-fn count_active_sessions(bridge: &IpcBridge) -> Result<usize, String> {
-    let val = bridge.call("terminal.list_tabs", json!({}))
-        .map_err(|e| format!("Falha de comunicação com Core IPC: {}", e))?;
-    if let Some(tabs) = val.get("tabs").and_then(|t| t.as_array()) {
-        let count: usize = tabs.iter().map(|t| t.get("panes_count").and_then(|p| p.as_u64()).unwrap_or(0) as usize).sum();
-        Ok(count)
-    } else {
-        Err("Resposta de listagem de terminais inválida do Core.".into())
+#[derive(Debug, Clone)]
+enum SessionInspection {
+    Known(usize),
+    Unknown(String),
+}
+
+fn count_active_sessions(bridge: &IpcBridge) -> SessionInspection {
+    let val = match bridge.call("terminal.list_tabs", json!({})) {
+        Ok(v) => v,
+        Err(e) => return SessionInspection::Unknown(format!("Falha de comunicação com Core IPC: {}", e)),
+    };
+    let tabs = match val.get("tabs").and_then(|t| t.as_array()) {
+        Some(t) => t,
+        None => return SessionInspection::Unknown("Resposta inválida do Core IPC: campo 'tabs' ausente ou não é array.".into()),
+    };
+    let mut total: usize = 0;
+    for tab in tabs {
+        let from_panes: Option<usize> = match tab.get("panes") {
+            Some(serde_json::Value::Object(m)) => Some(m.len()),
+            Some(serde_json::Value::Array(a)) => Some(a.len()),
+            _ => None,
+        };
+        let explicit = tab.get("active_panes_count").and_then(|v| v.as_u64())
+            .or_else(|| tab.get("panes_count").and_then(|v| v.as_u64()))
+            .map(|n| n as usize);
+
+        let n = match (from_panes, explicit) {
+            (Some(a), Some(b)) => a.max(b),
+            (Some(a), None) | (None, Some(a)) => a,
+            (None, None) => return SessionInspection::Unknown("Aba retornada pelo Core sem 'panes' ou 'panes_count'.".into()),
+        };
+        total = match total.checked_add(n) {
+            Some(t) => t,
+            None => return SessionInspection::Unknown("Estouro numérico ao somar sessões ativas.".into()),
+        };
+    }
+    SessionInspection::Known(total)
+}
+
+enum InstallGate {
+    Allow,
+    Block(String),
+}
+
+fn evaluate_gate(insp: SessionInspection, force_update: bool) -> InstallGate {
+    match insp {
+        SessionInspection::Unknown(why) => {
+            InstallGate::Block(format!(
+                "Segurança fail-closed: Estado das sessões de terminal é indefinido/desconhecido ({}). Atualização bloqueada; autorização forçada não se aplica a estados desconhecidos.",
+                why
+            ))
+        }
+        SessionInspection::Known(0) => InstallGate::Allow,
+        SessionInspection::Known(n) if force_update => InstallGate::Allow,
+        SessionInspection::Known(n) => {
+            InstallGate::Block(format!(
+                "Existem {} terminais ativos em execução. Conclua suas tarefas ou autorize a atualização forçada com confirmação explícita.",
+                n
+            ))
+        }
     }
 }
 
@@ -525,7 +579,10 @@ async fn updater_check(app: tauri::AppHandle, bridge: State<'_, Arc<IpcBridge>>)
     let current_version = app.package_info().version.to_string();
 
     // Check active sessions count from Core IPC (fail-closed if check fails)
-    let active_sessions_count = count_active_sessions(&bridge).unwrap_or(0);
+    let (sessions_known, active_sessions_count, sessions_error) = match count_active_sessions(&bridge) {
+        SessionInspection::Known(n) => (true, n, None),
+        SessionInspection::Unknown(why) => (false, 0, Some(why)),
+    };
 
     let updater = match app.updater() {
         Ok(u) => u,
@@ -537,6 +594,8 @@ async fn updater_check(app: tauri::AppHandle, bridge: State<'_, Arc<IpcBridge>>)
                 notes: String::new(),
                 date: String::new(),
                 active_sessions_count,
+                sessions_known,
+                sessions_error,
                 offline: true,
                 error: Some(format!("Falha ao inicializar verificador: {}", e)),
             });
@@ -552,6 +611,8 @@ async fn updater_check(app: tauri::AppHandle, bridge: State<'_, Arc<IpcBridge>>)
                 notes: update.body.clone().unwrap_or_else(|| "Notas de lançamento da versão Alpha.".into()),
                 date: update.date.map(|d| d.to_string()).unwrap_or_default(),
                 active_sessions_count,
+                sessions_known,
+                sessions_error,
                 offline: false,
                 error: None,
             })
@@ -564,6 +625,8 @@ async fn updater_check(app: tauri::AppHandle, bridge: State<'_, Arc<IpcBridge>>)
                 notes: String::new(),
                 date: String::new(),
                 active_sessions_count,
+                sessions_known,
+                sessions_error,
                 offline: false,
                 error: None,
             })
@@ -577,6 +640,8 @@ async fn updater_check(app: tauri::AppHandle, bridge: State<'_, Arc<IpcBridge>>)
                 notes: String::new(),
                 date: String::new(),
                 active_sessions_count,
+                sessions_known,
+                sessions_error,
                 offline: true,
                 error: Some(format!("Servidor de atualização inacessível (modo offline): {}", e)),
             })
@@ -594,32 +659,17 @@ async fn updater_download_and_install(
 
     let force_update = force.unwrap_or(false);
 
-    // Safety fence (Fail-Closed): do not proceed if sessions are active or if state check fails
-    let active_count = match count_active_sessions(&bridge) {
-        Ok(count) => count,
-        Err(e) => {
-            if !force_update {
-                return Err(format!(
-                    "Falha de segurança ao inspecionar sessões ativas (fail-closed): {}. Autorize a atualização forçada para prosseguir.",
-                    e
-                ));
-            }
-            0
-        }
-    };
-
-    if active_count > 0 && !force_update {
-        return Err(format!(
-            "Existem {} terminais ativos em execução. Conclua suas tarefas ou autorize a atualização forçada.",
-            active_count
-        ));
+    // ETAPA 1 (Fail-Closed Pré-Download): Verificar se sessões estão ativas ou se inspeção falhou
+    let pre_insp = count_active_sessions(&bridge);
+    if let InstallGate::Block(reason) = evaluate_gate(pre_insp, force_update) {
+        return Err(reason);
     }
 
     let updater = app.updater().map_err(|e| e.to_string())?;
     let update = updater.check().await.map_err(|e| format!("Falha ao consultar atualizações: {}", e))?;
 
     if let Some(update) = update {
-        // ETAPA 1 (Segurança): Baixar e validar a assinatura Ed25519 ANTES de desligar o runtime Python
+        // ETAPA 2 (Segurança): Baixar e validar a assinatura Ed25519 ANTES de desligar o runtime Python
         let app_handle_progress = app.clone();
         let mut downloaded: u64 = 0;
 
@@ -641,14 +691,10 @@ async fn updater_download_and_install(
             .await
             .map_err(|e| format!("Falha no download/validação da atualização: {}. O aplicativo e seus terminais continuam operacionais.", e))?;
 
-        // ETAPA 2 (Fail-Closed): Revalidar sessões imediatamente antes da aplicação
-        if let Ok(recheck_count) = count_active_sessions(&bridge) {
-            if recheck_count > 0 && !force_update {
-                return Err(format!(
-                    "Novas sessões de terminal foram iniciadas ({}) durante o download. Operação cancelada por segurança.",
-                    recheck_count
-                ));
-            }
+        // ETAPA 3 (Fail-Closed Revalidação Pré-Instalação): Revalidar atomicamente imediatamente antes da instalação
+        let post_insp = count_active_sessions(&bridge);
+        if let InstallGate::Block(reason) = evaluate_gate(post_insp, force_update) {
+            return Err(format!("Revalidação pré-instalação bloqueada: {}", reason));
         }
 
         let _ = app.emit("updater-progress", json!({
@@ -656,14 +702,14 @@ async fn updater_download_and_install(
             "percent": 100.0
         }));
 
-        // ETAPA 3: Apenas após validação e download concluídos, encerra o Python e Job Objects
+        // ETAPA 4: Apenas após validação e revalidação passarem, encerra o Python e Job Objects
         bridge.shutdown();
 
-        // ETAPA 4: Instala o payload validado
+        // ETAPA 5: Instala o payload validado
         update.install(downloaded_bytes)
             .map_err(|e| format!("Falha ao executar o instalador da atualização: {}", e))?;
 
-        // ETAPA 5: Reinicia o aplicativo preservando configurações e perfis
+        // ETAPA 6: Reinicia o aplicativo preservando configurações e perfis
         app.restart();
         Ok(true)
     } else {
