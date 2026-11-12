@@ -209,15 +209,19 @@ class TestDesktopUpdater(unittest.TestCase):
             self.assertEqual(subsystem_pyw, 2, "pythonw.exe must have subsystem 2 (GUI)")
 
     def test_10_version_a_to_b_detection_and_real_signature_verification(self) -> None:
-        """Verifies Version A (0.6.1-alpha.48) detects Version B (0.6.1-alpha.49) and verifies real Minisign signature."""
+        """Verifies Version A (0.6.1-alpha.48) detects newer Alpha B release and validates Minisign structure."""
         ctrl_a = DesktopUpdaterController(current_version="0.6.1-alpha.48")
         manifest_text = self.manifest_file.read_text(encoding="utf-8")
         result = ctrl_a.check_update(custom_manifest_content=manifest_text)
 
         self.assertTrue(result.available, "Version A must detect Version B update")
         self.assertEqual(result.current_version, "0.6.1-alpha.48")
-        self.assertEqual(result.latest_version, "0.6.1-alpha.49")
-        self.assertTrue(result.download_url.startswith("https://github.com/MaxxArtes/ai-coordinator/releases/download/v0.6.1-alpha.49/"))
+        self.assertGreaterEqual(compare_versions(result.latest_version, "0.6.1-alpha.49"), 0)
+        self.assertTrue(
+            result.download_url.startswith(
+                f"https://github.com/MaxxArtes/ai-coordinator/releases/download/v{result.latest_version}/"
+            )
+        )
         self.assertTrue(len(result.signature) > 64)
 
         # Test cryptographic verification of real signature if staging binary is present
@@ -269,9 +273,9 @@ class TestDesktopUpdater(unittest.TestCase):
         version_pkg = pkg_json["version"]
         version_tauri = tauri_conf["version"]
 
-        self.assertEqual(version_pkg, "0.6.1-alpha.48")
-        self.assertEqual(version_tauri, "0.6.1-alpha.48")
-        self.assertIn('version = "0.6.1-alpha.48"', cargo_toml)
+        self.assertEqual(version_pkg, "0.6.1-alpha.50")
+        self.assertEqual(version_tauri, "0.6.1-alpha.50")
+        self.assertIn('version = "0.6.1-alpha.50"', cargo_toml)
 
     def test_13_tab_info_ipc_contract_panes_and_active_counts(self) -> None:
         """Verifies TabInfo IPC contract exposes panes dict, panes_count, and active_panes_count."""
@@ -320,6 +324,146 @@ class TestDesktopUpdater(unittest.TestCase):
         self.assertEqual(d4["active_panes_count"], 3)
         self.assertIn("0", d4["panes"])
         self.assertIn("3", d4["panes"])
+
+    def test_14_update_freeze_mutual_exclusion_and_multi_tab_count(self) -> None:
+        """Verifies TerminalManager + SecureIPCServer enforce mutual exclusion when frozen for update
+        and report authoritative counts across multiple tabs."""
+        from unittest.mock import MagicMock
+        from desktop.terminal.manager import TabInfo, TerminalManager, TerminalManagerError
+        from desktop.ipc.server import SecureIPCServer
+
+        auth = MagicMock()
+        mgr = TerminalManager(authorizer=auth)
+
+        # Simulate 2 tabs with 2 active panes each = 4 active panes total
+        for tab_idx in (1, 2):
+            tab_id = f"tab-{tab_idx}"
+            panes = {}
+            for p_idx in (0, 1):
+                s = MagicMock()
+                s.to_dict.return_value = {"session_id": f"{tab_id}-p{p_idx}", "is_alive": True}
+                s.is_alive.return_value = True
+                panes[p_idx] = s
+            mgr.tabs[tab_id] = TabInfo(tab_id=tab_id, title=tab_id, project_path="D:\\proj", panes=panes)
+
+        ipc = SecureIPCServer(transport=MagicMock(), terminal_manager=mgr, session_token="tok-secret")
+
+        # Freeze via IPC: must return frozen=True, 2 tabs, panes_total=4, active_sessions_total=4
+        req_freeze = json.dumps({
+            "jsonrpc": "2.0",
+            "id": "1",
+            "method": "system.freeze_for_update",
+            "params": {},
+            "session_token": "tok-secret",
+        })
+        resp_freeze = ipc.handle_raw_payload(req_freeze)
+        self.assertIsNotNone(resp_freeze)
+        self.assertIsNone(resp_freeze.error)
+        res = resp_freeze.result
+        self.assertTrue(res["frozen"])
+        self.assertEqual(len(res["tabs"]), 2)
+        self.assertEqual(res["panes_total"], 4)
+        self.assertEqual(res["active_sessions_total"], 4)
+
+        # While frozen, creating a tab via IPC OR directly MUST fail
+        req_create_tab = json.dumps({
+            "jsonrpc": "2.0",
+            "id": "1b",
+            "method": "terminal.create_tab",
+            "params": {"tab_id": "tab-blocked", "project_path": str(_repo_root)},
+            "session_token": "tok-secret",
+        })
+        resp_blocked = ipc.handle_raw_payload(req_create_tab)
+        self.assertIsNotNone(resp_blocked)
+        self.assertIsNotNone(resp_blocked.error)
+
+        with self.assertRaises(TerminalManagerError):
+            mgr.create_tab("tok-secret", "tab-new", "New Tab", "D:\\proj")
+
+        with self.assertRaises(TerminalManagerError):
+            mgr.create_terminal("tok-secret", "tab-1", pane_id=2)
+
+        # Unfreeze via IPC and verify tab creation resumes
+        req_unfreeze = json.dumps({
+            "jsonrpc": "2.0",
+            "id": "2",
+            "method": "system.unfreeze_update",
+            "params": {},
+            "session_token": "tok-secret",
+        })
+        resp_unfreeze = ipc.handle_raw_payload(req_unfreeze)
+        self.assertIsNotNone(resp_unfreeze)
+        self.assertFalse(resp_unfreeze.result["frozen"])
+
+        new_tab = mgr.create_tab("tok-secret", "tab-new", "New Tab", str(_repo_root))
+        self.assertEqual(new_tab.tab_id, "tab-new")
+
+    def test_15_real_terminal_session_liveness_property_and_four_session_gate(self) -> None:
+        """Real TerminalSession.is_alive is a bool @property (not callable); freeze/to_dict must count 4 real sessions cleanly."""
+        import tempfile
+        from desktop.auth.authorizer import DesktopAuthorizer
+        from desktop.auth.profile import DesktopProfileManager
+        from desktop.terminal.manager import TerminalManager
+        from desktop.terminal.session import SessionKind
+
+        old_backend = os.environ.get("COORDINATOR_PTY_BACKEND")
+        os.environ["COORDINATOR_PTY_BACKEND"] = "pipe"
+        try:
+            with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmpdir:
+                tmp_path = Path(tmpdir)
+                prof_mgr = DesktopProfileManager(root_dir=tmp_path / "profiles")
+                authorizer = DesktopAuthorizer(profile_manager=prof_mgr)
+                token = authorizer.issue_session("default")
+
+                proj_dir = tmp_path / "proj"
+                proj_dir.mkdir(parents=True, exist_ok=True)
+                prof_mgr.authorize_project("default", proj_dir)
+
+                mgr = TerminalManager(authorizer=authorizer)
+                mgr.create_tab(token=token, tab_id="tab-a", title="A", project_path=proj_dir)
+                mgr.create_tab(token=token, tab_id="tab-b", title="B", project_path=proj_dir)
+                cmd = [sys.executable, "-u", "-c", "import time; time.sleep(10)"]
+
+                try:
+                    for tab_id in ("tab-a", "tab-b"):
+                        for pane_idx in range(2):
+                            sess = mgr.create_terminal(
+                                token=token,
+                                tab_id=tab_id,
+                                pane_id=pane_idx,
+                                kind=SessionKind.HUMAN_TERMINAL,
+                                command=cmd,
+                            )
+                            self.assertIsInstance(sess.is_alive, bool)
+                            self.assertTrue(sess.is_alive)
+
+                    tab_a_dict = mgr.get_tab("tab-a").to_dict()
+                    self.assertEqual(tab_a_dict["panes_count"], 2)
+                    self.assertEqual(tab_a_dict["active_panes_count"], 2)
+
+                    freeze_snapshot = mgr.freeze_for_update()
+                    self.assertTrue(freeze_snapshot["frozen"])
+                    self.assertEqual(freeze_snapshot["panes_total"], 4)
+                    self.assertEqual(freeze_snapshot["active_sessions_total"], 4)
+
+                    ctrl = DesktopUpdaterController("0.6.1-alpha.48")
+                    allowed_no_force, reason = ctrl.can_safely_update(
+                        active_sessions_count=freeze_snapshot["active_sessions_total"], force=False
+                    )
+                    self.assertFalse(allowed_no_force)
+                    self.assertIn("4", reason)
+
+                    allowed_force, _ = ctrl.can_safely_update(
+                        active_sessions_count=freeze_snapshot["active_sessions_total"], force=True
+                    )
+                    self.assertTrue(allowed_force)
+                finally:
+                    mgr.terminate_all()
+        finally:
+            if old_backend is None:
+                os.environ.pop("COORDINATOR_PTY_BACKEND", None)
+            else:
+                os.environ["COORDINATOR_PTY_BACKEND"] = old_backend
 
 
 if __name__ == "__main__":

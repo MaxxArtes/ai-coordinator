@@ -160,6 +160,8 @@ class SecureIPCServer:
     def _register_default_handlers(self) -> None:
         self.register("system.ping", self._handle_ping)
         self.register("system.status", self._handle_status)
+        self.register("system.freeze_for_update", self._handle_system_freeze_for_update)
+        self.register("system.unfreeze_update", self._handle_system_unfreeze_update)
         self.register("profile.get_active", self._handle_profile_get_active)
         self.register("profile.authorize_project", self._handle_profile_authorize_project)
         self.register("profile.list_authorized_projects", self._handle_profile_list_authorized_projects)
@@ -295,6 +297,14 @@ class SecureIPCServer:
             "panes_total": total_panes,
             "active_sessions_total": total_active,
         }
+
+    def _handle_system_freeze_for_update(self, _params: Dict[str, Any]) -> Dict[str, Any]:
+        mgr = self._get_terminal_manager()
+        return mgr.freeze_for_update()
+
+    def _handle_system_unfreeze_update(self, _params: Dict[str, Any]) -> Dict[str, Any]:
+        mgr = self._get_terminal_manager()
+        return mgr.unfreeze_update()
 
     def _handle_ping(self, _params: Dict[str, Any]) -> Dict[str, Any]:
         return {"status": "pong", "protocol": PROTOCOL_VERSION}

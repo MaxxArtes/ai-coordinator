@@ -35,7 +35,7 @@ export const App: React.FC = () => {
   const [isUpdateModalOpen, setIsUpdateModalOpen] = useState<boolean>(false);
   const [hasUpdateAvailable, setHasUpdateAvailable] = useState<boolean>(false);
   const [latestAvailableVersion, setLatestAvailableVersion] = useState<string>("");
-  const [appVersion, setAppVersion] = useState<string>("0.6.1-alpha.48");
+  const [appVersion, setAppVersion] = useState<string>("0.6.1-alpha.50");
 
   const termsRef = useRef<Map<string, Terminal>>(new Map());
   const lastSeqRef = useRef<Map<string, number>>(new Map());

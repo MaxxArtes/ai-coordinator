@@ -11,7 +11,7 @@ use std::collections::HashSet;
 use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use sysinfo::{Pid, ProcessRefreshKind, System};
 use tauri::{Emitter, State};
@@ -42,6 +42,8 @@ pub struct IpcBridge {
     child: Mutex<Option<Child>>,
     stdin: Mutex<Option<ChildStdin>>,
     reader: Mutex<Option<BufReader<ChildStdout>>>,
+    io_lock: Mutex<()>,
+    update_frozen: AtomicBool,
     token: String,
     seq: AtomicU64,
     resolved_python: String,
@@ -105,6 +107,8 @@ impl IpcBridge {
             child: Mutex::new(child_proc),
             stdin: Mutex::new(child_in),
             reader: Mutex::new(child_out),
+            io_lock: Mutex::new(()),
+            update_frozen: AtomicBool::new(false),
             token,
             seq: AtomicU64::new(1),
             resolved_python: py_path_str,
@@ -183,7 +187,7 @@ impl IpcBridge {
         Ok((py_path, script_path))
     }
 
-    pub fn call(&self, method: &str, params: Value) -> Result<Value, String> {
+    fn call_locked(&self, method: &str, params: Value) -> Result<Value, String> {
         let id = self.seq.fetch_add(1, Ordering::SeqCst);
         let req = json!({
             "jsonrpc": "2.0",
@@ -236,6 +240,97 @@ impl IpcBridge {
         Ok(resp.get("result").cloned().unwrap_or(Value::Null))
     }
 
+    pub fn call(&self, method: &str, params: Value) -> Result<Value, String> {
+        let _io_guard = self
+            .io_lock
+            .lock()
+            .map_err(|e| format!("IPC I/O mutex poisoned: {}", e))?;
+
+        if self.update_frozen.load(Ordering::SeqCst)
+            && matches!(
+                method,
+                "terminal.create_tab" | "terminal.create_session" | "terminal.restore_sessions"
+            )
+        {
+            return Err(
+                "Criação de sessões bloqueada: sistema congelado para atualização em andamento."
+                    .into(),
+            );
+        }
+
+        self.call_locked(method, params)
+    }
+
+    fn acquire_update_freeze(&self) -> (UpdateFreezeGuard<'_>, SessionInspection) {
+        let _io_guard = match self.io_lock.lock() {
+            Ok(g) => g,
+            Err(e) => {
+                return (
+                    UpdateFreezeGuard {
+                        bridge: self,
+                        committed: true,
+                    },
+                    SessionInspection::Unknown(format!("IPC I/O mutex poisoned: {}", e)),
+                );
+            }
+        };
+
+        self.update_frozen.store(true, Ordering::SeqCst);
+
+        match self.call_locked("system.freeze_for_update", json!({})) {
+            Ok(val) => {
+                if val.get("frozen").and_then(|f| f.as_bool()) != Some(true) {
+                    self.update_frozen.store(false, Ordering::SeqCst);
+                    let _ = self.call_locked("system.unfreeze_update", json!({}));
+                    return (
+                        UpdateFreezeGuard {
+                            bridge: self,
+                            committed: true,
+                        },
+                        SessionInspection::Unknown(
+                            "Core IPC não confirmou estado congelado (frozen != true).".into(),
+                        ),
+                    );
+                }
+
+                let insp = parse_tabs_inspection(&val);
+                if matches!(insp, SessionInspection::Unknown(_)) {
+                    self.update_frozen.store(false, Ordering::SeqCst);
+                    let _ = self.call_locked("system.unfreeze_update", json!({}));
+                    return (
+                        UpdateFreezeGuard {
+                            bridge: self,
+                            committed: true,
+                        },
+                        insp,
+                    );
+                }
+
+                (
+                    UpdateFreezeGuard {
+                        bridge: self,
+                        committed: false,
+                    },
+                    insp,
+                )
+            }
+            Err(e) => {
+                self.update_frozen.store(false, Ordering::SeqCst);
+                let _ = self.call_locked("system.unfreeze_update", json!({}));
+                (
+                    UpdateFreezeGuard {
+                        bridge: self,
+                        committed: true,
+                    },
+                    SessionInspection::Unknown(format!(
+                        "Falha ao congelar sessões para atualização: {}",
+                        e
+                    )),
+                )
+            }
+        }
+    }
+
     pub fn shutdown(&self) {
         // Step 1: Drop stdin handle to send EOF to the Python IPC server
         if let Ok(mut stdin_guard) = self.stdin.lock() {
@@ -259,6 +354,28 @@ impl IpcBridge {
                     let _ = child.kill();
                     let _ = child.wait();
                 }
+            }
+        }
+    }
+}
+
+struct UpdateFreezeGuard<'a> {
+    bridge: &'a IpcBridge,
+    committed: bool,
+}
+
+impl<'a> UpdateFreezeGuard<'a> {
+    fn commit(mut self) {
+        self.committed = true;
+    }
+}
+
+impl<'a> Drop for UpdateFreezeGuard<'a> {
+    fn drop(&mut self) {
+        if !self.committed {
+            self.bridge.update_frozen.store(false, Ordering::SeqCst);
+            if let Err(e) = self.bridge.call("system.unfreeze_update", json!({})) {
+                eprintln!("[UPDATER_FREEZE_WARN] Falha ao descongelar sessões no Core Python: {}", e);
             }
         }
     }
@@ -505,11 +622,7 @@ enum SessionInspection {
     Unknown(String),
 }
 
-fn count_active_sessions(bridge: &IpcBridge) -> SessionInspection {
-    let val = match bridge.call("terminal.list_tabs", json!({})) {
-        Ok(v) => v,
-        Err(e) => return SessionInspection::Unknown(format!("Falha de comunicação com Core IPC: {}", e)),
-    };
+fn parse_tabs_inspection(val: &Value) -> SessionInspection {
     let tabs = match val.get("tabs").and_then(|t| t.as_array()) {
         Some(t) => t,
         None => return SessionInspection::Unknown("Resposta inválida do Core IPC: campo 'tabs' ausente ou não é array.".into()),
@@ -538,12 +651,24 @@ fn count_active_sessions(bridge: &IpcBridge) -> SessionInspection {
     SessionInspection::Known(total)
 }
 
+fn count_active_sessions(bridge: &IpcBridge) -> SessionInspection {
+    let val = match bridge.call("terminal.list_tabs", json!({})) {
+        Ok(v) => v,
+        Err(e) => return SessionInspection::Unknown(format!("Falha de comunicação com Core IPC: {}", e)),
+    };
+    parse_tabs_inspection(&val)
+}
+
 enum InstallGate {
     Allow,
     Block(String),
 }
 
-fn evaluate_gate(insp: SessionInspection, force_update: bool) -> InstallGate {
+fn evaluate_gate(
+    insp: SessionInspection,
+    force_update: bool,
+    expected_active_sessions: Option<usize>,
+) -> InstallGate {
     match insp {
         SessionInspection::Unknown(why) => {
             InstallGate::Block(format!(
@@ -551,13 +676,35 @@ fn evaluate_gate(insp: SessionInspection, force_update: bool) -> InstallGate {
                 why
             ))
         }
-        SessionInspection::Known(0) => InstallGate::Allow,
-        SessionInspection::Known(n) if force_update => InstallGate::Allow,
-        SessionInspection::Known(n) => {
-            InstallGate::Block(format!(
-                "Existem {} terminais ativos em execução. Conclua suas tarefas ou autorize a atualização forçada com confirmação explícita.",
-                n
-            ))
+        SessionInspection::Known(actual) => {
+            if actual == 0 {
+                if let Some(expected) = expected_active_sessions {
+                    if expected != 0 {
+                        return InstallGate::Block(format!(
+                            "A contagem de sessões mudou de {} para 0 desde a sua autorização (sessions_changed). Confirmação anterior invalidada; verifique novamente.",
+                            expected
+                        ));
+                    }
+                }
+                InstallGate::Allow
+            } else if !force_update {
+                InstallGate::Block(format!(
+                    "Existem {} terminais ativos em execução. Conclua suas tarefas ou autorize a atualização forçada com confirmação explícita.",
+                    actual
+                ))
+            } else {
+                match expected_active_sessions {
+                    Some(expected) if expected == actual => InstallGate::Allow,
+                    Some(expected) => InstallGate::Block(format!(
+                        "A contagem de sessões mudou de {} para {} desde a sua autorização (sessions_changed). Confirmação anterior invalidada; reautorize para prosseguir.",
+                        expected, actual
+                    )),
+                    None => InstallGate::Block(format!(
+                        "Autorização forçada inválida: contagem esperada não foi informada pelo frontend para {} terminais ativos.",
+                        actual
+                    )),
+                }
+            }
         }
     }
 }
@@ -654,6 +801,7 @@ async fn updater_download_and_install(
     app: tauri::AppHandle,
     bridge: State<'_, Arc<IpcBridge>>,
     force: Option<bool>,
+    expected_active_sessions: Option<usize>,
 ) -> Result<bool, String> {
     use tauri_plugin_updater::UpdaterExt;
 
@@ -661,7 +809,7 @@ async fn updater_download_and_install(
 
     // ETAPA 1 (Fail-Closed Pré-Download): Verificar se sessões estão ativas ou se inspeção falhou
     let pre_insp = count_active_sessions(&bridge);
-    if let InstallGate::Block(reason) = evaluate_gate(pre_insp, force_update) {
+    if let InstallGate::Block(reason) = evaluate_gate(pre_insp, force_update, expected_active_sessions) {
         return Err(reason);
     }
 
@@ -669,7 +817,7 @@ async fn updater_download_and_install(
     let update = updater.check().await.map_err(|e| format!("Falha ao consultar atualizações: {}", e))?;
 
     if let Some(update) = update {
-        // ETAPA 2 (Segurança): Baixar e validar a assinatura Ed25519 ANTES de desligar o runtime Python
+        // ETAPA 2 (Segurança): Baixar e validar a assinatura Ed25519 ANTES de congelar/desligar o runtime Python
         let app_handle_progress = app.clone();
         let mut downloaded: u64 = 0;
 
@@ -691,18 +839,23 @@ async fn updater_download_and_install(
             .await
             .map_err(|e| format!("Falha no download/validação da atualização: {}. O aplicativo e seus terminais continuam operacionais.", e))?;
 
-        // ETAPA 3 (Fail-Closed Revalidação Pré-Instalação): Revalidar atomicamente imediatamente antes da instalação
-        let post_insp = count_active_sessions(&bridge);
-        if let InstallGate::Block(reason) = evaluate_gate(post_insp, force_update) {
+        // ETAPA 3 (Exclusão Mútua / Freeze + Revalidação Pré-Instalação):
+        // Congela criação de novas abas/sessões no Rust e no Core Python (sob RLock) antes de contar.
+        // Se a validação falhar, UpdateFreezeGuard::drop descongela automaticamente o sistema.
+        let (freeze_guard, post_insp) = bridge.acquire_update_freeze();
+        if let InstallGate::Block(reason) = evaluate_gate(post_insp, force_update, expected_active_sessions) {
             return Err(format!("Revalidação pré-instalação bloqueada: {}", reason));
         }
+
+        // Confirma permanência no estado congelado até o shutdown imediato
+        freeze_guard.commit();
 
         let _ = app.emit("updater-progress", json!({
             "status": "installing",
             "percent": 100.0
         }));
 
-        // ETAPA 4: Apenas após validação e revalidação passarem, encerra o Python e Job Objects
+        // ETAPA 4: Apenas após validação sob exclusão mútua passar, encerra o Python e Job Objects
         bridge.shutdown();
 
         // ETAPA 5: Instala o payload validado

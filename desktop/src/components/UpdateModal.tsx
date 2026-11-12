@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useCallback } from "react";
+import React, { useState, useEffect, useCallback, useRef } from "react";
 
 export interface UpdateCheckResult {
   available: boolean;
@@ -39,18 +39,73 @@ export const UpdateModal: React.FC<UpdateModalProps> = ({
   const [totalBytes, setTotalBytes] = useState<number>(0);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [forceAuthorized, setForceAuthorized] = useState<boolean>(false);
+  const [authorizedCount, setAuthorizedCount] = useState<number | null>(null);
 
-  // Load channel info and listen for real-time download progress
+  const checkSeqRef = useRef<number>(0);
+  const prevVisiblePanesRef = useRef<number>(activePanesCount);
+
+  const invalidateAuthorization = useCallback(() => {
+    setForceAuthorized(false);
+    setAuthorizedCount(null);
+  }, []);
+
+  const handleCheckUpdates = useCallback(async () => {
+    const seq = ++checkSeqRef.current;
+    setIsChecking(true);
+    setErrorMessage(null);
+    invalidateAuthorization();
+    try {
+      if (isTauri) {
+        const res: UpdateCheckResult = await callTauri("updater_check");
+        if (seq !== checkSeqRef.current) return;
+        setCheckResult(res);
+        if (res.error) {
+          setErrorMessage(res.error);
+        }
+      } else {
+        // Preview mode simulation
+        setTimeout(() => {
+          if (seq !== checkSeqRef.current) return;
+          setCheckResult({
+            available: true,
+            current_version: currentVersion,
+            latest_version: "0.6.1-alpha.50",
+            notes: "AI Coordinator Desktop Alpha — Nova versão de teste (simulada em modo preview).",
+            date: new Date().toISOString(),
+            active_sessions_count: activePanesCount,
+            sessions_known: true,
+            offline: false,
+          });
+          setIsChecking(false);
+        }, 500);
+        return;
+      }
+    } catch (err: any) {
+      if (seq !== checkSeqRef.current) return;
+      setErrorMessage(`Falha na verificação de atualização: ${err?.message || err}`);
+    } finally {
+      if (seq === checkSeqRef.current) {
+        setIsChecking(false);
+      }
+    }
+  }, [isTauri, callTauri, activePanesCount, currentVersion, invalidateAuthorization]);
+
+  // Load channel info, trigger fresh authoritative check, and listen for download progress
   useEffect(() => {
-    if (!isOpen) return;
+    if (!isOpen) {
+      invalidateAuthorization();
+      return;
+    }
 
     let unlistenFn: (() => void) | null = null;
+    prevVisiblePanesRef.current = activePanesCount;
+    handleCheckUpdates();
 
     if (isTauri) {
       callTauri("updater_get_channel_info")
         .then((info) => {
           if (info) {
-            setCurrentVersion(info.current_version || "0.6.1-alpha.48");
+            setCurrentVersion(info.current_version || "0.6.1-alpha.50");
             setChannel(info.channel || "alpha");
           }
         })
@@ -90,48 +145,44 @@ export const UpdateModal: React.FC<UpdateModalProps> = ({
     };
   }, [isOpen, isTauri, callTauri]);
 
-  const handleCheckUpdates = useCallback(async () => {
-    setIsChecking(true);
-    setErrorMessage(null);
-    try {
-      if (isTauri) {
-        const res: UpdateCheckResult = await callTauri("updater_check");
-        setCheckResult(res);
-        if (res.error) {
-          setErrorMessage(res.error);
-        }
-      } else {
-        // Preview mode simulation
-        setTimeout(() => {
-          setCheckResult({
-            available: true,
-            current_version: "0.6.0",
-            latest_version: "0.6.1-alpha.49",
-            notes: "AI Coordinator Desktop Alpha — Nova versão de teste (simulada em modo preview).",
-            date: new Date().toISOString(),
-            active_sessions_count: activePanesCount,
-            offline: false,
-          });
-          setIsChecking(false);
-        }, 500);
-        return;
-      }
-    } catch (err: any) {
-      setErrorMessage(`Falha na verificação de atualização: ${err?.message || err}`);
-    } finally {
-      setIsChecking(false);
+  // Invalidate prior authorization and refresh authoritative count if visible panes change while modal is open
+  useEffect(() => {
+    if (!isOpen || isUpdating) return;
+    if (activePanesCount !== prevVisiblePanesRef.current) {
+      prevVisiblePanesRef.current = activePanesCount;
+      invalidateAuthorization();
+      handleCheckUpdates();
     }
-  }, [isTauri, callTauri, activePanesCount]);
+  }, [activePanesCount, isOpen, isUpdating, invalidateAuthorization, handleCheckUpdates]);
+
+  // Invalidate prior authorization if checkResult state or count changed
+  useEffect(() => {
+    if (!checkResult || checkResult.sessions_known === false) {
+      if (forceAuthorized || authorizedCount !== null) {
+        invalidateAuthorization();
+      }
+      return;
+    }
+    if (authorizedCount !== null && checkResult.active_sessions_count !== authorizedCount) {
+      invalidateAuthorization();
+    }
+  }, [checkResult, forceAuthorized, authorizedCount, invalidateAuthorization]);
+
+  const sessionsKnown = checkResult !== null && checkResult.sessions_known !== false;
+  const authoritativeSessionsCount = checkResult ? checkResult.active_sessions_count : 0;
 
   const handleDownloadAndInstall = useCallback(async () => {
-    if (checkResult?.sessions_known === false) {
+    if (!checkResult || checkResult.sessions_known === false) {
+      invalidateAuthorization();
       setErrorMessage("Atualização bloqueada: estado das sessões é indefinido/desconhecido (fail-closed).");
       return;
     }
 
-    if (activePanesCount > 0 && !forceAuthorized) {
+    const expectedCount = checkResult.active_sessions_count;
+    if (expectedCount > 0 && (!forceAuthorized || authorizedCount !== expectedCount)) {
+      invalidateAuthorization();
       setErrorMessage(
-        `Existem ${activePanesCount} terminais ativos em execução. Marque a caixa de confirmação para autorizar o encerramento seguro antes de prosseguir.`
+        `Existem ${expectedCount} terminais ativos no Core (em todas as abas). Marque a caixa de confirmação para autorizar o encerramento seguro antes de prosseguir.`
       );
       return;
     }
@@ -142,7 +193,10 @@ export const UpdateModal: React.FC<UpdateModalProps> = ({
 
     try {
       if (isTauri) {
-        await callTauri("updater_download_and_install", { force: forceAuthorized });
+        await callTauri("updater_download_and_install", {
+          force: forceAuthorized,
+          expectedActiveSessions: forceAuthorized ? expectedCount : null,
+        });
         setUpdateStatus("Atualização concluída com sucesso. Reiniciando o aplicativo...");
       } else {
         // Preview mode simulation
@@ -154,10 +208,12 @@ export const UpdateModal: React.FC<UpdateModalProps> = ({
       }
     } catch (err: any) {
       setIsUpdating(false);
+      invalidateAuthorization();
       setErrorMessage(`Erro ao instalar atualização: ${err?.message || err}`);
       setUpdateStatus("");
+      handleCheckUpdates();
     }
-  }, [activePanesCount, forceAuthorized, isTauri, callTauri]);
+  }, [checkResult, forceAuthorized, authorizedCount, isTauri, callTauri, invalidateAuthorization, handleCheckUpdates]);
 
   if (!isOpen) return null;
 
@@ -260,26 +316,38 @@ export const UpdateModal: React.FC<UpdateModalProps> = ({
                     </div>
                   )}
 
-                  {/* Active sessions safety fence */}
-                  {activePanesCount > 0 && checkResult.sessions_known !== false && (
+                  {/* Active sessions safety fence (authoritative count across all tabs) */}
+                  {authoritativeSessionsCount > 0 && sessionsKnown && (
                     <div className="bg-amber-950/50 border border-amber-600/60 p-3 rounded space-y-2 mt-3">
                       <div className="text-amber-300 font-semibold flex items-center space-x-1">
                         <span>⚠️</span>
-                        <span>Atenção: {activePanesCount} terminal(is) ConPTY ativo(s)</span>
+                        <span>
+                          Atenção: {authoritativeSessionsCount} terminal(is) ConPTY ativo(s) no Core (todas as abas)
+                        </span>
                       </div>
+                      {activePanesCount !== authoritativeSessionsCount && (
+                        <p className="text-[10px] text-amber-300/80 font-mono">
+                          (Painéis na aba visível: {activePanesCount} | Total em execução: {authoritativeSessionsCount})
+                        </p>
+                      )}
                       <p className="text-[11px] text-amber-200/90 leading-tight">
                         Para proteger a integridade dos seus comandos, o atualizador não encerra
-                        processos em execução sem autorização prévia.
+                        processos em execução sem autorização prévia para a contagem atual.
                       </p>
                       <label className="flex items-center space-x-2 pt-1 cursor-pointer">
                         <input
                           type="checkbox"
-                          checked={forceAuthorized}
-                          onChange={(e) => setForceAuthorized(e.target.checked)}
+                          checked={forceAuthorized && authorizedCount === authoritativeSessionsCount}
+                          disabled={isChecking || isUpdating}
+                          onChange={(e) => {
+                            const checked = e.target.checked;
+                            setForceAuthorized(checked);
+                            setAuthorizedCount(checked ? authoritativeSessionsCount : null);
+                          }}
                           className="rounded border-gray-600 text-blue-600 focus:ring-0"
                         />
                         <span className="text-xs text-white font-medium">
-                          Autorizo o encerramento dos terminais para aplicar a atualização agora
+                          Autorizo o encerramento de todos os {authoritativeSessionsCount} terminal(is) ativo(s) agora
                         </span>
                       </label>
                     </div>
@@ -296,7 +364,13 @@ export const UpdateModal: React.FC<UpdateModalProps> = ({
                     </button>
                     <button
                       onClick={handleDownloadAndInstall}
-                      disabled={isUpdating || checkResult.sessions_known === false || (activePanesCount > 0 && !forceAuthorized)}
+                      disabled={
+                        isUpdating ||
+                        isChecking ||
+                        !sessionsKnown ||
+                        (authoritativeSessionsCount > 0 &&
+                          (!forceAuthorized || authorizedCount !== authoritativeSessionsCount))
+                      }
                       className="px-4 py-1.5 bg-emerald-600 hover:bg-emerald-500 text-white rounded text-xs font-semibold shadow-md disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
                     >
                       {isUpdating ? "Atualizando..." : "Atualizar e Reiniciar"}
