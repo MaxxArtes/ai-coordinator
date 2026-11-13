@@ -198,7 +198,8 @@ impl IpcBridge {
         Ok((py_path, script_path))
     }
 
-    fn call_locked(&self, method: &str, params: Value) -> Result<Value, String> {
+    /// One request/response exchange with the Core IPC; returns the whole parsed response (result or error).
+    fn exchange(&self, method: &str, params: Value) -> Result<Value, String> {
         let id = self.seq.fetch_add(1, Ordering::SeqCst);
         let req = json!({
             "jsonrpc": "2.0",
@@ -237,7 +238,11 @@ impl IpcBridge {
             return Err("Empty response received from Core IPC server".to_string());
         }
 
-        let resp: Value = serde_json::from_str(&resp_line).map_err(|e| e.to_string())?;
+        serde_json::from_str(&resp_line).map_err(|e| e.to_string())
+    }
+
+    fn call_locked(&self, method: &str, params: Value) -> Result<Value, String> {
+        let resp = self.exchange(method, params)?;
         if let Some(err) = resp.get("error") {
             if !err.is_null() {
                 let msg = err
@@ -248,6 +253,24 @@ impl IpcBridge {
             }
         }
 
+        Ok(resp.get("result").cloned().unwrap_or(Value::Null))
+    }
+
+    /// Like `call`, but keeps the Core's structured error object ({code, message, data}) so the UI can show
+    /// which field was rejected and why (decision D3). Transport failures become an INTERNAL_ERROR object.
+    pub fn call_structured(&self, method: &str, params: Value) -> Result<Value, Value> {
+        let _io_guard = self
+            .io_lock
+            .lock()
+            .map_err(|e| json!({ "code": -32603, "message": format!("IPC I/O mutex poisoned: {}", e) }))?;
+        let resp = self
+            .exchange(method, params)
+            .map_err(|msg| json!({ "code": -32603, "message": msg }))?;
+        if let Some(err) = resp.get("error") {
+            if !err.is_null() {
+                return Err(err.clone());
+            }
+        }
         Ok(resp.get("result").cloned().unwrap_or(Value::Null))
     }
 
@@ -1049,6 +1072,46 @@ fn updater_restart_app(app: tauri::AppHandle, bridge: State<Arc<IpcBridge>>) -> 
     Ok(())
 }
 
+// ---- Settings and vault (Marco 4D.3, Etapa 3): validation happens in the Core IPC; structured errors
+// reach the UI as {code, message, data}. Vault commands never return secret values. ----
+#[tauri::command]
+fn settings_get(bridge: State<Arc<IpcBridge>>) -> Result<Value, Value> {
+    bridge.call_structured("settings.get", json!({}))
+}
+
+#[tauri::command]
+fn settings_update(
+    schema_version: u32,
+    category: String,
+    values: Value,
+    bridge: State<Arc<IpcBridge>>,
+) -> Result<Value, Value> {
+    bridge.call_structured(
+        "settings.update",
+        json!({ "schema_version": schema_version, "category": category, "values": values }),
+    )
+}
+
+#[tauri::command]
+fn vault_status(bridge: State<Arc<IpcBridge>>) -> Result<Value, Value> {
+    bridge.call_structured("vault.status", json!({}))
+}
+
+#[tauri::command]
+fn vault_list_keys(bridge: State<Arc<IpcBridge>>) -> Result<Value, Value> {
+    bridge.call_structured("vault.list_keys", json!({}))
+}
+
+#[tauri::command]
+fn vault_set_secret(key: String, value: String, bridge: State<Arc<IpcBridge>>) -> Result<Value, Value> {
+    bridge.call_structured("vault.set_secret", json!({ "key": key, "value": value }))
+}
+
+#[tauri::command]
+fn vault_delete_secret(key: String, bridge: State<Arc<IpcBridge>>) -> Result<Value, Value> {
+    bridge.call_structured("vault.delete_secret", json!({ "key": key }))
+}
+
 fn main() {
     let bridge = Arc::new(IpcBridge::new());
     let bridge_window = bridge.clone();
@@ -1080,7 +1143,13 @@ fn main() {
             updater_get_channel_info,
             updater_check,
             updater_download_and_install,
-            updater_restart_app
+            updater_restart_app,
+            settings_get,
+            settings_update,
+            vault_status,
+            vault_list_keys,
+            vault_set_secret,
+            vault_delete_secret
         ])
         .run(tauri::generate_context!())
         .expect("error while running AI Coordinator Desktop");

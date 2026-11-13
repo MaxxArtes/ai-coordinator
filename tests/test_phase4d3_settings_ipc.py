@@ -133,6 +133,20 @@ def test_vault_rejects_invalid_key_names(env):
     assert resp.error["data"] == {"field": "key", "reason": "invalid_value"}
 
 
+def test_host_exposes_settings_and_vault_with_structured_errors():
+    import re
+
+    main_rs = (_repo_root / "desktop" / "src-tauri" / "src" / "main.rs").read_text(encoding="utf-8")
+    handlers = main_rs[main_rs.index("generate_handler![") :]
+    for command in ("settings_get", "settings_update", "vault_status", "vault_list_keys", "vault_set_secret", "vault_delete_secret"):
+        assert re.search(rf"fn {command}\([^)]*\)\s*->\s*Result<Value, Value>", main_rs), command
+        assert command in handlers, command
+    structured = main_rs[main_rs.index("pub fn call_structured(") :]
+    structured = structured[: structured.index("\n    }\n")]
+    assert "return Err(err.clone());" in structured  # the Core error object {code, message, data} is kept
+    assert "fn call_locked(&self, method: &str, params: Value) -> Result<Value, String>" in main_rs
+
+
 @pytest.mark.skipif(sys.platform != "win32", reason="DPAPI is Windows-specific")
 def test_vault_on_windows_stores_and_lists_names_only(env):
     secret = "sk-test-desktop-0123456789"
