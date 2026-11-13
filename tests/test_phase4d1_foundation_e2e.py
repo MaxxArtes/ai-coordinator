@@ -35,7 +35,13 @@ def test_e2e_clean_installation():
         res = verify_clean_install(Path(tmpdir) / "pristine_env")
         assert res["status"] == "passed"
         assert res["profile_created"] == "default"
-        assert res["vault_initialized"] is True
+        # Decision D8: DPAPI on Windows; elsewhere no secure store yet, so the vault is reported unavailable.
+        if sys.platform == "win32":
+            assert res["vault_initialized"] is True
+            assert res["vault_backend"] == "dpapi"
+        else:
+            assert res["vault_initialized"] is False
+            assert res["vault_backend"] == "unavailable"
 
 
 def test_e2e_live_ipc_and_tree_memory():

@@ -28,8 +28,23 @@ class VaultKeyNotFoundError(VaultError):
     """Raised when the requested secret key does not exist."""
 
 
+class VaultUnavailableError(VaultError):
+    """Raised when persistent credential storage is not available on this platform (decision D8)."""
+
+
+UNAVAILABLE_MESSAGE = (
+    "Armazenamento persistente de credenciais indisponível nesta plataforma: não há cofre seguro do sistema "
+    "integrado (DPAPI no Windows; Keychain e Secret Service planejados para a 4D.6). Nenhuma credencial foi gravada."
+)
+
+
 class BaseVault(abc.ABC):
     """Abstract base class for credential vaults."""
+
+    #: Whether this vault can persist secrets with adequate protection.
+    available: bool = True
+    #: Backend identifier for diagnostics ("dpapi", "aes_gcm", "unavailable").
+    backend_name: str = "unknown"
 
     def __init__(self, profile_name: str, vault_path: Path) -> None:
         self.profile_name = profile_name
@@ -63,6 +78,8 @@ class Win32DPAPIVault(BaseVault):
     eliminating external binary dependencies and guaranteeing that even within
     the same OS user account, Profile A's entropy cannot decrypt Profile B's data.
     """
+
+    backend_name = "dpapi"
 
     def __init__(self, profile_name: str, vault_path: Path) -> None:
         super().__init__(profile_name, vault_path)
@@ -216,6 +233,7 @@ class AESGCMVault(BaseVault):
     """
 
     ITERATIONS = 100_000
+    backend_name = "aes_gcm"
 
     def __init__(
         self,
@@ -224,7 +242,11 @@ class AESGCMVault(BaseVault):
         master_password: Optional[str] = None,
     ) -> None:
         super().__init__(profile_name, vault_path)
-        self.master_password = master_password or f"default-profile-key:{profile_name}"
+        # Decision D8: a password derivable from the profile name is not protection. An explicit master password
+        # (supplied by the operator or a test fixture) is mandatory; there is no implicit default.
+        if not master_password:
+            raise VaultUnavailableError(UNAVAILABLE_MESSAGE)
+        self.master_password = master_password
 
     def _derive_key(self, salt: bytes) -> bytes:
         from cryptography.hazmat.primitives.hashes import SHA256
@@ -317,16 +339,51 @@ class AESGCMVault(BaseVault):
         return sorted(self._load_dict().keys())
 
 
+class UnavailableVault(BaseVault):
+    """Placeholder for platforms without secure persistent storage: refuses every operation, writes nothing."""
+
+    available = False
+    backend_name = "unavailable"
+
+    def _refuse(self) -> None:
+        raise VaultUnavailableError(UNAVAILABLE_MESSAGE)
+
+    def set_secret(self, key: str, value: str) -> None:
+        self._refuse()
+
+    def get_secret(self, key: str) -> Optional[str]:
+        self._refuse()
+        return None
+
+    def delete_secret(self, key: str) -> bool:
+        self._refuse()
+        return False
+
+    def list_keys(self) -> List[str]:
+        self._refuse()
+        return []
+
+
 def create_vault(
     profile_dir: Path,
     profile_name: str,
     backend: str = "auto",
     master_password: Optional[str] = None,
 ) -> BaseVault:
-    """Factory creating the appropriate Vault instance based on OS or explicit configuration."""
+    """Factory creating the appropriate Vault instance based on OS or explicit configuration.
+
+    "auto": DPAPI on Windows. Elsewhere, AES-GCM only with an explicit master password; without one there is no
+    secure system store yet (Keychain / Secret Service are planned for 4D.6), so an UnavailableVault is returned
+    and every operation fails with a clear VaultUnavailableError (decision D8). Nothing is written to disk.
+    """
     vault_file = profile_dir / "vault.enc"
     if backend == "auto":
-        backend = "dpapi" if sys.platform == "win32" else "aes_gcm"
+        if sys.platform == "win32":
+            backend = "dpapi"
+        elif master_password:
+            backend = "aes_gcm"
+        else:
+            return UnavailableVault(profile_name=profile_name, vault_path=vault_file)
 
     if backend == "dpapi":
         return Win32DPAPIVault(profile_name=profile_name, vault_path=vault_file)

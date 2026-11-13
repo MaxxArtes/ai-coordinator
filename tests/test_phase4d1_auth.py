@@ -210,7 +210,8 @@ def test_authorizer_session_flow_and_constant_time(temp_profiles_dir):
 
 def test_authorizer_vault_delegation(temp_profiles_dir):
     mgr = DesktopProfileManager(root_dir=temp_profiles_dir)
-    authorizer = DesktopAuthorizer(profile_manager=mgr, vault_backend="aes_gcm")
+    # Decision D8: AES-GCM requires an explicit master password (no default derivable from the profile name).
+    authorizer = DesktopAuthorizer(profile_manager=mgr, vault_backend="aes_gcm", master_password="test-master-password")
 
     token = authorizer.issue_session("default")
     authorizer.authorize_vault_write(token, "API_KEY", "sk-live-desktop-safe")

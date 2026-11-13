@@ -130,12 +130,24 @@ def verify_clean_install(install_dir: Path) -> Dict[str, Any]:
     assert active_profile.name == "default"
     assert (install_dir / "profiles" / "default" / "profile.json").exists()
 
-    # Test vault initial creation
+    # Test vault initial creation. Decision D8: where no secure store exists the vault is reported unavailable
+    # instead of being "proven" with an insecure fallback; nothing is written in that case.
     vault = create_vault(
         profile_dir=Path(active_profile.data_dir),
         profile_name=active_profile.name,
         backend="auto",
     )
+    if not vault.available:
+        assert not vault.vault_path.exists(), "An unavailable vault must not write any file"
+        return {
+            "status": "passed",
+            "profile_created": active_profile.name,
+            "data_dir": active_profile.data_dir,
+            "vault_initialized": False,
+            "vault_backend": vault.backend_name,
+            "vault_note": "Armazenamento persistente de credenciais indisponível nesta plataforma (decisão D8).",
+        }
+
     test_key = "INSTALL_PROBE"
     vault.set_secret(test_key, "probe-value-ok")
     assert vault.get_secret(test_key) == "probe-value-ok"
@@ -146,6 +158,7 @@ def verify_clean_install(install_dir: Path) -> Dict[str, Any]:
         "profile_created": active_profile.name,
         "data_dir": active_profile.data_dir,
         "vault_initialized": True,
+        "vault_backend": vault.backend_name,
     }
 
 
