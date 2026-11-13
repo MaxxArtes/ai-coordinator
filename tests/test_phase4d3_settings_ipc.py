@@ -33,6 +33,22 @@ def env():
         yield {"server": server, "token": token, "root": root, "profiles": profiles}
 
 
+def test_native_package_copies_every_desktop_package_the_server_imports():
+    """The Windows build copies `desktop/<package>` folders one by one: a package the server imports and the
+    workflow does not copy only fails in the installed application, never in this repository's tests."""
+    import re
+
+    packaged = ["ipc", "auth", "terminal", "updater", "settings"]
+    imported = set()
+    for package in packaged:
+        for source in (_repo_root / "desktop" / package).rglob("*.py"):
+            imported.update(re.findall(r"^\s*(?:from|import)\s+desktop\.([a-z_]+)", source.read_text(encoding="utf-8"), re.M))
+    assert "settings" in imported
+    workflow = (_repo_root / ".github" / "workflows" / "desktop-alpha-build.yml").read_text(encoding="utf-8")
+    missing = sorted(name for name in imported if f'Copy-Item "desktop/{name}"' not in workflow)
+    assert missing == []
+
+
 def call(env, method, params=None):
     payload = {"jsonrpc": "2.0", "id": method, "method": method, "params": params or {}, "session_token": env["token"]}
     return env["server"].handle_raw_payload(json.dumps(payload))

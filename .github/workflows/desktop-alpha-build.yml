@@ -96,6 +96,7 @@ jobs:
 
           Copy-Item "desktop/ipc" -Destination "$resDesktop/" -Recurse -Force
           Copy-Item "desktop/auth" -Destination "$resDesktop/" -Recurse -Force
+          Copy-Item "desktop/settings" -Destination "$resDesktop/" -Recurse -Force
           Copy-Item "desktop/terminal" -Destination "$resDesktop/" -Recurse -Force
           Copy-Item "desktop/updater" -Destination "$resDesktop/" -Recurse -Force
           Copy-Item "desktop/updates" -Destination "$resDesktop/" -Recurse -Force
