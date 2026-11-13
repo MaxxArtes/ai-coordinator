@@ -20,16 +20,42 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Set
 
 
-class InvalidParamsError(ValueError):
-    """Invalid request parameters; reported as JSON-RPC INVALID_PARAMS with a structured `data` payload."""
+VAULT_UNAVAILABLE_CODE = -32004  # RPCErrorCode.VAULT_UNAVAILABLE
 
-    def __init__(self, message: str, *, field: str, reason: str) -> None:
+
+class StructuredRPCError(Exception):
+    """Handler error reported as a JSON-RPC error with a structured `data` payload {field, reason}."""
+
+    code = -32603  # INTERNAL_ERROR unless a subclass or the caller says otherwise
+
+    def __init__(self, message: str, *, field: str, reason: str, code: Optional[int] = None) -> None:
         super().__init__(message)
         self.field = field
         self.reason = reason
+        if code is not None:
+            self.code = code
 
     def to_data(self) -> Dict[str, str]:
         return {"field": self.field, "reason": self.reason}
+
+
+class InvalidParamsError(StructuredRPCError, ValueError):
+    """Invalid request parameters; reported as JSON-RPC INVALID_PARAMS (-32602)."""
+
+    code = -32602
+
+
+def validate_secret_key(value: Any) -> str:
+    """Vault key names: uppercase identifiers (e.g. OPENROUTER_API_KEY), 1-64 characters."""
+    import re
+
+    if not isinstance(value, str) or not re.fullmatch(r"[A-Z][A-Z0-9_]{0,63}", value):
+        raise InvalidParamsError(
+            "'key' deve ser um identificador em maiúsculas (A-Z, 0-9, _), com até 64 caracteres.",
+            field="key",
+            reason="invalid_value",
+        )
+    return value
 
 
 def validate_command_argv(value: Any) -> Optional[List[str]]:
@@ -216,6 +242,12 @@ class SecureIPCServer:
         self.register("terminal.close_session", self._handle_terminal_close_session)
         self.register("terminal.save_sessions", self._handle_terminal_save_sessions)
         self.register("terminal.list_tabs", self._handle_terminal_list_tabs)
+        self.register("settings.get", self._handle_settings_get)
+        self.register("settings.update", self._handle_settings_update)
+        self.register("vault.status", self._handle_vault_status)
+        self.register("vault.list_keys", self._handle_vault_list_keys)
+        self.register("vault.set_secret", self._handle_vault_set_secret)
+        self.register("vault.delete_secret", self._handle_vault_delete_secret)
 
     def _get_terminal_manager(self) -> Any:
         if self.terminal_manager is None:
@@ -267,6 +299,57 @@ class SecureIPCServer:
         mgr = self._get_terminal_manager()
         ok = mgr.resize_terminal(params["session_id"], params["cols"], params["rows"])
         return {"resized": ok}
+
+    # ---- Settings (Marco 4D.3, Etapa 3): versioned schema validated here, never only in the UI ----
+    def _settings_store(self) -> Any:
+        from desktop.settings import SettingsStore
+
+        return SettingsStore(self._get_terminal_manager().authorizer.profile_manager)
+
+    def _handle_settings_get(self, _params: Dict[str, Any]) -> Dict[str, Any]:
+        return self._settings_store().snapshot()
+
+    def _handle_settings_update(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        from desktop.settings import SettingsValidationError
+
+        try:
+            return self._settings_store().update(params)
+        except SettingsValidationError as exc:
+            raise InvalidParamsError(str(exc), field=exc.field, reason=exc.reason) from exc
+
+    # ---- Vault: write and list key names only; secret values never leave the vault through IPC ----
+    def _vault_for(self, token: Optional[str]) -> Any:
+        authorizer = self._get_terminal_manager().authorizer
+        profile_name = authorizer.validate_session(token or self.session_token)
+        return authorizer.get_vault(profile_name)
+
+    def _vault_call(self, token: Optional[str], operation: Callable[[Any], Any]) -> Any:
+        from desktop.auth.vault import VaultUnavailableError
+
+        try:
+            return operation(self._vault_for(token))
+        except VaultUnavailableError as exc:
+            raise StructuredRPCError(str(exc), field="vault", reason="unavailable", code=VAULT_UNAVAILABLE_CODE) from exc
+
+    def _handle_vault_status(self, _params: Dict[str, Any], token: Optional[str] = None) -> Dict[str, Any]:
+        vault = self._vault_for(token)
+        return {"available": bool(vault.available), "backend": vault.backend_name}
+
+    def _handle_vault_list_keys(self, _params: Dict[str, Any], token: Optional[str] = None) -> Dict[str, Any]:
+        return {"keys": self._vault_call(token, lambda vault: sorted(vault.list_keys()))}
+
+    def _handle_vault_set_secret(self, params: Dict[str, Any], token: Optional[str] = None) -> Dict[str, Any]:
+        key = validate_secret_key(params.get("key"))
+        value = params.get("value")
+        if not isinstance(value, str) or not value:
+            raise InvalidParamsError("'value' deve ser um texto não vazio.", field="value", reason="invalid_value")
+        self._vault_call(token, lambda vault: vault.set_secret(key, value))
+        return {"stored": True, "key": key}
+
+    def _handle_vault_delete_secret(self, params: Dict[str, Any], token: Optional[str] = None) -> Dict[str, Any]:
+        key = validate_secret_key(params.get("key"))
+        deleted = self._vault_call(token, lambda vault: vault.delete_secret(key))
+        return {"deleted": bool(deleted), "key": key}
 
     def _handle_profile_get_active(self, _params: Dict[str, Any]) -> Dict[str, Any]:
         mgr = self._get_terminal_manager()
@@ -427,10 +510,10 @@ class SecureIPCServer:
             else:
                 res = handler(req.params)
             return RPCResponse(id=req.id, result=res)
-        except InvalidParamsError as e:
+        except StructuredRPCError as e:
             return RPCResponse(
                 id=req.id,
-                error={"code": RPCErrorCode.INVALID_PARAMS.value, "message": str(e), "data": e.to_data()},
+                error={"code": e.code, "message": str(e), "data": e.to_data()},
             )
         except Exception as e:
             self.transport.log_diagnostic(f"Handler error in {req.method}: {e}")

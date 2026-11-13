@@ -155,6 +155,15 @@ class DesktopProfileManager:
         temp_file.write_text(json.dumps(profile.to_dict(), indent=2), encoding="utf-8")
         temp_file.replace(p_file)
 
+    def update_settings(self, profile_name: str, settings: Dict[str, Any]) -> DesktopProfile:
+        """Replace the persisted (non-secret) settings of a profile. Validation happens in desktop.settings."""
+        profile = self.get_profile(profile_name)
+        if not profile:
+            raise ValueError(f"Profile '{profile_name}' not found")
+        profile.settings = dict(settings)
+        self._save_profile(profile)
+        return profile
+
     def delete_profile(self, name: str) -> bool:
         """Delete a profile and its contents. Cannot delete active profile or 'default'."""
         cleaned = self._validate_name(name)

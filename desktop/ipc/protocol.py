@@ -28,6 +28,7 @@ class RPCErrorCode(int, Enum):
     PAYLOAD_TOO_LARGE = -32001
     SESSION_NOT_FOUND = -32002
     SECURITY_VIOLATION = -32003
+    VAULT_UNAVAILABLE = -32004
 
 
 class MetricProvenance(str, Enum):
