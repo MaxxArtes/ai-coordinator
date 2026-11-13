@@ -14,6 +14,7 @@ import { StartupStatus } from "../components/shell/StartupStatus";
 import { SettingsDialog } from "../components/settings/SettingsDialog";
 import type { SettingsCategoryId } from "../components/settings/categories";
 import type { UpdateCheckResult } from "../components/settings/UpdatesSection";
+import { applyInterfaceSettings, type SettingsSnapshot, type VaultStatus } from "../components/settings/api";
 
 const params = new URLSearchParams(window.location.search);
 const view = params.get("view") ?? "app-preview";
@@ -52,10 +53,37 @@ const CHECK_BASE: UpdateCheckResult = {
   runtime_stopped: false,
 };
 
-function fakeTauri(check: UpdateCheckResult) {
+function snapshot(overrides: Record<string, any> = {}): SettingsSnapshot {
+  const categories: any = {
+    perfil: { values: { display_name: null }, saved_fields: [], validated: true, applied: false, application: "pending_ui" },
+    geral: { values: { open_last_project_on_start: true }, saved_fields: [], validated: true, applied: false, application: "pending_ui" },
+    aparencia: { values: { stimulation: "standard", density: "comfortable" }, saved_fields: [], validated: true, applied: false, application: "pending_ui" },
+    terminal: { values: { font_size: 13, cursor_blink: true, scrollback_lines: 1000 }, saved_fields: [], validated: true, applied: false, application: "pending_ui" },
+    coordinator: {
+      values: { flight_budget: { max_steps: 20, max_elapsed_seconds: 1800, max_uncheckpointed_steps: 5, max_worker_calls: 10 } },
+      saved_fields: ["flight_budget"],
+      validated: true,
+      applied: false,
+      application: "unsupported",
+    },
+  };
+  for (const [k, v] of Object.entries(overrides)) categories[k] = { ...categories[k], ...v };
+  return { schema_version: 1, stored_schema_version: 1, unsupported_categories: {}, categories };
+}
+
+interface Fakes {
+  settings?: SettingsSnapshot;
+  vault?: VaultStatus;
+  vaultKeys?: string[];
+}
+
+function fakeTauri(check: UpdateCheckResult, fakes: Fakes = {}) {
   return async (cmd: string) => {
     if (cmd === "updater_get_channel_info") return { current_version: "0.6.1-alpha.50", channel: "alpha" };
     if (cmd === "updater_check") return check;
+    if (cmd === "settings_get") return fakes.settings ?? snapshot();
+    if (cmd === "vault_status") return fakes.vault ?? { available: false, backend: "unavailable" };
+    if (cmd === "vault_list_keys") return { keys: fakes.vaultKeys ?? [] };
     throw new Error(`comando indisponível na conferência visual: ${cmd}`);
   };
 }
@@ -67,10 +95,11 @@ const Shell: React.FC<{ header?: Partial<AppHeaderProps>; children: React.ReactN
   </div>
 );
 
-const SettingsView: React.FC<{ check: UpdateCheckResult; category?: SettingsCategoryId; panes?: number }> = ({
+const SettingsView: React.FC<{ check: UpdateCheckResult; category?: SettingsCategoryId; panes?: number; fakes?: Fakes }> = ({
   check,
   category = "sobre",
   panes = 2,
+  fakes,
 }) => (
   <Shell header={{ hasUpdateAvailable: check.available, latestAvailableVersion: check.latest_version }}>
     <main className="app__main">
@@ -84,7 +113,8 @@ const SettingsView: React.FC<{ check: UpdateCheckResult; category?: SettingsCate
       runtimeStatus={HEADER.status}
       connectionStatus="connected"
       activePanesCount={panes}
-      callTauri={fakeTauri(check)}
+      callTauri={fakeTauri(check, fakes)}
+      onSettingsChanged={(s) => applyInterfaceSettings(s)}
     />
   </Shell>
 );
@@ -123,6 +153,19 @@ const VIEWS: Record<string, () => React.ReactElement> = {
   "settings-perfil": () => <SettingsView check={CHECK_BASE} category="perfil" />,
   "settings-provedores": () => <SettingsView check={CHECK_BASE} category="provedores" />,
   "update-available": () => <SettingsView check={CHECK_BASE} />,
+  "e4-terminal": () => <SettingsView check={CHECK_BASE} category="terminal" />,
+  "e4-aparencia-aplicada": () => (
+    <SettingsView
+      check={CHECK_BASE}
+      category="aparencia"
+      fakes={{ settings: snapshot({ aparencia: { values: { stimulation: "low", density: "comfortable" }, saved_fields: ["density", "stimulation"] } }) }}
+    />
+  ),
+  "e4-coordinator": () => <SettingsView check={CHECK_BASE} category="coordinator" />,
+  "e4-provedores-dpapi": () => (
+    <SettingsView check={CHECK_BASE} category="provedores" fakes={{ vault: { available: true, backend: "dpapi" }, vaultKeys: ["OPENROUTER_API_KEY"] }} />
+  ),
+  "e4-provedores-indisponivel": () => <SettingsView check={CHECK_BASE} category="provedores" />,
   "update-runtime-stopped": () => (
     <SettingsView check={{ ...CHECK_BASE, available: false, runtime_stopped: true, sessions_known: false, sessions_error: "IPC child stdin is not available" }} />
   ),
