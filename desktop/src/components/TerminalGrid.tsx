@@ -35,58 +35,59 @@ export const TerminalGrid: React.FC<TerminalGridProps> = ({
   onClose,
   onMount,
 }) => {
+  // Same layout as Marco 4D.2: 1 pane full size, 2 panes side by side, 3-4 panes in a 2x2 grid.
   const getGridClass = (count: number) => {
     switch (count) {
       case 1:
-        return "grid-cols-1 grid-rows-1";
+        return "terminal-grid__panes--1";
       case 2:
-        return "grid-cols-2 grid-rows-1";
+        return "terminal-grid__panes--2";
       case 3:
       case 4:
       default:
-        return "grid-cols-2 grid-rows-2";
+        return "terminal-grid__panes--4";
     }
   };
 
   return (
-    <div className="flex flex-col h-full w-full bg-[#11111b]">
+    <div className="terminal-grid">
       {/* Top Controls Toolbar */}
-      <div className="flex items-center justify-between px-4 py-2 bg-[#181825] border-b border-gray-800 text-sm">
-        <div className="flex items-center space-x-3">
-          <span className="font-semibold text-gray-200">Aba: {tabId}</span>
-          <span className="text-xs font-mono text-gray-400 truncate max-w-md">
+      <div className="terminal-toolbar">
+        <div className="terminal-toolbar__group">
+          <span className="terminal-toolbar__tab">Aba: {tabId}</span>
+          <span className="terminal-toolbar__path" title={projectPath}>
             Raiz: {projectPath}
           </span>
-          <span className="text-xs px-2 py-0.5 rounded bg-gray-800 text-gray-300">
-            {panes.length} / 4 Painéis
-          </span>
+          <span className="badge">{panes.length} / 4 painéis</span>
         </div>
-        <div className="flex items-center space-x-2">
+        <div className="terminal-toolbar__group">
           {onSaveSessions && (
             <button
+              type="button"
               onClick={() => onSaveSessions(tabId)}
-              className="px-3 py-1 bg-gray-700 hover:bg-gray-600 text-gray-200 text-xs rounded transition focus:ring-1 focus:ring-blue-400"
+              className="btn btn--sm"
               title="Salvar layout e histórico sanitizado da sessão"
             >
-              Salvar Sessões
+              Salvar sessões
             </button>
           )}
           {onAddPane && panes.length < 4 && (
             <button
+              type="button"
               onClick={() => onAddPane(tabId)}
-              className="px-3 py-1 bg-blue-600 hover:bg-blue-500 text-white text-xs rounded font-medium transition focus:ring-1 focus:ring-blue-400"
+              className="btn btn--sm btn--primary"
               title="Adicionar novo terminal a esta aba"
             >
-              + Novo Terminal
+              + Novo terminal
             </button>
           )}
         </div>
       </div>
 
       {/* Grid of Panes */}
-      <div className={`grid flex-1 p-2 gap-2 h-full overflow-hidden ${getGridClass(panes.length)}`}>
+      <div className={`terminal-grid__panes ${getGridClass(panes.length)}`}>
         {panes.map((pane) => (
-          <div key={pane.sessionId} className="h-full w-full min-h-0 min-w-0">
+          <div key={pane.sessionId} className="terminal-grid__cell">
             <TerminalPane
               {...pane}
               onWrite={onWrite}

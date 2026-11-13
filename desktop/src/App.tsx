@@ -3,26 +3,21 @@ import { TerminalGrid } from "./components/TerminalGrid";
 import { TerminalPaneData } from "./components/TerminalPane";
 import { Terminal } from "xterm";
 import { UpdateModal } from "./components/UpdateModal";
-
-interface RuntimeMetrics {
-  host_pid: number;
-  host_ram_bytes: number;
-  total_tree_ram_bytes: number;
-  cpu_usage_percent: number;
-}
-
-interface RuntimeStatus {
-  core_version: string;
-  host_os: string;
-  is_isolated: boolean;
-  python_path: string;
-}
+import {
+  AppHeader,
+  type ConnectionStatus,
+  type RuntimeMetrics,
+  type RuntimeStatus,
+} from "./components/shell/AppHeader";
+import { NoticeBanner, type NoticeTone } from "./components/shell/NoticeBanner";
+import { AuthorizationScreen } from "./components/shell/AuthorizationScreen";
+import { StartupStatus } from "./components/shell/StartupStatus";
 
 export const App: React.FC = () => {
   const [isTauri, setIsTauri] = useState<boolean>(false);
   const isTauriRef = useRef<boolean>(false);
 
-  const [connectionStatus, setConnectionStatus] = useState<"connecting" | "authorizing" | "connected" | "failed">("connecting");
+  const [connectionStatus, setConnectionStatus] = useState<ConnectionStatus>("connecting");
   const [status, setStatus] = useState<RuntimeStatus | null>(null);
   const [metrics, setMetrics] = useState<RuntimeMetrics | null>(null);
   const [activeTab, setActiveTab] = useState<string>("tab-main");
@@ -32,6 +27,7 @@ export const App: React.FC = () => {
   const [inputPath, setInputPath] = useState<string>("");
   const [panes, setPanes] = useState<TerminalPaneData[]>([]);
   const [notice, setNotice] = useState<string>("");
+  const [noticeTone, setNoticeTone] = useState<NoticeTone>("error");
   const [isUpdateModalOpen, setIsUpdateModalOpen] = useState<boolean>(false);
   const [hasUpdateAvailable, setHasUpdateAvailable] = useState<boolean>(false);
   const [latestAvailableVersion, setLatestAvailableVersion] = useState<string>("");
@@ -45,6 +41,12 @@ export const App: React.FC = () => {
   const callTauri = useCallback(async (cmd: string, args?: Record<string, any>): Promise<any> => {
     const { invoke } = await import("@tauri-apps/api/core");
     return await invoke(cmd, args);
+  }, []);
+
+  // Application-level message with an explicit tone (errors by default).
+  const showNotice = useCallback((message: string, tone: NoticeTone = "error") => {
+    setNotice(message);
+    setNoticeTone(tone);
   }, []);
 
   const ensureTabCreated = useCallback(
@@ -81,7 +83,7 @@ export const App: React.FC = () => {
         try {
           await callTauri("terminal_write", { sessionId, data });
         } catch (err: any) {
-          setNotice(`Erro de escrita no terminal: ${err?.message || err}`);
+          showNotice(`Erro de escrita no terminal: ${err?.message || err}`);
         }
       } else {
         // Preview mode local echo & simulated response
@@ -123,7 +125,7 @@ export const App: React.FC = () => {
         try {
           await callTauri("terminal_close_session", { sessionId });
         } catch (err: any) {
-          setNotice(`Erro ao fechar sessão: ${err?.message || err}`);
+          showNotice(`Erro ao fechar sessão: ${err?.message || err}`);
         }
       }
       setPanes((prev) => prev.filter((p) => p.sessionId !== sessionId));
@@ -137,7 +139,7 @@ export const App: React.FC = () => {
   const handleAddPane = useCallback(
     async (tabId: string) => {
       if (panes.length >= 4) {
-        setNotice("Limite máximo de 4 painéis simultâneos por aba atingido.");
+        showNotice("Limite máximo de 4 painéis simultâneos por aba atingido.", "info");
         return;
       }
       const newPaneId = panes.length;
@@ -174,7 +176,7 @@ export const App: React.FC = () => {
         setPanes((prev) => [...prev, newPane]);
       } catch (err: any) {
         const msg = err?.message || String(err);
-        setNotice(`Falha ao criar terminal no painel ${newPaneId + 1}: ${msg}`);
+        showNotice(`Falha ao criar terminal no painel ${newPaneId + 1}: ${msg}`);
       }
     },
     [panes.length, projectPath, ensureTabCreated, callTauri]
@@ -184,7 +186,7 @@ export const App: React.FC = () => {
   const handleAuthorizeAndStart = useCallback(
     async (dirToAuthorize: string) => {
       if (!dirToAuthorize.trim()) {
-        setNotice("Informe um caminho de diretório válido.");
+        showNotice("Informe um caminho de diretório válido.");
         return;
       }
       try {
@@ -239,7 +241,7 @@ export const App: React.FC = () => {
         }
       } catch (err: any) {
         const msg = err?.message || String(err);
-        setNotice(`Falha na autorização do projeto: ${msg}`);
+        showNotice(`Falha na autorização do projeto: ${msg}`);
         setConnectionStatus("authorizing");
       }
     },
@@ -347,7 +349,7 @@ export const App: React.FC = () => {
         if (!mounted) return;
         setConnectionStatus("failed");
         const msg = err?.message || String(err);
-        setNotice(`Erro de inicialização da Alpha: ${msg}`);
+        showNotice(`Erro de inicialização da Alpha: ${msg}`);
       }
     }
 
@@ -438,157 +440,48 @@ export const App: React.FC = () => {
       if (isTauriRef.current) {
         try {
           const res = await callTauri("terminal_save_sessions", { tabId });
-          setNotice(`Sessão salva com sucesso: ${res?.total_sessions || panes.length} terminais arquivados.`);
+          showNotice(`Sessão salva com sucesso: ${res?.total_sessions || panes.length} terminais arquivados.`, "success");
         } catch (err: any) {
-          setNotice(`Falha ao salvar sessão: ${err?.message || err}`);
+          showNotice(`Falha ao salvar sessão: ${err?.message || err}`);
         }
       } else {
-        setNotice("Layout da sessão exportado (modo preview).");
+        showNotice("Layout da sessão exportado (modo preview).", "info");
       }
       setTimeout(() => setNotice(""), 4000);
     },
     [panes.length, callTauri]
   );
 
-  const formatBytes = (bytes: number) => {
-    if (bytes < 1024) return `${bytes} B`;
-    if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
-    return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
-  };
+  const isAuthorizingView = isAuthorizing || connectionStatus === "authorizing";
 
   return (
-    <div className="flex flex-col h-screen w-screen bg-[#11111b] text-[#cdd6f4]">
-      {/* Top Application Header */}
-      <header className="flex items-center justify-between px-4 py-2 bg-[#181825] border-b border-gray-700 select-none">
-        <div className="flex items-center space-x-3">
-          <span className="font-bold text-sm tracking-wide text-white">AI Coordinator Desktop</span>
-          <span className="text-xs px-2 py-0.5 rounded bg-gray-800 text-gray-300">
-            Core v{status?.core_version || "0.6.0"}
-          </span>
-          <span className="text-xs px-2 py-0.5 rounded bg-purple-900/60 text-purple-200 border border-purple-700/60 font-mono">
-            Alpha v{appVersion}
-          </span>
-          {isTauri ? (
-            <span className="text-xs px-2 py-0.5 rounded bg-emerald-600 text-white font-medium">
-              Tauri 2 + WebView2 (Nativo)
-            </span>
-          ) : (
-            <span
-              className="text-xs px-2 py-0.5 rounded bg-amber-600 text-white font-medium"
-              title="Visualização provisória via Vite/Navegador sem host Tauri"
-            >
-              Vite Preview (Não-Homologado)
-            </span>
-          )}
-          <span className="text-xs text-gray-400">
-            Supervisão ConPTY:{" "}
-            {connectionStatus === "connected" ? (
-              <strong className="text-emerald-400">Ativa</strong>
-            ) : connectionStatus === "authorizing" ? (
-              <strong className="text-blue-400">Aguardando Autorização</strong>
-            ) : connectionStatus === "connecting" ? (
-              <strong className="text-amber-400">Conectando...</strong>
-            ) : (
-              <strong className="text-red-400">Falha</strong>
-            )}
-          </span>
+    <div className="app">
+      <AppHeader
+        status={status}
+        appVersion={appVersion}
+        isTauri={isTauri}
+        connectionStatus={connectionStatus}
+        metrics={metrics}
+        hasUpdateAvailable={hasUpdateAvailable}
+        latestAvailableVersion={latestAvailableVersion}
+        onOpenUpdates={() => setIsUpdateModalOpen(true)}
+      />
 
-          {/* Direct verification of Python runtime path */}
-          {status?.python_path && (
-            <span
-              className="text-xs px-2 py-0.5 rounded bg-gray-800 text-gray-300 font-mono truncate max-w-xs"
-              title={`Caminho efetivo do runtime Python no host: ${status.python_path}`}
-            >
-              Python: {status.python_path.replace(/\\/g, "/").split("/").pop()} ({status.is_isolated ? "Isolado" : "Host"})
-            </span>
-          )}
-        </div>
-
-        {/* Telemetry metrics & Updates button */}
-        <div className="flex items-center space-x-3 text-xs font-mono text-gray-300">
-          {metrics ? (
-            <>
-              <span>PID: {metrics.host_pid}</span>
-              <span>RAM Host: {formatBytes(metrics.host_ram_bytes)}</span>
-              <span>RAM Árvore: {formatBytes(metrics.total_tree_ram_bytes)}</span>
-              <span>CPU: {metrics.cpu_usage_percent.toFixed(1)}%</span>
-            </>
-          ) : (
-            <span className="text-gray-500">Métricas em Espera</span>
-          )}
-
-          <button
-            onClick={() => setIsUpdateModalOpen(true)}
-            className={`px-2.5 py-1 rounded text-xs font-sans font-medium flex items-center space-x-1.5 transition-all ${
-              hasUpdateAvailable
-                ? "bg-purple-600 hover:bg-purple-500 text-white shadow-md animate-pulse"
-                : "bg-gray-800 hover:bg-gray-700 text-gray-300"
-            }`}
-            title="Configurações e Atualizações do AI Coordinator Desktop"
-          >
-            <span>{hasUpdateAvailable ? "✨" : "🔄"}</span>
-            <span>{hasUpdateAvailable ? `Atualização v${latestAvailableVersion}` : "Atualizações"}</span>
-          </button>
-        </div>
-      </header>
-
-      {/* Notice / Error Banner */}
-      {notice && (
-        <div className="bg-red-950 border-b border-red-800 px-4 py-1.5 text-xs text-red-200 flex items-center justify-between">
-          <span className="font-mono">{notice}</span>
-          <button onClick={() => setNotice("")} className="text-red-300 hover:text-white font-bold ml-4">
-            ✕
-          </button>
-        </div>
-      )}
+      {notice && <NoticeBanner message={notice} tone={noticeTone} onDismiss={() => setNotice("")} />}
 
       {/* Main Terminal Area */}
-      <main className="flex-1 w-full h-full min-h-0 overflow-hidden">
-        {isAuthorizing || connectionStatus === "authorizing" ? (
-          <div className="flex flex-col items-center justify-center h-full p-6 max-w-xl mx-auto">
-            <div className="bg-[#1e1e2e] border border-blue-500/40 rounded-lg p-6 shadow-2xl w-full">
-              <div className="flex items-center space-x-2 mb-3">
-                <span className="text-xl">🛡️</span>
-                <h2 className="text-sm font-bold text-white uppercase tracking-wider">
-                  Autorização de Projeto Obrigatória
-                </h2>
-              </div>
-              <p className="text-xs text-gray-300 mb-4 leading-relaxed">
-                Nenhum projeto está autorizado para o perfil ativo (<code className="text-blue-300">default</code>).
-                Para assegurar a contenção atômica do ConPTY e proteger o sistema de arquivos do host, informe e
-                autorize explicitamente o diretório de trabalho antes de iniciar o terminal.
-              </p>
-              <div className="mb-4">
-                <label className="block text-xs font-mono text-gray-400 mb-1">
-                  Caminho do Projeto no Host:
-                </label>
-                <input
-                  type="text"
-                  value={inputPath}
-                  onChange={(e) => setInputPath(e.target.value)}
-                  placeholder="Ex: C:\Users\10864 ou D:\meu-projeto"
-                  className="w-full bg-[#11111b] border border-gray-600 rounded px-3 py-2 text-xs font-mono text-white focus:outline-none focus:border-blue-500"
-                />
-              </div>
-              <div className="flex items-center justify-end space-x-3">
-                <button
-                  onClick={() => handleAuthorizeAndStart(inputPath)}
-                  className="px-4 py-2 bg-blue-600 hover:bg-blue-500 text-white rounded text-xs font-semibold tracking-wide transition-colors"
-                >
-                  Autorizar Diretório e Iniciar Terminal
-                </button>
-              </div>
-            </div>
-          </div>
+      <main className="app__main">
+        {isAuthorizingView ? (
+          <AuthorizationScreen
+            profileName="default"
+            inputPath={inputPath}
+            onInputPathChange={setInputPath}
+            onSubmit={handleAuthorizeAndStart}
+          />
         ) : connectionStatus === "connecting" && panes.length === 0 ? (
-          <div className="flex items-center justify-center h-full text-gray-400 font-mono text-sm">
-            Inicializando runtime do Core e conectando ponte ConPTY...
-          </div>
+          <StartupStatus state="connecting" />
         ) : connectionStatus === "failed" && panes.length === 0 ? (
-          <div className="flex flex-col items-center justify-center h-full text-red-400 font-mono text-sm p-4">
-            <p className="font-bold mb-2">Falha na Inicialização da Alpha Técnica</p>
-            <p className="text-gray-300 text-xs mb-4">{notice || "Verifique se o runtime Python privado está disponível."}</p>
-          </div>
+          <StartupStatus state="failed" detail={notice} />
         ) : (
           <TerminalGrid
             tabId={activeTab}

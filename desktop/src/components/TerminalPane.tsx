@@ -14,6 +14,7 @@
 import React, { useEffect, useRef } from "react";
 import { Terminal } from "xterm";
 import { FitAddon } from "xterm-addon-fit";
+import { Icon } from "./ui/Icon";
 
 export interface TerminalPaneData {
   sessionId: string;
@@ -123,39 +124,34 @@ export const TerminalPane: React.FC<TerminalPaneProps> = ({
     };
   }, [sessionId]);
 
-  const badgeColor = kind === "human_terminal" ? "bg-blue-600" : "bg-emerald-600";
-  const badgeLabel = kind === "human_terminal" ? "Terminal Humano" : "Agente Governado";
+  const badgeClass = kind === "human_terminal" ? "badge badge--human" : "badge badge--agent";
+  const badgeLabel = kind === "human_terminal" ? "Terminal humano" : "Agente governado";
 
   return (
-    <div
-      className="flex flex-col h-full w-full bg-[#181825] border border-gray-700 rounded overflow-hidden"
-      role="region"
-      aria-label={`Terminal ${title || `Painel ${paneId + 1}`}`}
-    >
+    <div className="terminal-pane" role="region" aria-label={`Terminal ${title || `Painel ${paneId + 1}`}`}>
       {/* Header Bar */}
-      <div className="flex items-center justify-between px-3 py-1 bg-[#1e1e2e] border-b border-gray-700 text-xs text-gray-300">
-        <div className="flex items-center space-x-2">
-          <span className={`px-2 py-0.5 rounded text-[10px] font-semibold text-white ${badgeColor}`}>
-            {badgeLabel}
-          </span>
-          <span className="font-mono text-gray-400">
+      <div className="terminal-pane__header">
+        <div className="terminal-pane__heading">
+          <span className={badgeClass}>{badgeLabel}</span>
+          <span className="terminal-pane__title">
             {title || `Painel ${paneId + 1}`} (Sessão: {sessionId.slice(0, 8)})
           </span>
         </div>
         {onClose && (
           <button
+            type="button"
             onClick={() => onClose(sessionId)}
-            className="text-gray-400 hover:text-red-400 focus:outline-none focus:ring-1 focus:ring-red-400 px-1 rounded"
-            title="Fechar Terminal"
-            aria-label="Fechar Terminal"
+            className="btn btn--ghost btn--ghost-danger btn--icon btn--sm"
+            title="Fechar terminal"
+            aria-label="Fechar terminal"
           >
-            ✕
+            <Icon name="close" size="sm" />
           </button>
         )}
       </div>
 
       {/* xterm.js DOM Mount Point */}
-      <div ref={containerRef} className="flex-1 w-full h-full p-1 overflow-hidden" tabIndex={0} />
+      <div ref={containerRef} className="terminal-pane__mount" tabIndex={0} />
     </div>
   );
 };
