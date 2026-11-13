@@ -847,6 +847,89 @@
   color: var(--c-warn);
 }
 
+.settings__badges {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: var(--sp-1);
+}
+
+.settings-form {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-4);
+}
+
+.settings-form__row {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-1);
+}
+
+.settings-form__fieldset {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-2);
+  margin: 0;
+  padding: 0;
+  border: 0;
+}
+
+.settings-form__fieldset legend {
+  margin-bottom: var(--sp-1);
+  padding: 0;
+}
+
+.settings-form__input {
+  max-width: 22rem;
+}
+
+.settings-form__status {
+  font-size: var(--fs-xs);
+  color: var(--c-fg-subtle);
+}
+
+.settings-form__notice {
+  margin: 0;
+  font-size: var(--fs-sm);
+  color: var(--c-ok);
+}
+
+.field__error {
+  font-size: var(--fs-xs);
+  color: var(--c-err);
+}
+
+.input[aria-invalid="true"],
+.settings-form__fieldset[aria-invalid="true"] {
+  border-color: var(--c-err);
+}
+
+.vault-keys {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-1);
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.vault-keys__item {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-3);
+  padding: var(--sp-2) var(--sp-3);
+  border: 1px solid var(--c-border);
+  border-radius: var(--radius);
+  background: var(--c-surface-raised);
+  font-size: var(--fs-sm);
+}
+
+.vault-keys__item .settings__note {
+  flex: 1;
+  margin: 0;
+}
+
 .kv {
   display: grid;
   grid-template-columns: 10rem minmax(0, 1fr);

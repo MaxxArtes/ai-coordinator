@@ -6,6 +6,7 @@ import { SettingsDialog } from "./SettingsDialog";
 import type { SettingsCategoryId } from "./categories";
 import type { UpdateCheckResult } from "./UpdatesSection";
 import type { RuntimeStatus } from "../shell/AppHeader";
+import { applyInterfaceSettings, type SettingsSnapshot } from "./api";
 
 vi.mock("@tauri-apps/api/event", () => ({ listen: vi.fn(async () => () => {}) }));
 
@@ -45,8 +46,33 @@ function makeCallTauri(handlers: Record<string, Handler>) {
   });
 }
 
+function snapshotWith(overrides: Partial<Record<string, any>> = {}): SettingsSnapshot {
+  const base: any = {
+    schema_version: 1,
+    stored_schema_version: null,
+    unsupported_categories: {},
+    categories: {
+      perfil: { values: { display_name: null }, saved_fields: [], validated: true, applied: false, application: "pending_ui" },
+      geral: { values: { open_last_project_on_start: true }, saved_fields: [], validated: true, applied: false, application: "pending_ui" },
+      aparencia: { values: { stimulation: "standard", density: "comfortable" }, saved_fields: [], validated: true, applied: false, application: "pending_ui" },
+      terminal: { values: { font_size: 13, cursor_blink: true, scrollback_lines: 1000 }, saved_fields: [], validated: true, applied: false, application: "pending_ui" },
+      coordinator: {
+        values: { flight_budget: { max_steps: 50, max_elapsed_seconds: 3600, max_uncheckpointed_steps: 10, max_worker_calls: 15 } },
+        saved_fields: [],
+        validated: true,
+        applied: false,
+        application: "unsupported",
+      },
+    },
+  };
+  for (const [cat, value] of Object.entries(overrides)) base.categories[cat] = { ...base.categories[cat], ...value };
+  return base as SettingsSnapshot;
+}
+
 function updaterHandlers(check: UpdateCheckResult): Record<string, Handler> {
   return {
+    settings_get: () => snapshotWith(),
+    vault_status: () => ({ available: false, backend: "unavailable" }),
     updater_get_channel_info: () => ({ current_version: "0.6.1-alpha.50", channel: "alpha" }),
     updater_check: () => check,
   };
@@ -112,7 +138,7 @@ describe("SettingsDialog — estrutura e navegação", () => {
 
   it("não apresenta como operacional nenhuma categoria ainda sem backend (D4)", async () => {
     const { user } = renderSettings(makeCallTauri(updaterHandlers(UP_TO_DATE)), { initialCategory: "perfil" });
-    for (const label of ORDER.slice(0, 8)) {
+    for (const label of ["Agentes", "Segurança"]) {
       await user.click(screen.getByRole("tab", { name: new RegExp(label) }));
       const panel = screen.getByRole("tabpanel", { name: new RegExp(label) });
       expect(within(panel).getByText("Ainda não configurável nesta versão experimental")).toBeInTheDocument();
@@ -125,8 +151,9 @@ describe("SettingsDialog — estrutura e navegação", () => {
   it("marca como não suportado o que exigiria mudar o Core ou um cofre inexistente (D8)", async () => {
     const { user } = renderSettings(makeCallTauri(updaterHandlers(UP_TO_DATE)), { initialCategory: "provedores" });
     const panel = screen.getByRole("tabpanel", { name: /Provedores/ });
-    expect(within(panel).getByText(/Desabilitado até existir cofre seguro do sistema/)).toBeInTheDocument();
-    expect(within(panel).getAllByText("Não suportado nesta versão").length).toBeGreaterThanOrEqual(2);
+    expect(await within(panel).findByText(/Armazenamento persistente de credenciais indisponível/)).toBeInTheDocument();
+    expect(within(panel).queryByRole("textbox")).not.toBeInTheDocument();
+    expect(panel.querySelector("input[type=password]")).toBeNull();
     await user.click(screen.getByRole("tab", { name: /Agentes/ }));
     expect(within(screen.getByRole("tabpanel", { name: /Agentes/ })).getByText("Gemini CLI")).toBeInTheDocument();
   });
@@ -218,5 +245,122 @@ describe("SettingsDialog — Sobre", () => {
     expect(await screen.findByText(/Runtime Core encerrado/)).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Reiniciar aplicativo" })).toBeEnabled();
     expect(screen.queryByText("O AI Coordinator Desktop está atualizado.")).not.toBeInTheDocument();
+  });
+});
+
+describe("SettingsDialog — configurações integradas (Etapa 4)", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    delete document.documentElement.dataset.stimulation;
+  });
+
+  it("carrega os valores reais e não declara aplicado o que só tem padrão", async () => {
+    renderSettings(makeCallTauri(updaterHandlers(UP_TO_DATE)), { initialCategory: "terminal" });
+    const panel = screen.getByRole("tabpanel", { name: /Terminal/ });
+    expect(await within(panel).findByDisplayValue("13")).toBeInTheDocument();
+    expect(within(panel).getByText("Padrão (não salvo)")).toBeInTheDocument();
+    expect(within(panel).getByText("Aplicação pendente")).toBeInTheDocument();
+    expect(within(panel).queryByText("Aplicado")).not.toBeInTheDocument();
+  });
+
+  it("salva Aparência e só declara aplicado o modo de baixa estimulação, que é aplicado de fato", async () => {
+    const saved = snapshotWith({
+      aparencia: { values: { stimulation: "low", density: "comfortable" }, saved_fields: ["density", "stimulation"] },
+    });
+    const callTauri = makeCallTauri({ ...updaterHandlers(UP_TO_DATE), settings_update: () => saved });
+    const root = document.createElement("div");
+    root.id = "root";
+    document.body.appendChild(root);
+    render(
+      <SettingsDialog
+        open
+        onClose={vi.fn()}
+        initialCategory="aparencia"
+        isTauri
+        runtimeStatus={RUNTIME}
+        connectionStatus="connected"
+        activePanesCount={0}
+        callTauri={callTauri}
+        onSettingsChanged={(s) => applyInterfaceSettings(s)}
+      />,
+      { container: root }
+    );
+    const user = userEvent.setup();
+    const panel = screen.getByRole("tabpanel", { name: /Aparência/ });
+    await user.click(await within(panel).findByRole("radio", { name: /Baixa estimulação/ }));
+    await user.click(within(panel).getByRole("button", { name: "Salvar" }));
+
+    expect(callTauri).toHaveBeenCalledWith("settings_update", {
+      schemaVersion: 1,
+      category: "aparencia",
+      values: { stimulation: "low", density: "comfortable" },
+    });
+    expect(await within(panel).findByText("Salvo")).toBeInTheDocument();
+    expect(within(panel).getByText("Validado no backend")).toBeInTheDocument();
+    expect(within(panel).getByText("Aplicação parcial")).toBeInTheDocument();
+    expect(within(panel).getByText(/Aplicado na interface: estimulação visual\. Demais campos: aplicação pendente\./)).toBeInTheDocument();
+    expect(document.documentElement.dataset.stimulation).toBe("low");
+  });
+
+  it("mostra o erro estruturado do backend no próprio campo e não marca nada como salvo", async () => {
+    const callTauri = makeCallTauri({
+      ...updaterHandlers(UP_TO_DATE),
+      settings_update: () => {
+        throw {
+          code: -32602,
+          message: "'terminal.font_size' deve estar entre 10 e 24.",
+          data: { field: "terminal.font_size", reason: "invalid_value" },
+        };
+      },
+    });
+    const { user } = renderSettings(callTauri, { initialCategory: "terminal" });
+    const panel = screen.getByRole("tabpanel", { name: /Terminal/ });
+    const input = await within(panel).findByLabelText("Tamanho da fonte");
+    await user.clear(input);
+    await user.type(input, "99");
+    await user.click(within(panel).getByRole("button", { name: "Salvar" }));
+
+    expect(await within(panel).findByText("'terminal.font_size' deve estar entre 10 e 24.")).toBeInTheDocument();
+    expect(input).toHaveAttribute("aria-invalid", "true");
+    expect(within(panel).getByText("Padrão (não salvo)")).toBeInTheDocument();
+  });
+
+  it("nunca apresenta o orçamento de missão como aplicado", async () => {
+    const saved = snapshotWith({ coordinator: { saved_fields: ["flight_budget"] } });
+    const callTauri = makeCallTauri({ ...updaterHandlers(UP_TO_DATE), settings_update: () => saved });
+    const { user } = renderSettings(callTauri, { initialCategory: "coordinator" });
+    const panel = screen.getByRole("tabpanel", { name: /Coordinator/ });
+    await within(panel).findByDisplayValue("50");
+    expect(within(panel).getByText("Não suportado nesta versão")).toBeInTheDocument();
+    await user.click(within(panel).getByRole("button", { name: "Salvar" }));
+    expect(await within(panel).findByText(/Não aplicado: o desktop ainda não executa missões/)).toBeInTheDocument();
+    expect(within(panel).queryByText("Aplicado")).not.toBeInTheDocument();
+  });
+
+  it("com cofre disponível grava a credencial sem jamais exibir o valor", async () => {
+    const keys: string[] = [];
+    const secret = "sk-test-0123456789-nao-exibir";
+    const callTauri = makeCallTauri({
+      ...updaterHandlers(UP_TO_DATE),
+      vault_status: () => ({ available: true, backend: "dpapi" }),
+      vault_list_keys: () => ({ keys: [...keys] }),
+      vault_set_secret: (args) => {
+        keys.push(args!.key);
+        return { stored: true, key: args!.key };
+      },
+    });
+    const { user } = renderSettings(callTauri, { initialCategory: "provedores" });
+    const panel = screen.getByRole("tabpanel", { name: /Provedores/ });
+    await user.type(await within(panel).findByLabelText(/Nome/), "OPENROUTER_API_KEY");
+    await user.type(within(panel).getByLabelText("Valor"), secret);
+    await user.click(within(panel).getByRole("button", { name: "Gravar no cofre" }));
+
+    expect(callTauri).toHaveBeenCalledWith("vault_set_secret", { key: "OPENROUTER_API_KEY", value: secret });
+    expect(await within(panel).findByText(/Credencial OPENROUTER_API_KEY gravada no cofre/)).toBeInTheDocument();
+    expect(within(panel).getByText("OPENROUTER_API_KEY")).toBeInTheDocument();
+    expect(within(panel).getByLabelText("Valor")).toHaveValue("");
+    expect(document.body.textContent).not.toContain(secret);
+    expect(screen.queryByDisplayValue(secret)).not.toBeInTheDocument();
+    expect(within(panel).getByText("Uso pelos provedores: não suportado nesta versão")).toBeInTheDocument();
   });
 });

@@ -4,6 +4,7 @@ import { TerminalPaneData } from "./components/TerminalPane";
 import { Terminal } from "xterm";
 import { SettingsDialog } from "./components/settings/SettingsDialog";
 import type { SettingsCategoryId } from "./components/settings/categories";
+import { applyInterfaceSettings, getSettings } from "./components/settings/api";
 import {
   AppHeader,
   type ConnectionStatus,
@@ -438,6 +439,16 @@ export const App: React.FC = () => {
     }
   }, [isTauri, connectionStatus, callTauri]);
 
+  // Saved interface preferences (e.g. low-stimulation mode) are applied as soon as the host answers.
+  useEffect(() => {
+    if (!isTauri) return;
+    getSettings(callTauri)
+      .then((snapshot) => applyInterfaceSettings(snapshot))
+      .catch(() => {
+        // Defaults stay in place; Configurações shows the load error when opened.
+      });
+  }, [isTauri, callTauri]);
+
   // Save session layout
   const handleSaveSessions = useCallback(
     async (tabId: string) => {
@@ -514,6 +525,7 @@ export const App: React.FC = () => {
         connectionStatus={connectionStatus}
         activePanesCount={panes.length}
         callTauri={callTauri}
+        onSettingsChanged={(snapshot) => applyInterfaceSettings(snapshot)}
       />
     </div>
   );

@@ -5,11 +5,14 @@
  * first/last; only the selected tab is in the Tab order. All panels stay mounted (inactive ones are hidden)
  * so an update in progress is never unmounted by switching categories.
  */
-import React, { useCallback, useRef, useState } from "react";
+import React, { useCallback, useEffect, useRef, useState } from "react";
 import { Dialog } from "../ui/Dialog";
 import type { ConnectionStatus, RuntimeStatus } from "../shell/AppHeader";
 import { AboutPanel } from "./AboutPanel";
 import { CategoryPanel } from "./CategoryPanel";
+import { SettingsForm } from "./SettingsForm";
+import { VaultPanel } from "./VaultPanel";
+import { getSettings, type BackedCategory, type SettingsSnapshot, type StructuredError } from "./api";
 import { SETTINGS_CATEGORIES, type SettingsCategoryId } from "./categories";
 
 export interface SettingsDialogProps {
@@ -21,6 +24,8 @@ export interface SettingsDialogProps {
   connectionStatus: ConnectionStatus;
   activePanesCount: number;
   callTauri: (cmd: string, args?: Record<string, any>) => Promise<any>;
+  /** Called with every settings snapshot loaded or saved, so the app applies interface-level preferences. */
+  onSettingsChanged?: (snapshot: SettingsSnapshot) => void;
 }
 
 export const SettingsDialog: React.FC<SettingsDialogProps> = ({ open, ...rest }) =>
@@ -34,7 +39,30 @@ const SettingsDialogContent: React.FC<Omit<SettingsDialogProps, "open">> = ({
   connectionStatus,
   activePanesCount,
   callTauri,
+  onSettingsChanged,
 }) => {
+  const [snapshot, setSnapshot] = useState<SettingsSnapshot | null>(null);
+  const [loadError, setLoadError] = useState<string | null>(null);
+  const onSettingsChangedRef = useRef(onSettingsChanged);
+  onSettingsChangedRef.current = onSettingsChanged;
+
+  const acceptSnapshot = useCallback((next: SettingsSnapshot) => {
+    setSnapshot(next);
+    setLoadError(null);
+    onSettingsChangedRef.current?.(next);
+  }, []);
+
+  useEffect(() => {
+    if (!isTauri) return;
+    let alive = true;
+    getSettings(callTauri)
+      .then((next) => alive && acceptSnapshot(next))
+      .catch((err: StructuredError) => alive && setLoadError(err.message));
+    return () => {
+      alive = false;
+    };
+  }, [isTauri, callTauri, acceptSnapshot]);
+
   const [active, setActive] = useState<SettingsCategoryId>(initialCategory);
   const [updatesLocked, setUpdatesLocked] = useState<boolean>(false);
   const tabRefs = useRef<Partial<Record<SettingsCategoryId, HTMLButtonElement | null>>>({});
@@ -121,6 +149,19 @@ const SettingsDialogContent: React.FC<Omit<SettingsDialogProps, "open">> = ({
                 onRequestClose={onClose}
                 onUpdatesLockChange={setUpdatesLocked}
               />
+            ) : category.backend === "settings" ? (
+              <SettingsForm
+                category={category.id as BackedCategory}
+                label={category.label}
+                summary={category.summary}
+                snapshot={snapshot}
+                loadError={loadError}
+                isTauri={isTauri}
+                callTauri={callTauri}
+                onSaved={acceptSnapshot}
+              />
+            ) : category.backend === "vault" ? (
+              <VaultPanel category={category} active={active === category.id} isTauri={isTauri} callTauri={callTauri} />
             ) : (
               <CategoryPanel category={category} />
             )}
