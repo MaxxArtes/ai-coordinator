@@ -458,7 +458,7 @@ nesta etapa; cada item depende de decisão e autorização próprias.
 | E2-6 | `profile.json` corrompido impede o aplicativo de iniciar; mudança de `schema_version` descarta as configurações sem migração; sem instância única | Média | Registrado |
 | E2-7 | O build de homologação tem a mesma versão do alpha publicado (`0.6.1-alpha.50`); a identificação é feita pelo SHA-256 do artefato | Média | Registrado |
 | E2-8 | Sete pontos de `tests/test_phase4d2_desktop_alpha_integration.py` usam o diretório de perfis real do usuário | Média | Registrado |
-| E2-9 | Fidelidade visual: acento azul (`#89b4fa`) em vez do ciano da referência 01; superfícies Catppuccin; marca `>_`, navegação Conversas/Monitoramento/Missões e indicadores circulares ainda não existem no aplicativo; ícone do aplicativo diferente da marca | Alta para a homologação visual | Registrado; depende de decisão do operador sobre etapa e escopo |
+| E2-9 | Fidelidade visual: acento azul (`#89b4fa`) em vez do ciano da referência 01; superfícies Catppuccin; marca `>_` dentro do aplicativo, navegação Conversas/Monitoramento/Missões e indicadores circulares ainda não existem | Alta para a homologação visual | Registrado; depende de decisão do operador sobre etapa e escopo. Ícone da janela, do executável e dos atalhos trocado em 13/11 pela logo enviada pelo operador (círculo com `>_`), com título "AI Coordinator Desktop" e barra de título escura |
 
 ### E.3 — Limites aceitos no painel de credenciais
 

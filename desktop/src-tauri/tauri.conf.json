@@ -13,7 +13,8 @@
     "windows": [
       {
         "label": "main",
-        "title": "AI Coordinator",
+        "title": "AI Coordinator Desktop",
+        "theme": "Dark",
         "width": 1280,
         "height": 800,
         "minWidth": 1024,
