@@ -1,6 +1,5 @@
 import React, { useState, useEffect, useCallback, useRef } from "react";
-import { Dialog } from "./ui/Dialog";
-import { Icon } from "./ui/Icon";
+import { Icon } from "../ui/Icon";
 
 export interface UpdateCheckResult {
   available: boolean;
@@ -16,17 +15,22 @@ export interface UpdateCheckResult {
   runtime_stopped?: boolean;
 }
 
-interface UpdateModalProps {
-  isOpen: boolean;
-  onClose: () => void;
+interface UpdatesSectionProps {
+  /** True while the section is visible (Configurações → Sobre); the first check runs when it becomes active. */
+  active: boolean;
+  /** "Adiar" closes the settings dialog. */
+  onRequestClose: () => void;
+  /** Reports when the dialog must not be dismissed (install running or runtime stopped). */
+  onLockChange?: (locked: boolean) => void;
   activePanesCount: number;
   isTauri: boolean;
   callTauri: (cmd: string, args?: Record<string, any>) => Promise<any>;
 }
 
-export const UpdateModal: React.FC<UpdateModalProps> = ({
-  isOpen,
-  onClose,
+export const UpdatesSection: React.FC<UpdatesSectionProps> = ({
+  active,
+  onRequestClose,
+  onLockChange,
   activePanesCount,
   isTauri,
   callTauri,
@@ -105,7 +109,7 @@ export const UpdateModal: React.FC<UpdateModalProps> = ({
 
   // Load channel info, trigger fresh authoritative check, and listen for download progress
   useEffect(() => {
-    if (!isOpen) {
+    if (!active) {
       invalidateAuthorization();
       setInstallError(null);
       return;
@@ -157,17 +161,17 @@ export const UpdateModal: React.FC<UpdateModalProps> = ({
     return () => {
       if (unlistenFn) unlistenFn();
     };
-  }, [isOpen, isTauri, callTauri]);
+  }, [active, isTauri, callTauri]);
 
   // Invalidate prior authorization and refresh authoritative count if visible panes change while modal is open
   useEffect(() => {
-    if (!isOpen || isUpdating || runtimeStopped) return;
+    if (!active || isUpdating || runtimeStopped) return;
     if (activePanesCount !== prevVisiblePanesRef.current) {
       prevVisiblePanesRef.current = activePanesCount;
       invalidateAuthorization();
       handleCheckUpdates();
     }
-  }, [activePanesCount, isOpen, isUpdating, runtimeStopped, invalidateAuthorization, handleCheckUpdates]);
+  }, [activePanesCount, active, isUpdating, runtimeStopped, invalidateAuthorization, handleCheckUpdates]);
 
   // Invalidate prior authorization if checkResult state or count changed
   useEffect(() => {
@@ -245,25 +249,18 @@ export const UpdateModal: React.FC<UpdateModalProps> = ({
     }
   }, [callTauri]);
 
-  if (!isOpen) return null;
-
-  // Closing is blocked while an install runs or after the runtime was stopped (restart is the only path).
-  const dismissible = !isUpdating && !runtimeStopped;
+  // The settings dialog cannot be dismissed while an install runs or after the runtime was stopped.
+  const locked = isUpdating || runtimeStopped;
+  useEffect(() => {
+    onLockChange?.(locked);
+  }, [locked, onLockChange]);
 
   return (
-    <Dialog
-      open
-      title="Atualizações do sistema"
-      onClose={onClose}
-      dismissible={dismissible}
-      closeLabel="Fechar atualizações"
-      footer={
-        <>
-          <span>Assinatura Minisign / Ed25519 ativa</span>
-          <span>Canal {channel.toUpperCase()}</span>
-        </>
-      }
-    >
+    <section className="stack" aria-labelledby="updates-section-title">
+      <h3 id="updates-section-title" className="settings__section-title">
+        Atualizações
+      </h3>
+
       {/* Metadata */}
       <dl className="meta-grid">
         <div>
@@ -348,12 +345,12 @@ export const UpdateModal: React.FC<UpdateModalProps> = ({
       {checkResult &&
         !runtimeStopped &&
         (checkResult.available ? (
-          <section className="update-card">
+          <div className="update-card">
             <div className="row-between">
-              <h3 className="update-card__title">
+              <h4 className="update-card__title">
                 <Icon name="update" size="sm" />
                 <span>Nova versão disponível: v{checkResult.latest_version}</span>
-              </h3>
+              </h4>
               {checkResult.date && (
                 <span className="update-card__date">{new Date(checkResult.date).toLocaleDateString()}</span>
               )}
@@ -417,7 +414,7 @@ export const UpdateModal: React.FC<UpdateModalProps> = ({
 
             {/* Install Action */}
             <div className="row-end">
-              <button type="button" onClick={onClose} disabled={isUpdating || runtimeStopped} className="btn">
+              <button type="button" onClick={onRequestClose} disabled={isUpdating || runtimeStopped} className="btn">
                 Adiar
               </button>
               <button
@@ -436,7 +433,7 @@ export const UpdateModal: React.FC<UpdateModalProps> = ({
                 {isUpdating ? "Atualizando…" : "Atualizar e reiniciar"}
               </button>
             </div>
-          </section>
+          </div>
         ) : (
           !checkResult.error && (
             <div className="callout callout--ok callout--center" role="status">
@@ -479,6 +476,11 @@ export const UpdateModal: React.FC<UpdateModalProps> = ({
           )}
         </div>
       )}
-    </Dialog>
+
+      <div className="updates-meta">
+        <span>Assinatura Minisign / Ed25519 verificada antes da instalação</span>
+        <span>Canal {channel.toUpperCase()}</span>
+      </div>
+    </section>
   );
 };

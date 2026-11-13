@@ -596,7 +596,8 @@ class TestDesktopUpdater(unittest.TestCase):
         import re
 
         main_rs = (_repo_root / "desktop" / "src-tauri" / "src" / "main.rs").read_text(encoding="utf-8")
-        modal = (_repo_root / "desktop" / "src" / "components" / "UpdateModal.tsx").read_text(encoding="utf-8")
+        # Updates moved to Configurações → Sobre (Marco 4D.3, Etapa 2); same logic, new container.
+        modal = (_repo_root / "desktop" / "src" / "components" / "settings" / "UpdatesSection.tsx").read_text(encoding="utf-8")
 
         start = main_rs.index("async fn updater_download_and_install(")
         end = main_rs.index("fn updater_restart_app(")
@@ -668,6 +669,33 @@ class TestDesktopUpdater(unittest.TestCase):
         self.assertIn("return;", branch)
         self.assertIn('callTauri("updater_restart_app")', modal)
         self.assertIn("disabled={isUpdating || runtimeStopped}", modal)
+
+    def test_18_about_reports_real_versions_not_hardcoded(self) -> None:
+        """Configurações → Sobre: the IPC status reports the bundled Core version and the running Python, and
+        the host reads them from the Core instead of hard-coding them (Marco 4D.3, Etapa 2)."""
+        import platform
+        import re
+        from unittest.mock import MagicMock
+
+        import ai_coordinator
+        from desktop.ipc.server import SecureIPCServer
+
+        ipc = SecureIPCServer(transport=MagicMock(), terminal_manager=MagicMock(), session_token="tok-about")
+        resp = ipc.handle_raw_payload(
+            json.dumps({"jsonrpc": "2.0", "id": "s", "method": "system.status", "params": {}, "session_token": "tok-about"})
+        )
+        self.assertIsNone(resp.error)
+        self.assertEqual(resp.result["version"], ai_coordinator.__version__)
+        self.assertEqual(resp.result["python_version"], platform.python_version())
+        self.assertEqual(resp.result["platform"], sys.platform)
+
+        main_rs = (_repo_root / "desktop" / "src-tauri" / "src" / "main.rs").read_text(encoding="utf-8")
+        status_fn = main_rs[main_rs.index("fn get_runtime_status(") : main_rs.index("fn get_process_tree_metrics(")]
+        self.assertNotRegex(status_fn, r'core_version:\s*"0\.6\.0"')
+        self.assertIn('bridge.call("system.status"', status_fn)
+        self.assertIn('env!("CARGO_PKG_VERSION")', status_fn)
+        self.assertIn('env!("CARGO_PKG_LICENSE")', status_fn)
+        self.assertIsNone(re.search(r'"version":\s*"0\.6\.0"', (_repo_root / "desktop" / "ipc" / "server.py").read_text(encoding="utf-8")))
 
 
 if __name__ == "__main__":

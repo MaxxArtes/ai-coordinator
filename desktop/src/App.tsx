@@ -2,7 +2,8 @@ import React, { useEffect, useRef, useState, useCallback } from "react";
 import { TerminalGrid } from "./components/TerminalGrid";
 import { TerminalPaneData } from "./components/TerminalPane";
 import { Terminal } from "xterm";
-import { UpdateModal } from "./components/UpdateModal";
+import { SettingsDialog } from "./components/settings/SettingsDialog";
+import type { SettingsCategoryId } from "./components/settings/categories";
 import {
   AppHeader,
   type ConnectionStatus,
@@ -28,10 +29,12 @@ export const App: React.FC = () => {
   const [panes, setPanes] = useState<TerminalPaneData[]>([]);
   const [notice, setNotice] = useState<string>("");
   const [noticeTone, setNoticeTone] = useState<NoticeTone>("error");
-  const [isUpdateModalOpen, setIsUpdateModalOpen] = useState<boolean>(false);
+  const [isSettingsOpen, setIsSettingsOpen] = useState<boolean>(false);
+  const [settingsCategory, setSettingsCategory] = useState<SettingsCategoryId>("perfil");
   const [hasUpdateAvailable, setHasUpdateAvailable] = useState<boolean>(false);
   const [latestAvailableVersion, setLatestAvailableVersion] = useState<string>("");
-  const [appVersion, setAppVersion] = useState<string>("0.6.1-alpha.50");
+  // Read from the host (get_runtime_status / updater_get_channel_info); empty until known.
+  const [appVersion, setAppVersion] = useState<string>("");
 
   const termsRef = useRef<Map<string, Terminal>>(new Map());
   const lastSeqRef = useRef<Map<string, number>>(new Map());
@@ -68,7 +71,7 @@ export const App: React.FC = () => {
         lastSeqRef.current.set(sessionId, 0);
       }
       // Header information for interactive session
-      term.writeln("\x1b[1;36m=== AI Coordinator Desktop — Alpha v0.6.0 ===\x1b[0m");
+      term.writeln("\x1b[1;36m=== AI Coordinator Desktop ===\x1b[0m");
       term.writeln(`\x1b[90mSessão conectada: ${sessionId.slice(0, 8)} | Terminal Interativo\x1b[0m\r\n`);
     } else {
       termsRef.current.delete(sessionId);
@@ -270,6 +273,7 @@ export const App: React.FC = () => {
 
           const st = await callTauri("get_runtime_status");
           if (mounted && st) setStatus(st);
+          if (mounted && st?.app_version) setAppVersion(st.app_version);
 
           // Query active profile and authorized projects
           const profInfo = await callTauri("profile_get_active");
@@ -464,7 +468,10 @@ export const App: React.FC = () => {
         metrics={metrics}
         hasUpdateAvailable={hasUpdateAvailable}
         latestAvailableVersion={latestAvailableVersion}
-        onOpenUpdates={() => setIsUpdateModalOpen(true)}
+        onOpenSettings={() => {
+          setSettingsCategory(hasUpdateAvailable ? "sobre" : "perfil");
+          setIsSettingsOpen(true);
+        }}
       />
 
       {notice && <NoticeBanner message={notice} tone={noticeTone} onDismiss={() => setNotice("")} />}
@@ -497,12 +504,15 @@ export const App: React.FC = () => {
         )}
       </main>
 
-      {/* Update Modal */}
-      <UpdateModal
-        isOpen={isUpdateModalOpen}
-        onClose={() => setIsUpdateModalOpen(false)}
-        activePanesCount={panes.length}
+      {/* Unified settings (updates live in Configurações → Sobre) */}
+      <SettingsDialog
+        open={isSettingsOpen}
+        onClose={() => setIsSettingsOpen(false)}
+        initialCategory={settingsCategory}
         isTauri={isTauri}
+        runtimeStatus={status}
+        connectionStatus={connectionStatus}
+        activePanesCount={panes.length}
         callTauri={callTauri}
       />
     </div>

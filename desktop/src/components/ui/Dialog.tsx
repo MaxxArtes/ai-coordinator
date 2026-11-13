@@ -23,7 +23,7 @@ const FOCUSABLE_SELECTOR = [
 
 export function getFocusableElements(root: HTMLElement): HTMLElement[] {
   return Array.from(root.querySelectorAll<HTMLElement>(FOCUSABLE_SELECTOR)).filter(
-    (el) => el.getAttribute("aria-hidden") !== "true" && !el.closest("[inert]")
+    (el) => el.getAttribute("aria-hidden") !== "true" && !el.closest("[inert]") && !el.closest("[hidden]")
   );
 }
 

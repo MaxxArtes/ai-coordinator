@@ -14,9 +14,20 @@ import abc
 import io
 import json
 import os
+import platform
 import sys
 from pathlib import Path
 from typing import Any, Callable, Dict, Optional, Set
+
+
+def _core_version() -> str:
+    """Version of the bundled Core package (ai_coordinator.__version__), or "unknown" if it cannot be read."""
+    try:
+        import ai_coordinator
+
+        return str(ai_coordinator.__version__)
+    except Exception:
+        return "unknown"
 
 # In isolated mode (-I), Python enables -P (safe path) which strips the script's directory.
 # Explicitly ensure the module, desktop, and repo/src paths are in sys.path.
@@ -312,7 +323,11 @@ class SecureIPCServer:
     def _handle_status(self, _params: Dict[str, Any]) -> Dict[str, Any]:
         return {
             "status": "ready",
-            "version": "0.6.0",
+            # Read from the bundled Core package and the running interpreter; never hard-coded.
+            "version": _core_version(),
+            "python_version": platform.python_version(),
+            "python_implementation": platform.python_implementation(),
+            "platform": sys.platform,
             "protocol_version": PROTOCOL_VERSION,
             "authenticated": True,
         }

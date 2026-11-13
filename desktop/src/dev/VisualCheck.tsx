@@ -11,21 +11,32 @@ import { AppHeader, type AppHeaderProps } from "../components/shell/AppHeader";
 import { AuthorizationScreen } from "../components/shell/AuthorizationScreen";
 import { NoticeBanner } from "../components/shell/NoticeBanner";
 import { StartupStatus } from "../components/shell/StartupStatus";
-import { UpdateModal, type UpdateCheckResult } from "../components/UpdateModal";
+import { SettingsDialog } from "../components/settings/SettingsDialog";
+import type { SettingsCategoryId } from "../components/settings/categories";
+import type { UpdateCheckResult } from "../components/settings/UpdatesSection";
 
 const params = new URLSearchParams(window.location.search);
 const view = params.get("view") ?? "app-preview";
 if (params.get("stimulation") === "low") document.documentElement.dataset.stimulation = "low";
 
 const HEADER: AppHeaderProps = {
-  status: { core_version: "0.6.0", host_os: "windows", is_isolated: true, python_path: "C:\\App\\runtime\\python\\python.exe" },
+  status: {
+    core_version: "0.6.0",
+    python_version: "3.12.8",
+    app_version: "0.6.1-alpha.50",
+    license: "PolyForm-Noncommercial-1.0.0",
+    host_os: "windows",
+    host_arch: "x86_64",
+    is_isolated: true,
+    python_path: "C:\\App\\runtime\\python\\python.exe",
+  },
   appVersion: "0.6.1-alpha.50",
   isTauri: true,
   connectionStatus: "connected",
   metrics: { host_pid: 4242, host_ram_bytes: 61_000_000, total_tree_ram_bytes: 128_000_000, cpu_usage_percent: 1.4 },
   hasUpdateAvailable: false,
   latestAvailableVersion: "",
-  onOpenUpdates: () => undefined,
+  onOpenSettings: () => undefined,
 };
 
 const CHECK_BASE: UpdateCheckResult = {
@@ -56,12 +67,25 @@ const Shell: React.FC<{ header?: Partial<AppHeaderProps>; children: React.ReactN
   </div>
 );
 
-const UpdateView: React.FC<{ check: UpdateCheckResult; panes?: number }> = ({ check, panes = 2 }) => (
+const SettingsView: React.FC<{ check: UpdateCheckResult; category?: SettingsCategoryId; panes?: number }> = ({
+  check,
+  category = "sobre",
+  panes = 2,
+}) => (
   <Shell header={{ hasUpdateAvailable: check.available, latestAvailableVersion: check.latest_version }}>
     <main className="app__main">
       <StartupStatus state="connecting" />
     </main>
-    <UpdateModal isOpen onClose={() => undefined} activePanesCount={panes} isTauri callTauri={fakeTauri(check)} />
+    <SettingsDialog
+      open
+      onClose={() => undefined}
+      initialCategory={category}
+      isTauri
+      runtimeStatus={HEADER.status}
+      connectionStatus="connected"
+      activePanesCount={panes}
+      callTauri={fakeTauri(check)}
+    />
   </Shell>
 );
 
@@ -96,12 +120,14 @@ const VIEWS: Record<string, () => React.ReactElement> = {
       </main>
     </Shell>
   ),
-  "update-available": () => <UpdateView check={CHECK_BASE} />,
+  "settings-perfil": () => <SettingsView check={CHECK_BASE} category="perfil" />,
+  "settings-provedores": () => <SettingsView check={CHECK_BASE} category="provedores" />,
+  "update-available": () => <SettingsView check={CHECK_BASE} />,
   "update-runtime-stopped": () => (
-    <UpdateView check={{ ...CHECK_BASE, available: false, runtime_stopped: true, sessions_known: false, sessions_error: "IPC child stdin is not available" }} />
+    <SettingsView check={{ ...CHECK_BASE, available: false, runtime_stopped: true, sessions_known: false, sessions_error: "IPC child stdin is not available" }} />
   ),
   "update-error": () => (
-    <UpdateView
+    <SettingsView
       check={{
         ...CHECK_BASE,
         available: false,

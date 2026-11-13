@@ -5,7 +5,11 @@ export type ConnectionStatus = "connecting" | "authorizing" | "connected" | "fai
 
 export interface RuntimeStatus {
   core_version: string;
+  python_version?: string | null;
+  app_version?: string;
+  license?: string;
   host_os: string;
+  host_arch?: string;
   is_isolated: boolean;
   python_path: string;
 }
@@ -25,7 +29,8 @@ export interface AppHeaderProps {
   metrics: RuntimeMetrics | null;
   hasUpdateAvailable: boolean;
   latestAvailableVersion: string;
-  onOpenUpdates: () => void;
+  /** Opens Configurações (at Sobre when an update is available). */
+  onOpenSettings: () => void;
 }
 
 export const formatBytes = (bytes: number): string => {
@@ -49,7 +54,7 @@ export const AppHeader: React.FC<AppHeaderProps> = ({
   metrics,
   hasUpdateAvailable,
   latestAvailableVersion,
-  onOpenUpdates,
+  onOpenSettings,
 }) => {
   const connection = CONNECTION_LABEL[connectionStatus];
   const pythonName = status?.python_path ? status.python_path.replace(/\\/g, "/").split("/").pop() : null;
@@ -58,8 +63,8 @@ export const AppHeader: React.FC<AppHeaderProps> = ({
     <header className="app-header">
       <div className="app-header__identity">
         <h1 className="app-header__title">AI Coordinator Desktop</h1>
-        <span className="badge">Core v{status?.core_version || "0.6.0"}</span>
-        <span className="badge badge--channel badge--mono">Alpha v{appVersion}</span>
+        <span className="badge">Core {status?.core_version ? `v${status.core_version}` : "…"}</span>
+        <span className="badge badge--channel badge--mono">Alpha{appVersion ? ` v${appVersion}` : ""}</span>
         {isTauri ? (
           <span className="badge badge--ok">Tauri 2 + WebView2 (nativo)</span>
         ) : (
@@ -106,12 +111,16 @@ export const AppHeader: React.FC<AppHeaderProps> = ({
 
         <button
           type="button"
-          onClick={onOpenUpdates}
+          onClick={onOpenSettings}
           className={hasUpdateAvailable ? "btn btn--sm btn--attention" : "btn btn--sm"}
-          title="Atualizações do AI Coordinator Desktop"
+          title={
+            hasUpdateAvailable
+              ? `Configurações — atualização v${latestAvailableVersion} disponível em Sobre`
+              : "Configurações do AI Coordinator Desktop"
+          }
         >
-          <Icon name={hasUpdateAvailable ? "update" : "refresh"} size="sm" />
-          <span>{hasUpdateAvailable ? `Atualização v${latestAvailableVersion}` : "Atualizações"}</span>
+          <Icon name={hasUpdateAvailable ? "update" : "settings"} size="sm" />
+          <span>{hasUpdateAvailable ? `Configurações · atualização v${latestAvailableVersion}` : "Configurações"}</span>
         </button>
       </div>
     </header>

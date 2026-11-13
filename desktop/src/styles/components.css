@@ -731,6 +731,153 @@
   color: var(--c-fg-subtle);
 }
 
+/* ---------- Settings dialog (Marco 4D.3.1) ---------- */
+.settings {
+  display: grid;
+  grid-template-columns: 12rem minmax(0, 1fr);
+  gap: var(--sp-5);
+  min-height: 26rem;
+}
+
+.settings__nav {
+  padding-right: var(--sp-4);
+  border-right: 1px solid var(--c-border);
+}
+
+.settings__tablist {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.settings__tab {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--sp-2);
+  width: 100%;
+  padding: var(--sp-2) var(--sp-3);
+  border: 1px solid transparent;
+  border-radius: var(--radius);
+  background: transparent;
+  color: var(--c-fg-muted);
+  font-size: var(--fs-sm);
+  text-align: left;
+  transition: background-color var(--motion-fast) ease, color var(--motion-fast) ease;
+}
+
+.settings__tab:hover {
+  background: var(--c-surface-raised);
+  color: var(--c-fg);
+}
+
+.settings__tab[aria-selected="true"] {
+  border-color: var(--c-border-strong);
+  background: var(--c-surface-overlay);
+  color: var(--c-fg);
+  font-weight: var(--fw-semibold);
+}
+
+.settings__tab-state {
+  font-size: var(--fs-xs);
+  font-weight: normal;
+  color: var(--c-fg-subtle);
+}
+
+.settings__panel {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-4);
+  min-width: 0;
+}
+
+.settings__panel-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--sp-3);
+}
+
+.settings__heading {
+  margin: 0;
+  font-size: var(--fs-lg);
+  font-weight: var(--fw-semibold);
+  color: var(--c-fg);
+}
+
+.settings__summary {
+  margin: 0;
+  font-size: var(--fs-sm);
+  color: var(--c-fg-muted);
+}
+
+.settings__section-title {
+  margin: 0 0 var(--sp-2);
+  font-size: var(--fs-sm);
+  font-weight: var(--fw-semibold);
+  color: var(--c-fg);
+}
+
+.settings__list {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-2);
+  margin: 0;
+  padding-left: var(--sp-5);
+  font-size: var(--fs-sm);
+  color: var(--c-fg-muted);
+}
+
+.settings__note {
+  display: block;
+  margin: var(--sp-1) 0 0;
+  font-size: var(--fs-xs);
+  color: var(--c-fg-subtle);
+}
+
+.badge--planned {
+  border-color: var(--c-border-strong);
+  background: transparent;
+  color: var(--c-fg-muted);
+}
+
+.badge--unsupported {
+  border-color: var(--c-warn-border);
+  background: var(--c-warn-bg);
+  color: var(--c-warn);
+}
+
+.kv {
+  display: grid;
+  grid-template-columns: 10rem minmax(0, 1fr);
+  gap: var(--sp-2) var(--sp-4);
+  margin: 0;
+  font-size: var(--fs-sm);
+}
+
+.kv dt {
+  color: var(--c-fg-subtle);
+}
+
+.kv dd {
+  margin: 0;
+  font-family: var(--font-mono);
+  color: var(--c-fg);
+  word-break: break-all;
+  user-select: text;
+}
+
+.updates-meta {
+  display: flex;
+  justify-content: space-between;
+  gap: var(--sp-3);
+  padding-top: var(--sp-2);
+  border-top: 1px solid var(--c-border);
+  font-family: var(--font-mono);
+  font-size: var(--fs-xs);
+  color: var(--c-fg-subtle);
+}
+
 /* ---------- Terminal area (layout metrics identical to the 4D.2 grid) ---------- */
 .terminal-grid {
   display: flex;

@@ -4,7 +4,7 @@ import React from "react";
  * Decorative line icons (replace the emoji glyphs previously used as icons).
  * Always aria-hidden: the meaning must also be present as text next to the icon.
  */
-export type IconName = "refresh" | "update" | "shield" | "alert" | "stop" | "close" | "check" | "info";
+export type IconName = "refresh" | "update" | "shield" | "alert" | "stop" | "close" | "check" | "info" | "settings";
 
 const PATHS: Record<IconName, React.ReactNode> = {
   refresh: (
@@ -43,6 +43,12 @@ const PATHS: Record<IconName, React.ReactNode> = {
     <>
       <circle cx="8" cy="8" r="5.5" />
       <path d="M8 7.25v3.5M8 5.25v.01" />
+    </>
+  ),
+  settings: (
+    <>
+      <circle cx="8" cy="8" r="2.25" />
+      <path d="M8 1.75v1.75M8 12.5v1.75M1.75 8H3.5M12.5 8h1.75M3.58 3.58l1.24 1.24M11.18 11.18l1.24 1.24M3.58 12.42l1.24-1.24M11.18 4.82l1.24-1.24" />
     </>
   ),
 };

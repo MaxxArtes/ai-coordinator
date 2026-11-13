@@ -70,22 +70,22 @@ describe("AppHeader", () => {
     latestAvailableVersion: "",
   };
 
-  it("abre as atualizações pelo botão do cabeçalho", async () => {
+  it("abre as Configurações pelo botão do cabeçalho", async () => {
     const user = userEvent.setup();
-    const onOpenUpdates = vi.fn();
-    render(<AppHeader {...base} onOpenUpdates={onOpenUpdates} />);
-    await user.click(screen.getByRole("button", { name: "Atualizações" }));
-    expect(onOpenUpdates).toHaveBeenCalledTimes(1);
+    const onOpenSettings = vi.fn();
+    render(<AppHeader {...base} onOpenSettings={onOpenSettings} />);
+    await user.click(screen.getByRole("button", { name: "Configurações" }));
+    expect(onOpenSettings).toHaveBeenCalledTimes(1);
     expect(screen.getByText(/Python: python\.exe \(isolado\)/)).toBeInTheDocument();
   });
 
-  it("indica atualização disponível no rótulo do botão", () => {
-    render(<AppHeader {...base} hasUpdateAvailable latestAvailableVersion="0.6.1-alpha.51" onOpenUpdates={vi.fn()} />);
-    expect(screen.getByRole("button", { name: "Atualização v0.6.1-alpha.51" })).toBeInTheDocument();
+  it("indica atualização disponível no rótulo do botão de Configurações", () => {
+    render(<AppHeader {...base} hasUpdateAvailable latestAvailableVersion="0.6.1-alpha.51" onOpenSettings={vi.fn()} />);
+    expect(screen.getByRole("button", { name: "Configurações · atualização v0.6.1-alpha.51" })).toBeInTheDocument();
   });
 
   it("sinaliza o modo de visualização sem host Tauri", () => {
-    render(<AppHeader {...base} isTauri={false} onOpenUpdates={vi.fn()} />);
+    render(<AppHeader {...base} isTauri={false} onOpenSettings={vi.fn()} />);
     expect(screen.getByText("Vite Preview (não homologado)")).toBeInTheDocument();
   });
 });

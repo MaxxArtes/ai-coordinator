@@ -58,6 +58,11 @@ samp {
   box-shadow: var(--focus-ring);
 }
 
+/* The hidden attribute always wins over component display rules (e.g. inactive settings panels). */
+[hidden] {
+  display: none !important;
+}
+
 /* Visually hidden but available to assistive technology. */
 .sr-only {
   position: absolute;

@@ -25,7 +25,11 @@ const CREATE_NO_WINDOW: u32 = 0x08000000;
 #[derive(Serialize, Deserialize, Clone)]
 pub struct RuntimeStatus {
     pub core_version: String,
+    pub python_version: Option<String>,
+    pub app_version: String,
+    pub license: String,
     pub host_os: String,
+    pub host_arch: String,
     pub is_isolated: bool,
     pub python_path: String,
 }
@@ -444,9 +448,23 @@ fn ping() -> &'static str {
 #[tauri::command]
 fn get_runtime_status(bridge: State<Arc<IpcBridge>>) -> RuntimeStatus {
     let is_isolated = !bridge.resolved_python.starts_with("UNAVAILABLE");
+    // Core and Python versions are reported by the running Core (system.status), never hard-coded;
+    // app version and license come from this build's Cargo metadata.
+    let core_status = bridge.call("system.status", json!({})).ok();
+    let core_field = |key: &str| -> Option<String> {
+        core_status
+            .as_ref()
+            .and_then(|v| v.get(key))
+            .and_then(|v| v.as_str())
+            .map(String::from)
+    };
     RuntimeStatus {
-        core_version: "0.6.0".into(),
+        core_version: core_field("version").unwrap_or_else(|| "indisponível".into()),
+        python_version: core_field("python_version"),
+        app_version: env!("CARGO_PKG_VERSION").into(),
+        license: env!("CARGO_PKG_LICENSE").into(),
         host_os: std::env::consts::OS.into(),
+        host_arch: std::env::consts::ARCH.into(),
         is_isolated,
         python_path: bridge.resolved_python.clone(),
     }
