@@ -10,7 +10,12 @@ backups/
 !.env.example
 *.log
 .keys/
-auth/
+# Coordinator state directory at the repository root only. Unanchored, this rule also hid new
+# source files under desktop/auth/ (the desktop authorization package).
+/auth/
+# Credential vaults and profile secrets must never be versioned, wherever they appear.
+vault.enc
+*.vault
 *.key
 *.secret
 *privkey*
