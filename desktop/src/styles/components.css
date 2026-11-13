@@ -173,8 +173,14 @@
   background: var(--c-surface-hover);
 }
 
-.btn:disabled {
+.btn:disabled,
+.btn[aria-disabled="true"] {
   opacity: 0.5;
+}
+
+/* Busy but still focusable (a real `disabled` would drop the keyboard focus to the document). */
+.btn[aria-disabled="true"] {
+  pointer-events: none;
 }
 
 .btn--primary {
@@ -198,6 +204,12 @@
   border-color: var(--c-err);
   background: var(--c-err);
   filter: brightness(1.08);
+}
+
+/* Destructive answer of an inline question while a pointer click cannot answer it yet (keyboard can). */
+.btn--arming {
+  opacity: 0.5;
+  cursor: default;
 }
 
 .btn--ghost {
@@ -335,6 +347,12 @@
   font-weight: var(--fw-semibold);
 }
 
+/* Long unbreakable names (credential keys) wrap inside the callout instead of overflowing it. */
+.callout__title > span {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
 .callout__body {
   margin: 0;
   font-size: var(--fs-xs);
@@ -453,6 +471,22 @@
 
 .input:focus-visible {
   border-color: var(--c-focus);
+}
+
+.input:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+/* Locked while an operation runs: read-only keeps the keyboard focus, which `disabled` would drop. */
+.input[readonly] {
+  opacity: 0.7;
+  cursor: default;
+}
+
+/* The engine's own "reveal password" control would put a credential on screen in clear text. */
+.input[type="password"]::-ms-reveal {
+  display: none;
 }
 
 .input::placeholder {
@@ -893,6 +927,17 @@
   margin: 0;
   font-size: var(--fs-sm);
   color: var(--c-ok);
+  overflow-wrap: anywhere;
+}
+
+/* Work in progress, or an outcome that changed nothing in the vault: not a success. */
+.settings-form__notice--neutral {
+  color: var(--c-fg-subtle);
+}
+
+/* The live region stays mounted while empty; it must not add a row gap to the panel then. */
+.settings-form__notice:empty {
+  margin-top: calc(-1 * var(--sp-4));
 }
 
 .field__error {
@@ -916,6 +961,7 @@
 
 .vault-keys__item {
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
   gap: var(--sp-3);
   padding: var(--sp-2) var(--sp-3);
@@ -925,9 +971,30 @@
   font-size: var(--fs-sm);
 }
 
+.vault-keys__item .text-mono {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+/* Wraps to its own line as a whole next to a long name, instead of being squeezed into a narrow column. */
 .vault-keys__item .settings__note {
-  flex: 1;
+  flex: 1 1 12rem;
   margin: 0;
+}
+
+/* Stays at the end of its line when a long name pushes it to a second one. */
+.vault-keys__item > .btn {
+  margin-left: auto;
+}
+
+/* The removal question takes its own line under the credential it is about. */
+.vault-keys__item > .callout {
+  flex: 1 0 100%;
+}
+
+/* A failed removal is reported between the heading and the list. */
+.vault-keys__failure {
+  margin-bottom: var(--sp-2);
 }
 
 .kv {

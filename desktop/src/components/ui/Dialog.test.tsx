@@ -83,6 +83,29 @@ describe("Dialog", () => {
     expect(onClose).toHaveBeenCalledTimes(2);
   });
 
+  it("não fecha pelo segundo clique de um clique duplo que cai no fundo", async () => {
+    const onClose = vi.fn();
+    await openDialog({ onClose });
+    const backdrop = screen.getByTestId("dialog-backdrop");
+    fireEvent.mouseDown(backdrop, { detail: 2 });
+    fireEvent.mouseDown(backdrop, { detail: 3 });
+    expect(onClose).not.toHaveBeenCalled();
+    expect(screen.getByRole("dialog")).toBeInTheDocument();
+    fireEvent.mouseDown(backdrop, { detail: 1 });
+    expect(onClose).toHaveBeenCalledTimes(1);
+  });
+
+  it("não fecha pela repetição de um Esc mantido pressionado", async () => {
+    const onClose = vi.fn();
+    await openDialog({ onClose });
+    const inside = screen.getByRole("button", { name: "Primeiro" });
+    fireEvent.keyDown(inside, { key: "Escape", repeat: true });
+    expect(onClose).not.toHaveBeenCalled();
+    expect(screen.getByRole("dialog")).toBeInTheDocument();
+    fireEvent.keyDown(inside, { key: "Escape" });
+    expect(onClose).toHaveBeenCalledTimes(1);
+  });
+
   it("não fecha por Esc, fundo ou botão quando não dispensável", async () => {
     const onClose = vi.fn();
     const user = await openDialog({ onClose, dismissible: false });

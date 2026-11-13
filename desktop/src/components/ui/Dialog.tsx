@@ -95,7 +95,9 @@ const DialogSurface: React.FC<Omit<DialogProps, "open">> = ({
       if (event.key === "Escape") {
         event.preventDefault();
         event.stopPropagation();
-        requestClose();
+        // Only the press itself: a key held down repeats, and the repeats of an Escape that has just answered
+        // something inside the dialog (an inline question) must not go on to close the dialog.
+        if (!event.repeat) requestClose();
         return;
       }
       if (event.key !== "Tab" || !dialogRef.current) return;
@@ -122,7 +124,10 @@ const DialogSurface: React.FC<Omit<DialogProps, "open">> = ({
 
   const handleBackdropMouseDown = useCallback(
     (event: React.MouseEvent<HTMLDivElement>) => {
-      if (event.target === event.currentTarget) requestClose();
+      // Only the first press of a pointer gesture. When what was under the pointer has just gone away (an
+      // inline question that closed, the dialog getting shorter), the second click of a double click lands
+      // on the backdrop and must not close everything.
+      if (event.target === event.currentTarget && event.detail <= 1) requestClose();
     },
     [requestClose]
   );
