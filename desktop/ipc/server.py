@@ -17,7 +17,39 @@ import os
 import platform
 import sys
 from pathlib import Path
-from typing import Any, Callable, Dict, Optional, Set
+from typing import Any, Callable, Dict, List, Optional, Set
+
+
+class InvalidParamsError(ValueError):
+    """Invalid request parameters; reported as JSON-RPC INVALID_PARAMS with a structured `data` payload."""
+
+    def __init__(self, message: str, *, field: str, reason: str) -> None:
+        super().__init__(message)
+        self.field = field
+        self.reason = reason
+
+    def to_data(self) -> Dict[str, str]:
+        return {"field": self.field, "reason": self.reason}
+
+
+def validate_command_argv(value: Any) -> Optional[List[str]]:
+    """Contract of terminal.create_session `command`: None (default shell) or a non-empty argv list.
+
+    Strings are rejected instead of being split: list2cmdline would turn each character into an argument,
+    and shell-style splitting would reintroduce quoting ambiguity. Arguments must be non-empty text without NUL.
+    """
+    if value is None:
+        return None
+    if not isinstance(value, list) or not value:
+        raise InvalidParamsError(
+            "'command' deve ser uma lista não vazia de argumentos (argv), não um texto.", field="command", reason="type"
+        )
+    for arg in value:
+        if not isinstance(arg, str) or not arg or "\x00" in arg:
+            raise InvalidParamsError(
+                "'command' aceita apenas argumentos de texto não vazios e sem caractere nulo.", field="command", reason="item"
+            )
+    return list(value)
 
 
 def _core_version() -> str:
@@ -219,7 +251,7 @@ class SecureIPCServer:
             tab_id=params["tab_id"],
             pane_id=params["pane_id"],
             kind=kind,
-            command=params.get("command"),
+            command=validate_command_argv(params.get("command")),
             cwd=params.get("cwd"),
             cols=params.get("cols", 80),
             rows=params.get("rows", 24),
@@ -395,6 +427,11 @@ class SecureIPCServer:
             else:
                 res = handler(req.params)
             return RPCResponse(id=req.id, result=res)
+        except InvalidParamsError as e:
+            return RPCResponse(
+                id=req.id,
+                error={"code": RPCErrorCode.INVALID_PARAMS.value, "message": str(e), "data": e.to_data()},
+            )
         except Exception as e:
             self.transport.log_diagnostic(f"Handler error in {req.method}: {e}")
             return RPCResponse(

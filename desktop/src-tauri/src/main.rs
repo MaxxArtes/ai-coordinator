@@ -563,7 +563,8 @@ fn terminal_create_session(
     tab_id: String,
     pane_id: u32,
     kind: String,
-    command: Option<String>,
+    // argv list (program + arguments); a plain string is rejected by deserialization and by the Core IPC.
+    command: Option<Vec<String>>,
     cwd: Option<String>,
     cols: Option<u16>,
     rows: Option<u16>,
