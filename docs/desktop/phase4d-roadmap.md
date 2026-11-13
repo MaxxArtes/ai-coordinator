@@ -432,3 +432,37 @@ Prevalecem sobre os mockups: abas principais Conversas, Monitoramento e Missões
 dentro de Monitoramento); Configurações pela engrenagem, incluindo Sobre → Atualizações; indicadores por terminal com
 proveniência real, estimada ou indisponível, sem percentuais inventados. Fidelidade visual só é declarada com captura
 nativa (Tauri/WebView2) e validação humana.
+
+## Apêndice E — Pendências registradas na Etapa 4 da 4D.3 (13/11/2026)
+
+Registro separado, pedido pelo operador ao autorizar o commit da confirmação no cofre. Nada aqui foi implementado
+nesta etapa; cada item depende de decisão e autorização próprias.
+
+### E.1 — Substituição atômica de credenciais no backend
+
+| Aspecto | Situação |
+|---|---|
+| Hoje | Configurações → Provedores confere a lista de nomes do cofre e, se o nome existe, pergunta antes de substituir. Conferir e gravar são duas chamadas: `vault.set_secret` grava sem condição, e cada operação lê, altera e regrava o `vault.enc` inteiro sem trava entre processos |
+| Risco | Outro escritor entre a conferência e a gravação (outra janela do aplicativo, a versão portátil ao lado da instalada, a CLI) é sobrescrito sem pergunta, ou tem a própria gravação perdida |
+| Proposta | `vault.set_secret` com modo explícito (`if_absent` ou `overwrite`); com `if_absent` e nome existente, erro estruturado com `reason: "exists"`; resposta com `replaced: true/false`; trava de arquivo entre processos em volta de ler-alterar-gravar. O painel passaria a gravar com `if_absent` e só enviaria `overwrite` depois da confirmação |
+
+### E.2 — Achados da preparação das conferências nativas, fora do escopo da Etapa 4
+
+| ID | Achado | Severidade | Situação |
+|---|---|---|---|
+| E2-1 | O servidor IPC lê o stdin com a codificação padrão do Windows (cp1252), e o host Rust escreve UTF-8. Caracteres como Á, Í, aspas curvas e vários emojis derrubam o Core (terminais incluídos); outros acentos chegam trocados ao cofre e às configurações, com resposta de sucesso. Anterior à 4D.3 | Alta | Registrado; correção pede autorização |
+| E2-2 | O build Windows não copiava `desktop/settings` para o pacote, então Perfil, Geral, Aparência, Terminal e Coordinator falhariam no aplicativo instalado (o artefato da Etapa 3, `4a8eaa4`, também não tinha a pasta) | Alta | Corrigido nesta etapa: uma linha no workflow e um teste que exige copiar todo pacote `desktop.*` importado pelo servidor |
+| E2-3 | Cofre ilegível ou falha da DPAPI aparece como cofre disponível, com erro não estruturado (em inglês, sem `field`/`reason`) e sem ação de recuperação na interface | Média | Registrado |
+| E2-4 | Valor formado só por espaços é aceito; valores não são aparados | Baixa | Registrado |
+| E2-5 | Baixa estimulação: a primeira pintura sai no modo padrão até o Core responder; falha de `settings_get` na abertura é silenciosa; a frase "Aplicado na interface" é fixa; o tema do terminal (xterm) não muda | Média | Registrado; critério de aceite a definir com o operador |
+| E2-6 | `profile.json` corrompido impede o aplicativo de iniciar; mudança de `schema_version` descarta as configurações sem migração; sem instância única | Média | Registrado |
+| E2-7 | O build de homologação tem a mesma versão do alpha publicado (`0.6.1-alpha.50`); a identificação é feita pelo SHA-256 do artefato | Média | Registrado |
+| E2-8 | Sete pontos de `tests/test_phase4d2_desktop_alpha_integration.py` usam o diretório de perfis real do usuário | Média | Registrado |
+| E2-9 | Fidelidade visual: acento azul (`#89b4fa`) em vez do ciano da referência 01; superfícies Catppuccin; marca `>_`, navegação Conversas/Monitoramento/Missões e indicadores circulares ainda não existem no aplicativo; ícone do aplicativo diferente da marca | Alta para a homologação visual | Registrado; depende de decisão do operador sobre etapa e escopo |
+
+### E.3 — Limites aceitos no painel de credenciais
+
+- Uma gravação já enviada ao cofre conclui mesmo que Configurações seja fechada; o resultado não é exibido depois.
+- "Cancelar" mantém nome e valor digitados, para corrigir o nome sem redigitar a credencial; ambos são descartados
+  ao sair do painel, ao fechar Configurações e depois de uma gravação bem-sucedida.
+- O clique de ponteiro no botão destrutivo só responde depois de 600 ms (indicado visualmente); teclado sem atraso.
