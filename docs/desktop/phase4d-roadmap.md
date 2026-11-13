@@ -416,3 +416,19 @@ Sobre sem alterar as garantias de assinatura, autorização, congelamento e recu
 antecipar a telemetria da 4D.4; sem modificar `src/` nem a arquitetura do Core; homologação operacional da 4D.2
 mantida pendente; nenhuma tag, release ou versão estável. Execução incremental, com evidências de cada etapa antes de
 ampliar o escopo.
+
+## Apêndice D — Referências visuais aprovadas da 4D.3 (13/11/2026)
+
+Pacote entregue pelo operador e versionado sem alterações gráficas em `docs/desktop/design-references/4d3/`
+(origem: `AI-Coordinator-referencias-visuais-4D3.zip`).
+
+| Arquivo | Papel | SHA-256 (prefixo) |
+|---|---|---|
+| `01-layout-principal-aprovado.png` | Referência principal: estrutura compacta, quatro terminais 2×2, barras finas, rodapés técnicos e marca em ciano com o símbolo `>_` (conceito visual aprovado) | `2DDCC4D040B0DDEC` |
+| `02-indicadores-e-tooltip.png` | Referência complementar: legibilidade dos três indicadores circulares (contexto, 5 h, semanal), tooltip de contexto e estados de atividade | `2FEF176C66ECFCE8` |
+| `REFERENCIAS-E-CRITERIOS.md` | Hierarquia, decisões que prevalecem sobre os mockups e critérios de comparação visual | — |
+
+Prevalecem sobre os mockups: abas principais Conversas, Monitoramento e Missões (sem Workspace; Analytics/Cotas
+dentro de Monitoramento); Configurações pela engrenagem, incluindo Sobre → Atualizações; indicadores por terminal com
+proveniência real, estimada ou indisponível, sem percentuais inventados. Fidelidade visual só é declarada com captura
+nativa (Tauri/WebView2) e validação humana.
