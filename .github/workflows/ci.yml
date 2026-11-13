@@ -46,6 +46,21 @@ jobs:
       - name: Build Python distributions
         run: python -m build --outdir dist
 
+  desktop-frontend:
+    name: Desktop frontend (types, build, tests)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22.22.2"
+      - name: Install, type-check, build and test the desktop frontend
+        working-directory: desktop
+        run: |
+          npm ci
+          npm run build
+          npm test
+
   opencode-package:
     name: Verify OpenCode V2 package
     runs-on: ubuntu-latest
