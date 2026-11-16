@@ -22,6 +22,59 @@ use std::os::windows::process::CommandExt;
 #[cfg(windows)]
 const CREATE_NO_WINDOW: u32 = 0x08000000;
 
+// Title bar color of the "main" window: #071017, measured on the title bar of the operator's
+// reference screenshot (the logo blue #001c44 is the alternative left unused).
+// COLORREF layout is 0x00BBGGRR, so #071017 becomes 0x00171007.
+#[cfg(windows)]
+const MAIN_WINDOW_CAPTION_COLOR: u32 = 0x00171007;
+
+// DWMWA_CAPTION_COLOR from dwmapi.h. Honoured from Windows 11 build 22000 on; Windows 10 answers
+// E_INVALIDARG, which is ignored (the window keeps the default dark caption from "theme": "Dark").
+#[cfg(windows)]
+const DWMWA_CAPTION_COLOR: u32 = 35;
+
+#[cfg(windows)]
+#[allow(non_snake_case)]
+#[link(name = "dwmapi")]
+extern "system" {
+    // The HWND goes as a pointer-sized integer: same ABI as the `void*` handle, and the cast below
+    // compiles whether tauri's `windows::Win32::Foundation::HWND` wraps `*mut c_void` (current
+    // `windows` releases) or `isize` (older ones).
+    fn DwmSetWindowAttribute(
+        hwnd: isize,
+        dw_attribute: u32,
+        pv_attribute: *const std::ffi::c_void,
+        cb_attribute: u32,
+    ) -> i32;
+}
+
+/// Paints the title bar of the "main" window with MAIN_WINDOW_CAPTION_COLOR.
+/// Best effort: a missing window, a missing handle or a failing HRESULT keeps the default caption
+/// and never panics nor aborts startup.
+#[cfg(windows)]
+fn apply_main_window_caption_color<R: tauri::Runtime>(app: &tauri::App<R>) {
+    use tauri::Manager;
+
+    let Some(window) = app.get_webview_window("main") else {
+        return;
+    };
+    let Ok(hwnd) = window.hwnd() else {
+        return;
+    };
+    let color: u32 = MAIN_WINDOW_CAPTION_COLOR;
+    // SAFETY: `hwnd` is the live handle of a window owned by this process (created before the
+    // setup hook runs); `pv_attribute` points to a COLORREF on the stack that outlives the call and
+    // `cb_attribute` is exactly its size. The call does not retain the pointer.
+    let _hresult = unsafe {
+        DwmSetWindowAttribute(
+            hwnd.0 as isize,
+            DWMWA_CAPTION_COLOR,
+            &color as *const u32 as *const std::ffi::c_void,
+            std::mem::size_of::<u32>() as u32,
+        )
+    };
+}
+
 #[derive(Serialize, Deserialize, Clone)]
 pub struct RuntimeStatus {
     pub core_version: String,
@@ -1120,6 +1173,12 @@ fn main() {
         .manage(bridge)
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
+        .setup(|_app| {
+            // Windows only: color the "main" title bar; failures are ignored inside the helper.
+            #[cfg(windows)]
+            apply_main_window_caption_color(_app);
+            Ok(())
+        })
         .on_window_event(move |_window, event| {
             if let tauri::WindowEvent::Destroyed = event {
                 bridge_window.shutdown();
