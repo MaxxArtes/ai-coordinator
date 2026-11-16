@@ -39,6 +39,10 @@ class IPCClientProcess:
             stderr=subprocess.PIPE,
             env=env,
             text=True,
+            # The wire is UTF-8 like the Tauri host's (E2-1), not the locale code page. "replace" only matters for
+            # stderr, which under -I still uses the locale code page for diagnostics.
+            encoding="utf-8",
+            errors="replace",
             bufsize=1,  # Line buffered
         )
 

@@ -2,7 +2,7 @@
 
 Features:
 - Enforces session token authentication (mere knowledge of PID or owner_id does NOT authorize).
-- NDJSON over stdin/stdout; diagnostic logs strictly to stderr.
+- NDJSON over stdin/stdout, UTF-8 in both directions whatever the locale code page; diagnostic logs strictly to stderr.
 - Payloads capped at MAX_PAYLOAD_BYTES (1 MB).
 - Fault-tolerant transport detecting BrokenPipe and disconnects without crashing.
 - Preserves Core v0.6.0 MetricProvenance contract while providing Desktop DataOrigin metadata.
@@ -17,7 +17,7 @@ import os
 import platform
 import sys
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Set
+from typing import Any, Callable, Dict, List, Optional, Set, Union
 
 
 VAULT_UNAVAILABLE_CODE = -32004  # RPCErrorCode.VAULT_UNAVAILABLE
@@ -121,9 +121,27 @@ except (ImportError, ValueError):
     )
 
 
+class UndecodableLine:
+    """A request line whose bytes are not valid UTF-8 (E2-1).
+
+    Keeps only its size: the content is never kept, logged or echoed, because the line may carry the value of
+    vault.set_secret. The server answers it with a structured PARSE_ERROR and keeps serving.
+    """
+
+    __slots__ = ("size_bytes",)
+
+    def __init__(self, size_bytes: int) -> None:
+        self.size_bytes = size_bytes
+
+
+def _is_binary_stream(stream: Any) -> bool:
+    return isinstance(stream, (io.RawIOBase, io.BufferedIOBase))
+
+
 class BaseTransport(abc.ABC):
     @abc.abstractmethod
-    def read_message(self) -> Optional[str]:
+    def read_message(self) -> Union[str, UndecodableLine, None]:
+        """Next request line (stripped), an UndecodableLine, or None at end of input."""
         pass
 
     @abc.abstractmethod
@@ -136,17 +154,24 @@ class BaseTransport(abc.ABC):
 
 
 class StreamTransport(BaseTransport):
-    """NDJSON stream transport over standard handles or in-memory streams."""
+    """NDJSON stream transport over standard handles or in-memory streams.
+
+    The wire is UTF-8 in both directions (the Tauri host writes and reads Rust Strings). The process's own stdin and
+    stdout are therefore used through their binary buffers and decoded/encoded here: the host starts Python with -I,
+    which ignores PYTHONIOENCODING/PYTHONUTF8, and on Windows piped text handles use the locale code page (cp1252),
+    which garbled accents and crashed the server on characters such as "Á" (E2-1). Injected streams may be text
+    (used as given) or binary (UTF-8).
+    """
 
     def __init__(
         self,
-        reader: Optional[io.TextIOBase] = None,
-        writer: Optional[io.TextIOBase] = None,
+        reader: Optional[Union[io.TextIOBase, io.BufferedIOBase]] = None,
+        writer: Optional[Union[io.TextIOBase, io.BufferedIOBase]] = None,
         diag: Optional[io.TextIOBase] = None,
         log_file: Optional[Path] = None,
     ) -> None:
-        self.reader = reader or sys.stdin
-        self.writer = writer or sys.stdout
+        self.reader = reader if reader is not None else getattr(sys.stdin, "buffer", sys.stdin)
+        self.writer = writer if writer is not None else getattr(sys.stdout, "buffer", sys.stdout)
         self.diag = diag or sys.stderr
         self._log_file_handle: Optional[io.TextIOBase] = None
 
@@ -158,21 +183,35 @@ class StreamTransport(BaseTransport):
             except Exception:
                 self._log_file_handle = None
 
-    def read_message(self) -> Optional[str]:
+    def read_message(self) -> Union[str, UndecodableLine, None]:
         try:
             line = self.reader.readline()
-            if not line:
-                return None
-            return line.strip()
         except (BrokenPipeError, ConnectionResetError):
             return None
         except Exception as e:
-            self.log_diagnostic(f"[IPC_READ_ERROR] {e}")
+            # Exception type only: a decoding error message may quote bytes of the received line.
+            self.log_diagnostic(f"[IPC_READ_ERROR] {type(e).__name__}")
             return None
+        if not line:
+            return None
+        if isinstance(line, (bytes, bytearray)):
+            try:
+                line = bytes(line).decode("utf-8")
+            except UnicodeDecodeError:
+                # A bad line is answered and skipped, never treated as end of input.
+                size = len(line.strip())
+                self.log_diagnostic(f"[IPC_READ_ERROR] Request line is not valid UTF-8 ({size} bytes; content not logged)")
+                return UndecodableLine(size)
+        return line.strip()
 
     def write_message(self, message: str) -> bool:
         try:
-            self.writer.write(message.strip() + "\n")
+            line = message.strip() + "\n"
+            if _is_binary_stream(self.writer):
+                # "\n" only (no text-mode "\r\n"); always valid UTF-8 for the host, even for an unpaired surrogate.
+                self.writer.write(line.encode("utf-8", errors="replace"))
+            else:
+                self.writer.write(line)
             self.writer.flush()
             return True
         except (BrokenPipeError, ConnectionResetError):
@@ -450,12 +489,20 @@ class SecureIPCServer:
     def register(self, method_name: str, handler: Callable[[Dict[str, Any]], Any]) -> None:
         self.handlers[method_name] = handler
 
-    def handle_raw_payload(self, raw_line: str) -> Optional[RPCResponse]:
-        if not raw_line.strip():
-            return None
+    def handle_raw_payload(self, raw_line: Union[str, UndecodableLine]) -> Optional[RPCResponse]:
+        if isinstance(raw_line, UndecodableLine):
+            size, valid_utf8 = raw_line.size_bytes, False
+        else:
+            if not raw_line.strip():
+                return None
+            try:
+                size, valid_utf8 = len(raw_line.encode("utf-8")), True
+            except UnicodeEncodeError:
+                # Unpaired surrogates: text decoded with surrogateescape from bytes that are not UTF-8.
+                size, valid_utf8 = len(raw_line.encode("utf-8", errors="surrogatepass")), False
 
-        # 1. Payload size check
-        if len(raw_line.encode("utf-8")) > MAX_PAYLOAD_BYTES:
+        # 1. Payload size check (UTF-8 bytes of the stripped line, checked before anything else)
+        if size > MAX_PAYLOAD_BYTES:
             self.transport.log_diagnostic(f"Payload exceeded {MAX_PAYLOAD_BYTES} bytes")
             return RPCResponse(
                 id=None,
@@ -465,7 +512,18 @@ class SecureIPCServer:
                 },
             )
 
-        # 2. JSON syntax check
+        # 2. Encoding check: the wire is UTF-8; the content of a bad line is never echoed back
+        if not valid_utf8:
+            return RPCResponse(
+                id=None,
+                error={
+                    "code": RPCErrorCode.PARSE_ERROR.value,
+                    "message": "Parse error: request line is not valid UTF-8",
+                    "data": {"field": "request", "reason": "invalid_utf8"},
+                },
+            )
+
+        # 3. JSON syntax check
         try:
             data = json.loads(raw_line)
         except json.JSONDecodeError as err:
@@ -482,7 +540,7 @@ class SecureIPCServer:
 
         req = RPCRequest.from_dict(data)
 
-        # 3. Authentication check for non-public methods
+        # 4. Authentication check for non-public methods
         if req.method not in self.PUBLIC_METHODS:
             if not req.session_token or req.session_token != self.session_token:
                 self.transport.log_diagnostic(f"Unauthorized call to {req.method}")
@@ -494,7 +552,7 @@ class SecureIPCServer:
                     },
                 )
 
-        # 4. Method dispatch
+        # 5. Method dispatch
         if req.method not in self.handlers:
             return RPCResponse(
                 id=req.id,
