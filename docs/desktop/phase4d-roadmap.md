@@ -450,7 +450,7 @@ nesta etapa; cada item depende de decisão e autorização próprias.
 
 | ID | Achado | Severidade | Situação |
 |---|---|---|---|
-| E2-1 | O servidor IPC lê o stdin com a codificação padrão do Windows (cp1252), e o host Rust escreve UTF-8. Caracteres como Á, Í, aspas curvas e vários emojis derrubam o Core (terminais incluídos); outros acentos chegam trocados ao cofre e às configurações, com resposta de sucesso. Anterior à 4D.3 | Alta | Registrado; correção pede autorização |
+| E2-1 | O servidor IPC lê o stdin com a codificação padrão do Windows (cp1252), e o host Rust escreve UTF-8. Caracteres como Á, Í, aspas curvas e vários emojis derrubam o Core (terminais incluídos); outros acentos chegam trocados ao cofre e às configurações, com resposta de sucesso. Anterior à 4D.3 | Alta | Corrigido em 16/11 (autorizado pelo operador): o servidor lê e escreve os handles reais em binário, sempre em UTF-8; linha com bytes inválidos recebe erro estruturado (-32700, `reason: "invalid_utf8"`) sem derrubar o servidor e sem registrar o conteúdo; resposta termina em `\n`. O cliente de verificação (`desktop/ipc/client.py`) também passou a usar UTF-8. Teste `tests/test_phase4d3_ipc_utf8.py` (falha no código anterior, passa no novo). Valores gravados com acento trocado antes da correção não são convertidos |
 | E2-2 | O build Windows não copiava `desktop/settings` para o pacote, então Perfil, Geral, Aparência, Terminal e Coordinator falhariam no aplicativo instalado (o artefato da Etapa 3, `4a8eaa4`, também não tinha a pasta) | Alta | Corrigido nesta etapa: uma linha no workflow e um teste que exige copiar todo pacote `desktop.*` importado pelo servidor |
 | E2-3 | Cofre ilegível ou falha da DPAPI aparece como cofre disponível, com erro não estruturado (em inglês, sem `field`/`reason`) e sem ação de recuperação na interface | Média | Registrado |
 | E2-4 | Valor formado só por espaços é aceito; valores não são aparados | Baixa | Registrado |
@@ -458,7 +458,10 @@ nesta etapa; cada item depende de decisão e autorização próprias.
 | E2-6 | `profile.json` corrompido impede o aplicativo de iniciar; mudança de `schema_version` descarta as configurações sem migração; sem instância única | Média | Registrado |
 | E2-7 | O build de homologação tem a mesma versão do alpha publicado (`0.6.1-alpha.50`); a identificação é feita pelo SHA-256 do artefato | Média | Registrado |
 | E2-8 | Sete pontos de `tests/test_phase4d2_desktop_alpha_integration.py` usam o diretório de perfis real do usuário | Média | Registrado |
-| E2-9 | Fidelidade visual: acento azul (`#89b4fa`) em vez do ciano da referência 01; superfícies Catppuccin; marca `>_` dentro do aplicativo, navegação Conversas/Monitoramento/Missões e indicadores circulares ainda não existem | Alta para a homologação visual | Registrado; depende de decisão do operador sobre etapa e escopo. Ícone da janela, do executável e dos atalhos trocado em 13/11 pela logo enviada pelo operador (círculo com `>_`), com título "AI Coordinator Desktop" e barra de título escura |
+| E2-9 | Fidelidade visual: acento azul (`#89b4fa`) em vez do ciano da referência 01; superfícies Catppuccin; marca `>_` dentro do aplicativo, navegação Conversas/Monitoramento/Missões e indicadores circulares ainda não existem | Alta para a homologação visual | Registrado; depende de decisão do operador sobre etapa e escopo. Ícone da janela, do executável e dos atalhos trocado em 13/11 pela logo enviada pelo operador (círculo com `>_`), com título "AI Coordinator Desktop" e barra de título escura. Em 16/11: barra de título da janela principal em `#071017` (cor da barra no print de referência do operador; Windows 11) e a logo também no instalador e no desinstalador. Plano das Etapas 5 e 6 (fidelidade visual) entregue ao operador em 16/11 para aprovação, fora do repositório |
+| E2-10 | Com `-I`, o stderr do servidor IPC continua na codificação local; linhas de diagnóstico com acento chegam ao host como UTF-8 inválido e são descartadas pela leitura do stderr | Baixa | Registrado em 16/11 (revisão da correção do E2-1) |
+| E2-11 | Duas linhas ainda derrubam o servidor IPC (e o Core e os terminais junto): JSON muito aninhado dentro de 1 MB (`RecursionError`) e `method` que não é texto (`TypeError`). O host não envia nenhuma das duas | Média | Registrado em 16/11 (revisão da correção do E2-1) |
+| E2-12 | Um surrogate isolado escrito como escape JSON (`\ud800`) é aceito e gravado; a leitura seguinte devolve um valor que o host rejeita. O host não consegue enviar esse escape | Baixa | Registrado em 16/11 (revisão da correção do E2-1) |
 
 ### E.3 — Limites aceitos no painel de credenciais
 
@@ -466,3 +469,26 @@ nesta etapa; cada item depende de decisão e autorização próprias.
 - "Cancelar" mantém nome e valor digitados, para corrigir o nome sem redigitar a credencial; ambos são descartados
   ao sair do painel, ao fechar Configurações e depois de uma gravação bem-sucedida.
 - O clique de ponteiro no botão destrutivo só responde depois de 600 ms (indicado visualmente); teclado sem atraso.
+
+## Apêndice F — Proposta visual para depois da homologação: sinapses interativas (16/11/2026)
+
+Registro autorizado pelo operador em 16/11/2026. É só uma proposta: não faz parte da 4D.3, nada foi implementado e a
+avaliação acontece depois da homologação nativa. Origem: ideia do operador (13/11) inspirada na interatividade do site
+pitaIA, aproveitando a linguagem visual e o comportamento, sem copiar a tecnologia. A animação do site não foi
+inspecionada, então não se sabe se ele usa WebGL, Three.js ou shaders.
+
+| Aspecto | Proposta |
+|---|---|
+| Resposta ao cursor | Pontos luminosos atraídos ou deslocados suavemente pelo mouse; conexões mudam de curvatura e pequenos pulsos atravessam a rede; movimento lento, com inércia, para não parecer animação repetitiva |
+| Profundidade | Parte das sinapses em primeiro plano e parte desfocada ao fundo (paralaxe discreta). Ciano para conexões estabelecidas, dourado para conexões novas, violeta durante reorganizações |
+| Estado real | Animações só para eventos verificados: pulso entre o Coordinator e o agente ao iniciar uma missão; mudança de estado da conexão ao concluir uma delegação. Nunca simular decisões ou aprendizados inexistentes |
+| Tecnologia | CSS e SVG para ícones, transições e brilhos; Canvas 2D para as sinapses e a interação com o cursor; WebGL/Three.js só se um protótipo mostrar ganho visual claro, pelo custo de memória e GPU no WebView2 |
+| Onde aplicar | Abertura: a rede em tela cheia, recuando para o fundo da interface. Conversas: animação mínima, para não atrapalhar a leitura dos terminais. Missões: uso funcional, mostrando relações e comunicações reais entre Coordinators, agentes e tarefas |
+| Salvaguardas | Pausar com a janela oculta; respeitar a preferência do sistema por movimento reduzido e o modo de baixa estimulação; opção para desligar os efeitos |
+
+Dependências e limites:
+
+- O uso em Missões depende da 4D.5, e os eventos reais dependem da telemetria da 4D.4.
+- A avaliação pode usar uma gravação curta da interação no site, se o operador enviar.
+- A implementação exige decisão própria do operador (etapa, escopo e critério de aceite), como qualquer item deste
+  roadmap.
