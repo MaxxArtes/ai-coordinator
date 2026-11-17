@@ -15,7 +15,12 @@
  * - Size: no fit and no PTY resize while the box has no area (a hidden view, a minimized window); the PTY is told
  *   only when the columns or rows really change.
  * - Keyboard: one Tab stop per terminal; F6/Shift+F6 leave the terminal (every other key goes to the shell); the pane
- *   has a focus region in its header ("Terminal N de M"), the F6 entry, from which Enter or Space enters the terminal.
+ *   has a focus region in its header, the F6 entry, from which Enter, Space or a click enters the terminal.
+ *
+ * Marco 4D.3, Etapa 6:
+ * - Stable identity: the name uses a number that never repeats in the tab ("05 · Terminal"), not the position.
+ * - Header and footer with real data only: program (executable name, never the arguments), live state, folder, PID.
+ *   Whatever is not known is said to be unknown.
  */
 
 import React, { useEffect, useId, useRef } from "react";
@@ -24,20 +29,34 @@ import { FitAddon } from "xterm-addon-fit";
 import { Icon } from "./ui/Icon";
 import { terminalKeyFilter } from "./shell/shortcuts";
 import { applyXtermAppearance, readXtermAppearance, watchXtermTheme } from "../styles/xtermTheme";
+import { formatTerminalNumber } from "./terminalIdentity";
+import { paneStateText, type PaneState } from "./useTerminalStates";
 
 export interface TerminalPaneData {
   sessionId: string;
   tabId: string;
+  /** Slot of the pane in the tab (0-3), as reported by the host. */
   paneId: number;
   kind: "human_terminal" | "governed_agent";
   title?: string;
+  /** Number that never repeats while the tab exists: the terminal's name. */
+  number: number;
+  /** Executable name only (never the arguments). */
+  program?: string;
+  cwd?: string;
+  pid?: number | null;
+  createdAt?: string;
+  /** What terminal_create_session reported, until the first state query answers. */
+  startedAlive?: boolean;
 }
 
 export interface TerminalPaneProps extends TerminalPaneData {
-  /** 1-based position of the pane in the tab ("Terminal N de M"). */
+  /** 1-based position of the pane in the tab. */
   position: number;
   /** Number of panes in the tab. */
   total: number;
+  /** Live state; unknown when not given. */
+  state?: PaneState;
   onWrite: (sessionId: string, data: string) => void;
   onResize: (sessionId: string, cols: number, rows: number) => void;
   onClose?: (sessionId: string) => void;
@@ -47,14 +66,25 @@ export interface TerminalPaneProps extends TerminalPaneData {
 /** A box under 1 px (hidden view, minimized window): FitAddon would shrink the terminal to 2×1. */
 export const hasArea = (width: number, height: number): boolean => width >= 1 && height >= 1;
 
+const KIND_LABEL: Record<TerminalPaneData["kind"], { short: string; long: string }> = {
+  human_terminal: { short: "Terminal", long: "Terminal humano" },
+  governed_agent: { short: "Agente", long: "Agente governado" },
+};
+
+/** Last folder of a path, for the footer (the full path goes in the title). */
+const folderOf = (path: string): string => path.split(/[\\/]+/).filter(Boolean).pop() ?? path;
+
 export const TerminalPane: React.FC<TerminalPaneProps> = ({
   sessionId,
-  tabId,
   paneId,
   kind,
-  title,
+  number,
+  program,
+  cwd,
+  pid,
   position,
   total,
+  state = { kind: "unknown" },
   onWrite,
   onResize,
   onClose,
@@ -152,8 +182,12 @@ export const TerminalPane: React.FC<TerminalPaneProps> = ({
     };
   }, [sessionId]);
 
-  // xterm announces its input as "Terminal input": the name now says which terminal it is and how to leave it.
-  const terminalName = `Terminal ${position} de ${total}. F6 sai do terminal`;
+  const label = KIND_LABEL[kind];
+  const name = `${label.short} ${formatTerminalNumber(number)}`;
+  const where = `${name}, ${position} de ${total}`;
+
+  // xterm announces its input as "Terminal input": the name says which terminal it is and how to leave it.
+  const terminalName = `${where}. F6 sai do terminal`;
   useEffect(() => {
     terminalRef.current?.textarea?.setAttribute("aria-label", terminalName);
   }, [sessionId, terminalName]);
@@ -174,31 +208,39 @@ export const TerminalPane: React.FC<TerminalPaneProps> = ({
     enterTerminal();
   };
 
-  const badgeClass = kind === "human_terminal" ? "badge badge--human" : "badge badge--agent";
-  const badgeLabel = kind === "human_terminal" ? "Terminal humano" : "Agente governado";
+  const stateText = paneStateText(state);
+  const slot = Math.min(Math.max(paneId, 0), 3) + 1;
 
   return (
     <div
-      className="terminal-pane"
+      className={`terminal-pane terminal-pane--slot-${slot} terminal-pane--${state.kind}`}
       role="region"
-      aria-label={`Terminal ${title || `Painel ${paneId + 1}`}`}
+      aria-label={name}
       data-f6-region="pane"
+      data-session-id={sessionId}
     >
-      {/* Header Bar */}
+      {/* Header: identity, program and live state */}
       <div className="terminal-pane__header">
         <div
           className="terminal-pane__heading terminal-pane__focus-region"
           role="group"
-          aria-label={`Terminal ${position} de ${total}`}
+          aria-label={where}
           aria-describedby={hintId}
           tabIndex={-1}
           data-f6-entry=""
           onKeyDown={handleEntryKeyDown}
           onClick={enterTerminal}
         >
-          <span className={badgeClass}>{badgeLabel}</span>
+          <span className="terminal-pane__glyph" aria-hidden="true">
+            &gt;_
+          </span>
           <span className="terminal-pane__title">
-            {title || `Painel ${paneId + 1}`} (Sessão: {sessionId.slice(0, 8)})
+            {formatTerminalNumber(number)} · {label.short}
+          </span>
+          {program && <span className="terminal-pane__program">{program}</span>}
+          <span className={`terminal-pane__state terminal-pane__state--${state.kind}`}>
+            <span className="terminal-pane__state-dot" aria-hidden="true" />
+            {state.kind === "alive" ? <span className="sr-only">{stateText}</span> : <span>{stateText}</span>}
           </span>
         </div>
         <span id={hintId} className="sr-only">
@@ -209,8 +251,8 @@ export const TerminalPane: React.FC<TerminalPaneProps> = ({
             type="button"
             onClick={() => onClose(sessionId)}
             className="btn btn--ghost btn--ghost-danger btn--icon btn--sm"
-            title="Fechar terminal"
-            aria-label="Fechar terminal"
+            title={`Fechar ${name}`}
+            aria-label={`Fechar ${name}`}
           >
             <Icon name="close" size="sm" />
           </button>
@@ -219,6 +261,27 @@ export const TerminalPane: React.FC<TerminalPaneProps> = ({
 
       {/* xterm.js DOM Mount Point (no Tab stop of its own: the terminal input is the stop) */}
       <div ref={containerRef} className="terminal-pane__mount" />
+
+      {/* Technical footer: only what the host reported */}
+      <div className="terminal-pane__footer">
+        <span className="terminal-pane__footer-start">
+          {state.kind === "preview" ? (
+            <span>Preview: sem processo</span>
+          ) : (
+            <>
+              <span className="terminal-pane__footer-program">{program ?? "programa desconhecido"}</span>
+              <span>Local</span>
+              {cwd && (
+                <span className="terminal-pane__footer-folder" title={cwd}>
+                  {folderOf(cwd)}
+                </span>
+              )}
+              <span>{pid ? `PID ${pid}` : "PID indisponível"}</span>
+            </>
+          )}
+        </span>
+        <span className="terminal-pane__footer-end">{label.long}</span>
+      </div>
     </div>
   );
 };

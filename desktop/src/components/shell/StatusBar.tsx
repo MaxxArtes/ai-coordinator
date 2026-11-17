@@ -14,6 +14,8 @@ export interface StatusBarProps {
   connectionStatus: ConnectionStatus;
   coreVersion?: string | null;
   paneCount: number;
+  /** "(3 ativos)" from the live states of the terminals; omitted when unknown to the caller. */
+  activeText?: string | null;
   metrics: RuntimeMetrics | null;
   /** The last metrics reading failed: the previous value is no longer a measurement. */
   metricsUnavailable?: boolean;
@@ -81,6 +83,7 @@ export const StatusBar: React.FC<StatusBarProps> = ({
   connectionStatus,
   coreVersion,
   paneCount,
+  activeText,
   metrics,
   metricsUnavailable = false,
   projectPath,
@@ -92,7 +95,10 @@ export const StatusBar: React.FC<StatusBarProps> = ({
     <footer className="status-bar" aria-label="Barra de status">
       <div className="status-bar__group">
         <span className="status-bar__item">{coreStatusText(isTauri, connectionStatus, coreVersion)}</span>
-        <Item label="Terminais:" value={`${paneCount} de ${MAX_TERMINALS}${preview ? " (preview)" : ""}`} />
+        <Item
+          label="Terminais:"
+          value={`${paneCount} de ${MAX_TERMINALS}${preview ? " (preview)" : activeText ? ` ${activeText}` : ""}`}
+        />
         <Item label="RAM da árvore:" value={treeRamText(isTauri, connectionStatus, metrics, metricsUnavailable)} />
         <Item label="CPU:" value="indisponível" />
       </div>

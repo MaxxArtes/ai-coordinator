@@ -42,6 +42,10 @@ function pairs(): Pair[] {
     }
   }
   out.push(["--c-ok", "--c-pill-ok-bg", 4.5]);
+  // Pane colors: text in the pane footer and the >_ mark in the pane header.
+  for (const fg of ["--c-pane-1", "--c-pane-2", "--c-pane-3", "--c-pane-4"]) {
+    for (const bg of ["--c-surface-raised", "--c-surface-overlay"]) out.push([fg, bg, 4.5]);
+  }
   out.push(["--c-term-fg", "--c-term-bg", 4.5], ["--c-term-fg", "--c-term-selection", 4.5]);
   for (const fg of ANSI_TEXT) out.push([fg, "--c-term-bg", 4.5]);
   for (const fg of ["--c-border-control", "--c-focus"]) {

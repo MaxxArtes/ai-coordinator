@@ -86,16 +86,6 @@
   color: var(--c-channel);
 }
 
-.badge--human {
-  border-color: var(--c-accent);
-  color: var(--c-accent);
-}
-
-.badge--agent {
-  border-color: var(--c-agent);
-  color: var(--c-agent);
-}
-
 /* ---------- Buttons ---------- */
 .btn {
   display: inline-flex;
@@ -1023,6 +1013,7 @@
   height: 100%;
   width: 100%;
   overflow: hidden;
+  container-type: inline-size;
   border: 1px solid var(--c-border);
   border-radius: var(--radius);
   background: var(--c-surface);
@@ -1038,7 +1029,9 @@
   display: flex;
   align-items: center;
   justify-content: space-between;
-  padding: var(--sp-1) var(--sp-3);
+  gap: var(--sp-2);
+  min-height: var(--h-pane-header);
+  padding: 2px var(--sp-2) 2px var(--sp-3);
   border-bottom: 1px solid var(--c-border);
   background: var(--c-surface-raised);
   font-size: var(--fs-xs);
@@ -1057,7 +1050,123 @@
   text-overflow: ellipsis;
   white-space: nowrap;
   font-family: var(--font-mono);
+  font-size: var(--fs-sm);
+  font-weight: var(--fw-semibold);
+  color: var(--c-fg);
+}
+
+/* ---------- Pane identity, state and footer (Etapa 6) ---------- */
+.terminal-pane__glyph {
+  flex: none;
+  font-family: var(--font-mono);
+  font-size: var(--fs-sm);
+  font-weight: var(--fw-semibold);
+}
+
+.terminal-pane--slot-1 .terminal-pane__glyph,
+.terminal-pane--slot-1 .terminal-pane__footer-program {
+  color: var(--c-pane-1);
+}
+
+.terminal-pane--slot-2 .terminal-pane__glyph,
+.terminal-pane--slot-2 .terminal-pane__footer-program {
+  color: var(--c-pane-2);
+}
+
+.terminal-pane--slot-3 .terminal-pane__glyph,
+.terminal-pane--slot-3 .terminal-pane__footer-program {
+  color: var(--c-pane-3);
+}
+
+.terminal-pane--slot-4 .terminal-pane__glyph,
+.terminal-pane--slot-4 .terminal-pane__footer-program {
+  color: var(--c-pane-4);
+}
+
+.terminal-pane__program {
+  flex: none;
+  padding: 0 6px;
+  border: 1px solid var(--c-border-strong);
+  border-radius: var(--radius-sm);
+  font-family: var(--font-mono);
+  font-size: var(--fs-xs);
+  line-height: 16px;
   color: var(--c-fg-muted);
+  white-space: nowrap;
+}
+
+.terminal-pane__state {
+  display: inline-flex;
+  flex: none;
+  align-items: center;
+  gap: var(--sp-1);
+  font-size: var(--fs-xs);
+  white-space: nowrap;
+  color: var(--c-fg-subtle);
+}
+
+/* A border, not a background: it stays visible when Windows forces the colors. */
+.terminal-pane__state-dot {
+  width: 8px;
+  height: 8px;
+  border: 4px solid currentColor;
+  border-radius: 50%;
+}
+
+.terminal-pane__state--alive {
+  color: var(--c-ok);
+}
+
+.terminal-pane__state--ended {
+  color: var(--c-warn);
+}
+
+/* Unknown or simulated: a hollow dot, never the green of a live process. */
+.terminal-pane__state--unknown .terminal-pane__state-dot,
+.terminal-pane__state--preview .terminal-pane__state-dot {
+  border-width: 1px;
+}
+
+.terminal-pane__footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--sp-3);
+  min-height: var(--h-pane-footer);
+  padding: 0 var(--sp-3);
+  border-top: 1px solid var(--c-border);
+  background: var(--c-surface-overlay);
+  font-family: var(--font-mono);
+  font-size: var(--fs-xs);
+  line-height: var(--lh-tight);
+  color: var(--c-fg-muted);
+  white-space: nowrap;
+  overflow: hidden;
+}
+
+.terminal-pane__footer-start {
+  display: flex;
+  gap: var(--sp-3);
+  min-width: 0;
+  overflow: hidden;
+}
+
+.terminal-pane__footer-folder {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.terminal-pane__footer-end {
+  flex: none;
+  color: var(--c-fg-subtle);
+}
+
+/* Narrow pane (2×2 at 1024 px): the program badge goes first; the footer still names it. */
+@container (max-width: 520px) {
+  .terminal-pane__program {
+    display: none;
+  }
 }
 
 .terminal-pane__mount {

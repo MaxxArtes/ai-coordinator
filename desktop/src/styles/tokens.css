@@ -48,6 +48,12 @@
   --c-pill-ok-bg: #04261f;
   --c-pill-ok-border: #07342b;
 
+  /* One color per pane slot (identity at a glance; the name and number say it too) */
+  --c-pane-1: #22d3ee;
+  --c-pane-2: #c084fc;
+  --c-pane-3: #fbbf24;
+  --c-pane-4: #60a5fa;
+
   /* Status */
   --c-ok: #34d399;
   --c-warn: #fbbf24;
@@ -131,6 +137,8 @@
   --gap-pane: 6px;
   --accent-line: 2px;
   --term-pad: 4px;
+  --h-pane-header: 28px;
+  --h-pane-footer: 20px;
   --brand-w: 22px;
   --brand-h: 18px;
   --radius-brand: 4px;
@@ -170,6 +178,11 @@
   --c-brand-border: #22343b;
   --c-pill-ok-bg: #16241f;
   --c-pill-ok-border: #1f3029;
+  /* A single accent on every pane: no color coding in low stimulation */
+  --c-pane-1: #8cc4cf;
+  --c-pane-2: #8cc4cf;
+  --c-pane-3: #8cc4cf;
+  --c-pane-4: #8cc4cf;
   --c-ok: #9ccbb4;
   --c-warn: #d9c48f;
   --c-err: #d79a9a;

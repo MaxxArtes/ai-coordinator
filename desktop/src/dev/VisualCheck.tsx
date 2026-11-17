@@ -20,6 +20,7 @@ import { MainViews } from "../components/shell/PlannedView";
 import { StatusBar } from "../components/shell/StatusBar";
 import { TerminalGrid } from "../components/TerminalGrid";
 import type { TerminalPaneData } from "../components/TerminalPane";
+import type { PaneState } from "../components/useTerminalStates";
 import { AuthorizationScreen } from "../components/shell/AuthorizationScreen";
 import { NoticeBanner } from "../components/shell/NoticeBanner";
 import { StartupStatus } from "../components/shell/StartupStatus";
@@ -182,8 +183,19 @@ const FOUR_PANES: TerminalPaneData[] = [0, 1, 2, 3].map((i) => ({
   tabId: "tab-main",
   paneId: i,
   kind: "human_terminal",
-  title: `Terminal Interativo ${i + 1}`,
+  number: [1, 2, 5, 6][i],
+  program: "cmd.exe",
+  cwd: PROJECT,
+  pid: 4100 + i,
 }));
+
+/** Fixture states, one of each kind, so every header variant can be compared. */
+const FIXTURE_STATES: Record<string, PaneState> = {
+  "fixture-1": { kind: "alive" },
+  "fixture-2": { kind: "alive" },
+  "fixture-3": { kind: "ended", exitCode: 0 },
+  "fixture-4": { kind: "unknown" },
+};
 
 const noop = () => undefined;
 
@@ -193,6 +205,7 @@ const ConversasView: React.FC<{ view: MainViewId }> = ({ view: initial }) => (
       tabId="tab-main"
       projectPath={PROJECT}
       panes={FOUR_PANES}
+      states={FIXTURE_STATES}
       onAddPane={noop}
       onSaveSessions={noop}
       onWrite={noop}

@@ -15,11 +15,14 @@ import React from "react";
 import { Terminal } from "xterm";
 import { TerminalPane, TerminalPaneData } from "./TerminalPane";
 import { Icon } from "./ui/Icon";
+import type { PaneState } from "./useTerminalStates";
 
 export interface TerminalGridProps {
   tabId: string;
   projectPath: string;
   panes: TerminalPaneData[];
+  /** Live state of each pane, by session_id (unknown when missing). */
+  states?: Record<string, PaneState>;
   onAddPane?: (tabId: string) => void;
   onSaveSessions?: (tabId: string) => void;
   onWrite: (sessionId: string, data: string) => void;
@@ -58,6 +61,7 @@ export const TerminalGrid: React.FC<TerminalGridProps> = ({
   tabId,
   projectPath,
   panes,
+  states,
   onAddPane,
   onSaveSessions,
   onWrite,
@@ -114,6 +118,7 @@ export const TerminalGrid: React.FC<TerminalGridProps> = ({
               {...pane}
               position={index + 1}
               total={panes.length}
+              state={states?.[pane.sessionId]}
               onWrite={onWrite}
               onResize={onResize}
               onClose={onClose}

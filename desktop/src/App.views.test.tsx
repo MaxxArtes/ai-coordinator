@@ -18,9 +18,13 @@ import { FakeResizeObserver, resetXterm, xtermLog } from "./test/fakeXterm";
 
 const METRICS = { host_pid: 4242, host_ram_bytes: 61_027_123, total_tree_ram_bytes: 134_637_159, cpu_usage_percent: 37.5 };
 
+type HostSession = { pane_id: number; alive: boolean; exit_code: number | null };
+
+/** Simulated host. Like the fixed manager (F10): a taken slot is never reused; the lowest free one is used instead. */
 function host({ preview = false, authorized = true, metricsFail = false } = {}) {
   let sessions = 0;
-  invoke.mockImplementation(async (cmd: string) => {
+  const registry = new Map<string, HostSession>();
+  invoke.mockImplementation(async (cmd: string, args?: any) => {
     switch (cmd) {
       case "ping":
         if (preview) throw new Error("sem host Tauri");
@@ -32,11 +36,38 @@ function host({ preview = false, authorized = true, metricsFail = false } = {}) 
       case "terminal_create_tab":
       case "terminal_resize":
       case "terminal_write":
-      case "terminal_close_session":
         return { ok: true };
-      case "terminal_create_session":
+      case "terminal_close_session":
+        registry.delete(args?.sessionId);
+        return { ok: true };
+      case "terminal_create_session": {
+        const taken = new Set(Array.from(registry.values()).map((r) => r.pane_id));
+        const slot = !taken.has(args?.paneId) ? args?.paneId : [0, 1, 2, 3].find((n) => !taken.has(n));
+        if (slot === undefined) throw new Error("aba cheia");
         sessions++;
-        return { session_id: `sess-${sessions}` };
+        const id = `sess-${sessions}`;
+        registry.set(id, { pane_id: slot, alive: true, exit_code: null });
+        return {
+          session_id: id,
+          pane_id: slot,
+          command: ["C:\\Windows\\System32\\cmd.exe", "/k", "SEGREDO"],
+          cwd: "D:\\proj",
+          pid: 1000 + sessions,
+          is_alive: true,
+          created_at: "2026-11-17T12:00:00Z",
+        };
+      }
+      case "terminal_list_tabs":
+        return {
+          tabs: [
+            {
+              tab_id: "tab-main",
+              panes: Object.fromEntries(
+                Array.from(registry.entries()).map(([id, r]) => [String(r.pane_id), { session_id: id, is_alive: r.alive, exit_code: r.exit_code }]),
+              ),
+            },
+          ],
+        };
       case "terminal_get_output":
         return { raw: "", next_seq: 0 };
       case "get_process_tree_metrics":
@@ -50,6 +81,7 @@ function host({ preview = false, authorized = true, metricsFail = false } = {}) 
         throw new Error(`comando não simulado: ${cmd}`);
     }
   });
+  return registry;
 }
 
 const count = (cmd: string) => invoke.mock.calls.filter((c) => c[0] === cmd).length;
@@ -178,7 +210,7 @@ describe("App views", () => {
     renderApp();
     await connected();
     const textarea = xtermLog.created[0].textarea!;
-    expect(textarea).toHaveAttribute("aria-label", "Terminal 1 de 1. F6 sai do terminal");
+    expect(textarea).toHaveAttribute("aria-label", "Terminal 01, 1 de 1. F6 sai do terminal");
     textarea.focus();
     const keys: KeyboardEventInit[] = [{ key: "Tab" }, { key: "Escape" }, { key: "Tab", shiftKey: true }, { key: "c", ctrlKey: true }];
     for (const [i, init] of keys.entries()) {
@@ -219,9 +251,9 @@ describe("App views", () => {
       f6();
       trail.push(where());
     }
-    expect(trail).toEqual(["main-tab-conversas", "Salvar sessões", "Terminal 1 de 2", "Terminal 2 de 2", "main-tab-conversas"]);
+    expect(trail).toEqual(["main-tab-conversas", "Salvar sessões", "Terminal 01, 1 de 2", "Terminal 02, 2 de 2", "main-tab-conversas"]);
     f6(true);
-    expect(where()).toBe("Terminal 2 de 2");
+    expect(where()).toBe("Terminal 02, 2 de 2");
 
     await user.click(screen.getByRole("tab", { name: /^Monitoramento/ }));
     f6();
@@ -262,6 +294,84 @@ describe("App views", () => {
     },
     10000,
   );
+
+  it("F10 in the interface: open 3, close the middle one, open 1; unique names, focus never on the body", async () => {
+    const user = userEvent.setup();
+    host();
+    renderApp();
+    await connected();
+    for (let i = 2; i <= 3; i++) {
+      await user.click(screen.getByRole("button", { name: /Novo terminal/ }));
+      await waitFor(() => expect(xtermLog.created).toHaveLength(i));
+    }
+    await user.click(screen.getByRole("button", { name: "Fechar Terminal 02" }));
+    await waitFor(() => expect(screen.queryByRole("region", { name: "Terminal 02" })).toBeNull());
+    expect(document.activeElement).toHaveAttribute("aria-label", "Terminal 03, 2 de 2");
+
+    await user.click(screen.getByRole("button", { name: /Novo terminal/ }));
+    await waitFor(() => expect(screen.getByRole("region", { name: "Terminal 04" })).toBeInTheDocument());
+    const creates = invoke.mock.calls.filter((c) => c[0] === "terminal_create_session");
+    expect(creates[creates.length - 1][1]).toMatchObject({ paneId: 1 }); // the free slot, not panes.length
+    expect(document.activeElement).toHaveAttribute("aria-label", "Terminal 04, 3 de 3");
+    const names = screen.getAllByRole("region").map((r) => r.getAttribute("aria-label")).filter((n) => /^Terminal \d/.test(n ?? ""));
+    expect(names).toEqual(["Terminal 01", "Terminal 03", "Terminal 04"]);
+    expect(bar()).toHaveTextContent("Terminais: 3 de 4");
+    expect(document.body.textContent).not.toMatch(/Falha ao criar|SEGREDO/);
+    expect(document.body.textContent).toMatch(/cmd\.exe/);
+  }, 10000);
+
+  it(
+    "F10 in the interface: an exited terminal is shown as ended, keeps its slot, and closing it touches no other",
+    async () => {
+      const user = userEvent.setup();
+      const registry = host();
+      renderApp();
+      await connected();
+      for (let i = 2; i <= 3; i++) {
+        await user.click(screen.getByRole("button", { name: /Novo terminal/ }));
+        await waitFor(() => expect(xtermLog.created).toHaveLength(i));
+      }
+      registry.set("sess-3", { pane_id: 2, alive: false, exit_code: 0 }); // `exit` typed in the 3rd terminal
+      const third = () => screen.getByRole("region", { name: "Terminal 03" });
+      await waitFor(() => expect(third()).toHaveTextContent("encerrado, código 0"), { timeout: 3500 });
+      expect(bar()).toHaveTextContent("Terminais: 3 de 4 (2 ativos)");
+
+      const writes = count("terminal_write");
+      fireEvent.keyDown(xtermLog.created[2].textarea!, { key: "Enter" });
+      await act(async () => {
+        await new Promise((resolve) => setTimeout(resolve, 50));
+      });
+      expect(count("terminal_write")).toBe(writes); // nothing is sent to an ended process
+
+      await user.click(screen.getByRole("button", { name: /Novo terminal/ }));
+      await waitFor(() => expect(screen.getByRole("region", { name: "Terminal 04" })).toBeInTheDocument());
+      const creates = invoke.mock.calls.filter((c) => c[0] === "terminal_create_session");
+      expect(creates[creates.length - 1][1]).toMatchObject({ paneId: 3 }); // slot 2 is still held by the ended one
+
+      await user.click(screen.getByRole("button", { name: "Fechar Terminal 03" }));
+      await waitFor(() => expect(screen.queryByRole("region", { name: "Terminal 03" })).toBeNull());
+      expect(invoke.mock.calls.filter((c) => c[0] === "terminal_close_session").map((c) => c[1])).toEqual([{ sessionId: "sess-3" }]);
+      expect(Array.from(registry.keys()).sort()).toEqual(["sess-1", "sess-2", "sess-4"]);
+      await waitFor(() => expect(bar()).toHaveTextContent("Terminais: 3 de 4 (3 ativos)"), { timeout: 3500 });
+    },
+    12000,
+  );
+
+  it("a failed close keeps the pane: no process is left without a pane to close it", async () => {
+    const user = userEvent.setup();
+    host();
+    renderApp();
+    await connected();
+    const original = invoke.getMockImplementation()!;
+    invoke.mockImplementation(async (cmd: string, args?: any) => {
+      if (cmd === "terminal_close_session") throw new Error("IPC parado");
+      return original(cmd, args);
+    });
+    await user.click(screen.getByRole("button", { name: "Fechar Terminal 01" }));
+    expect(await screen.findByText(/O terminal continua aberto/)).toBeInTheDocument();
+    expect(screen.getByRole("region", { name: "Terminal 01" })).toBeInTheDocument();
+    expect(xtermLog.disposed).toBe(0);
+  });
 
   it("the preview claims no Core, no connection and no measurement", async () => {
     host({ preview: true });

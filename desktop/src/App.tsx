@@ -1,4 +1,4 @@
-import React, { useEffect, useRef, useState, useCallback } from "react";
+import React, { useEffect, useMemo, useRef, useState, useCallback } from "react";
 import { TerminalGrid } from "./components/TerminalGrid";
 import { TerminalPaneData } from "./components/TerminalPane";
 import { Terminal } from "xterm";
@@ -16,6 +16,8 @@ import { MainNav, type MainViewId } from "./components/shell/MainNav";
 import { MainViews } from "./components/shell/PlannedView";
 import { StatusBar } from "./components/shell/StatusBar";
 import { installGlobalShortcuts } from "./components/shell/shortcuts";
+import { lowestFreeSlot, paneFromSession } from "./components/terminalIdentity";
+import { activeCountText, resolvePaneState, useTerminalStates, type PaneState } from "./components/useTerminalStates";
 import { NoticeBanner, type NoticeTone } from "./components/shell/NoticeBanner";
 import { AuthorizationScreen } from "./components/shell/AuthorizationScreen";
 import { StartupStatus } from "./components/shell/StartupStatus";
@@ -50,6 +52,15 @@ export const App: React.FC = () => {
   const termsRef = useRef<Map<string, Terminal>>(new Map());
   const lastSeqRef = useRef<Map<string, number>>(new Map());
   const createdTabsRef = useRef<Set<string>>(new Set());
+  // Terminal names use a number that never repeats while the tab exists (F10): never the position on screen.
+  const nextNumberRef = useRef<number>(1);
+  const takeNumber = () => nextNumberRef.current++;
+  const panesRef = useRef<TerminalPaneData[]>([]);
+  panesRef.current = panes;
+  // Where the keyboard focus goes after a pane is created or closed (never left on the page body).
+  const focusAfterRef = useRef<{ sessionId?: string; strip?: boolean } | null>(null);
+  // Terminals ended by `exit`: input is no longer sent to them.
+  const endedRef = useRef<Set<string>>(new Set());
 
   // A connection change is announced once per change (never periodically), in a polite hidden status region.
   const connectionText = connectionLabel(isTauri, connectionStatus).text;
@@ -107,6 +118,7 @@ export const App: React.FC = () => {
   const handleWrite = useCallback(
     async (sessionId: string, data: string) => {
       if (isTauriRef.current) {
+        if (endedRef.current.has(sessionId)) return; // the process ended: nothing to write to
         try {
           await callTauri("terminal_write", { sessionId, data });
         } catch (err: any) {
@@ -152,9 +164,17 @@ export const App: React.FC = () => {
         try {
           await callTauri("terminal_close_session", { sessionId });
         } catch (err: any) {
-          showNotice(`Erro ao fechar sessão: ${err?.message || err}`);
+          // The pane stays: removing it would leave a process the interface no longer shows nor closes (F10).
+          showNotice(`Erro ao fechar sessão: ${err?.message || err}. O terminal continua aberto.`);
+          return;
         }
       }
+      // The focus goes to the pane that takes this place, else the previous one, else the tab strip.
+      const current = panesRef.current;
+      const index = current.findIndex((p) => p.sessionId === sessionId);
+      const neighbour = current[index + 1] ?? current[index - 1];
+      focusAfterRef.current = neighbour ? { sessionId: neighbour.sessionId } : { strip: true };
+      endedRef.current.delete(sessionId);
       setPanes((prev) => prev.filter((p) => p.sessionId !== sessionId));
       termsRef.current.delete(sessionId);
       lastSeqRef.current.delete(sessionId);
@@ -165,21 +185,22 @@ export const App: React.FC = () => {
   // Add new pane (Defaults strictly to human_terminal)
   const handleAddPane = useCallback(
     async (tabId: string) => {
-      if (panes.length >= 4) {
+      // A free slot, never the number of panes: a pane ended by `exit` keeps its slot until closed (F10).
+      const slot = lowestFreeSlot(panes);
+      if (slot === null) {
         showNotice("Limite máximo de 4 painéis simultâneos por aba atingido.", "info");
         return;
       }
-      const newPaneId = panes.length;
       const kind = "human_terminal";
 
       try {
-        let realSessionId = `preview-sess-${Date.now().toString(36)}-${newPaneId}`;
+        let newPane: TerminalPaneData;
 
         if (isTauriRef.current) {
           await ensureTabCreated(tabId, projectPath);
           const sess = await callTauri("terminal_create_session", {
             tabId,
-            paneId: newPaneId,
+            paneId: slot,
             kind,
             cwd: projectPath,
             cols: 80,
@@ -189,24 +210,19 @@ export const App: React.FC = () => {
           if (!sess || !sess.session_id) {
             throw new Error("Backend não retornou session_id válido");
           }
-          realSessionId = sess.session_id;
+          newPane = paneFromSession(sess, takeNumber(), tabId, slot, kind);
+        } else {
+          newPane = { sessionId: `preview-sess-${Date.now().toString(36)}-${slot}`, tabId, paneId: slot, kind, number: takeNumber() };
         }
 
-        const newPane: TerminalPaneData = {
-          sessionId: realSessionId,
-          tabId,
-          paneId: newPaneId,
-          kind,
-          title: `Terminal Interativo ${newPaneId + 1}`,
-        };
-
+        focusAfterRef.current = { sessionId: newPane.sessionId };
         setPanes((prev) => [...prev, newPane]);
       } catch (err: any) {
         const msg = err?.message || String(err);
-        showNotice(`Falha ao criar terminal no painel ${newPaneId + 1}: ${msg}`);
+        showNotice(`Falha ao criar terminal: ${msg}`);
       }
     },
-    [panes.length, projectPath, ensureTabCreated, callTauri]
+    [panes, projectPath, ensureTabCreated, callTauri]
   );
 
   // Authorize project directory and start session
@@ -247,14 +263,7 @@ export const App: React.FC = () => {
           });
 
           if (sess && sess.session_id) {
-            const firstPane: TerminalPaneData = {
-              sessionId: sess.session_id,
-              tabId: activeTab,
-              paneId: 0,
-              kind: "human_terminal",
-              title: "Terminal Interativo 1",
-            };
-            setPanes([firstPane]);
+            setPanes([paneFromSession(sess, takeNumber(), activeTab, 0)]);
             setConnectionStatus("connected");
           } else {
             throw new Error("Sessão inicial não retornou session_id válido");
@@ -330,14 +339,7 @@ export const App: React.FC = () => {
 
             if (!mounted) return;
             if (sess && sess.session_id) {
-              const firstPane: TerminalPaneData = {
-                sessionId: sess.session_id,
-                tabId: activeTab,
-                paneId: 0,
-                kind: "human_terminal",
-                title: "Terminal Interativo 1",
-              };
-              setPanes([firstPane]);
+              setPanes([paneFromSession(sess, takeNumber(), activeTab, 0)]);
               setConnectionStatus("connected");
             } else {
               throw new Error("Sessão inicial não retornou session_id válido");
@@ -368,7 +370,7 @@ export const App: React.FC = () => {
               tabId: activeTab,
               paneId: 0,
               kind: "human_terminal",
-              title: "Terminal Interativo (Preview)",
+              number: takeNumber(),
             },
           ]);
           setConnectionStatus("connected");
@@ -496,6 +498,28 @@ export const App: React.FC = () => {
     [panes.length, callTauri]
   );
 
+  // Live state of every terminal (F9): only what the host reports; unknown otherwise.
+  const stateSnapshot = useTerminalStates(isTauri, callTauri, activeTab, panes.map((p) => p.sessionId));
+  const paneStates = useMemo<Record<string, PaneState>>(
+    () => Object.fromEntries(panes.map((p) => [p.sessionId, resolvePaneState(isTauri, stateSnapshot, p.sessionId, p.startedAlive)])),
+    [panes, isTauri, stateSnapshot]
+  );
+  endedRef.current = new Set(Object.keys(paneStates).filter((id) => paneStates[id].kind === "ended"));
+  const activeText = panes.length > 0 ? activeCountText(Object.values(paneStates)) : null;
+
+  // After a pane is created or closed, the focus lands on a pane region or on the tab strip, never on the body.
+  useEffect(() => {
+    const target = focusAfterRef.current;
+    if (!target) return;
+    focusAfterRef.current = null;
+    const el = target.sessionId
+      ? Array.from(document.querySelectorAll<HTMLElement>("[data-session-id]"))
+          .find((pane) => pane.getAttribute("data-session-id") === target.sessionId)
+          ?.querySelector<HTMLElement>(".terminal-pane__focus-region")
+      : document.querySelector<HTMLElement>(".tab-strip [data-f6-entry]");
+    el?.focus();
+  }, [panes]);
+
   const isAuthorizingView = isAuthorizing || connectionStatus === "authorizing";
 
   // Conversas shows the authorization and startup screens too; the navigation stays available on all of them.
@@ -515,6 +539,7 @@ export const App: React.FC = () => {
       tabId={activeTab}
       projectPath={projectPath}
       panes={panes}
+      states={paneStates}
       onAddPane={handleAddPane}
       onSaveSessions={handleSaveSessions}
       onWrite={handleWrite}
@@ -552,6 +577,7 @@ export const App: React.FC = () => {
         connectionStatus={connectionStatus}
         coreVersion={status?.core_version}
         paneCount={panes.length}
+        activeText={activeText}
         metrics={metrics}
         metricsUnavailable={metricsFailed}
         projectPath={projectPath}

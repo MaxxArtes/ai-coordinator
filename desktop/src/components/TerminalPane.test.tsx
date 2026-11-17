@@ -138,7 +138,10 @@ function props(over: Partial<TerminalPaneProps> = {}): TerminalPaneProps {
     tabId: "tab-1",
     paneId: 1,
     kind: "human_terminal",
-    title: "Terminal Interativo 2",
+    number: 7,
+    program: "cmd.exe",
+    cwd: "C:/work/proj",
+    pid: 4321,
     position: 2,
     total: 3,
     onWrite: vi.fn(),
@@ -281,7 +284,7 @@ describe("TerminalPane keyboard", () => {
 
   it("the pane focus region: a named group, out of the Tab order, the F6 entry of the pane region", () => {
     const { container } = render(<TerminalPane {...props()} />);
-    const region = screen.getByRole("group", { name: "Terminal 2 de 3" });
+    const region = screen.getByRole("group", { name: "Terminal 07, 2 de 3" });
     expect(region).toHaveClass("terminal-pane__focus-region");
     expect(region).toHaveAttribute("tabindex", "-1");
     expect(region).toHaveAttribute("data-f6-entry");
@@ -292,7 +295,7 @@ describe("TerminalPane keyboard", () => {
   it("Enter and Space enter the terminal without sending anything; other keys do nothing", () => {
     const p = props();
     render(<TerminalPane {...p} />);
-    const region = screen.getByRole("group", { name: "Terminal 2 de 3" });
+    const region = screen.getByRole("group", { name: "Terminal 07, 2 de 3" });
     region.focus();
     fireEvent.keyDown(region, { key: "a" });
     expect(term().focusCount).toBe(0);
@@ -309,7 +312,7 @@ describe("TerminalPane keyboard", () => {
     const user = userEvent.setup();
     const p = props();
     render(<TerminalPane {...p} />);
-    await user.click(screen.getByRole("group", { name: "Terminal 2 de 3" }));
+    await user.click(screen.getByRole("group", { name: "Terminal 07, 2 de 3" }));
     expect(document.activeElement).toBe(term().textarea);
     expect(p.onWrite).not.toHaveBeenCalled();
   });
@@ -317,18 +320,18 @@ describe("TerminalPane keyboard", () => {
   it("Tab from the focus region goes to the close button, then into the terminal", async () => {
     const user = userEvent.setup();
     render(<TerminalPane {...props()} />);
-    screen.getByRole("group", { name: "Terminal 2 de 3" }).focus();
+    screen.getByRole("group", { name: "Terminal 07, 2 de 3" }).focus();
     await user.tab();
-    expect(document.activeElement).toBe(screen.getByRole("button", { name: "Fechar terminal" }));
+    expect(document.activeElement).toBe(screen.getByRole("button", { name: "Fechar Terminal 07" }));
     await user.tab();
     expect(document.activeElement).toBe(term().textarea);
   });
 
   it("names the terminal input after its position and keeps it in step", () => {
     const { rerender, container } = render(<TerminalPane {...props()} />);
-    expect(term().textarea).toHaveAttribute("aria-label", "Terminal 2 de 3. F6 sai do terminal");
+    expect(term().textarea).toHaveAttribute("aria-label", "Terminal 07, 2 de 3. F6 sai do terminal");
     rerender(<TerminalPane {...props({ position: 1, total: 2 })} />);
-    expect(term().textarea).toHaveAttribute("aria-label", "Terminal 1 de 2. F6 sai do terminal");
+    expect(term().textarea).toHaveAttribute("aria-label", "Terminal 07, 1 de 2. F6 sai do terminal");
     expect(container.innerHTML).not.toContain("Terminal input");
   });
 
@@ -378,7 +381,7 @@ describe("TerminalPane keyboard", () => {
 
 describe("TerminalGrid tab strip", () => {
   const panes = (n: number) =>
-    Array.from({ length: n }, (_, i) => ({ sessionId: `s-${i + 1}`, tabId: "tab-main", paneId: i, kind: "human_terminal" as const }));
+    Array.from({ length: n }, (_, i) => ({ sessionId: `s-${i + 1}`, tabId: "tab-main", paneId: i, kind: "human_terminal" as const, number: [4, 9, 12, 13][i] }));
   const grid = (n: number, over: Record<string, unknown> = {}) => (
     <TerminalGrid
       tabId="tab-main"
@@ -430,8 +433,78 @@ describe("TerminalGrid tab strip", () => {
     expect(screen.queryByRole("button", { name: "Novo terminal" })).toBeNull();
   });
 
-  it("numbers every pane by position", () => {
+  it("names every pane by its stable number, with its position alongside", () => {
     render(grid(3));
-    for (const n of [1, 2, 3]) expect(screen.getByRole("group", { name: `Terminal ${n} de 3` })).toBeInTheDocument();
+    for (const [i, n] of ["04", "09", "12"].entries()) {
+      expect(screen.getByRole("group", { name: `Terminal ${n}, ${i + 1} de 3` })).toBeInTheDocument();
+      expect(screen.getByRole("region", { name: `Terminal ${n}` })).toBeInTheDocument();
+    }
+  });
+
+  it("passes each pane its live state, by session", () => {
+    render(grid(2, { states: { "s-1": { kind: "alive" }, "s-2": { kind: "ended", exitCode: 0 } } }));
+    expect(screen.getByRole("region", { name: "Terminal 04" })).toHaveClass("terminal-pane--alive");
+    expect(screen.getByRole("region", { name: "Terminal 09" })).toHaveTextContent("encerrado, código 0");
+  });
+});
+
+describe("TerminalPane identity, state and footer (Etapa 6)", () => {
+  it("header: the stable number, the program and the live state; no percentage anywhere", () => {
+    const { container } = render(<TerminalPane {...props({ state: { kind: "alive" } })} />);
+    const header = container.querySelector(".terminal-pane__header")!;
+    expect(header).toHaveTextContent("07 · Terminal");
+    expect(header.querySelector(".terminal-pane__program")).toHaveTextContent("cmd.exe");
+    expect(header.querySelector(".terminal-pane__state--alive .sr-only")).toHaveTextContent("ativo");
+    expect(screen.getByRole("region", { name: "Terminal 07" })).toHaveClass("terminal-pane--slot-2");
+    expect(container.textContent).not.toMatch(/%/);
+  });
+
+  it.each([
+    [{ kind: "ended", exitCode: 0 }, "encerrado, código 0"],
+    [{ kind: "ended", exitCode: null }, "encerrado, código desconhecido"],
+    [{ kind: "unknown" }, "estado desconhecido"],
+    [{ kind: "preview" }, "preview, sem processo"],
+  ] as const)("a state other than alive is written out: %j", (state, text) => {
+    const { container } = render(<TerminalPane {...props({ state })} />);
+    const shown = container.querySelector(".terminal-pane__state")!;
+    expect(shown).toHaveTextContent(text);
+    expect(shown.querySelector(".sr-only")).toBeNull();
+    expect(container.textContent).not.toMatch(/\bativo\b/);
+  });
+
+  it("no state given: unknown, never alive", () => {
+    const { container } = render(<TerminalPane {...props()} />);
+    expect(container.querySelector(".terminal-pane__state")).toHaveTextContent("estado desconhecido");
+  });
+
+  it("footer: program, Local, the folder (full path in the title), the PID and the kind", () => {
+    const { container } = render(<TerminalPane {...props({ state: { kind: "alive" } })} />);
+    const footer = container.querySelector(".terminal-pane__footer")!;
+    expect(footer.querySelector(".terminal-pane__footer-program")).toHaveTextContent("cmd.exe");
+    expect(footer).toHaveTextContent("Local");
+    expect(footer.querySelector(".terminal-pane__footer-folder")).toHaveAttribute("title", "C:/work/proj");
+    expect(footer.querySelector(".terminal-pane__footer-folder")).toHaveTextContent(/^proj$/);
+    expect(footer).toHaveTextContent("PID 4321");
+    expect(footer.querySelector(".terminal-pane__footer-end")).toHaveTextContent("Terminal humano");
+  });
+
+  it("what the host did not report is said to be unknown", () => {
+    const { container } = render(<TerminalPane {...props({ program: undefined, pid: null, cwd: undefined })} />);
+    const footer = container.querySelector(".terminal-pane__footer")!;
+    expect(footer).toHaveTextContent("programa desconhecido");
+    expect(footer).toHaveTextContent("PID indisponível");
+    expect(container.querySelector(".terminal-pane__program")).toBeNull();
+  });
+
+  it("the preview has no process to describe", () => {
+    const { container } = render(<TerminalPane {...props({ state: { kind: "preview" }, program: undefined, pid: null })} />);
+    expect(container.querySelector(".terminal-pane__footer")).toHaveTextContent("Preview: sem processo");
+    expect(container.querySelector(".terminal-pane__footer")).not.toHaveTextContent("PID");
+  });
+
+  it("a governed agent is named as such", () => {
+    render(<TerminalPane {...props({ kind: "governed_agent" })} />);
+    expect(screen.getByRole("region", { name: "Agente 07" })).toHaveTextContent("07 · Agente");
+    expect(screen.getByRole("region", { name: "Agente 07" })).toHaveTextContent("Agente governado");
   });
 });
