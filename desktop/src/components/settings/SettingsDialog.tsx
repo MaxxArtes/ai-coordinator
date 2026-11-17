@@ -7,7 +7,7 @@
  */
 import React, { useCallback, useEffect, useRef, useState } from "react";
 import { Dialog } from "../ui/Dialog";
-import type { ConnectionStatus, RuntimeStatus } from "../shell/AppHeader";
+import type { ConnectionStatus, RuntimeMetrics, RuntimeStatus } from "../shell/AppHeader";
 import { AboutPanel } from "./AboutPanel";
 import { CategoryPanel } from "./CategoryPanel";
 import { SettingsForm } from "./SettingsForm";
@@ -23,6 +23,8 @@ export interface SettingsDialogProps {
   runtimeStatus: RuntimeStatus | null;
   connectionStatus: ConnectionStatus;
   activePanesCount: number;
+  /** Host metrics for Sobre → Diagnóstico (optional). */
+  metrics?: RuntimeMetrics | null;
   callTauri: (cmd: string, args?: Record<string, any>) => Promise<any>;
   /** Called with every settings snapshot loaded or saved, so the app applies interface-level preferences. */
   onSettingsChanged?: (snapshot: SettingsSnapshot) => void;
@@ -38,6 +40,7 @@ const SettingsDialogContent: React.FC<Omit<SettingsDialogProps, "open">> = ({
   runtimeStatus,
   connectionStatus,
   activePanesCount,
+  metrics,
   callTauri,
   onSettingsChanged,
 }) => {
@@ -145,6 +148,7 @@ const SettingsDialogContent: React.FC<Omit<SettingsDialogProps, "open">> = ({
                 runtimeStatus={runtimeStatus}
                 connectionStatus={connectionStatus}
                 activePanesCount={activePanesCount}
+                metrics={metrics}
                 callTauri={callTauri}
                 onRequestClose={onClose}
                 onUpdatesLockChange={setUpdatesLocked}

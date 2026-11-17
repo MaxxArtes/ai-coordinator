@@ -2,12 +2,24 @@
  * Development-only visual check (Marco 4D.3, fundação visual).
  * Served by the Vite dev server at /visual-check.html?view=<view>[&stimulation=low]; never bundled in the app.
  * Renders each shell state with fixed fixtures so screenshots are deterministic.
+ * Every fixture view carries the FIXTURE band: its version, connection, metrics and update are not real.
  */
-import React from "react";
+import React, { useState } from "react";
 import ReactDOM from "react-dom/client";
 import "../index.css";
 import { App } from "../App";
-import { AppHeader, type AppHeaderProps } from "../components/shell/AppHeader";
+import {
+  AppHeader,
+  type AppHeaderProps,
+  type ConnectionStatus,
+  type RuntimeMetrics,
+  type RuntimeStatus,
+} from "../components/shell/AppHeader";
+import { MainNav, type MainViewId } from "../components/shell/MainNav";
+import { MainViews } from "../components/shell/PlannedView";
+import { StatusBar } from "../components/shell/StatusBar";
+import { TerminalGrid } from "../components/TerminalGrid";
+import type { TerminalPaneData } from "../components/TerminalPane";
 import { AuthorizationScreen } from "../components/shell/AuthorizationScreen";
 import { NoticeBanner } from "../components/shell/NoticeBanner";
 import { StartupStatus } from "../components/shell/StartupStatus";
@@ -20,21 +32,24 @@ const params = new URLSearchParams(window.location.search);
 const view = params.get("view") ?? "app-preview";
 if (params.get("stimulation") === "low") document.documentElement.dataset.stimulation = "low";
 
+const RUNTIME: RuntimeStatus = {
+  core_version: "0.6.0",
+  python_version: "3.12.8",
+  app_version: "0.6.1-alpha.50",
+  license: "PolyForm-Noncommercial-1.0.0",
+  host_os: "windows",
+  host_arch: "x86_64",
+  is_isolated: true,
+  python_path: "C:\\App\\runtime\\python\\python.exe",
+};
+
+const FIXTURE_METRICS: RuntimeMetrics = { host_pid: 4242, host_ram_bytes: 61_000_000, total_tree_ram_bytes: 128_000_000 };
+const PROJECT = "D:\\ai-coordinator";
+
 const HEADER: AppHeaderProps = {
-  status: {
-    core_version: "0.6.0",
-    python_version: "3.12.8",
-    app_version: "0.6.1-alpha.50",
-    license: "PolyForm-Noncommercial-1.0.0",
-    host_os: "windows",
-    host_arch: "x86_64",
-    is_isolated: true,
-    python_path: "C:\\App\\runtime\\python\\python.exe",
-  },
   appVersion: "0.6.1-alpha.50",
   isTauri: true,
   connectionStatus: "connected",
-  metrics: { host_pid: 4242, host_ram_bytes: 61_000_000, total_tree_ram_bytes: 128_000_000, cpu_usage_percent: 1.4 },
   hasUpdateAvailable: false,
   latestAvailableVersion: "",
   onOpenSettings: () => undefined,
@@ -88,12 +103,56 @@ function fakeTauri(check: UpdateCheckResult, fakes: Fakes = {}) {
   };
 }
 
-const Shell: React.FC<{ header?: Partial<AppHeaderProps>; children: React.ReactNode }> = ({ header, children }) => (
-  <div className="app">
-    <AppHeader {...HEADER} {...header} />
-    {children}
-  </div>
+/** A full-width band (not a badge): everything below it is fixture data. */
+const FixtureBanner: React.FC = () => (
+  <p className="fixture-banner" role="note">
+    FIXTURE: dados fictícios para conferência visual
+  </p>
 );
+
+interface ShellProps {
+  connection?: ConnectionStatus;
+  update?: string;
+  panes?: number;
+  metrics?: RuntimeMetrics | null;
+  view?: MainViewId;
+  notices?: React.ReactNode;
+  children: React.ReactNode;
+}
+
+const Shell: React.FC<ShellProps> = ({
+  connection = "connected",
+  update,
+  panes = 0,
+  metrics = FIXTURE_METRICS,
+  view = "conversas",
+  notices,
+  children,
+}) => {
+  const [active, setActive] = useState<MainViewId>(view);
+  return (
+    <div className="app">
+      <FixtureBanner />
+      <AppHeader
+        {...HEADER}
+        connectionStatus={connection}
+        hasUpdateAvailable={!!update}
+        latestAvailableVersion={update ?? ""}
+        nav={<MainNav active={active} onSelect={setActive} paneCount={panes} />}
+      />
+      {notices}
+      <MainViews active={active} conversas={children} />
+      <StatusBar
+        isTauri
+        connectionStatus={connection}
+        coreVersion={RUNTIME.core_version}
+        paneCount={panes}
+        metrics={metrics}
+        projectPath={PROJECT}
+      />
+    </div>
+  );
+};
 
 const SettingsView: React.FC<{ check: UpdateCheckResult; category?: SettingsCategoryId; panes?: number; fakes?: Fakes }> = ({
   check,
@@ -101,53 +160,87 @@ const SettingsView: React.FC<{ check: UpdateCheckResult; category?: SettingsCate
   panes = 2,
   fakes,
 }) => (
-  <Shell header={{ hasUpdateAvailable: check.available, latestAvailableVersion: check.latest_version }}>
-    <main className="app__main">
-      <StartupStatus state="connecting" />
-    </main>
+  <Shell update={check.available ? check.latest_version : undefined} panes={panes}>
+    <StartupStatus state="connecting" />
     <SettingsDialog
       open
       onClose={() => undefined}
       initialCategory={category}
       isTauri
-      runtimeStatus={HEADER.status}
+      runtimeStatus={RUNTIME}
       connectionStatus="connected"
       activePanesCount={panes}
+      metrics={FIXTURE_METRICS}
       callTauri={fakeTauri(check, fakes)}
       onSettingsChanged={(s) => applyInterfaceSettings(s)}
     />
   </Shell>
 );
 
+const FOUR_PANES: TerminalPaneData[] = [0, 1, 2, 3].map((i) => ({
+  sessionId: `fixture-${i + 1}`,
+  tabId: "tab-main",
+  paneId: i,
+  kind: "human_terminal",
+  title: `Terminal Interativo ${i + 1}`,
+}));
+
+const noop = () => undefined;
+
+const ConversasView: React.FC<{ view: MainViewId }> = ({ view: initial }) => (
+  <Shell view={initial} panes={4}>
+    <TerminalGrid
+      tabId="tab-main"
+      projectPath={PROJECT}
+      panes={FOUR_PANES}
+      onAddPane={noop}
+      onSaveSessions={noop}
+      onWrite={noop}
+      onResize={noop}
+      onClose={noop}
+      onMount={(_, term) => term?.writeln("FIXTURE: terminal fictício, sem sessão real")}
+    />
+  </Shell>
+);
+
 const VIEWS: Record<string, () => React.ReactElement> = {
   "app-preview": () => <App />,
+  "conversas-4": () => <ConversasView view="conversas" />,
+  monitoramento: () => <ConversasView view="monitoramento" />,
+  missoes: () => <ConversasView view="missoes" />,
   auth: () => (
-    <Shell header={{ connectionStatus: "authorizing", metrics: null }}>
-      <main className="app__main">
-        <AuthorizationScreen profileName="default" inputPath="" onInputPathChange={() => undefined} onSubmit={() => undefined} />
-      </main>
+    <Shell connection="authorizing" metrics={null}>
+      <AuthorizationScreen profileName="default" inputPath="" onInputPathChange={() => undefined} onSubmit={() => undefined} />
     </Shell>
   ),
   "startup-failed": () => (
-    <Shell header={{ connectionStatus: "failed", metrics: null }}>
-      <NoticeBanner
-        message="Erro de inicialização da Alpha: Fail-closed: runtime Python privado não encontrado."
-        tone="error"
-        onDismiss={() => undefined}
-      />
-      <main className="app__main">
-        <StartupStatus state="failed" detail="Fail-closed: runtime Python privado não encontrado." />
-      </main>
+    <Shell
+      connection="failed"
+      metrics={null}
+      notices={
+        <NoticeBanner
+          message="Erro de inicialização da Alpha: Fail-closed: runtime Python privado não encontrado."
+          tone="error"
+          onDismiss={() => undefined}
+        />
+      }
+    >
+      <StartupStatus state="failed" detail="Fail-closed: runtime Python privado não encontrado." />
     </Shell>
   ),
   notices: () => (
-    <Shell header={{ connectionStatus: "connecting" }}>
-      <NoticeBanner message="Falha ao salvar sessão: o Core recusou a exportação." tone="error" onDismiss={() => undefined} />
-      <NoticeBanner message="Sessão salva com sucesso: 2 terminais arquivados." tone="success" onDismiss={() => undefined} />
-      <NoticeBanner message="Limite máximo de 4 painéis simultâneos por aba atingido." tone="info" onDismiss={() => undefined} />
-      <main className="app__main">
-        <StartupStatus state="connecting" />
-      </main>
+    <Shell
+      connection="connecting"
+      metrics={null}
+      notices={
+        <>
+          <NoticeBanner message="Falha ao salvar sessão: o Core recusou a exportação." tone="error" onDismiss={() => undefined} />
+          <NoticeBanner message="Sessão salva com sucesso: 2 terminais arquivados." tone="success" onDismiss={() => undefined} />
+          <NoticeBanner message="Limite máximo de 4 painéis simultâneos por aba atingido." tone="info" onDismiss={() => undefined} />
+        </>
+      }
+    >
+      <StartupStatus state="connecting" />
     </Shell>
   ),
   "settings-perfil": () => <SettingsView check={CHECK_BASE} category="perfil" />,

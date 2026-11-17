@@ -38,82 +38,16 @@
   outline-offset: calc(-1 * var(--focus-width));
 }
 
-/* ---------- Header ---------- */
+/* ---------- Header: brand and pill | navigation | gear (details in the Etapa 5 section below) ---------- */
 .app-header {
-  display: flex;
+  display: grid;
+  grid-template-columns: minmax(max-content, 1fr) auto minmax(max-content, 1fr);
   align-items: center;
-  justify-content: space-between;
-  gap: var(--sp-3);
-  padding: var(--sp-2) var(--sp-4);
-  background: var(--c-surface);
+  column-gap: var(--sp-3);
+  min-height: var(--h-header);
+  padding: 0 var(--sp-3);
+  background: var(--c-chrome);
   border-bottom: 1px solid var(--c-border);
-}
-
-.app-header__identity,
-.app-header__meta {
-  display: flex;
-  align-items: center;
-  gap: var(--sp-2);
-  min-width: 0;
-}
-
-/* Identity badges may wrap; metrics and the updates button always stay on one line. */
-.app-header__identity {
-  flex: 1 1 auto;
-  flex-wrap: wrap;
-}
-
-.app-header__meta {
-  flex: none;
-  flex-wrap: nowrap;
-}
-
-.app-header__title {
-  margin: 0;
-  font-size: var(--fs-md);
-  font-weight: var(--fw-semibold);
-  color: var(--c-fg);
-  letter-spacing: 0.01em;
-}
-
-.app-header__metrics {
-  display: flex;
-  gap: var(--sp-3);
-  margin: 0;
-  font-family: var(--font-mono);
-  font-size: var(--fs-xs);
-  color: var(--c-fg-muted);
-}
-
-.app-header__metrics dt {
-  display: inline;
-  color: var(--c-fg-subtle);
-}
-
-.app-header__metrics dd {
-  display: inline;
-  margin: 0 0 0 var(--sp-1);
-}
-
-.status-text {
-  font-size: var(--fs-xs);
-  color: var(--c-fg-muted);
-}
-
-.status--ok {
-  color: var(--c-ok);
-}
-
-.status--info {
-  color: var(--c-accent);
-}
-
-.status--warn {
-  color: var(--c-warn);
-}
-
-.status--err {
-  color: var(--c-err);
 }
 
 /* ---------- Badges ---------- */

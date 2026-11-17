@@ -1,5 +1,6 @@
 import React from "react";
-import type { ConnectionStatus, RuntimeStatus } from "../shell/AppHeader";
+import type { ConnectionStatus, RuntimeMetrics, RuntimeStatus } from "../shell/AppHeader";
+import { formatBytesPtBR } from "../shell/StatusBar";
 import { UpdatesSection } from "./UpdatesSection";
 
 export interface AboutPanelProps {
@@ -8,6 +9,8 @@ export interface AboutPanelProps {
   runtimeStatus: RuntimeStatus | null;
   connectionStatus: ConnectionStatus;
   activePanesCount: number;
+  /** Host metrics (get_process_tree_metrics): PID and RAM of the main process appear only once measured. Never CPU. */
+  metrics?: RuntimeMetrics | null;
   callTauri: (cmd: string, args?: Record<string, any>) => Promise<any>;
   onRequestClose: () => void;
   onUpdatesLockChange: (locked: boolean) => void;
@@ -29,11 +32,13 @@ export const AboutPanel: React.FC<AboutPanelProps> = ({
   runtimeStatus,
   connectionStatus,
   activePanesCount,
+  metrics,
   callTauri,
   onRequestClose,
   onUpdatesLockChange,
 }) => {
   const rs = runtimeStatus;
+  const mainRam = metrics ? formatBytesPtBR(metrics.host_ram_bytes) : null;
   return (
     <>
       <div className="settings__panel-header">
@@ -81,6 +86,14 @@ export const AboutPanel: React.FC<AboutPanelProps> = ({
           <dd>{rs?.python_path || UNAVAILABLE}</dd>
           <dt>Terminais na aba</dt>
           <dd>{activePanesCount}</dd>
+          {metrics && (
+            <>
+              <dt>PID do processo principal</dt>
+              <dd>{metrics.host_pid}</dd>
+              <dt>RAM do processo principal</dt>
+              <dd>{mainRam ? `${mainRam} (medida)` : UNAVAILABLE}</dd>
+            </>
+          )}
         </dl>
       </section>
 

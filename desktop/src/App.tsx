@@ -7,10 +7,14 @@ import type { SettingsCategoryId } from "./components/settings/categories";
 import { applyInterfaceSettings, getSettings } from "./components/settings/api";
 import {
   AppHeader,
+  connectionLabel,
   type ConnectionStatus,
   type RuntimeMetrics,
   type RuntimeStatus,
 } from "./components/shell/AppHeader";
+import { MainNav, type MainViewId } from "./components/shell/MainNav";
+import { MainViews } from "./components/shell/PlannedView";
+import { StatusBar } from "./components/shell/StatusBar";
 import { NoticeBanner, type NoticeTone } from "./components/shell/NoticeBanner";
 import { AuthorizationScreen } from "./components/shell/AuthorizationScreen";
 import { StartupStatus } from "./components/shell/StartupStatus";
@@ -23,6 +27,9 @@ export const App: React.FC = () => {
   const [status, setStatus] = useState<RuntimeStatus | null>(null);
   const [metrics, setMetrics] = useState<RuntimeMetrics | null>(null);
   const [activeTab, setActiveTab] = useState<string>("tab-main");
+  // The main view is separate from activeTab: switching views never re-runs the connection effect, which depends
+  // on activeTab and would recreate the tab and its sessions.
+  const [mainView, setMainView] = useState<MainViewId>("conversas");
   const [projectPath, setProjectPath] = useState<string>("");
   const [authorizedProjects, setAuthorizedProjects] = useState<string[]>([]);
   const [isAuthorizing, setIsAuthorizing] = useState<boolean>(false);
@@ -40,6 +47,16 @@ export const App: React.FC = () => {
   const termsRef = useRef<Map<string, Terminal>>(new Map());
   const lastSeqRef = useRef<Map<string, number>>(new Map());
   const createdTabsRef = useRef<Set<string>>(new Set());
+
+  // A connection change is announced once per change (never periodically), in a polite hidden status region.
+  const connectionText = connectionLabel(isTauri, connectionStatus).text;
+  const [connectionNotice, setConnectionNotice] = useState<string>("");
+  const lastConnectionTextRef = useRef<string | null>(null);
+  useEffect(() => {
+    const previous = lastConnectionTextRef.current;
+    lastConnectionTextRef.current = connectionText;
+    if (previous !== null && previous !== connectionText) setConnectionNotice(`Conexão: ${connectionText}`);
+  }, [connectionText]);
 
   // Direct invocation without swallowing errors
   const callTauri = useCallback(async (cmd: string, args?: Record<string, any>): Promise<any> => {
@@ -469,51 +486,63 @@ export const App: React.FC = () => {
 
   const isAuthorizingView = isAuthorizing || connectionStatus === "authorizing";
 
+  // Conversas shows the authorization and startup screens too; the navigation stays available on all of them.
+  const conversasContent = isAuthorizingView ? (
+    <AuthorizationScreen
+      profileName="default"
+      inputPath={inputPath}
+      onInputPathChange={setInputPath}
+      onSubmit={handleAuthorizeAndStart}
+    />
+  ) : connectionStatus === "connecting" && panes.length === 0 ? (
+    <StartupStatus state="connecting" />
+  ) : connectionStatus === "failed" && panes.length === 0 ? (
+    <StartupStatus state="failed" detail={notice} />
+  ) : (
+    <TerminalGrid
+      tabId={activeTab}
+      projectPath={projectPath}
+      panes={panes}
+      onAddPane={handleAddPane}
+      onSaveSessions={handleSaveSessions}
+      onWrite={handleWrite}
+      onResize={handleResize}
+      onClose={handleClosePane}
+      onMount={handleMount}
+    />
+  );
+
   return (
     <div className="app">
       <AppHeader
-        status={status}
         appVersion={appVersion}
         isTauri={isTauri}
         connectionStatus={connectionStatus}
-        metrics={metrics}
         hasUpdateAvailable={hasUpdateAvailable}
         latestAvailableVersion={latestAvailableVersion}
         onOpenSettings={() => {
           setSettingsCategory(hasUpdateAvailable ? "sobre" : "perfil");
           setIsSettingsOpen(true);
         }}
+        nav={<MainNav active={mainView} onSelect={setMainView} paneCount={panes.length} />}
       />
+      <p className="sr-only" role="status" data-testid="connection-notice">
+        {connectionNotice}
+      </p>
 
       {notice && <NoticeBanner message={notice} tone={noticeTone} onDismiss={() => setNotice("")} />}
 
-      {/* Main Terminal Area */}
-      <main className="app__main">
-        {isAuthorizingView ? (
-          <AuthorizationScreen
-            profileName="default"
-            inputPath={inputPath}
-            onInputPathChange={setInputPath}
-            onSubmit={handleAuthorizeAndStart}
-          />
-        ) : connectionStatus === "connecting" && panes.length === 0 ? (
-          <StartupStatus state="connecting" />
-        ) : connectionStatus === "failed" && panes.length === 0 ? (
-          <StartupStatus state="failed" detail={notice} />
-        ) : (
-          <TerminalGrid
-            tabId={activeTab}
-            projectPath={projectPath}
-            panes={panes}
-            onAddPane={handleAddPane}
-            onSaveSessions={handleSaveSessions}
-            onWrite={handleWrite}
-            onResize={handleResize}
-            onClose={handleClosePane}
-            onMount={handleMount}
-          />
-        )}
-      </main>
+      {/* The three views share one cell; Conversas stays mounted (invisible and inert while another view is shown). */}
+      <MainViews active={mainView} conversas={conversasContent} />
+
+      <StatusBar
+        isTauri={isTauri}
+        connectionStatus={connectionStatus}
+        coreVersion={status?.core_version}
+        paneCount={panes.length}
+        metrics={metrics}
+        projectPath={projectPath}
+      />
 
       {/* Unified settings (updates live in Configurações → Sobre) */}
       <SettingsDialog
@@ -524,6 +553,7 @@ export const App: React.FC = () => {
         runtimeStatus={status}
         connectionStatus={connectionStatus}
         activePanesCount={panes.length}
+        metrics={metrics}
         callTauri={callTauri}
         onSettingsChanged={(snapshot) => applyInterfaceSettings(snapshot)}
       />

@@ -1,5 +1,6 @@
 import React from "react";
 import { Icon } from "../ui/Icon";
+import { BrandMark } from "./BrandMark";
 
 export type ConnectionStatus = "connecting" | "authorizing" | "connected" | "failed";
 
@@ -18,109 +19,98 @@ export interface RuntimeMetrics {
   host_pid: number;
   host_ram_bytes: number;
   total_tree_ram_bytes: number;
-  cpu_usage_percent: number;
+  /** Sent by the host but never shown until a reliable reading exists (4D.4): the interface says "indisponível". */
+  cpu_usage_percent?: number;
 }
 
 export interface AppHeaderProps {
-  status: RuntimeStatus | null;
+  /** Real application version (package metadata); empty or invalid shows nothing. */
   appVersion: string;
   isTauri: boolean;
   connectionStatus: ConnectionStatus;
-  metrics: RuntimeMetrics | null;
+  /** True only after a real updater_check answered "available". */
   hasUpdateAvailable: boolean;
   latestAvailableVersion: string;
   /** Opens Configurações (at Sobre when an update is available). */
   onOpenSettings: () => void;
+  /** Main navigation (MainNav), in the middle of the header. */
+  nav?: React.ReactNode;
 }
 
-export const formatBytes = (bytes: number): string => {
-  if (bytes < 1024) return `${bytes} B`;
-  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
-  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+export type ConnectionTone = "ok" | "info" | "warn" | "err";
+
+export interface ConnectionLabel {
+  text: string;
+  tone: ConnectionTone;
+}
+
+const CONNECTION_LABEL: Record<ConnectionStatus, ConnectionLabel> = {
+  connected: { text: "Core conectado", tone: "ok" },
+  connecting: { text: "Conectando…", tone: "warn" },
+  authorizing: { text: "Aguardando autorização", tone: "info" },
+  failed: { text: "Falha", tone: "err" },
 };
 
-const CONNECTION_LABEL: Record<ConnectionStatus, { text: string; tone: string }> = {
-  connected: { text: "Ativa", tone: "status--ok" },
-  authorizing: { text: "Aguardando autorização", tone: "status--info" },
-  connecting: { text: "Conectando…", tone: "status--warn" },
-  failed: { text: "Falha", tone: "status--err" },
-};
+/** isTauri is false both before the host answers and in the browser preview; only "connecting" is ambiguous. */
+export const isPreviewMode = (isTauri: boolean, status: ConnectionStatus): boolean => !isTauri && status !== "connecting";
+
+/** The preview never claims a connection: it has no Core. */
+export function connectionLabel(isTauri: boolean, status: ConnectionStatus): ConnectionLabel {
+  return isPreviewMode(isTauri, status) ? { text: "Preview: sem Core", tone: "warn" } : CONNECTION_LABEL[status];
+}
+
+const VERSION_RE = /^\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?$/;
+
+/** "v0.6.1-alpha.50" for a real version; null for empty or text such as "indisponível" (never a lone "v"). */
+export function formatVersion(raw: string | null | undefined): string | null {
+  const value = raw?.trim();
+  return value && VERSION_RE.test(value) ? `v${value}` : null;
+}
 
 export const AppHeader: React.FC<AppHeaderProps> = ({
-  status,
   appVersion,
   isTauri,
   connectionStatus,
-  metrics,
   hasUpdateAvailable,
   latestAvailableVersion,
   onOpenSettings,
+  nav,
 }) => {
-  const connection = CONNECTION_LABEL[connectionStatus];
-  const pythonName = status?.python_path ? status.python_path.replace(/\\/g, "/").split("/").pop() : null;
+  const connection = connectionLabel(isTauri, connectionStatus);
+  const version = formatVersion(appVersion);
+  const latest = formatVersion(latestAvailableVersion);
+  const gearName = hasUpdateAvailable ? `Configurações · atualização ${latest ?? "disponível"}` : "Configurações";
 
   return (
-    <header className="app-header">
-      <div className="app-header__identity">
-        <h1 className="app-header__title">AI Coordinator Desktop</h1>
-        <span className="badge">Core {status?.core_version ? `v${status.core_version}` : "…"}</span>
-        <span className="badge badge--channel badge--mono">Alpha{appVersion ? ` v${appVersion}` : ""}</span>
-        {isTauri ? (
-          <span className="badge badge--ok">Tauri 2 + WebView2 (nativo)</span>
-        ) : (
-          <span className="badge badge--warn" title="Visualização provisória via Vite/navegador sem host Tauri">
-            Vite Preview (não homologado)
-          </span>
-        )}
-        <span className="status-text" role="status">
-          Supervisão ConPTY: <strong className={connection.tone}>{connection.text}</strong>
+    <header className="app-header" data-f6-region="header">
+      <div className="app-header__start">
+        <div className="brand">
+          <BrandMark />
+          <h1 className="brand__title">AI Coordinator Desktop</h1>
+        </div>
+        {version && <span className="app-header__version">{version}</span>}
+        <span className={`status-pill status-pill--${connection.tone}`}>
+          <span className="status-pill__dot" aria-hidden="true" />
+          {connection.text}
         </span>
-        {pythonName && (
-          <span
-            className="badge badge--mono badge--truncate"
-            title={`Caminho efetivo do runtime Python no host: ${status!.python_path}`}
-          >
-            Python: {pythonName} ({status!.is_isolated ? "isolado" : "host"})
-          </span>
-        )}
       </div>
 
-      <div className="app-header__meta">
-        {metrics ? (
-          <dl className="app-header__metrics" aria-label="Métricas do processo">
-            <div>
-              <dt>PID</dt>
-              <dd>{metrics.host_pid}</dd>
-            </div>
-            <div>
-              <dt>RAM host</dt>
-              <dd>{formatBytes(metrics.host_ram_bytes)}</dd>
-            </div>
-            <div>
-              <dt>RAM árvore</dt>
-              <dd>{formatBytes(metrics.total_tree_ram_bytes)}</dd>
-            </div>
-            <div>
-              <dt>CPU</dt>
-              <dd>{metrics.cpu_usage_percent.toFixed(1)}%</dd>
-            </div>
-          </dl>
-        ) : (
-          <span className="status-text">Métricas em espera</span>
-        )}
+      {nav}
 
+      <div className="app-header__end">
         <button
           type="button"
           onClick={onOpenSettings}
-          className={hasUpdateAvailable ? "btn btn--sm btn--attention" : "btn btn--sm"}
+          aria-label={gearName}
+          className={hasUpdateAvailable ? "btn btn--sm btn--ghost btn--attention app-gear" : "btn btn--sm btn--ghost app-gear"}
           title={
             hasUpdateAvailable
-              ? `Configurações — atualização v${latestAvailableVersion} disponível em Sobre`
+              ? `Configurações: atualização ${latest ? `${latest} ` : ""}disponível em Sobre`
               : "Configurações do AI Coordinator Desktop"
           }
         >
-          <Icon name={hasUpdateAvailable ? "update" : "settings"} size="sm" />
-          <span>{hasUpdateAvailable ? `Configurações · atualização v${latestAvailableVersion}` : "Configurações"}</span>
+          <Icon name="settings" size="sm" />
+          {hasUpdateAvailable && <span className="app-gear__label">Atualização</span>}
         </button>
       </div>
     </header>

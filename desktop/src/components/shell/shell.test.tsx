@@ -76,7 +76,7 @@ describe("AppHeader", () => {
     render(<AppHeader {...base} onOpenSettings={onOpenSettings} />);
     await user.click(screen.getByRole("button", { name: "Configurações" }));
     expect(onOpenSettings).toHaveBeenCalledTimes(1);
-    expect(screen.getByText(/Python: python\.exe \(isolado\)/)).toBeInTheDocument();
+    expect(screen.queryByText(/Python:/)).not.toBeInTheDocument();
   });
 
   it("indica atualização disponível no rótulo do botão de Configurações", () => {
@@ -86,6 +86,67 @@ describe("AppHeader", () => {
 
   it("sinaliza o modo de visualização sem host Tauri", () => {
     render(<AppHeader {...base} isTauri={false} onOpenSettings={vi.fn()} />);
-    expect(screen.getByText("Vite Preview (não homologado)")).toBeInTheDocument();
+    expect(screen.getByText("Preview: sem Core")).toBeInTheDocument();
+    expect(document.body.textContent).not.toMatch(/conectado/i);
+  });
+
+  it("mostra a marca decorativa, o título e a versão real", () => {
+    const { container } = render(<AppHeader {...base} onOpenSettings={vi.fn()} />);
+    expect(container.querySelector(".brand__mark")).toHaveAttribute("aria-hidden", "true");
+    expect(screen.getByRole("heading", { level: 1, name: "AI Coordinator Desktop" })).toBeInTheDocument();
+    expect(screen.getByText("v0.6.1-alpha.50")).toBeInTheDocument();
+  });
+
+  it.each(["", "indisponível", "  "])("sem versão conhecida (%j) não mostra 'v' solto", (appVersion) => {
+    const { container } = render(<AppHeader {...base} appVersion={appVersion} onOpenSettings={vi.fn()} />);
+    expect(container.querySelector(".app-header__version")).toBeNull();
+    expect(screen.queryByText(/^v/)).toBeNull();
+  });
+
+  it("um texto e um tom por estado de conexão", () => {
+    const seen = new Set<string>();
+    for (const [connectionStatus, text, tone] of [
+      ["connected", "Core conectado", "ok"],
+      ["connecting", "Conectando…", "warn"],
+      ["authorizing", "Aguardando autorização", "info"],
+      ["failed", "Falha", "err"],
+    ] as const) {
+      const { container, unmount } = render(<AppHeader {...base} connectionStatus={connectionStatus} onOpenSettings={vi.fn()} />);
+      const pill = container.querySelector(".status-pill");
+      expect(pill).toHaveTextContent(text);
+      expect(pill).toHaveClass(`status-pill--${tone}`);
+      seen.add(pill!.textContent ?? "");
+      unmount();
+    }
+    expect(seen.size).toBe(4);
+  });
+
+  it("não mostra Python, CPU, métricas nem Vite Preview, no host e no preview", () => {
+    for (const isTauri of [true, false]) {
+      const { unmount } = render(<AppHeader {...base} isTauri={isTauri} onOpenSettings={vi.fn()} />);
+      expect(document.body.textContent).not.toMatch(/Python:|CPU|PID|RAM|Vite Preview|Ativa/);
+      unmount();
+    }
+  });
+
+  it("'Atualização' só aparece com atualização real; o nome do botão é estável", () => {
+    const { rerender } = render(<AppHeader {...base} onOpenSettings={vi.fn()} />);
+    expect(screen.queryByText("Atualização")).toBeNull();
+    expect(screen.getByRole("button", { name: "Configurações" })).toBeInTheDocument();
+    rerender(<AppHeader {...base} hasUpdateAvailable latestAvailableVersion="0.6.1-alpha.51" onOpenSettings={vi.fn()} />);
+    expect(screen.getByText("Atualização")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Configurações · atualização v0.6.1-alpha.51" })).toHaveClass("btn--attention");
+  });
+
+  it("atualização sem versão válida não deixa 'v' solto no nome", () => {
+    render(<AppHeader {...base} hasUpdateAvailable latestAvailableVersion="" onOpenSettings={vi.fn()} />);
+    expect(screen.getByRole("button", { name: "Configurações · atualização disponível" })).toBeInTheDocument();
+  });
+
+  it("é a região do F6 e põe a navegação recebida no centro", () => {
+    render(<AppHeader {...base} onOpenSettings={vi.fn()} nav={<nav aria-label="Seções principais" />} />);
+    const banner = screen.getByRole("banner");
+    expect(banner).toHaveAttribute("data-f6-region", "header");
+    expect(banner).toContainElement(screen.getByRole("navigation", { name: "Seções principais" }));
   });
 });
