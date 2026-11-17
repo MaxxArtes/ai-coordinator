@@ -235,27 +235,31 @@ class TerminalManager:
             if not session:
                 return False
 
+            # Keep the session supervised and its slot reserved until termination is confirmed.
+            # A false result or exception leaves both registries intact, so the operator can retry (F10).
+            if session.terminate() is not True:
+                return False
+
             # Only this very session leaves its slot: never the one that may occupy the slot later (F10).
             tab = self.tabs.get(session.tab_id)
             if tab and tab.panes.get(session.pane_id) is session:
                 tab.panes.pop(session.pane_id, None)
 
             self.sessions.pop(session_id, None)
-        return session.terminate()
+            return True
 
     def close_tab(self, tab_id: str) -> bool:
         """Close tab and cleanly terminate all contained terminals."""
         with self._lock:
-            tab = self.tabs.pop(tab_id, None)
+            tab = self.tabs.get(tab_id)
             if not tab:
                 return False
-            sessions_to_terminate = list(tab.panes.values())
-            for session in sessions_to_terminate:
-                self.sessions.pop(session.session_id, None)
-
-        for session in sessions_to_terminate:
-            session.terminate()
-        return True
+            # close_terminal uses this same RLock. Failed sessions stay in the tab, with their slots reserved.
+            for session in list(tab.panes.values()):
+                if not self.close_terminal(session.session_id):
+                    return False
+            self.tabs.pop(tab_id, None)
+            return True
 
     def save_tab_sessions(self, tab_id: str) -> SessionLayoutExport:
         """Export sanitized visual buffer and layout metadata for the tab."""

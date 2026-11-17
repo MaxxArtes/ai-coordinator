@@ -39,7 +39,7 @@ function host({ preview = false, authorized = true, metricsFail = false } = {}) 
         return { ok: true };
       case "terminal_close_session":
         registry.delete(args?.sessionId);
-        return { ok: true };
+        return { closed: true };
       case "terminal_create_session": {
         const taken = new Set(Array.from(registry.values()).map((r) => r.pane_id));
         const slot = !taken.has(args?.paneId) ? args?.paneId : [0, 1, 2, 3].find((n) => !taken.has(n));
@@ -111,6 +111,33 @@ afterEach(() => {
 });
 
 describe("App views", () => {
+  it("real App headers never invent quota or context, even when the host supplies bogus metrics", async () => {
+    const user = userEvent.setup();
+    const registry = host();
+    const original = invoke.getMockImplementation()!;
+    invoke.mockImplementation(async (cmd: string, args?: any) => {
+      const result = await original(cmd, args);
+      if (cmd === "terminal_list_tabs") {
+        for (const tab of result.tabs) for (const pane of Object.values(tab.panes) as any[]) {
+          Object.assign(pane, { context_percent: 90, quota_5h_percent: 81, quota_7d_percent: 75 });
+        }
+      }
+      return result;
+    });
+    renderApp();
+    await connected();
+    await user.click(screen.getByRole("button", { name: /Novo terminal/ }));
+    await waitFor(() => expect(xtermLog.created).toHaveLength(2));
+    registry.set("sess-1", { pane_id: 0, alive: false, exit_code: 0 });
+    await waitFor(() => expect(screen.getByRole("region", { name: "Terminal 01" })).toHaveTextContent("encerrado"), { timeout: 3500 });
+    for (const header of document.querySelectorAll(".terminal-pane__header")) {
+      expect(header.textContent).not.toContain("%");
+      expect(header.querySelectorAll(".indicator-ring--unknown")).toHaveLength(3);
+      expect(within(header as HTMLElement).getByRole("button", { name: /Indicadores.*indisponíveis/ })).toBeInTheDocument();
+    }
+    expect(document.querySelector(".pane-indicators__popover")).toBeNull();
+  }, 10000);
+
   it.each([1, 4])(
     "keeps %i terminal(s) through three round trips across the views and Configurações",
     async (n) => {
@@ -356,6 +383,27 @@ describe("App views", () => {
     },
     12000,
   );
+
+  it.each([false, undefined])("an unconfirmed close (%s) keeps the pane and allows a retry", async (closed) => {
+    const user = userEvent.setup();
+    const registry = host();
+    renderApp();
+    await connected();
+    const original = invoke.getMockImplementation()!;
+    invoke.mockImplementation(async (cmd: string, args?: any) => {
+      if (cmd === "terminal_close_session") return { closed };
+      return original(cmd, args);
+    });
+    await user.click(screen.getByRole("button", { name: "Fechar Terminal 01" }));
+    expect(await screen.findByText(/O terminal continua aberto/)).toBeInTheDocument();
+    expect(screen.getByRole("region", { name: "Terminal 01" })).toBeInTheDocument();
+    expect(xtermLog.disposed).toBe(0);
+    expect(registry.has("sess-1")).toBe(true);
+    invoke.mockImplementation(original);
+    await user.click(screen.getByRole("button", { name: "Fechar Terminal 01" }));
+    await waitFor(() => expect(screen.queryByRole("region", { name: "Terminal 01" })).toBeNull());
+    expect(registry.has("sess-1")).toBe(false);
+  });
 
   it("a failed close keeps the pane: no process is left without a pane to close it", async () => {
     const user = userEvent.setup();

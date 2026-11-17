@@ -154,6 +154,58 @@ def test_closing_a_stale_session_never_unregisters_the_slot_owner(env):
     assert owner.is_alive
 
 
+@pytest.mark.parametrize("raises", [False, True])
+@pytest.mark.parametrize("whole_tab", [False, True])
+def test_failed_close_keeps_process_registered_and_slot_reserved_until_retry(env, raises, whole_tab):
+    first = _open(env, 0)
+    other = _open(env, 1)
+    original = first.backend.terminate
+
+    def fail():
+        if raises:
+            raise RuntimeError("termination refused")
+        return False
+
+    first.backend.terminate = fail
+    close = (lambda: env.mgr.close_tab(TAB)) if whole_tab else (lambda: env.mgr.close_terminal(first.session_id))
+    if raises:
+        with pytest.raises(RuntimeError, match="termination refused"):
+            close()
+    else:
+        assert close() is False
+    assert first.is_alive and other.is_alive
+    assert env.mgr.get_session(first.session_id) is first
+    assert _registered(env.mgr)[0] is first
+    newcomer = _open(env, 0)
+    assert newcomer.pane_id == 2
+    assert _registered(env.mgr)[0] is first
+    assert env.mgr.get_session(other.session_id) is other
+    first.backend.terminate = original
+    assert close() is True
+    assert not first.is_alive
+    assert env.mgr.get_session(first.session_id) is None
+    if whole_tab:
+        assert env.mgr.get_tab(TAB) is None
+        assert not other.is_alive and not newcomer.is_alive
+    else:
+        assert other.is_alive and newcomer.is_alive
+        assert env.mgr.close_tab(TAB) is True
+
+
+def test_failed_tab_close_keeps_only_unclosed_sessions_until_retry(env):
+    first, middle, third = (_open(env, i) for i in range(3))
+    original = middle.backend.terminate
+    middle.backend.terminate = lambda: False
+    assert env.mgr.close_tab(TAB) is False
+    assert not first.is_alive
+    assert env.mgr.get_session(first.session_id) is None
+    assert _registered(env.mgr) == {1: middle, 2: third}
+    assert middle.is_alive and third.is_alive
+    middle.backend.terminate = original
+    assert env.mgr.close_tab(TAB) is True
+    assert env.mgr.sessions == {}
+
+
 def _check_invariants(mgr: TerminalManager, closed_ids: set) -> None:
     tab = mgr.get_tab(TAB)
     panes = list(tab.panes.values()) if tab else []

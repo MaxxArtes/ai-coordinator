@@ -1026,7 +1026,9 @@
 }
 
 .terminal-pane__header {
+  position: relative;
   display: flex;
+  flex: none;
   align-items: center;
   justify-content: space-between;
   gap: var(--sp-2);
@@ -1039,6 +1041,7 @@
 }
 
 .terminal-pane__heading {
+  flex: 1 1 auto;
   display: flex;
   align-items: center;
   gap: var(--sp-2);
@@ -1164,10 +1167,73 @@
 
 /* Narrow pane (2×2 at 1024 px): the program badge goes first; the footer still names it. */
 @container (max-width: 520px) {
-  .terminal-pane__program {
+  .terminal-pane__program,
+  .indicator-ring__label {
     display: none;
   }
 }
+
+.pane-indicators { flex: none; }
+.pane-indicators__button {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  min-width: var(--h-control);
+  min-height: var(--h-control);
+  padding: 0 var(--sp-1);
+  border: 1px solid var(--c-border-control);
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--c-fg-muted);
+  cursor: pointer;
+}
+.pane-indicators__button:hover,
+.pane-indicators__button[aria-expanded="true"] { background: var(--c-surface-hover); }
+.indicator-ring {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  font-family: var(--font-mono);
+  font-size: var(--fs-xs);
+  white-space: nowrap;
+}
+.indicator-ring__svg { width: 14px; height: 14px; flex: none; }
+.indicator-ring__track { stroke: var(--c-ring-unknown); }
+.indicator-ring--unknown .indicator-ring__track { stroke-dasharray: 2 2; }
+.indicator-ring__arc { stroke: currentColor; }
+.indicator-ring--low { color: var(--c-ok); }
+.indicator-ring--mid { color: var(--c-warn); }
+.indicator-ring--high { color: var(--c-err); }
+.indicator-ring--measured,
+.indicator-ring--estimated,
+.indicator-ring--unknown { line-height: var(--lh-tight); }
+.indicator-ring__label,
+.indicator-ring__value { color: var(--c-fg-muted); }
+.indicator-ring__fixture { color: var(--c-fg-subtle); }
+
+/* Anchored within the pane; scroll rather than clipping an explanation in a short panel. */
+.pane-indicators__popover {
+  position: absolute;
+  z-index: 5;
+  top: 100%;
+  right: var(--sp-1);
+  width: min(28rem, calc(100% - var(--sp-2)));
+  max-height: min(24rem, calc(50vh - 140px));
+  overflow: auto;
+  padding: var(--sp-3);
+  border: 1px solid var(--c-border-control);
+  border-radius: var(--radius);
+  background: var(--c-surface-overlay);
+  color: var(--c-fg);
+  box-shadow: var(--shadow-dialog);
+  font-size: var(--fs-xs);
+  line-height: var(--lh-normal);
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
+.pane-indicators__title { margin: 0 0 var(--sp-2); font-weight: var(--fw-semibold); }
+.pane-indicators__readings { margin: 0; padding-left: var(--sp-4); }
+.pane-indicators__readings li + li { margin-top: var(--sp-2); }
 
 .terminal-pane__mount {
   flex: 1 1 0%;

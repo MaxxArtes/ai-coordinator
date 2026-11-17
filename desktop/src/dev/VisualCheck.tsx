@@ -21,6 +21,8 @@ import { StatusBar } from "../components/shell/StatusBar";
 import { TerminalGrid } from "../components/TerminalGrid";
 import type { TerminalPaneData } from "../components/TerminalPane";
 import type { PaneState } from "../components/useTerminalStates";
+import { PaneIndicators } from "../components/indicators/PaneIndicators";
+import { INDICATOR_KINDS, type IndicatorReading } from "../components/indicators/readings";
 import { AuthorizationScreen } from "../components/shell/AuthorizationScreen";
 import { NoticeBanner } from "../components/shell/NoticeBanner";
 import { StartupStatus } from "../components/shell/StartupStatus";
@@ -216,9 +218,33 @@ const ConversasView: React.FC<{ view: MainViewId }> = ({ view: initial }) => (
   </Shell>
 );
 
+/** Values for this page only, always marked test_fixture. */
+const IndicatorFixtures: React.FC<{ open?: boolean }> = ({ open = false }) => {
+  const readings: IndicatorReading[] = INDICATOR_KINDS.map((kind, i) => ({
+    kind, provenance: i === 1 ? "estimated" : "measured", origin: "test_fixture",
+    percent: [18, 65, 91][i], source: "conferência visual fictícia", asOf: "2026-11-17T12:00:00Z",
+  }));
+  return (
+    <Shell panes={1}>
+      <div className="terminal-grid">
+        <div className="terminal-grid__panes terminal-grid__panes--1">
+          <div className="terminal-pane">
+            <div className="terminal-pane__header">
+              <span className="terminal-pane__title">01 · Terminal (fixture)</span>
+              <PaneIndicators terminalName="Terminal 01" readings={readings} initiallyOpen={open} />
+            </div>
+          </div>
+        </div>
+      </div>
+    </Shell>
+  );
+};
+
 const VIEWS: Record<string, () => React.ReactElement> = {
   "app-preview": () => <App />,
   "conversas-4": () => <ConversasView view="conversas" />,
+  "indicadores-fixture": () => <IndicatorFixtures />,
+  "indicadores-popover": () => <IndicatorFixtures open />,
   monitoramento: () => <ConversasView view="monitoramento" />,
   missoes: () => <ConversasView view="missoes" />,
   auth: () => (

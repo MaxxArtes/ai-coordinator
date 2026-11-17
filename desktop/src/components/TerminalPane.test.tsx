@@ -288,7 +288,7 @@ describe("TerminalPane keyboard", () => {
     expect(region).toHaveClass("terminal-pane__focus-region");
     expect(region).toHaveAttribute("tabindex", "-1");
     expect(region).toHaveAttribute("data-f6-entry");
-    expect(region).toHaveAccessibleDescription("Enter: digitar no terminal. Tab: botão fechar. F6: próxima região.");
+    expect(region).toHaveAccessibleDescription("Enter: digitar no terminal. Tab: indicadores e botão fechar. F6: próxima região.");
     expect(container.querySelector(".terminal-pane")).toHaveAttribute("data-f6-region", "pane");
   });
 
@@ -317,10 +317,12 @@ describe("TerminalPane keyboard", () => {
     expect(p.onWrite).not.toHaveBeenCalled();
   });
 
-  it("Tab from the focus region goes to the close button, then into the terminal", async () => {
+  it("Tab from the focus region goes to indicators, close, then the terminal", async () => {
     const user = userEvent.setup();
     render(<TerminalPane {...props()} />);
     screen.getByRole("group", { name: "Terminal 07, 2 de 3" }).focus();
+    await user.tab();
+    expect(document.activeElement).toBe(screen.getByRole("button", { name: /^Indicadores do Terminal 07:/ }));
     await user.tab();
     expect(document.activeElement).toBe(screen.getByRole("button", { name: "Fechar Terminal 07" }));
     await user.tab();

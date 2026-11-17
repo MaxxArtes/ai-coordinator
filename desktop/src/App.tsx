@@ -162,7 +162,8 @@ export const App: React.FC = () => {
     async (sessionId: string) => {
       if (isTauriRef.current) {
         try {
-          await callTauri("terminal_close_session", { sessionId });
+          const result = await callTauri("terminal_close_session", { sessionId });
+          if (result?.closed !== true) throw new Error("O host não confirmou o fechamento");
         } catch (err: any) {
           // The pane stays: removing it would leave a process the interface no longer shows nor closes (F10).
           showNotice(`Erro ao fechar sessão: ${err?.message || err}. O terminal continua aberto.`);

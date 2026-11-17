@@ -31,6 +31,8 @@ import { terminalKeyFilter } from "./shell/shortcuts";
 import { applyXtermAppearance, readXtermAppearance, watchXtermTheme } from "../styles/xtermTheme";
 import { formatTerminalNumber } from "./terminalIdentity";
 import { paneStateText, type PaneState } from "./useTerminalStates";
+import { PaneIndicators } from "./indicators/PaneIndicators";
+import type { IndicatorReading } from "./indicators/readings";
 
 export interface TerminalPaneData {
   sessionId: string;
@@ -57,6 +59,8 @@ export interface TerminalPaneProps extends TerminalPaneData {
   total: number;
   /** Live state; unknown when not given. */
   state?: PaneState;
+  /** Only visual-check fixtures supply values; the App uses unknown readings. */
+  readings?: IndicatorReading[];
   onWrite: (sessionId: string, data: string) => void;
   onResize: (sessionId: string, cols: number, rows: number) => void;
   onClose?: (sessionId: string) => void;
@@ -85,6 +89,7 @@ export const TerminalPane: React.FC<TerminalPaneProps> = ({
   position,
   total,
   state = { kind: "unknown" },
+  readings,
   onWrite,
   onResize,
   onClose,
@@ -194,8 +199,8 @@ export const TerminalPane: React.FC<TerminalPaneProps> = ({
 
   const hintId = useId();
   const hint = onClose
-    ? "Enter: digitar no terminal. Tab: botão fechar. F6: próxima região."
-    : "Enter: digitar no terminal. F6: próxima região.";
+    ? "Enter: digitar no terminal. Tab: indicadores e botão fechar. F6: próxima região."
+    : "Enter: digitar no terminal. Tab: indicadores. F6: próxima região.";
 
   // A click enters the terminal too: screen readers in browse mode turn Enter and Space into a click on the region.
   const enterTerminal = () => terminalRef.current?.focus();
@@ -246,6 +251,7 @@ export const TerminalPane: React.FC<TerminalPaneProps> = ({
         <span id={hintId} className="sr-only">
           {hint}
         </span>
+        <PaneIndicators terminalName={name} readings={readings} />
         {onClose && (
           <button
             type="button"
