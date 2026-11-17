@@ -1,58 +1,103 @@
 /*
- * AI Coordinator Desktop — design tokens (Marco 4D.3, fundação visual).
+ * AI Coordinator Desktop — design tokens (Marco 4D.3, Etapa 5: palette of visual reference 01).
  *
- * Every color, size and duration used by the components comes from these custom properties.
- * Components never hard-code colors. The main identity is the dark palette the app already used.
- *
- * Contrast (WCAG 2.x, normal text): --c-fg on --c-bg ~13:1; --c-fg-muted on --c-surface ~8:1;
- * --c-fg-subtle on --c-surface ~6:1; --c-on-accent on --c-accent ~9:1.
+ * - Components never use a literal color: every color, size and duration comes from these custom properties
+ *   (checked by css.rules.test.ts).
+ * - Text sizes are rem with a 0.75rem (12 px) floor. Geometry is CSS px measured on the content; the Windows scale
+ *   (125% and up) is applied by WebView2, so nothing here zooms or scales.
+ * - Contrast (WCAG 2.x) is recomputed by tokens.contrast.test.ts for every mode. Reference values (standard | low):
+ *   - --c-fg on --c-bg 15.7 | 11.6; worst text, --c-fg-subtle on --c-surface-hover, 5.3 | 4.9;
+ *   - --c-accent on --c-surface-hover 9.5 | 7.7; status colors on --c-surface-raised >= 6.6 | 7.1;
+ *   - --c-border-control and --c-focus on every surface >= 3.2 | 3.1 (non-text contrast);
+ *   - terminal text on --c-term-bg 13.0 | 11.1; ANSI text colors >= 5.0 | 5.3 (black is a background color).
+ * - --c-border and --c-border-strong are decorative separators only; controls use --c-border-control.
+ * - --c-term-* are read by styles/xtermTheme.ts: always literal #rrggbb (or a system color in forced-colors), never var().
  */
 :root {
   color-scheme: dark;
 
   /* Surfaces */
-  --c-bg: #11111b;
-  --c-surface: #181825;
-  --c-surface-raised: #1e1e2e;
-  --c-surface-overlay: #313244;
-  --c-surface-hover: #45475a;
-  --c-border: #313244;
-  --c-border-strong: #45475a;
-  --c-backdrop: rgba(17, 17, 27, 0.78);
+  --c-bg: #07090e;
+  --c-chrome: #0d1117;
+  --c-surface: #0c0f16;
+  --c-surface-raised: #101521;
+  --c-surface-overlay: #111622;
+  --c-surface-hover: #161b26;
+  --c-nav-inset: #080a0f;
+  --c-backdrop: rgba(7, 9, 14, 0.78);
+
+  /* Borders */
+  --c-border: #1c1f27;
+  --c-border-strong: #2a2f3a;
+  --c-border-control: #636b7e;
 
   /* Text */
-  --c-fg: #cdd6f4;
-  --c-fg-muted: #a6adc8;
-  --c-fg-subtle: #9399b2;
-  --c-on-accent: #11111b;
+  --c-fg: #e4e4e7;
+  --c-fg-muted: #a1a1aa;
+  --c-fg-subtle: #8b8e99;
+  --c-on-accent: #07090e;
 
-  /* Accent and status */
-  --c-accent: #89b4fa;
-  --c-accent-hover: #b4befe;
-  --c-ok: #a6e3a1;
-  --c-warn: #f9e2af;
-  --c-err: #f38ba8;
-  --c-info: #89dceb;
-  --c-agent: #94e2d5;
-  --c-channel: #cba6f7;
+  /* Accent, brand and focus */
+  --c-accent: #22d3ee;
+  --c-accent-strong: #06b6d4;
+  --c-accent-hover: #67e8f9;
+  --c-focus: #22d3ee;
+  --c-pane-focus: #0891b2;
+  --c-brand-bg: #0a2532;
+  --c-brand-border: #0f3241;
+  --c-pill-ok-bg: #04261f;
+  --c-pill-ok-border: #07342b;
+
+  /* Status */
+  --c-ok: #34d399;
+  --c-warn: #fbbf24;
+  --c-err: #f87171;
+  --c-info: #60a5fa;
+  --c-agent: #a78bfa;
+  --c-channel: #c084fc;
 
   /* Tinted status backgrounds and borders (explicit rgba: no color-mix dependency) */
-  --c-ok-bg: rgba(166, 227, 161, 0.1);
-  --c-ok-border: rgba(166, 227, 161, 0.45);
-  --c-warn-bg: rgba(249, 226, 175, 0.1);
-  --c-warn-border: rgba(249, 226, 175, 0.45);
-  --c-err-bg: rgba(243, 139, 168, 0.12);
-  --c-err-border: rgba(243, 139, 168, 0.5);
-  --c-info-bg: rgba(137, 180, 250, 0.1);
-  --c-info-border: rgba(137, 180, 250, 0.45);
+  --c-ok-bg: rgba(52, 211, 153, 0.12);
+  --c-ok-border: rgba(52, 211, 153, 0.45);
+  --c-warn-bg: rgba(251, 191, 36, 0.12);
+  --c-warn-border: rgba(251, 191, 36, 0.45);
+  --c-err-bg: rgba(248, 113, 113, 0.12);
+  --c-err-border: rgba(248, 113, 113, 0.45);
+  --c-info-bg: rgba(96, 165, 250, 0.12);
+  --c-info-border: rgba(96, 165, 250, 0.45);
 
-  /* Focus */
-  --c-focus: #89b4fa;
-  --focus-ring: 0 0 0 2px var(--c-bg), 0 0 0 4px var(--c-focus);
+  /* Terminal (xterm theme, 21 colors) */
+  --c-term-bg: #0c0f16;
+  --c-term-fg: #d4d4d8;
+  --c-term-cursor: #22d3ee;
+  --c-term-cursor-accent: #0c0f16;
+  --c-term-selection: #1e293b;
+  --c-term-black: #343a46;
+  --c-term-red: #f87171;
+  --c-term-green: #34d399;
+  --c-term-yellow: #fbbf24;
+  --c-term-blue: #60a5fa;
+  --c-term-magenta: #c084fc;
+  --c-term-cyan: #22d3ee;
+  --c-term-white: #d4d4d8;
+  --c-term-bright-black: #7c8394;
+  --c-term-bright-red: #fca5a5;
+  --c-term-bright-green: #6ee7b7;
+  --c-term-bright-yellow: #fcd34d;
+  --c-term-bright-blue: #93c5fd;
+  --c-term-bright-magenta: #d8b4fe;
+  --c-term-bright-cyan: #67e8f9;
+  --c-term-bright-white: #f4f4f5;
 
-  /* Typography */
+  /* Elevation and focus */
+  --shadow-dialog: 0 18px 48px rgba(0, 0, 0, 0.55);
+  --shadow-pane-focus: 0 0 0 1px var(--c-pane-focus), 0 0 8px rgba(34, 211, 238, 0.16);
+  --focus-width: 2px;
+  --focus-offset: 2px;
+
+  /* Typography: Segoe UI for the interface, a monospace font for technical labels (the terminal font is xterm's) */
   --font-ui: "Segoe UI", system-ui, -apple-system, Roboto, Helvetica, Arial, sans-serif;
-  --font-mono: "Cascadia Code", "Fira Code", Consolas, monospace;
+  --font-mono: "Cascadia Mono", "Cascadia Code", Consolas, monospace;
   --fs-xs: 0.75rem;
   --fs-sm: 0.8125rem;
   --fs-md: 0.875rem;
@@ -73,7 +118,22 @@
   --radius-sm: 4px;
   --radius: 6px;
   --radius-lg: 8px;
-  --shadow-dialog: 0 18px 48px rgba(0, 0, 0, 0.55);
+
+  /* Geometry (CSS px, minimum heights: the content may grow them) */
+  --h-header: 32px;
+  --h-strip: 28px;
+  --h-statusbar: 24px;
+  --h-nav-tab: 24px;
+  --h-pill: 20px;
+  --h-control: 24px;
+  --gutter: 8px;
+  --gap-band: 8px;
+  --gap-pane: 6px;
+  --accent-line: 2px;
+  --term-pad: 4px;
+  --brand-w: 22px;
+  --brand-h: 18px;
+  --radius-brand: 4px;
 
   /* Motion */
   --motion-fast: 120ms;
@@ -82,33 +142,74 @@
 }
 
 /*
- * Low-stimulation mode (4D.3.4): softer contrast that still meets WCAG AA (--c-fg on --c-bg ~10:1,
- * --c-fg-subtle on --c-surface ~5.2:1, lowest pair ~4.8:1), desaturated accents, no elevation and no motion.
- * Activated by <html data-stimulation="low">; the Aparência category will expose the toggle.
+ * Low-stimulation mode: every --c-* is redefined (softer contrast that still meets WCAG AA), no glow, no elevation,
+ * no motion. Activated by <html data-stimulation="low">; the Aparência category exposes the toggle.
  */
 :root[data-stimulation="low"] {
-  --c-bg: #1e1e2e;
-  --c-surface: #232334;
-  --c-surface-raised: #29293b;
-  --c-surface-overlay: #35364a;
-  --c-surface-hover: #404258;
-  --c-border: #35364a;
-  --c-border-strong: #4a4c63;
-  --c-fg: #c3c9e0;
-  --c-fg-muted: #a3a9c2;
-  --c-fg-subtle: #8f95ad;
-  --c-accent: #9fb4dc;
-  --c-accent-hover: #b3c3e3;
-  --c-ok: #a9cfa6;
-  --c-warn: #ddd0ad;
-  --c-err: #d9a3b2;
-  --c-info: #9fc7cf;
-  --c-agent: #a2c8c1;
-  --c-channel: #bcaed6;
-  --c-focus: #b3c3e3;
+  --c-bg: #10131a;
+  --c-chrome: #12151c;
+  --c-surface: #151820;
+  --c-surface-raised: #1a1e27;
+  --c-surface-overlay: #1d212b;
+  --c-surface-hover: #232733;
+  --c-nav-inset: #0e1117;
+  --c-backdrop: rgba(16, 19, 26, 0.78);
+  --c-border: #262a34;
+  --c-border-strong: #333844;
+  --c-border-control: #6b7282;
+  --c-fg: #c9ccd4;
+  --c-fg-muted: #a3a7b2;
+  --c-fg-subtle: #8f94a0;
+  --c-on-accent: #10131a;
+  --c-accent: #8cc4cf;
+  --c-accent-strong: #7fb5c0;
+  --c-accent-hover: #a6d3dc;
+  --c-focus: #8cc4cf;
+  --c-pane-focus: #6c9fa9;
+  --c-brand-bg: #17262c;
+  --c-brand-border: #22343b;
+  --c-pill-ok-bg: #16241f;
+  --c-pill-ok-border: #1f3029;
+  --c-ok: #9ccbb4;
+  --c-warn: #d9c48f;
+  --c-err: #d79a9a;
+  --c-info: #9db4d6;
+  --c-agent: #b3abd6;
+  --c-channel: #c2aed6;
+  --c-ok-bg: rgba(156, 203, 180, 0.12);
+  --c-ok-border: rgba(156, 203, 180, 0.45);
+  --c-warn-bg: rgba(217, 196, 143, 0.12);
+  --c-warn-border: rgba(217, 196, 143, 0.45);
+  --c-err-bg: rgba(215, 154, 154, 0.12);
+  --c-err-border: rgba(215, 154, 154, 0.45);
+  --c-info-bg: rgba(157, 180, 214, 0.12);
+  --c-info-border: rgba(157, 180, 214, 0.45);
+  --c-term-bg: #151820;
+  --c-term-fg: #c9ccd4;
+  --c-term-cursor: #8cc4cf;
+  --c-term-cursor-accent: #151820;
+  --c-term-selection: #2a3140;
+  --c-term-black: #2c313c;
+  --c-term-red: #d79a9a;
+  --c-term-green: #9ccbb4;
+  --c-term-yellow: #d9c48f;
+  --c-term-blue: #9db4d6;
+  --c-term-magenta: #c2aed6;
+  --c-term-cyan: #8cc4cf;
+  --c-term-white: #c9ccd4;
+  --c-term-bright-black: #868c99;
+  --c-term-bright-red: #e3b1b1;
+  --c-term-bright-green: #b3d8c5;
+  --c-term-bright-yellow: #e4d4a8;
+  --c-term-bright-blue: #b6c8e3;
+  --c-term-bright-magenta: #d3c4e3;
+  --c-term-bright-cyan: #a8d3db;
+  --c-term-bright-white: #dfe1e6;
   --shadow-dialog: none;
+  --shadow-pane-focus: 0 0 0 1px var(--c-pane-focus);
   --motion-fast: 0ms;
   --motion: 0ms;
+  --motion-spin: 0ms;
 }
 
 /* System preference for reduced motion (applies in any mode). */
@@ -116,5 +217,70 @@
   :root {
     --motion-fast: 0ms;
     --motion: 0ms;
+  }
+}
+
+/*
+ * Windows contrast themes (forced colors). The selector list also beats the low-stimulation block.
+ * - Focus, pane focus, the active accent line and control borders use system colors.
+ * - The terminal follows the system palette (light or dark): xtermTheme.ts resolves the system colors to #rrggbb,
+ *   applies them to the open terminals without recreating them, and raises xterm's minimumContrastRatio to 7.
+ * - --c-term-selection-fg exists only here: in the other modes the selected text keeps its own color.
+ */
+@media (forced-colors: active) {
+  :root,
+  :root[data-stimulation="low"] {
+    --c-focus: Highlight;
+    --c-pane-focus: Highlight;
+    --c-accent-strong: Highlight;
+    --c-border-control: ButtonBorder;
+    --shadow-dialog: none;
+    --shadow-pane-focus: none;
+    --c-term-bg: Canvas;
+    --c-term-fg: CanvasText;
+    --c-term-cursor: CanvasText;
+    --c-term-cursor-accent: Canvas;
+    --c-term-selection: Highlight;
+    --c-term-selection-fg: HighlightText;
+    /* Dark contrast themes ("Night sky", "Aquatic", "Dusk"): bright ANSI colors, all >= 4.5:1 on their backgrounds. */
+    --c-term-black: #000000;
+    --c-term-red: #ff7070;
+    --c-term-green: #4dff4d;
+    --c-term-yellow: #ffff4d;
+    --c-term-blue: #9090ff;
+    --c-term-magenta: #ff70ff;
+    --c-term-cyan: #4dffff;
+    --c-term-white: #e5e5e5;
+    --c-term-bright-black: #a0a0a0;
+    --c-term-bright-red: #ff8f8f;
+    --c-term-bright-green: #80ff80;
+    --c-term-bright-yellow: #ffff80;
+    --c-term-bright-blue: #a8a8ff;
+    --c-term-bright-magenta: #ff99ff;
+    --c-term-bright-cyan: #80ffff;
+    --c-term-bright-white: #ffffff;
+  }
+}
+
+/* Light contrast themes (for example "Desert"): dark ANSI colors, all >= 6:1 on white. */
+@media (forced-colors: active) and (prefers-color-scheme: light) {
+  :root,
+  :root[data-stimulation="low"] {
+    --c-term-black: #000000;
+    --c-term-red: #9e0000;
+    --c-term-green: #005f00;
+    --c-term-yellow: #5f4b00;
+    --c-term-blue: #0033b3;
+    --c-term-magenta: #8a008a;
+    --c-term-cyan: #005c66;
+    --c-term-white: #3d3d3d;
+    --c-term-bright-black: #505050;
+    --c-term-bright-red: #b30000;
+    --c-term-bright-green: #006b00;
+    --c-term-bright-yellow: #6b5400;
+    --c-term-bright-blue: #0047d6;
+    --c-term-bright-magenta: #a000a0;
+    --c-term-bright-cyan: #006b78;
+    --c-term-bright-white: #1f1f1f;
   }
 }

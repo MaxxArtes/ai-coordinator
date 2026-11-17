@@ -48,19 +48,30 @@ samp {
   font-family: var(--font-mono);
 }
 
-/* Focus is always visible for keyboard users; mouse clicks do not leave rings behind. */
-:focus {
+/*
+ * Focus is always visible for keyboard users; mouse clicks do not leave rings behind.
+ * An outline (not a box-shadow) stays visible in the Windows contrast themes.
+ */
+:focus:not(:focus-visible) {
   outline: none;
 }
 
 :focus-visible {
-  outline: none;
-  box-shadow: var(--focus-ring);
+  outline: var(--focus-width) solid var(--c-focus);
+  outline-offset: var(--focus-offset);
 }
 
 /* The hidden attribute always wins over component display rules (e.g. inactive settings panels). */
 [hidden] {
   display: none !important;
+}
+
+/*
+ * Hidden but still laid out: the box keeps its size, so the terminals behind it are never resized.
+ * Always paired with the inert attribute, which removes the content from focus and from assistive technology.
+ */
+.is-invisible {
+  visibility: hidden !important;
 }
 
 /* Visually hidden but available to assistive technology. */
@@ -87,12 +98,12 @@ samp {
 }
 
 ::-webkit-scrollbar-thumb {
-  background: var(--c-surface-hover);
+  background: var(--c-border-strong);
   border-radius: var(--radius-sm);
 }
 
 ::-webkit-scrollbar-thumb:hover {
-  background: var(--c-border-strong);
+  background: var(--c-border-control);
 }
 
 /* Motion policy: no animation when the system asks for reduced motion or in low-stimulation mode. */
@@ -112,4 +123,12 @@ samp {
 :root[data-stimulation="low"] *::after {
   animation: none !important;
   transition: none !important;
+}
+
+/* Windows contrast themes: the focus outline is restated so that no component rule can remove it. */
+@media (forced-colors: active) {
+  :focus-visible {
+    outline: var(--focus-width) solid var(--c-focus);
+    outline-offset: var(--focus-offset);
+  }
 }

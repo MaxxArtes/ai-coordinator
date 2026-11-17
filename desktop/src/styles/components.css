@@ -11,10 +11,31 @@
 }
 
 .app__main {
+  display: grid;
+  grid-template: minmax(0, 1fr) / minmax(0, 1fr);
   flex: 1 1 0%;
   width: 100%;
   min-height: 0;
   overflow: hidden;
+}
+
+/* Every view shares the same grid cell: switching views never resizes (nor recreates) the terminals. */
+.app__main > * {
+  grid-area: 1 / 1;
+  min-width: 0;
+  min-height: 0;
+}
+
+.app-view {
+  display: flex;
+  flex-direction: column;
+  width: 100%;
+  height: 100%;
+  overflow: hidden;
+}
+
+.app-view:focus-visible {
+  outline-offset: calc(-1 * var(--focus-width));
 }
 
 /* ---------- Header ---------- */
@@ -155,7 +176,7 @@
   gap: var(--sp-2);
   min-height: 28px;
   padding: var(--sp-1) var(--sp-3);
-  border: 1px solid var(--c-border-strong);
+  border: 1px solid var(--c-border-control);
   border-radius: var(--radius);
   background: var(--c-surface-overlay);
   color: var(--c-fg);
@@ -234,7 +255,7 @@
 }
 
 .btn--sm {
-  min-height: 24px;
+  min-height: var(--h-control);
   padding: 2px var(--sp-2);
   font-size: var(--fs-xs);
 }
@@ -460,7 +481,7 @@
 .input {
   width: 100%;
   padding: var(--sp-2) var(--sp-3);
-  border: 1px solid var(--c-border-strong);
+  border: 1px solid var(--c-border-control);
   border-radius: var(--radius);
   background: var(--c-bg);
   color: var(--c-fg);
@@ -1072,9 +1093,9 @@
 .terminal-grid__panes {
   display: grid;
   flex: 1 1 0%;
-  gap: var(--sp-2);
+  gap: var(--gap-pane);
   height: 100%;
-  padding: var(--sp-2);
+  padding: var(--gap-band) var(--gutter);
   overflow: hidden;
 }
 
@@ -1111,9 +1132,10 @@
   background: var(--c-surface);
 }
 
-/* Keyboard focus inside a terminal is visible on the pane border (4D.3.5). */
+/* Focused pane: a 2 px ring (a static glow in the standard mode, none in low stimulation). */
 .terminal-pane:focus-within {
-  border-color: var(--c-focus);
+  border-color: var(--c-pane-focus);
+  box-shadow: var(--shadow-pane-focus);
 }
 
 .terminal-pane__header {
@@ -1146,6 +1168,429 @@
   flex: 1 1 0%;
   height: 100%;
   width: 100%;
-  padding: var(--sp-1);
+  min-height: 0;
+  padding: 0;
+  background: var(--c-term-bg);
   overflow: hidden;
+}
+
+/* FitAddon subtracts only the padding of .xterm itself: with the padding inside, no row is clipped. */
+.terminal-pane__mount > .xterm {
+  height: 100%;
+  padding: var(--term-pad);
+}
+
+/*
+ * Focus region of the pane (role=group, tabIndex -1, entry of F6): an inset ring, because the pane clips its
+ * content (overflow hidden) and the header has only a few px of padding.
+ */
+.terminal-pane__focus-region {
+  display: flex;
+  flex: 1 1 auto;
+  align-items: center;
+  align-self: stretch;
+  gap: var(--sp-2);
+  min-width: 0;
+  border-radius: var(--radius-sm);
+  cursor: default;
+}
+
+.terminal-pane__focus-region:focus-visible {
+  outline-offset: calc(-1 * var(--focus-width));
+}
+
+/* ---------- Header: brand, connection pill, navigation and gear (Etapa 5) ---------- */
+.app-header__start {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-3);
+  min-width: 0;
+}
+
+.app-header__end {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: var(--sp-2);
+}
+
+.app-header__version {
+  font-family: var(--font-mono);
+  font-size: var(--fs-xs);
+  color: var(--c-fg-subtle);
+  white-space: nowrap;
+}
+
+/* The window minimum is 1024 CSS px; below it (development browser only) the version is the first to go. */
+@media (max-width: 1023px) {
+  .app-header__version {
+    display: none;
+  }
+}
+
+.brand {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  min-width: 0;
+}
+
+.brand__mark {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: none;
+  width: var(--brand-w);
+  height: var(--brand-h);
+  border: 1px solid var(--c-brand-border);
+  border-radius: var(--radius-brand);
+  background: var(--c-brand-bg);
+  color: var(--c-accent);
+}
+
+.brand__mark svg {
+  width: 14px;
+  height: 11px;
+}
+
+.brand__title {
+  margin: 0;
+  font-size: var(--fs-md);
+  font-weight: var(--fw-semibold);
+  line-height: var(--lh-tight);
+  color: var(--c-fg);
+  white-space: nowrap;
+}
+
+.status-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-height: var(--h-pill);
+  padding: 0 var(--sp-2);
+  border: 1px solid var(--c-border-strong);
+  border-radius: 999px;
+  font-size: var(--fs-xs);
+  font-weight: var(--fw-medium);
+  line-height: 1;
+  white-space: nowrap;
+}
+
+/* A border, not a background: it stays visible when Windows forces the colors. */
+.status-pill__dot {
+  flex: none;
+  width: 8px;
+  height: 8px;
+  border: 4px solid currentColor;
+  border-radius: 50%;
+}
+
+.status-pill--ok {
+  border-color: var(--c-pill-ok-border);
+  background: var(--c-pill-ok-bg);
+  color: var(--c-ok);
+}
+
+.status-pill--info {
+  border-color: var(--c-info-border);
+  background: var(--c-info-bg);
+  color: var(--c-info);
+}
+
+.status-pill--warn {
+  border-color: var(--c-warn-border);
+  background: var(--c-warn-bg);
+  color: var(--c-warn);
+}
+
+.status-pill--err {
+  border-color: var(--c-err-border);
+  background: var(--c-err-bg);
+  color: var(--c-err);
+}
+
+.main-nav {
+  display: flex;
+  justify-content: center;
+  min-width: 0;
+}
+
+.main-nav__list {
+  display: flex;
+  gap: 2px;
+  padding: 2px;
+  border: 1px solid var(--c-border);
+  border-radius: var(--radius);
+  background: var(--c-nav-inset);
+}
+
+.main-nav__tab {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--sp-2);
+  min-height: var(--h-nav-tab);
+  padding: 0 var(--sp-3);
+  border: 0;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--c-fg-muted);
+  font-size: var(--fs-sm);
+  font-weight: var(--fw-medium);
+  white-space: nowrap;
+  transition:
+    background-color var(--motion-fast) ease,
+    color var(--motion-fast) ease;
+}
+
+.main-nav__tab:hover {
+  background: var(--c-surface-hover);
+  color: var(--c-fg);
+}
+
+/* Only the active tab has a border: a transparent border on the others would show up in forced colors. */
+.main-nav__tab[aria-selected="true"] {
+  padding-top: var(--accent-line);
+  border-bottom: var(--accent-line) solid var(--c-accent-strong);
+  background: var(--c-surface-raised);
+  color: var(--c-fg);
+}
+
+.main-nav__count {
+  flex: none;
+  min-width: 18px;
+  padding: 0 5px;
+  border: 1px solid var(--c-border-strong);
+  border-radius: 999px;
+  background: var(--c-surface-overlay);
+  color: var(--c-fg);
+  font-family: var(--font-mono);
+  font-size: var(--fs-xs);
+  line-height: 16px;
+  text-align: center;
+}
+
+.main-nav__tab[aria-selected="true"] .main-nav__count {
+  border-color: var(--c-accent-strong);
+  color: var(--c-accent);
+}
+
+.app-gear {
+  min-width: var(--h-control);
+}
+
+.app-gear__label {
+  font-size: var(--fs-xs);
+  font-weight: var(--fw-semibold);
+}
+
+/* ---------- Temporary views (Monitoramento 4D.4, Missões 4D.5) ---------- */
+.planned-view {
+  align-items: center;
+  justify-content: center;
+  padding: var(--sp-6);
+  overflow: auto;
+  background: var(--c-bg);
+}
+
+.planned-view__card {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-3);
+  width: 100%;
+  max-width: 40rem;
+  padding: var(--sp-6);
+  border: 1px solid var(--c-border-strong);
+  border-radius: var(--radius-lg);
+  background: var(--c-surface-raised);
+}
+
+.planned-view__badges {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--sp-2);
+}
+
+.planned-view__title {
+  margin: 0;
+  font-size: var(--fs-lg);
+  font-weight: var(--fw-semibold);
+  color: var(--c-fg);
+}
+
+.planned-view__text {
+  margin: 0;
+  font-size: var(--fs-sm);
+  line-height: var(--lh-normal);
+  color: var(--c-fg-muted);
+}
+
+.badge--temporary {
+  border-color: var(--c-warn-border);
+  background: var(--c-warn-bg);
+  color: var(--c-warn);
+}
+
+.badge--milestone {
+  border-color: var(--c-accent-strong);
+  color: var(--c-accent);
+  font-family: var(--font-mono);
+}
+
+/* Visual check page only: marks fixture data. A full-width band, not a badge. */
+.fixture-banner {
+  padding: var(--sp-1) var(--sp-4);
+  border-bottom: 1px solid var(--c-warn-border);
+  background: var(--c-warn-bg);
+  color: var(--c-warn);
+  font-family: var(--font-mono);
+  font-size: var(--fs-xs);
+  font-weight: var(--fw-semibold);
+}
+
+/* ---------- Tab strip of Conversas ---------- */
+.tab-strip {
+  display: flex;
+  align-items: stretch;
+  justify-content: space-between;
+  gap: var(--sp-3);
+  min-height: var(--h-strip);
+  margin: 0 var(--gutter);
+  border-bottom: 1px solid var(--c-border);
+}
+
+.tab-strip__label {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  max-width: 40%;
+  padding: 0 var(--sp-3);
+  border-top: var(--accent-line) solid var(--c-accent-strong);
+  background: var(--c-surface);
+  color: var(--c-fg);
+  font-family: var(--font-mono);
+  font-size: var(--fs-sm);
+}
+
+.tab-strip__label .icon {
+  color: var(--c-accent);
+}
+
+.tab-strip__name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.tab-strip__actions {
+  display: flex;
+  flex: none;
+  align-items: center;
+  gap: var(--sp-2);
+}
+
+.tab-strip__layout {
+  font-family: var(--font-mono);
+  font-size: var(--fs-xs);
+  color: var(--c-fg-subtle);
+  white-space: nowrap;
+}
+
+/* ---------- Status bar ---------- */
+.status-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--sp-4);
+  min-height: var(--h-statusbar);
+  padding: 0 var(--sp-3);
+  border-top: 1px solid var(--c-border);
+  background: var(--c-chrome);
+  color: var(--c-fg-muted);
+  font-family: var(--font-mono);
+  font-size: var(--fs-xs);
+  line-height: var(--lh-tight);
+  white-space: nowrap;
+}
+
+/* The first group (Core, terminals, RAM, CPU) never shrinks: only the project path does. */
+.status-bar__group {
+  display: flex;
+  flex: none;
+  align-items: center;
+  gap: var(--sp-4);
+}
+
+.status-bar__group--end {
+  flex: 1 1 0%;
+  justify-content: flex-end;
+  min-width: 0;
+}
+
+.status-bar__item {
+  flex: none;
+}
+
+.status-bar__label {
+  color: var(--c-fg-subtle);
+}
+
+.status-bar__value {
+  color: var(--c-fg);
+}
+
+.status-bar__value--ok {
+  color: var(--c-ok);
+}
+
+.status-bar__value--warn {
+  color: var(--c-warn);
+}
+
+.status-bar__value--err {
+  color: var(--c-err);
+}
+
+.status-bar__path {
+  display: flex;
+  flex: 0 1 auto;
+  min-width: 0;
+}
+
+/* The ellipsis falls in the middle of the path: the head shrinks, the folder name never does. */
+.status-bar__path-head {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.status-bar__path-tail {
+  flex: none;
+}
+
+.kbd {
+  padding: 0 4px;
+  border: 1px solid var(--c-border-strong);
+  border-radius: var(--radius-sm);
+  background: var(--c-surface-raised);
+  color: var(--c-fg);
+  font-family: var(--font-mono);
+  font-size: var(--fs-xs);
+  line-height: 16px;
+}
+
+/* ---------- Windows contrast themes ---------- */
+@media (forced-colors: active) {
+  .terminal-pane:focus-within {
+    outline: var(--focus-width) solid var(--c-pane-focus);
+    outline-offset: calc(-1 * var(--focus-width));
+  }
+
+  /*
+   * The terminal draws its own palette, resolved from the system colors by xtermTheme.ts: without this the bar
+   * cursor (a box-shadow) and the selection layer would vanish.
+   */
+  .terminal-pane__mount {
+    forced-color-adjust: none;
+  }
 }

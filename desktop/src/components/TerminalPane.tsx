@@ -15,6 +15,7 @@ import React, { useEffect, useRef } from "react";
 import { Terminal } from "xterm";
 import { FitAddon } from "xterm-addon-fit";
 import { Icon } from "./ui/Icon";
+import { applyXtermAppearance, readXtermAppearance, watchXtermTheme } from "../styles/xtermTheme";
 
 export interface TerminalPaneData {
   sessionId: string;
@@ -57,26 +58,15 @@ export const TerminalPane: React.FC<TerminalPaneProps> = ({
   useEffect(() => {
     if (!containerRef.current) return;
 
-    // 1. Initialize xterm instance with accessible dark palette
+    // 1. Initialize xterm with the palette of the design tokens (standard, low stimulation or Windows contrast theme)
+    const appearance = readXtermAppearance();
     const term = new Terminal({
       cursorBlink: true,
       cursorStyle: "bar",
       fontSize: 13,
       fontFamily: "'Cascadia Code', 'Fira Code', 'Consolas', monospace",
-      theme: {
-        background: "#181825",
-        foreground: "#cdd6f4",
-        cursor: "#f5e0dc",
-        selectionBackground: "#45475a",
-        black: "#45475a",
-        red: "#f38ba8",
-        green: "#a6e3a1",
-        yellow: "#f9e2af",
-        blue: "#89b4fa",
-        magenta: "#cba6f7",
-        cyan: "#94e2d5",
-        white: "#bac2de",
-      },
+      theme: appearance.theme,
+      minimumContrastRatio: appearance.minimumContrastRatio,
       scrollback: 1000, // Aligned with bounded buffer (1000 lines)
       allowProposedApi: true,
     });
@@ -89,6 +79,9 @@ export const TerminalPane: React.FC<TerminalPaneProps> = ({
 
     terminalRef.current = term;
     fitAddonRef.current = fitAddon;
+
+    // Theme changes (low stimulation, Windows contrast themes) are applied in place: the session is never restarted.
+    const stopTheme = watchXtermTheme((next) => applyXtermAppearance(term, next));
 
     if (onMountRef.current) {
       onMountRef.current(sessionId, term);
@@ -118,6 +111,7 @@ export const TerminalPane: React.FC<TerminalPaneProps> = ({
       if (onMountRef.current) {
         onMountRef.current(sessionId, null);
       }
+      stopTheme();
       dataDisposable.dispose();
       observer.disconnect();
       term.dispose();
