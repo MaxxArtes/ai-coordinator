@@ -125,7 +125,12 @@ class TerminalManager:
         rows: int = 24,
         backend: Optional[BasePtyBackend] = None,
     ) -> TerminalSession:
-        """Spawn a new terminal session in a specific tab and pane slot (0-3)."""
+        """Spawn a new terminal session in a tab, in a free pane slot (0-3).
+
+        The identity of a terminal is its ``session_id``; ``pane_id`` is only a slot. A registered session, alive or
+        ended by ``exit``, keeps its slot until it is closed and is never overwritten (F10): when the requested slot is
+        taken, the lowest free slot is used instead, and the session reports the slot it got.
+        """
         with self._lock:
             if self._update_frozen:
                 raise TerminalManagerError(
@@ -142,8 +147,14 @@ class TerminalManager:
             if not tab:
                 raise TerminalManagerError(f"Tab '{tab_id}' does not exist")
 
-            if pane_id in tab.panes and _session_is_alive(tab.panes[pane_id]):
-                raise TerminalManagerError(f"Pane {pane_id} in tab '{tab_id}' is already active")
+            if pane_id in tab.panes:
+                free = [slot for slot in range(MAX_PANES_PER_TAB) if slot not in tab.panes]
+                if not free:
+                    raise TerminalManagerError(
+                        f"Tab '{tab_id}' already has {MAX_PANES_PER_TAB} registered terminals "
+                        "(ended ones included): close one before opening another"
+                    )
+                pane_id = free[0]
 
             # 2. Determine target working directory
             target_cwd = Path(cwd) if cwd else Path(tab.project_path)
@@ -224,8 +235,9 @@ class TerminalManager:
             if not session:
                 return False
 
+            # Only this very session leaves its slot: never the one that may occupy the slot later (F10).
             tab = self.tabs.get(session.tab_id)
-            if tab and session.pane_id in tab.panes:
+            if tab and tab.panes.get(session.pane_id) is session:
                 tab.panes.pop(session.pane_id, None)
 
             self.sessions.pop(session_id, None)
