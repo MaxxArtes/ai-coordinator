@@ -45,8 +45,12 @@ export class FakeTerminal {
     // Like xterm: a key press in the textarea goes through the custom handler, then becomes data for the shell.
     textarea.addEventListener("keydown", (event) => {
       if (this.keyHandler && this.keyHandler(event) === false) return;
-      const data = KEY_DATA[event.key];
-      if (data !== undefined) this.emit(event.shiftKey && event.key === "Tab" ? "\x1b[Z" : event.ctrlKey && event.key === "c" ? "\x03" : data);
+      const data = keyData(event);
+      if (data === undefined) return;
+      // Like xterm: a key it turns into data is cancelled and does not bubble.
+      event.preventDefault();
+      event.stopPropagation();
+      this.emit(data);
     });
   }
 
@@ -90,12 +94,14 @@ export class FakeTerminal {
   }
 }
 
-const KEY_DATA: Record<string, string> = {
-  Tab: "\t",
-  Escape: "\x1b",
-  Enter: "\r",
-  c: "c",
-};
+/** The bytes xterm sends for the keys the tests use. */
+function keyData(event: KeyboardEvent): string | undefined {
+  if (event.key === "Tab") return event.shiftKey ? "\x1b[Z" : "\t";
+  if (event.key === "Escape") return "\x1b";
+  if (event.key === "Enter") return "\r";
+  if (event.key === "c") return event.ctrlKey ? "\x03" : "c";
+  return undefined;
+}
 
 export class FakeFitAddon {
   activate(): void {}

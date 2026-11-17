@@ -15,6 +15,7 @@ import {
 import { MainNav, type MainViewId } from "./components/shell/MainNav";
 import { MainViews } from "./components/shell/PlannedView";
 import { StatusBar } from "./components/shell/StatusBar";
+import { installGlobalShortcuts } from "./components/shell/shortcuts";
 import { NoticeBanner, type NoticeTone } from "./components/shell/NoticeBanner";
 import { AuthorizationScreen } from "./components/shell/AuthorizationScreen";
 import { StartupStatus } from "./components/shell/StartupStatus";
@@ -57,6 +58,9 @@ export const App: React.FC = () => {
     lastConnectionTextRef.current = connectionText;
     if (previous !== null && previous !== connectionText) setConnectionNotice(`Conexão: ${connectionText}`);
   }, [connectionText]);
+
+  // F6/Shift+F6 between regions and the F5/Ctrl+R/Ctrl+Shift+R guard: a single listener on the window.
+  useEffect(() => installGlobalShortcuts(window), []);
 
   // Direct invocation without swallowing errors
   const callTauri = useCallback(async (cmd: string, args?: Record<string, any>): Promise<any> => {
@@ -542,7 +546,11 @@ export const App: React.FC = () => {
         paneCount={panes.length}
         metrics={metrics}
         projectPath={projectPath}
-      />
+      >
+        <span className="status-bar__item">
+          <kbd className="kbd">F6</kbd> alternar regiões
+        </span>
+      </StatusBar>
 
       {/* Unified settings (updates live in Configurações → Sobre) */}
       <SettingsDialog

@@ -9,12 +9,20 @@
  * - Keyboard accessibility, focus management, and copy/paste keybindings.
  * - Stale-closure prevention: Callbacks are kept in live refs so xterm instance
  *   is never disposed or re-mounted due to callback reference changes.
+ *
+ * Marco 4D.3, Etapa 5:
+ * - Theme from the design tokens, changed live (low stimulation, Windows contrast themes) without a restart.
+ * - Size: no fit and no PTY resize while the box has no area (a hidden view, a minimized window); the PTY is told
+ *   only when the columns or rows really change.
+ * - Keyboard: one Tab stop per terminal; F6/Shift+F6 leave the terminal (every other key goes to the shell); the pane
+ *   has a focus region in its header ("Terminal N de M"), the F6 entry, from which Enter or Space enters the terminal.
  */
 
-import React, { useEffect, useRef } from "react";
+import React, { useEffect, useId, useRef } from "react";
 import { Terminal } from "xterm";
 import { FitAddon } from "xterm-addon-fit";
 import { Icon } from "./ui/Icon";
+import { terminalKeyFilter } from "./shell/shortcuts";
 import { applyXtermAppearance, readXtermAppearance, watchXtermTheme } from "../styles/xtermTheme";
 
 export interface TerminalPaneData {
@@ -26,11 +34,18 @@ export interface TerminalPaneData {
 }
 
 export interface TerminalPaneProps extends TerminalPaneData {
+  /** 1-based position of the pane in the tab ("Terminal N de M"). */
+  position: number;
+  /** Number of panes in the tab. */
+  total: number;
   onWrite: (sessionId: string, data: string) => void;
   onResize: (sessionId: string, cols: number, rows: number) => void;
   onClose?: (sessionId: string) => void;
   onMount?: (sessionId: string, term: Terminal | null) => void;
 }
+
+/** A box under 1 px (hidden view, minimized window): FitAddon would shrink the terminal to 2×1. */
+export const hasArea = (width: number, height: number): boolean => width >= 1 && height >= 1;
 
 export const TerminalPane: React.FC<TerminalPaneProps> = ({
   sessionId,
@@ -38,6 +53,8 @@ export const TerminalPane: React.FC<TerminalPaneProps> = ({
   paneId,
   kind,
   title,
+  position,
+  total,
   onWrite,
   onResize,
   onClose,
@@ -56,7 +73,8 @@ export const TerminalPane: React.FC<TerminalPaneProps> = ({
   onMountRef.current = onMount;
 
   useEffect(() => {
-    if (!containerRef.current) return;
+    const container = containerRef.current;
+    if (!container) return;
 
     // 1. Initialize xterm with the palette of the design tokens (standard, low stimulation or Windows contrast theme)
     const appearance = readXtermAppearance();
@@ -73,9 +91,15 @@ export const TerminalPane: React.FC<TerminalPaneProps> = ({
 
     const fitAddon = new FitAddon();
     term.loadAddon(fitAddon);
+    // F6/Shift+F6 leave the terminal (shell/shortcuts.ts); every other key goes to the shell.
+    term.attachCustomKeyEventHandler(terminalKeyFilter);
 
-    term.open(containerRef.current);
-    fitAddon.fit();
+    term.open(container);
+    // One Tab stop per terminal: since Chromium 130 a scrollable area is itself a Tab stop once there is history.
+    // A click on the scrollbar still focuses the terminal (xterm handles mousedown on its element).
+    term.element?.querySelector<HTMLElement>(".xterm-viewport")?.setAttribute("tabindex", "-1");
+    const initialBox = container.getBoundingClientRect();
+    if (hasArea(initialBox.width, initialBox.height)) fitAddon.fit();
 
     terminalRef.current = term;
     fitAddonRef.current = fitAddon;
@@ -92,45 +116,90 @@ export const TerminalPane: React.FC<TerminalPaneProps> = ({
       onWriteRef.current(sessionId, data);
     });
 
-    // 3. Resize handling with ResizeObserver using live ref
-    const observer = new ResizeObserver(() => {
+    // 3. The PTY hears only real changes of columns or rows. The last size sent starts empty, so the initial sync
+    //    always goes out (the session is born 80×24 and the first fit may also give 80×24).
+    let lastSent: { cols: number; rows: number } | null = null;
+    const syncSize = () => {
+      if (lastSent && lastSent.cols === term.cols && lastSent.rows === term.rows) return;
+      lastSent = { cols: term.cols, rows: term.rows };
+      onResizeRef.current(sessionId, term.cols, term.rows);
+    };
+
+    const observer = new ResizeObserver((entries) => {
+      const box = entries[entries.length - 1]?.contentRect;
+      if (!box || !hasArea(box.width, box.height)) return; // zero area: no fit and no PTY resize
       try {
         fitAddon.fit();
-        onResizeRef.current(sessionId, term.cols, term.rows);
+        syncSize();
       } catch (err) {
         // Ignored during unmount
       }
     });
 
-    observer.observe(containerRef.current);
+    observer.observe(container);
 
     // Initial resize sync
-    onResizeRef.current(sessionId, term.cols, term.rows);
+    syncSize();
 
     return () => {
+      stopTheme();
       if (onMountRef.current) {
         onMountRef.current(sessionId, null);
       }
-      stopTheme();
       dataDisposable.dispose();
       observer.disconnect();
       term.dispose();
     };
   }, [sessionId]);
 
+  // xterm announces its input as "Terminal input": the name now says which terminal it is and how to leave it.
+  const terminalName = `Terminal ${position} de ${total}. F6 sai do terminal`;
+  useEffect(() => {
+    terminalRef.current?.textarea?.setAttribute("aria-label", terminalName);
+  }, [sessionId, terminalName]);
+
+  const hintId = useId();
+  const hint = onClose
+    ? "Enter: digitar no terminal. Tab: botão fechar. F6: próxima região."
+    : "Enter: digitar no terminal. F6: próxima região.";
+
+  // F6 entry of the pane. preventDefault on keydown also suppresses the keypress: the Enter never reaches the shell.
+  const handleEntryKeyDown = (event: React.KeyboardEvent<HTMLDivElement>) => {
+    if (event.target !== event.currentTarget || event.ctrlKey || event.altKey || event.metaKey) return;
+    if (event.key !== "Enter" && event.key !== " ") return;
+    event.preventDefault();
+    terminalRef.current?.focus();
+  };
+
   const badgeClass = kind === "human_terminal" ? "badge badge--human" : "badge badge--agent";
   const badgeLabel = kind === "human_terminal" ? "Terminal humano" : "Agente governado";
 
   return (
-    <div className="terminal-pane" role="region" aria-label={`Terminal ${title || `Painel ${paneId + 1}`}`}>
+    <div
+      className="terminal-pane"
+      role="region"
+      aria-label={`Terminal ${title || `Painel ${paneId + 1}`}`}
+      data-f6-region="pane"
+    >
       {/* Header Bar */}
       <div className="terminal-pane__header">
-        <div className="terminal-pane__heading">
+        <div
+          className="terminal-pane__heading terminal-pane__focus-region"
+          role="group"
+          aria-label={`Terminal ${position} de ${total}`}
+          aria-describedby={hintId}
+          tabIndex={-1}
+          data-f6-entry=""
+          onKeyDown={handleEntryKeyDown}
+        >
           <span className={badgeClass}>{badgeLabel}</span>
           <span className="terminal-pane__title">
             {title || `Painel ${paneId + 1}`} (Sessão: {sessionId.slice(0, 8)})
           </span>
         </div>
+        <span id={hintId} className="sr-only">
+          {hint}
+        </span>
         {onClose && (
           <button
             type="button"
@@ -144,8 +213,8 @@ export const TerminalPane: React.FC<TerminalPaneProps> = ({
         )}
       </div>
 
-      {/* xterm.js DOM Mount Point */}
-      <div ref={containerRef} className="terminal-pane__mount" tabIndex={0} />
+      {/* xterm.js DOM Mount Point (no Tab stop of its own: the terminal input is the stop) */}
+      <div ref={containerRef} className="terminal-pane__mount" />
     </div>
   );
 };

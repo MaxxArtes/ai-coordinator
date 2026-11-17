@@ -69,12 +69,6 @@
   font-family: var(--font-mono);
 }
 
-.badge--truncate {
-  max-width: 20rem;
-  overflow: hidden;
-  text-overflow: ellipsis;
-}
-
 .badge--ok {
   background: var(--c-ok-bg);
   border-color: var(--c-ok-border);
@@ -990,38 +984,6 @@
   height: 100%;
   width: 100%;
   background: var(--c-bg);
-}
-
-.terminal-toolbar {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  padding: var(--sp-2) var(--sp-4);
-  border-bottom: 1px solid var(--c-border);
-  background: var(--c-surface);
-  font-size: var(--fs-md);
-}
-
-.terminal-toolbar__group {
-  display: flex;
-  align-items: center;
-  gap: var(--sp-3);
-  min-width: 0;
-}
-
-.terminal-toolbar__tab {
-  font-weight: var(--fw-semibold);
-  color: var(--c-fg);
-}
-
-.terminal-toolbar__path {
-  max-width: 28rem;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  font-family: var(--font-mono);
-  font-size: var(--fs-xs);
-  color: var(--c-fg-muted);
 }
 
 .terminal-grid__panes {

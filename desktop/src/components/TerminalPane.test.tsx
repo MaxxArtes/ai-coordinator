@@ -1,93 +1,161 @@
 /**
- * TerminalPane with a stand-in xterm (jsdom has no canvas nor layout).
- * Etapa 5, decision C: a theme change (low stimulation, Windows contrast theme) re-themes the open terminal in place;
- * the terminal, its session and its listeners are never recreated.
+ * TerminalPane and the tab strip of TerminalGrid, with a stand-in xterm (jsdom has no canvas nor layout).
+ * Etapa 5: theme switched in place (decision C), zero-area guard, one Tab stop per terminal, the pane focus region
+ * (F6 entry, decision 9), the accessible name of the terminal input and the key filter.
  */
-import { act, render } from "@testing-library/react";
+import React from "react";
+import { act, fireEvent, render, screen } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-const xterm = vi.hoisted(() => {
-  const instances: FakeTerminal[] = [];
+const h = vi.hoisted(() => {
+  const state = {
+    terms: [] as any[],
+    observers: [] as any[],
+    proposed: null as null | { cols: number; rows: number },
+    fits: 0,
+  };
   class FakeTerminal {
-    options: Record<string, unknown>;
-    themeAssignments = 0;
-    disposed = false;
     cols = 80;
     rows = 24;
-    dataListeners: Array<(data: string) => void> = [];
+    options: Record<string, unknown>;
+    themeAssignments = 0;
     element: HTMLElement | undefined;
     textarea: HTMLTextAreaElement | undefined;
+    keyHandler: ((e: KeyboardEvent) => boolean) | undefined;
+    keyHandlerCount = 0;
+    dataListeners: Array<(d: string) => void> = [];
+    disposed = false;
+    focusCount = 0;
     constructor(options: Record<string, unknown>) {
-      const self = this;
       let theme = options.theme;
       this.options = { ...options };
       Object.defineProperty(this.options, "theme", {
         get: () => theme,
         set: (value) => {
-          self.themeAssignments++;
+          this.themeAssignments++;
           theme = value;
         },
       });
-      instances.push(this);
+      state.terms.push(this);
     }
-    loadAddon() {}
-    open(parent: HTMLElement) {
-      this.element = document.createElement("div");
-      this.element.className = "xterm";
-      this.textarea = document.createElement("textarea");
-      this.textarea.className = "xterm-helper-textarea";
-      this.element.appendChild(this.textarea);
-      parent.appendChild(this.element);
+    loadAddon(addon: { activate(t: unknown): void }) {
+      addon.activate(this);
     }
-    onData(fn: (data: string) => void) {
+    attachCustomKeyEventHandler(fn: (e: KeyboardEvent) => boolean) {
+      this.keyHandler = fn;
+      this.keyHandlerCount++;
+    }
+    onData(fn: (d: string) => void) {
       this.dataListeners.push(fn);
       return { dispose: () => (this.dataListeners = this.dataListeners.filter((f) => f !== fn)) };
     }
-    attachCustomKeyEventHandler() {}
+    resize(cols: number, rows: number) {
+      this.cols = cols;
+      this.rows = rows;
+    }
+    open(parent: HTMLElement) {
+      const root = document.createElement("div");
+      root.className = "xterm";
+      const viewport = document.createElement("div");
+      viewport.className = "xterm-viewport";
+      const screenEl = document.createElement("div");
+      screenEl.className = "xterm-screen";
+      const textarea = document.createElement("textarea");
+      textarea.className = "xterm-helper-textarea";
+      textarea.setAttribute("aria-label", "Terminal input");
+      screenEl.appendChild(textarea);
+      root.append(viewport, screenEl);
+      parent.appendChild(root);
+      this.element = root;
+      this.textarea = textarea;
+    }
     focus() {
+      this.focusCount++;
       this.textarea?.focus();
     }
+    write() {}
+    writeln() {}
     dispose() {
       this.disposed = true;
     }
   }
-  return { instances, FakeTerminal };
+  class FakeFitAddon {
+    term: FakeTerminal | undefined;
+    activate(t: FakeTerminal) {
+      this.term = t;
+    }
+    dispose() {}
+    fit() {
+      state.fits++;
+      if (state.proposed) this.term!.resize(state.proposed.cols, state.proposed.rows);
+    }
+  }
+  return { state, FakeTerminal, FakeFitAddon };
 });
 
-vi.mock("xterm", () => ({ Terminal: xterm.FakeTerminal }));
-vi.mock("xterm-addon-fit", () => ({
-  FitAddon: class {
-    fit() {}
-  },
-}));
+vi.mock("xterm", () => ({ Terminal: h.FakeTerminal }));
+vi.mock("xterm-addon-fit", () => ({ FitAddon: h.FakeFitAddon }));
 
-import { TerminalPane } from "./TerminalPane";
+import { hasArea, TerminalPane, type TerminalPaneProps } from "./TerminalPane";
+import { TerminalGrid } from "./TerminalGrid";
 
 class FakeResizeObserver {
+  callback: ResizeObserverCallback;
+  disconnected = false;
+  constructor(callback: ResizeObserverCallback) {
+    this.callback = callback;
+    h.state.observers.push(this);
+  }
   observe() {}
-  disconnect() {}
+  unobserve() {}
+  disconnect() {
+    this.disconnected = true;
+  }
+  fire(width: number, height: number) {
+    this.callback([{ contentRect: { width, height } } as ResizeObserverEntry], this as unknown as ResizeObserver);
+  }
 }
 
 const flush = () => new Promise((resolve) => setTimeout(resolve, 0));
 
-/** The tokens the jsdom page would resolve: standard or low stimulation. */
+/** The tokens the page would resolve: standard or low stimulation. */
 function stubTokens() {
   const real = window.getComputedStyle;
   vi.spyOn(window, "getComputedStyle").mockImplementation((el: Element) => {
     if (el !== document.documentElement) return real(el);
     const low = document.documentElement.dataset.stimulation === "low";
-    return { getPropertyValue: (name: string) => (name === "--c-term-bg" ? (low ? "#151820" : "#0c0f16") : name.startsWith("--c-term-") && name !== "--c-term-selection-fg" ? "#d4d4d8" : "") } as unknown as CSSStyleDeclaration;
+    return {
+      getPropertyValue: (name: string) =>
+        name === "--c-term-bg" ? (low ? "#151820" : "#0c0f16") : name.startsWith("--c-term-") && name !== "--c-term-selection-fg" ? "#d4d4d8" : "",
+    } as unknown as CSSStyleDeclaration;
   });
 }
 
-function renderPane(onWrite = vi.fn()) {
-  return render(
-    <TerminalPane sessionId="session-1" tabId="tab-1" paneId={0} kind="human_terminal" onWrite={onWrite} onResize={vi.fn()} onClose={vi.fn()} />,
-  );
+function props(over: Partial<TerminalPaneProps> = {}): TerminalPaneProps {
+  return {
+    sessionId: "session-1",
+    tabId: "tab-1",
+    paneId: 1,
+    kind: "human_terminal",
+    title: "Terminal Interativo 2",
+    position: 2,
+    total: 3,
+    onWrite: vi.fn(),
+    onResize: vi.fn(),
+    onClose: vi.fn(),
+    onMount: vi.fn(),
+    ...over,
+  };
 }
 
+const term = () => h.state.terms[0];
+
 beforeEach(() => {
-  xterm.instances.length = 0;
+  h.state.terms.length = 0;
+  h.state.observers.length = 0;
+  h.state.proposed = null;
+  h.state.fits = 0;
   vi.stubGlobal("ResizeObserver", FakeResizeObserver);
   stubTokens();
 });
@@ -97,11 +165,10 @@ afterEach(() => {
   delete document.documentElement.dataset.stimulation;
 });
 
-describe("TerminalPane theme", () => {
-  it("starts with the token palette (no literal colors) and xterm's own font", () => {
-    renderPane();
-    expect(xterm.instances).toHaveLength(1);
-    const options = xterm.instances[0].options as { theme: Record<string, string>; fontSize: number; fontFamily: string; minimumContrastRatio: number };
+describe("TerminalPane theme (decision C)", () => {
+  it("starts with the token palette and keeps xterm's own font", () => {
+    render(<TerminalPane {...props()} />);
+    const options = term().options as { theme: Record<string, string>; fontSize: number; fontFamily: string; minimumContrastRatio: number };
     expect(options.theme.background).toBe("#0c0f16");
     expect(Object.keys(options.theme)).toHaveLength(21);
     expect(options.fontSize).toBe(13);
@@ -109,44 +176,253 @@ describe("TerminalPane theme", () => {
     expect(options.minimumContrastRatio).toBe(1);
   });
 
-  it("switching to low stimulation re-themes the same terminal: no new instance, no dispose, input still flows", async () => {
-    const onWrite = vi.fn();
-    renderPane(onWrite);
-    const term = xterm.instances[0];
-    const before = term.options.theme;
-
+  it("a theme change re-themes the same terminal: no new instance, no dispose, input still flows", async () => {
+    const p = props();
+    render(<TerminalPane {...p} />);
+    const before = term().options.theme;
     await act(async () => {
       document.documentElement.dataset.stimulation = "low";
       await flush();
     });
-
-    expect(xterm.instances).toHaveLength(1);
-    expect(term.disposed).toBe(false);
-    expect(term.themeAssignments).toBe(1);
-    expect(term.options.theme).not.toBe(before);
-    expect((term.options.theme as Record<string, string>).background).toBe("#151820");
-
-    term.dataListeners.forEach((fn) => fn("dir\r"));
-    expect(onWrite).toHaveBeenCalledWith("session-1", "dir\r");
-
+    expect(h.state.terms).toHaveLength(1);
+    expect(term().disposed).toBe(false);
+    expect(term().themeAssignments).toBe(1);
+    expect(term().options.theme).not.toBe(before);
+    expect(term().options.theme.background).toBe("#151820");
+    term().dataListeners.forEach((fn: (d: string) => void) => fn("dir\r"));
+    expect(p.onWrite).toHaveBeenCalledWith("session-1", "dir\r");
     await act(async () => {
       delete document.documentElement.dataset.stimulation;
       await flush();
     });
-    expect(term.themeAssignments).toBe(2);
-    expect((term.options.theme as Record<string, string>).background).toBe("#0c0f16");
-    expect(xterm.instances).toHaveLength(1);
+    expect(term().themeAssignments).toBe(2);
+    expect(h.state.terms).toHaveLength(1);
   });
 
-  it("stops watching the theme when the pane closes", async () => {
-    const view = renderPane();
-    const term = xterm.instances[0];
+  it("closing the pane stops the theme watch and cleans up", async () => {
+    const p = props();
+    const view = render(<TerminalPane {...p} />);
+    const t = term();
     view.unmount();
-    expect(term.disposed).toBe(true);
+    expect(t.disposed).toBe(true);
+    expect(h.state.observers[0].disconnected).toBe(true);
+    expect(p.onMount).toHaveBeenLastCalledWith("session-1", null);
     await act(async () => {
       document.documentElement.dataset.stimulation = "low";
       await flush();
     });
-    expect(term.themeAssignments).toBe(0);
+    expect(t.themeAssignments).toBe(0);
+  });
+});
+
+describe("TerminalPane size", () => {
+  it("hasArea refuses boxes under 1 px", () => {
+    expect(hasArea(0, 0)).toBe(false);
+    expect(hasArea(0.5, 300)).toBe(false);
+    expect(hasArea(300, 0.5)).toBe(false);
+    expect(hasArea(1, 1)).toBe(true);
+  });
+
+  it("keeps the initial sync: one resize 80×24 on mount, even without area (jsdom)", () => {
+    const p = props();
+    render(<TerminalPane {...p} />);
+    expect(h.state.fits).toBe(0);
+    expect(p.onResize).toHaveBeenCalledTimes(1);
+    expect(p.onResize).toHaveBeenCalledWith("session-1", 80, 24);
+  });
+
+  it("with area on mount: fits once and syncs the fitted size", () => {
+    vi.spyOn(HTMLElement.prototype, "getBoundingClientRect").mockReturnValue({ width: 800, height: 600 } as DOMRect);
+    h.state.proposed = { cols: 100, rows: 30 };
+    const p = props();
+    render(<TerminalPane {...p} />);
+    expect(h.state.fits).toBe(1);
+    expect(p.onResize).toHaveBeenCalledTimes(1);
+    expect(p.onResize).toHaveBeenCalledWith("session-1", 100, 30);
+  });
+
+  it("zero area (hidden view, minimized window): no fit and no PTY resize", () => {
+    const p = props();
+    render(<TerminalPane {...p} />);
+    const observer = h.state.observers[0];
+    act(() => {
+      observer.fire(0, 0);
+      observer.fire(0.5, 300);
+    });
+    expect(h.state.fits).toBe(0);
+    expect(p.onResize).toHaveBeenCalledTimes(1);
+  });
+
+  it("the PTY hears only real changes of columns or rows", () => {
+    const p = props();
+    render(<TerminalPane {...p} />);
+    const observer = h.state.observers[0];
+    act(() => observer.fire(800, 600)); // same 80×24
+    expect(h.state.fits).toBe(1);
+    expect(p.onResize).toHaveBeenCalledTimes(1);
+    h.state.proposed = { cols: 100, rows: 30 };
+    act(() => observer.fire(1000, 750));
+    expect(p.onResize).toHaveBeenCalledTimes(2);
+    expect(p.onResize).toHaveBeenLastCalledWith("session-1", 100, 30);
+    act(() => observer.fire(1001, 751));
+    expect(p.onResize).toHaveBeenCalledTimes(2);
+  });
+});
+
+describe("TerminalPane keyboard", () => {
+  it("one Tab stop per terminal: the mount has no tabindex and the viewport is out of the Tab order", () => {
+    const { container } = render(<TerminalPane {...props()} />);
+    const mount = container.querySelector(".terminal-pane__mount")!;
+    expect(mount).not.toHaveAttribute("tabindex");
+    expect(mount.querySelector(".xterm-viewport")).toHaveAttribute("tabindex", "-1");
+    const stops = Array.from(mount.querySelectorAll<HTMLElement>("*")).filter((el) => el.tabIndex >= 0);
+    expect(stops).toEqual([term().textarea]);
+  });
+
+  it("the pane focus region: a named group, out of the Tab order, the F6 entry of the pane region", () => {
+    const { container } = render(<TerminalPane {...props()} />);
+    const region = screen.getByRole("group", { name: "Terminal 2 de 3" });
+    expect(region).toHaveClass("terminal-pane__focus-region");
+    expect(region).toHaveAttribute("tabindex", "-1");
+    expect(region).toHaveAttribute("data-f6-entry");
+    expect(region).toHaveAccessibleDescription("Enter: digitar no terminal. Tab: botão fechar. F6: próxima região.");
+    expect(container.querySelector(".terminal-pane")).toHaveAttribute("data-f6-region", "pane");
+  });
+
+  it("Enter and Space enter the terminal without sending anything; other keys do nothing", () => {
+    const p = props();
+    render(<TerminalPane {...p} />);
+    const region = screen.getByRole("group", { name: "Terminal 2 de 3" });
+    region.focus();
+    fireEvent.keyDown(region, { key: "a" });
+    expect(term().focusCount).toBe(0);
+    expect(fireEvent.keyDown(region, { key: "Enter" })).toBe(false); // default prevented
+    expect(term().focusCount).toBe(1);
+    expect(document.activeElement).toBe(term().textarea);
+    region.focus();
+    fireEvent.keyDown(region, { key: " " });
+    expect(term().focusCount).toBe(2);
+    expect(p.onWrite).not.toHaveBeenCalled();
+  });
+
+  it("Tab from the focus region goes to the close button, then into the terminal", async () => {
+    const user = userEvent.setup();
+    render(<TerminalPane {...props()} />);
+    screen.getByRole("group", { name: "Terminal 2 de 3" }).focus();
+    await user.tab();
+    expect(document.activeElement).toBe(screen.getByRole("button", { name: "Fechar terminal" }));
+    await user.tab();
+    expect(document.activeElement).toBe(term().textarea);
+  });
+
+  it("names the terminal input after its position and keeps it in step", () => {
+    const { rerender, container } = render(<TerminalPane {...props()} />);
+    expect(term().textarea).toHaveAttribute("aria-label", "Terminal 2 de 3. F6 sai do terminal");
+    rerender(<TerminalPane {...props({ position: 1, total: 2 })} />);
+    expect(term().textarea).toHaveAttribute("aria-label", "Terminal 1 de 2. F6 sai do terminal");
+    expect(container.innerHTML).not.toContain("Terminal input");
+  });
+
+  it("F6 and Shift+F6 never reach the shell; the browser action is cancelled on keydown only", () => {
+    render(<TerminalPane {...props()} />);
+    expect(term().keyHandlerCount).toBe(1);
+    for (const shiftKey of [false, true]) {
+      const down = new KeyboardEvent("keydown", { key: "F6", shiftKey, cancelable: true });
+      expect(term().keyHandler(down)).toBe(false);
+      expect(down.defaultPrevented).toBe(true);
+      for (const type of ["keypress", "keyup"]) {
+        const other = new KeyboardEvent(type, { key: "F6", shiftKey, cancelable: true });
+        expect(term().keyHandler(other)).toBe(false);
+        expect(other.defaultPrevented).toBe(false);
+      }
+    }
+  });
+
+  it.each([
+    ["Tab", {}],
+    ["Tab", { shiftKey: true }],
+    ["Escape", {}],
+    ["c", { ctrlKey: true }],
+    ["3", { ctrlKey: true }],
+    ["1", { altKey: true }],
+    ["F6", { altKey: true }],
+    ["F6", { ctrlKey: true }],
+  ])("%s %j goes to the shell untouched", (key, init) => {
+    render(<TerminalPane {...props()} />);
+    const event = new KeyboardEvent("keydown", { key, cancelable: true, ...init });
+    expect(term().keyHandler(event)).toBe(true);
+    expect(event.defaultPrevented).toBe(false);
+  });
+
+  it("Tab, Esc, Shift+Tab and Ctrl+C bytes reach onWrite exactly", () => {
+    const p = props();
+    render(<TerminalPane {...p} />);
+    for (const data of ["\t", "\x1b", "\x1b[Z", "\x03"]) term().dataListeners.forEach((fn: (d: string) => void) => fn(data));
+    expect((p.onWrite as ReturnType<typeof vi.fn>).mock.calls).toEqual([
+      ["session-1", "\t"],
+      ["session-1", "\x1b"],
+      ["session-1", "\x1b[Z"],
+      ["session-1", "\x03"],
+    ]);
+  });
+});
+
+describe("TerminalGrid tab strip", () => {
+  const panes = (n: number) =>
+    Array.from({ length: n }, (_, i) => ({ sessionId: `s-${i + 1}`, tabId: "tab-main", paneId: i, kind: "human_terminal" as const }));
+  const grid = (n: number, over: Record<string, unknown> = {}) => (
+    <TerminalGrid
+      tabId="tab-main"
+      projectPath={"D:\\work\\ai-coordinator"}
+      panes={panes(n)}
+      onAddPane={vi.fn()}
+      onSaveSessions={vi.fn()}
+      onWrite={vi.fn()}
+      onResize={vi.fn()}
+      onClose={vi.fn()}
+      {...over}
+    />
+  );
+
+  it("shows the project folder (full path in the title) and the layout in words, not 'Aba:' or 'Raiz:'", () => {
+    const { container, rerender } = render(grid(1));
+    const label = container.querySelector(".tab-strip__label")!;
+    expect(label).toHaveAttribute("title", "D:\\work\\ai-coordinator");
+    expect(label).toHaveTextContent("ai-coordinator");
+    const layouts: string[] = [];
+    for (const n of [1, 2, 3, 4]) {
+      rerender(grid(n));
+      layouts.push(container.querySelector(".tab-strip__layout")!.textContent ?? "");
+    }
+    expect(layouts).toEqual(["Painel único", "Lado a lado", "Grade 2×2", "Grade 2×2"]);
+    expect(container.textContent).not.toMatch(/Aba:|Raiz:|painéis/);
+  });
+
+  it("is the F6 strip region; its entry is Salvar sessões, or Novo terminal without it", () => {
+    const { rerender } = render(grid(2));
+    const strip = screen.getByRole("group", { name: "Aba do projeto" });
+    expect(strip).toHaveAttribute("data-f6-region", "strip");
+    expect(screen.getByRole("button", { name: "Salvar sessões" })).toHaveAttribute("data-f6-entry");
+    expect(screen.getByRole("button", { name: "Novo terminal" })).not.toHaveAttribute("data-f6-entry");
+    rerender(grid(2, { onSaveSessions: undefined }));
+    expect(screen.getByRole("button", { name: "Novo terminal" })).toHaveAttribute("data-f6-entry");
+  });
+
+  it("the buttons call back with the tab, and Novo terminal disappears at 4 panes", async () => {
+    const user = userEvent.setup();
+    const onAddPane = vi.fn();
+    const onSaveSessions = vi.fn();
+    const { rerender } = render(grid(3, { onAddPane, onSaveSessions }));
+    await user.click(screen.getByRole("button", { name: "Salvar sessões" }));
+    await user.click(screen.getByRole("button", { name: "Novo terminal" }));
+    expect(onSaveSessions).toHaveBeenCalledWith("tab-main");
+    expect(onAddPane).toHaveBeenCalledWith("tab-main");
+    rerender(grid(4, { onAddPane, onSaveSessions }));
+    expect(screen.queryByRole("button", { name: "Novo terminal" })).toBeNull();
+  });
+
+  it("numbers every pane by position", () => {
+    render(grid(3));
+    for (const n of [1, 2, 3]) expect(screen.getByRole("group", { name: `Terminal ${n} de 3` })).toBeInTheDocument();
   });
 });
