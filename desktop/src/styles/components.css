@@ -1489,4 +1489,13 @@
   .terminal-pane__mount {
     forced-color-adjust: none;
   }
+
+  /* The terminal scrollbar follows the system palette too (it would stay dark on a light contrast theme). */
+  .terminal-pane__mount ::-webkit-scrollbar-track {
+    background: var(--c-term-bg);
+  }
+
+  .terminal-pane__mount ::-webkit-scrollbar-thumb {
+    background: var(--c-term-fg);
+  }
 }

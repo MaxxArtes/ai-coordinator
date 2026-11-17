@@ -15,6 +15,8 @@ export interface StatusBarProps {
   coreVersion?: string | null;
   paneCount: number;
   metrics: RuntimeMetrics | null;
+  /** The last metrics reading failed: the previous value is no longer a measurement. */
+  metricsUnavailable?: boolean;
   projectPath: string;
   /** Extra items at the end of the bar (the F6 hint). */
   children?: React.ReactNode;
@@ -30,9 +32,12 @@ const STATE: Record<ConnectionStatus, string> = {
 const MIB = 1024 * 1024;
 const ONE_DECIMAL = new Intl.NumberFormat("pt-BR", { minimumFractionDigits: 1, maximumFractionDigits: 1 });
 
-/** Base 1024 with KB, MB and GB, as the Windows Task Manager shows them; null when not a measurement. */
+/**
+ * Base 1024 with KB, MB and GB, as the Windows Task Manager shows them; null when not a measurement (the host reports
+ * 0 when it cannot find the process).
+ */
 export function formatBytesPtBR(bytes: number): string | null {
-  if (typeof bytes !== "number" || !Number.isFinite(bytes) || bytes < 0) return null;
+  if (typeof bytes !== "number" || !Number.isFinite(bytes) || bytes <= 0) return null;
   if (bytes >= 1024 * MIB) return `${ONE_DECIMAL.format(bytes / (1024 * MIB))} GB`;
   if (bytes >= MIB) return `${ONE_DECIMAL.format(bytes / MIB)} MB`;
   return `${ONE_DECIMAL.format(bytes / 1024)} KB`;
@@ -45,8 +50,14 @@ export function coreStatusText(isTauri: boolean, status: ConnectionStatus, coreV
   return `${core} · ${STATE[status]}`;
 }
 
-export function treeRamText(isTauri: boolean, status: ConnectionStatus, metrics: RuntimeMetrics | null): string {
+export function treeRamText(
+  isTauri: boolean,
+  status: ConnectionStatus,
+  metrics: RuntimeMetrics | null,
+  unavailable = false
+): string {
   if (isPreviewMode(isTauri, status)) return "indisponível (preview)";
+  if (unavailable) return "indisponível";
   if (!metrics) return "aguardando";
   const value = formatBytesPtBR(metrics.total_tree_ram_bytes);
   return value ? `${value} (medida)` : "indisponível";
@@ -71,6 +82,7 @@ export const StatusBar: React.FC<StatusBarProps> = ({
   coreVersion,
   paneCount,
   metrics,
+  metricsUnavailable = false,
   projectPath,
   children,
 }) => {
@@ -81,7 +93,7 @@ export const StatusBar: React.FC<StatusBarProps> = ({
       <div className="status-bar__group">
         <span className="status-bar__item">{coreStatusText(isTauri, connectionStatus, coreVersion)}</span>
         <Item label="Terminais:" value={`${paneCount} de ${MAX_TERMINALS}${preview ? " (preview)" : ""}`} />
-        <Item label="RAM da árvore:" value={treeRamText(isTauri, connectionStatus, metrics)} />
+        <Item label="RAM da árvore:" value={treeRamText(isTauri, connectionStatus, metrics, metricsUnavailable)} />
         <Item label="CPU:" value="indisponível" />
       </div>
       <div className="status-bar__group status-bar__group--end">

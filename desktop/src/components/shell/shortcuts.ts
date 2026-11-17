@@ -68,9 +68,17 @@ export function cycleRegion(direction: 1 | -1, root: Document | HTMLElement = do
   const regions = findRegions(root);
   const count = regions.length;
   if (count === 0) return false;
-  const here = regions.indexOf(currentRegion(doc.activeElement) as HTMLElement);
-  // Outside every region (the page body): F6 enters the first region, Shift+F6 the last one.
-  const start = here >= 0 ? here : direction === 1 ? -1 : count;
+  const active = doc.activeElement;
+  const here = regions.indexOf(currentRegion(active) as HTMLElement);
+  let start: number;
+  if (here >= 0) start = here;
+  else if (!active || active === doc.body) start = direction === 1 ? -1 : count; // page body: first or last region
+  else {
+    // A control outside every region (a notice between the header and the views): follow the screen order from it.
+    const next = regions.findIndex((r) => !!(active.compareDocumentPosition(r) & Node.DOCUMENT_POSITION_FOLLOWING));
+    const after = next < 0 ? count : next;
+    start = direction === 1 ? after - 1 : after;
+  }
   for (let step = 1; step <= count; step++) {
     const entry = findEntry(regions[(((start + direction * step) % count) + count) % count]);
     entry?.focus();

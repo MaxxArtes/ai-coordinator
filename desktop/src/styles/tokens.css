@@ -224,7 +224,8 @@
  * Windows contrast themes (forced colors). The selector list also beats the low-stimulation block.
  * - Focus, pane focus, the active accent line and control borders use system colors.
  * - The terminal follows the system palette (light or dark): xtermTheme.ts resolves the system colors to #rrggbb,
- *   applies them to the open terminals without recreating them, and raises xterm's minimumContrastRatio to 7.
+ *   picks the light ANSI set when the background is light, applies them to the open terminals without recreating
+ *   them, and raises xterm's minimumContrastRatio to 7.
  * - --c-term-selection-fg exists only here: in the other modes the selected text keeps its own color.
  */
 @media (forced-colors: active) {
@@ -259,28 +260,26 @@
     --c-term-bright-magenta: #ff99ff;
     --c-term-bright-cyan: #80ffff;
     --c-term-bright-white: #ffffff;
-  }
-}
-
-/* Light contrast themes (for example "Desert"): dark ANSI colors, all >= 6:1 on white. */
-@media (forced-colors: active) and (prefers-color-scheme: light) {
-  :root,
-  :root[data-stimulation="low"] {
-    --c-term-black: #000000;
-    --c-term-red: #9e0000;
-    --c-term-green: #005f00;
-    --c-term-yellow: #5f4b00;
-    --c-term-blue: #0033b3;
-    --c-term-magenta: #8a008a;
-    --c-term-cyan: #005c66;
-    --c-term-white: #3d3d3d;
-    --c-term-bright-black: #505050;
-    --c-term-bright-red: #b30000;
-    --c-term-bright-green: #006b00;
-    --c-term-bright-yellow: #6b5400;
-    --c-term-bright-blue: #0047d6;
-    --c-term-bright-magenta: #a000a0;
-    --c-term-bright-cyan: #006b78;
-    --c-term-bright-white: #1f1f1f;
+    /*
+     * Light contrast themes ("Desert" and others): dark ANSI colors, all >= 6:1 on white. xtermTheme.ts uses them
+     * when the resolved Canvas is light. The choice is made from the real background, not from prefers-color-scheme:
+     * the window theme fixed by the host may keep that query "dark" under a light contrast theme.
+     */
+    --c-term-light-black: #000000;
+    --c-term-light-red: #9e0000;
+    --c-term-light-green: #005f00;
+    --c-term-light-yellow: #5f4b00;
+    --c-term-light-blue: #0033b3;
+    --c-term-light-magenta: #8a008a;
+    --c-term-light-cyan: #005c66;
+    --c-term-light-white: #3d3d3d;
+    --c-term-light-bright-black: #505050;
+    --c-term-light-bright-red: #b30000;
+    --c-term-light-bright-green: #006b00;
+    --c-term-light-bright-yellow: #6b5400;
+    --c-term-light-bright-blue: #0047d6;
+    --c-term-light-bright-magenta: #a000a0;
+    --c-term-light-bright-cyan: #006b78;
+    --c-term-light-bright-white: #1f1f1f;
   }
 }

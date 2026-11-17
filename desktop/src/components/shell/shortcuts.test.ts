@@ -185,6 +185,23 @@ describe("F6 regions", () => {
     expect(active().id).toBe("entry-2");
   });
 
+  it("from a control outside every region (a notice), F6 follows the screen order", () => {
+    buildShell(2);
+    const notice = document.createElement("button");
+    notice.id = "dismiss-notice";
+    document.querySelector("header")!.after(notice);
+    notice.focus();
+    press("F6");
+    expect(active().id).toBe("save");
+    notice.focus();
+    press("F6", { shiftKey: true });
+    expect(active().id).toBe("tab-conversas");
+    document.querySelector("main")!.after(notice); // after every region: F6 wraps to the first one
+    notice.focus();
+    press("F6");
+    expect(active().id).toBe("tab-conversas");
+  });
+
   it("a region without an available entry is skipped", () => {
     buildShell(2, "conversas", { strip: false });
     document.body.focus();

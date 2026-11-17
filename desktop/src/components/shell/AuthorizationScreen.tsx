@@ -24,7 +24,7 @@ export const AuthorizationScreen: React.FC<AuthorizationScreenProps> = ({
   };
 
   return (
-    <div className="screen-center">
+    <div className="screen-center" data-f6-region="view">
       <form className="card" onSubmit={handleSubmit} aria-labelledby={`${inputId}-title`}>
         <h2 id={`${inputId}-title`} className="card__title">
           <Icon name="shield" />
@@ -50,6 +50,7 @@ export const AuthorizationScreen: React.FC<AuthorizationScreenProps> = ({
             autoComplete="off"
             spellCheck={false}
             autoFocus
+            data-f6-entry=""
           />
           <span id={hintId} className="field__hint">
             Apenas diretórios autorizados podem ser usados como raiz dos terminais.

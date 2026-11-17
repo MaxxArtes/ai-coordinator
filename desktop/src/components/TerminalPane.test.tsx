@@ -305,6 +305,15 @@ describe("TerminalPane keyboard", () => {
     expect(p.onWrite).not.toHaveBeenCalled();
   });
 
+  it("a click on the focus region enters the terminal (screen readers in browse mode send a click)", async () => {
+    const user = userEvent.setup();
+    const p = props();
+    render(<TerminalPane {...p} />);
+    await user.click(screen.getByRole("group", { name: "Terminal 2 de 3" }));
+    expect(document.activeElement).toBe(term().textarea);
+    expect(p.onWrite).not.toHaveBeenCalled();
+  });
+
   it("Tab from the focus region goes to the close button, then into the terminal", async () => {
     const user = userEvent.setup();
     render(<TerminalPane {...props()} />);

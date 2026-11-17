@@ -163,12 +163,15 @@ export const TerminalPane: React.FC<TerminalPaneProps> = ({
     ? "Enter: digitar no terminal. Tab: botão fechar. F6: próxima região."
     : "Enter: digitar no terminal. F6: próxima região.";
 
+  // A click enters the terminal too: screen readers in browse mode turn Enter and Space into a click on the region.
+  const enterTerminal = () => terminalRef.current?.focus();
+
   // F6 entry of the pane. preventDefault on keydown also suppresses the keypress: the Enter never reaches the shell.
   const handleEntryKeyDown = (event: React.KeyboardEvent<HTMLDivElement>) => {
     if (event.target !== event.currentTarget || event.ctrlKey || event.altKey || event.metaKey) return;
     if (event.key !== "Enter" && event.key !== " ") return;
     event.preventDefault();
-    terminalRef.current?.focus();
+    enterTerminal();
   };
 
   const badgeClass = kind === "human_terminal" ? "badge badge--human" : "badge badge--agent";
@@ -191,6 +194,7 @@ export const TerminalPane: React.FC<TerminalPaneProps> = ({
           tabIndex={-1}
           data-f6-entry=""
           onKeyDown={handleEntryKeyDown}
+          onClick={enterTerminal}
         >
           <span className={badgeClass}>{badgeLabel}</span>
           <span className="terminal-pane__title">

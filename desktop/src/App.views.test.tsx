@@ -18,7 +18,7 @@ import { FakeResizeObserver, resetXterm, xtermLog } from "./test/fakeXterm";
 
 const METRICS = { host_pid: 4242, host_ram_bytes: 61_027_123, total_tree_ram_bytes: 134_637_159, cpu_usage_percent: 37.5 };
 
-function host({ preview = false } = {}) {
+function host({ preview = false, authorized = true, metricsFail = false } = {}) {
   let sessions = 0;
   invoke.mockImplementation(async (cmd: string) => {
     switch (cmd) {
@@ -28,7 +28,7 @@ function host({ preview = false } = {}) {
       case "get_runtime_status":
         return { core_version: "0.6.0", app_version: "0.6.1-alpha.50", host_os: "windows", is_isolated: true, python_path: "C:\\app\\python.exe" };
       case "profile_get_active":
-        return { authorized_projects: ["D:\\proj"] };
+        return { authorized_projects: authorized ? ["D:\\proj"] : [] };
       case "terminal_create_tab":
       case "terminal_resize":
       case "terminal_write":
@@ -40,6 +40,7 @@ function host({ preview = false } = {}) {
       case "terminal_get_output":
         return { raw: "", next_seq: 0 };
       case "get_process_tree_metrics":
+        if (metricsFail) throw new Error("processo não encontrado");
         return METRICS;
       case "updater_get_channel_info":
         return { current_version: "0.6.1-alpha.50", channel: "alpha" };
@@ -235,6 +236,32 @@ describe("App views", () => {
     expect(fireEvent.keyDown(document.body, { key: "r", code: "KeyR", ctrlKey: true })).toBe(false);
     expect(xtermLog.created).toHaveLength(2);
   });
+
+  it("F6 reaches the authorization form and comes back to the navigation", async () => {
+    host({ authorized: false });
+    renderApp();
+    const input = await screen.findByLabelText("Caminho do projeto no host");
+    (document.activeElement as HTMLElement | null)?.blur();
+    const f6 = () => fireEvent.keyDown(document.activeElement ?? document.body, { key: "F6" });
+    f6();
+    expect(document.activeElement?.id).toBe("main-tab-conversas");
+    f6();
+    expect(document.activeElement).toBe(input);
+    f6();
+    expect(document.activeElement?.id).toBe("main-tab-conversas");
+  });
+
+  it(
+    "a failed metrics reading is shown as 'indisponível', never as the last measurement",
+    async () => {
+      host({ metricsFail: true });
+      renderApp();
+      await connected();
+      await waitFor(() => expect(bar()).toHaveTextContent("RAM da árvore: indisponível"), { timeout: 3500 });
+      expect(bar().textContent).not.toMatch(/\(medida\)/);
+    },
+    10000,
+  );
 
   it("the preview claims no Core, no connection and no measurement", async () => {
     host({ preview: true });

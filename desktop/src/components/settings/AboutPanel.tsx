@@ -89,7 +89,7 @@ export const AboutPanel: React.FC<AboutPanelProps> = ({
           {metrics && (
             <>
               <dt>PID do processo principal</dt>
-              <dd>{metrics.host_pid}</dd>
+              <dd>{metrics.host_pid > 0 ? metrics.host_pid : UNAVAILABLE}</dd>
               <dt>RAM do processo principal</dt>
               <dd>{mainRam ? `${mainRam} (medida)` : UNAVAILABLE}</dd>
             </>

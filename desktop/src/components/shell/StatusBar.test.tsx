@@ -48,6 +48,15 @@ describe("StatusBar", () => {
     expect(bar()).toHaveTextContent("Core · conectando…");
   });
 
+  it("a zero reading or a failed reading is not shown as a measurement", () => {
+    const { rerender } = render(<StatusBar {...base} metrics={{ host_pid: 0, host_ram_bytes: 0, total_tree_ram_bytes: 0 }} />);
+    expect(bar()).toHaveTextContent("RAM da árvore: indisponível");
+    expect(bar().textContent).not.toMatch(/\(medida\)/);
+    rerender(<StatusBar {...base} metricsUnavailable />);
+    expect(bar()).toHaveTextContent("RAM da árvore: indisponível");
+    expect(bar().textContent).not.toMatch(/128,4|\(medida\)/);
+  });
+
   it("CPU is always 'indisponível', even when the host sends a number", () => {
     render(<StatusBar {...base} />);
     expect(bar()).toHaveTextContent("CPU: indisponível");
@@ -75,6 +84,7 @@ describe("StatusBar", () => {
     expect(formatBytesPtBR(1.5 * 1024 * 1024 * 1024)).toBe("1,5 GB");
     expect(formatBytesPtBR(Number.NaN)).toBeNull();
     expect(formatBytesPtBR(-1)).toBeNull();
+    expect(formatBytesPtBR(0)).toBeNull();
     expect(splitProjectPath("D:\\ai-coordinator\\")).toEqual({ head: "D:\\", tail: "ai-coordinator" });
     expect(splitProjectPath("projeto")).toEqual({ head: "", tail: "projeto" });
   });

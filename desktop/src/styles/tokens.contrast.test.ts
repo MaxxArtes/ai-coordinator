@@ -4,8 +4,8 @@
  * Text pairs need 4.5:1; borders, focus rings and the cursor need 3:1 (WCAG 2.x, non-text contrast).
  */
 import { describe, expect, it } from "vitest";
-import { composite, contrastRatio, parseColor, readSrc, resolveToken, tokensFor, type TokenMap } from "./testing/cssSource";
-import { buildXtermTheme, XTERM_THEME_TOKENS } from "./xtermTheme";
+import { composite, contrastRatio, parseColor, readSrc, resolveToken, stripComments, tokensFor, type TokenMap } from "./testing/cssSource";
+import { buildXtermTheme, XTERM_LIGHT_ANSI_TOKENS, XTERM_THEME_TOKENS } from "./xtermTheme";
 
 const CSS = readSrc("styles/tokens.css");
 
@@ -138,8 +138,8 @@ describe("Windows contrast themes (forced colors)", () => {
   });
 
   it("the terminal follows the system palette: background, text, cursor and selection are system colors", () => {
-    for (const light of [false, true]) {
-      const t = tokensFor(CSS, { forced: true, light });
+    for (const low of [false, true]) {
+      const t = tokensFor(CSS, { forced: true, low });
       expect(t.get("--c-term-bg")).toBe("Canvas");
       expect(t.get("--c-term-fg")).toBe("CanvasText");
       expect(t.get("--c-term-cursor")).toBe("CanvasText");
@@ -150,8 +150,8 @@ describe("Windows contrast themes (forced colors)", () => {
   });
 
   it("light contrast themes get dark ANSI colors: all 16 readable (4.5:1) on light system backgrounds", () => {
-    const t = tokensFor(CSS, { forced: true, light: true });
-    const ansi = Object.values(XTERM_THEME_TOKENS).filter((k) => /black|red|green|yellow|blue|magenta|cyan|white/.test(k));
+    const t = tokensFor(CSS, { forced: true });
+    const ansi = Object.values(XTERM_LIGHT_ANSI_TOKENS);
     expect(ansi).toHaveLength(16);
     const bad: string[] = [];
     for (const palette of LIGHT) {
@@ -179,13 +179,36 @@ describe("Windows contrast themes (forced colors)", () => {
     }
   });
 
-  it("the contrast palettes apply only inside forced colors, the light one only with a light system background", () => {
+  it("the contrast palettes exist only inside forced colors; none depends on prefers-color-scheme", () => {
     expect(MODES.standard.get("--c-term-white")).toBe("#d4d4d8");
     expect(MODES.low.get("--c-term-white")).toBe("#c9ccd4");
-    expect(tokensFor(CSS, { forced: true }).get("--c-term-white")).toBe("#e5e5e5");
-    expect(tokensFor(CSS, { forced: true, low: true }).get("--c-term-white")).toBe("#e5e5e5");
-    expect(tokensFor(CSS, { forced: true, light: true }).get("--c-term-white")).toBe("#3d3d3d");
-    expect(tokensFor(CSS, { forced: true, light: true, low: true }).get("--c-term-white")).toBe("#3d3d3d");
+    for (const low of [false, true]) {
+      const t = tokensFor(CSS, { forced: true, low });
+      expect(t.get("--c-term-white")).toBe("#e5e5e5");
+      expect(t.get("--c-term-light-white")).toBe("#3d3d3d");
+    }
     expect(MODES.standard.has("--c-term-selection-fg")).toBe(false);
+    expect(MODES.standard.has("--c-term-light-white")).toBe(false);
+    expect(stripComments(CSS)).not.toMatch(/prefers-color-scheme/);
+  });
+
+  it("buildXtermTheme picks the ANSI set from the real background, light or dark", () => {
+    const t = tokensFor(CSS, { forced: true });
+    const read = (palette: Record<string, string>) => (name: string) => {
+      const value = t.get(name);
+      return value === undefined ? "" : (palette[value] ?? value);
+    };
+    for (const palette of LIGHT) {
+      const theme = buildXtermTheme(read(palette));
+      expect(theme.background).toBe(palette.Canvas);
+      expect(theme.white).toBe("#3d3d3d");
+      expect(theme.brightWhite).toBe("#1f1f1f");
+    }
+    for (const palette of DARK) {
+      const theme = buildXtermTheme(read(palette));
+      expect(theme.background).toBe(palette.Canvas);
+      expect(theme.white).toBe("#e5e5e5");
+      expect(theme.selectionForeground).toBe(palette.HighlightText);
+    }
   });
 });

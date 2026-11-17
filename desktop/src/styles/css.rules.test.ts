@@ -136,6 +136,8 @@ describe("CSS and component rules", () => {
     expect(decl(find(BASE_RULES, ":focus-visible", forced), "outline")[0]).toMatch(/solid/);
     expect(decl(find(COMPONENT_RULES, ".terminal-pane:focus-within", forced), "outline")[0]).toMatch(/solid/);
     expect(decl(find(COMPONENT_RULES, ".terminal-pane__mount", forced), "forced-color-adjust")).toEqual(["none"]);
+    expect(decl(find(COMPONENT_RULES, ".terminal-pane__mount ::-webkit-scrollbar-track", forced), "background")).toEqual(["var(--c-term-bg)"]);
+    expect(decl(find(COMPONENT_RULES, ".terminal-pane__mount ::-webkit-scrollbar-thumb", forced), "background")).toEqual(["var(--c-term-fg)"]);
     expect(decl(find(COMPONENT_RULES, ".terminal-pane__focus-region:focus-visible"), "outline-offset")[0]).toMatch(/-1/);
   });
 

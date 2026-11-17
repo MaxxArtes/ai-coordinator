@@ -27,6 +27,8 @@ export const App: React.FC = () => {
   const [connectionStatus, setConnectionStatus] = useState<ConnectionStatus>("connecting");
   const [status, setStatus] = useState<RuntimeStatus | null>(null);
   const [metrics, setMetrics] = useState<RuntimeMetrics | null>(null);
+  // The last metrics reading failed: the previous value stops being shown as a measurement.
+  const [metricsFailed, setMetricsFailed] = useState<boolean>(false);
   const [activeTab, setActiveTab] = useState<string>("tab-main");
   // The main view is separate from activeTab: switching views never re-runs the connection effect, which depends
   // on activeTab and would recreate the tab and its sessions.
@@ -392,9 +394,15 @@ export const App: React.FC = () => {
     const interval = setInterval(async () => {
       try {
         const m = await callTauri("get_process_tree_metrics");
-        if (m) setMetrics(m);
+        if (m) {
+          setMetrics(m);
+          setMetricsFailed(false);
+        } else {
+          setMetricsFailed(true);
+        }
       } catch {
-        // Telemetry errors are non-fatal
+        // Telemetry errors are non-fatal, but the last value is no longer a measurement.
+        setMetricsFailed(true);
       }
     }, 2000);
     return () => clearInterval(interval);
@@ -545,6 +553,7 @@ export const App: React.FC = () => {
         coreVersion={status?.core_version}
         paneCount={panes.length}
         metrics={metrics}
+        metricsUnavailable={metricsFailed}
         projectPath={projectPath}
       >
         <span className="status-bar__item">
@@ -561,7 +570,7 @@ export const App: React.FC = () => {
         runtimeStatus={status}
         connectionStatus={connectionStatus}
         activePanesCount={panes.length}
-        metrics={metrics}
+        metrics={metricsFailed ? null : metrics}
         callTauri={callTauri}
         onSettingsChanged={(snapshot) => applyInterfaceSettings(snapshot)}
       />

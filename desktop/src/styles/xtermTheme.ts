@@ -78,6 +78,45 @@ export function normalizeColor(value: string): string {
   return "#" + [m[1], m[2], m[3]].map((n) => Math.min(255, Number(n)).toString(16).padStart(2, "0")).join("");
 }
 
+type AnsiKey = Exclude<keyof typeof XTERM_THEME_TOKENS, "background" | "foreground" | "cursor" | "cursorAccent" | "selectionBackground">;
+
+/**
+ * Dark ANSI set for light contrast themes. Only the contrast themes define these tokens; they replace the ANSI colors
+ * when the resolved background is light. The decision comes from the background itself, not from
+ * prefers-color-scheme, which the host window theme may keep "dark" under a light contrast theme.
+ */
+export const XTERM_LIGHT_ANSI_TOKENS: Record<AnsiKey, string> = {
+  black: "--c-term-light-black",
+  red: "--c-term-light-red",
+  green: "--c-term-light-green",
+  yellow: "--c-term-light-yellow",
+  blue: "--c-term-light-blue",
+  magenta: "--c-term-light-magenta",
+  cyan: "--c-term-light-cyan",
+  white: "--c-term-light-white",
+  brightBlack: "--c-term-light-bright-black",
+  brightRed: "--c-term-light-bright-red",
+  brightGreen: "--c-term-light-bright-green",
+  brightYellow: "--c-term-light-bright-yellow",
+  brightBlue: "--c-term-light-bright-blue",
+  brightMagenta: "--c-term-light-bright-magenta",
+  brightCyan: "--c-term-light-bright-cyan",
+  brightWhite: "--c-term-light-bright-white",
+};
+
+/** WCAG relative luminance of a "#rrggbb" color. */
+export function relativeLuminance(hex: string): number {
+  const n = parseInt(hex.slice(1), 16);
+  const lin = (c: number) => {
+    const v = c / 255;
+    return v <= 0.04045 ? v / 12.92 : Math.pow((v + 0.055) / 1.055, 2.4);
+  };
+  return 0.2126 * lin((n >> 16) & 255) + 0.7152 * lin((n >> 8) & 255) + 0.0722 * lin(n & 255);
+}
+
+/** A background on which dark text reads better than light text. */
+export const isLightBackground = (hex: string): boolean => relativeLuminance(hex) > 0.18;
+
 /**
  * Pure: a NEW object on every call. A token that is missing or not a color is left out, so xterm keeps its own
  * default for that key instead of receiving an invalid value.
@@ -88,6 +127,12 @@ export function buildXtermTheme(read: CssVarReader): XtermTheme {
   for (const key of Object.keys(all) as XtermThemeKey[]) {
     const color = normalizeColor(read(all[key]));
     if (color) theme[key] = color;
+  }
+  if (theme.background && isLightBackground(theme.background)) {
+    for (const key of Object.keys(XTERM_LIGHT_ANSI_TOKENS) as AnsiKey[]) {
+      const color = normalizeColor(read(XTERM_LIGHT_ANSI_TOKENS[key]));
+      if (color) theme[key] = color;
+    }
   }
   return theme;
 }
