@@ -13,11 +13,55 @@ from __future__ import annotations
 import abc
 import io
 import json
+import math
+import secrets
 import os
 import platform
 import sys
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Set, Union
+
+
+MAX_JSON_DEPTH = 64
+MAX_NUMBER_DIGITS = 128
+MAX_RPC_IDENTIFIER_LENGTH = 256
+
+
+def _json_integer(text: str) -> int:
+    if len(text.lstrip("-")) > MAX_NUMBER_DIGITS:
+        raise ValueError("JSON integer exceeds the permitted precision")
+    return int(text)
+
+
+def _json_float(text: str) -> float:
+    number = float(text)
+    if not math.isfinite(number):
+        raise ValueError("JSON numbers must be finite")
+    return number
+
+
+def _reject_json_constant(_text: str) -> None:
+    raise ValueError("Non-JSON numeric constant")
+
+
+def _bounded_json_depth(value: Any) -> bool:
+    pending = [(value, 0)]
+    while pending:
+        item, depth = pending.pop()
+        if not isinstance(item, (dict, list)):
+            continue
+        if depth >= MAX_JSON_DEPTH:
+            return False
+        children = item.values() if isinstance(item, dict) else item
+        pending.extend((child, depth + 1) for child in children if isinstance(child, (dict, list)))
+    return True
+
+
+def _safe_rpc_id(value: Any) -> bool:
+    # A bool is an int in Python, but never a JSON-RPC identifier.
+    return value is None or type(value) is int or (
+        isinstance(value, str) and len(value) <= MAX_RPC_IDENTIFIER_LENGTH
+    )
 
 
 VAULT_UNAVAILABLE_CODE = -32004  # RPCErrorCode.VAULT_UNAVAILABLE
@@ -185,7 +229,13 @@ class StreamTransport(BaseTransport):
 
     def read_message(self) -> Union[str, UndecodableLine, None]:
         try:
-            line = self.reader.readline()
+            # Bound each allocation and drain an oversized frame to its newline, so the next request is intact.
+            line = self.reader.readline(MAX_PAYLOAD_BYTES + 2)
+            newline = b"\n" if isinstance(line, (bytes, bytearray)) else "\n"
+            if len(line) > MAX_PAYLOAD_BYTES and not line.endswith(newline):
+                while line and not line.endswith(newline):
+                    line = self.reader.readline(MAX_PAYLOAD_BYTES + 2)
+                return UndecodableLine(MAX_PAYLOAD_BYTES + 1)  # size check takes precedence over encoding
         except (BrokenPipeError, ConnectionResetError):
             return None
         except Exception as e:
@@ -523,40 +573,56 @@ class SecureIPCServer:
                 },
             )
 
-        # 3. JSON syntax check
+        # 3. Parse within bounded depth/precision. Error strings never quote request content.
         try:
-            data = json.loads(raw_line)
-        except json.JSONDecodeError as err:
-            return RPCResponse(
-                id=None,
-                error={"code": RPCErrorCode.PARSE_ERROR.value, "message": f"Parse error: {err}"},
-            )
+            data = json.loads(raw_line, parse_int=_json_integer, parse_float=_json_float,
+                              parse_constant=_reject_json_constant)
+        except (json.JSONDecodeError, RecursionError, ValueError, OverflowError):
+            return RPCResponse(id=None, error={
+                "code": RPCErrorCode.PARSE_ERROR.value,
+                "message": "Parse error: invalid or excessively complex JSON",
+                "data": {"field": "request", "reason": "invalid_json"},
+            })
 
-        if not isinstance(data, dict) or "method" not in data:
-            return RPCResponse(
-                id=data.get("id") if isinstance(data, dict) else None,
-                error={"code": RPCErrorCode.INVALID_REQUEST.value, "message": "Missing 'method' field"},
-            )
-
+        if not _bounded_json_depth(data):
+            return RPCResponse(id=None, error={"code": RPCErrorCode.PARSE_ERROR.value,
+                                              "message": "Parse error: excessively complex JSON"})
+        if not isinstance(data, dict):
+            return RPCResponse(id=None, error={"code": RPCErrorCode.INVALID_REQUEST.value,
+                                              "message": "Invalid request envelope"})
+        identifier = data.get("id")
+        method = data.get("method")
+        token = data.get("session_token")
+        if (not _safe_rpc_id(identifier) or data.get("jsonrpc") != "2.0"
+                or data.get("protocol_version", PROTOCOL_VERSION) != PROTOCOL_VERSION
+                or not isinstance(method, str) or not method or len(method) > MAX_RPC_IDENTIFIER_LENGTH
+                or (token is not None and not isinstance(token, str))):
+            return RPCResponse(id=None, error={"code": RPCErrorCode.INVALID_REQUEST.value,
+                                              "message": "Invalid request envelope"})
+        if not isinstance(data.get("params", {}), dict):
+            return RPCResponse(id=identifier, error={
+                "code": RPCErrorCode.INVALID_PARAMS.value,
+                "message": "Parameters must be an object",
+                "data": {"field": "params", "reason": "type"},
+            })
         req = RPCRequest.from_dict(data)
 
-        # 4. Authentication check for non-public methods
+        # 4. Authenticate with a constant-time comparison, never logging a supplied method or token.
         if req.method not in self.PUBLIC_METHODS:
-            if not req.session_token or req.session_token != self.session_token:
-                self.transport.log_diagnostic(f"Unauthorized call to {req.method}")
-                return RPCResponse(
-                    id=req.id,
-                    error={
-                        "code": RPCErrorCode.AUTH_ERROR.value,
-                        "message": "Invalid or missing ephemeral session token",
-                    },
-                )
+            if (not req.session_token or not self.session_token or not secrets.compare_digest(
+                    req.session_token.encode("utf-8", errors="surrogatepass"),
+                    self.session_token.encode("utf-8", errors="surrogatepass"))):
+                self.transport.log_diagnostic("Unauthorized IPC call (request content omitted)")
+                return RPCResponse(id=req.id, error={
+                    "code": RPCErrorCode.AUTH_ERROR.value,
+                    "message": "Invalid or missing ephemeral session token",
+                })
 
         # 5. Method dispatch
         if req.method not in self.handlers:
             return RPCResponse(
                 id=req.id,
-                error={"code": RPCErrorCode.METHOD_NOT_FOUND.value, "message": f"Method '{req.method}' not found"},
+                error={"code": RPCErrorCode.METHOD_NOT_FOUND.value, "message": "Method not found"},
             )
 
         try:
@@ -574,11 +640,17 @@ class SecureIPCServer:
                 error={"code": e.code, "message": str(e), "data": e.to_data()},
             )
         except Exception as e:
-            self.transport.log_diagnostic(f"Handler error in {req.method}: {e}")
-            return RPCResponse(
-                id=req.id,
-                error={"code": RPCErrorCode.INTERNAL_ERROR.value, "message": str(e)},
-            )
+            # Arbitrary exception text may include a credential value. Known user errors get fixed messages only.
+            from desktop.auth.authorizer import SecurityAuthorizationError
+            from desktop.terminal.manager import TerminalManagerError
+
+            message = "Internal error: operation could not be completed"
+            if isinstance(e, SecurityAuthorizationError):
+                message = "Project not authorized or session invalid"
+            elif isinstance(e, TerminalManagerError):
+                message = "Requested tab or terminal does not exist" if "does not exist" in str(e) else "Terminal operation failed"
+            self.transport.log_diagnostic(f"IPC handler failed: {type(e).__name__} (content omitted)")
+            return RPCResponse(id=req.id, error={"code": RPCErrorCode.INTERNAL_ERROR.value, "message": message})
 
     def send_notification(self, event: str, data: Dict[str, Any]) -> bool:
         notif = RPCNotification(event=event, data=data)
@@ -591,7 +663,14 @@ class SecureIPCServer:
 
         resp = self.handle_raw_payload(raw)
         if resp is not None:
-            out = json.dumps(resp.to_dict())
+            try:
+                out = json.dumps(resp.to_dict(), allow_nan=False)
+            except (TypeError, ValueError, RecursionError, OverflowError):
+                self.transport.log_diagnostic("IPC response serialization failed (content omitted)")
+                out = json.dumps(RPCResponse(id=resp.id, error={
+                    "code": RPCErrorCode.INTERNAL_ERROR.value,
+                    "message": "Internal error: invalid handler response",
+                }).to_dict())
             if not self.transport.write_message(out):
                 return False
         return True
@@ -613,7 +692,10 @@ class SecureIPCServer:
 
 
 if __name__ == "__main__":
-    token = os.environ.get("COORDINATOR_IPC_TOKEN", "default-dev-token")
+    token = os.environ.get("COORDINATOR_IPC_TOKEN")
+    if not token:
+        sys.stderr.write("IPC startup refused: ephemeral session token is required.\n")
+        raise SystemExit(2)
     transport = StreamTransport()
     server = SecureIPCServer(transport=transport, session_token=token)
     try:
