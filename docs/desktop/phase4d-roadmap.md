@@ -445,6 +445,7 @@ nesta etapa; cada item depende de decisão e autorização próprias.
 | Hoje | Configurações → Provedores confere a lista de nomes do cofre e, se o nome existe, pergunta antes de substituir. Conferir e gravar são duas chamadas: `vault.set_secret` grava sem condição, e cada operação lê, altera e regrava o `vault.enc` inteiro sem trava entre processos |
 | Risco | Outro escritor entre a conferência e a gravação (outra janela do aplicativo, a versão portátil ao lado da instalada, a CLI) é sobrescrito sem pergunta, ou tem a própria gravação perdida |
 | Proposta | `vault.set_secret` com modo explícito (`if_absent` ou `overwrite`); com `if_absent` e nome existente, erro estruturado com `reason: "exists"`; resposta com `replaced: true/false`; trava de arquivo entre processos em volta de ler-alterar-gravar. O painel passaria a gravar com `if_absent` e só enviaria `overwrite` depois da confirmação |
+| Situação (18/11) | Implementado nas Etapas 7 e 8 da 4D.3: gravação condicional à revisão do cofre, com trava entre processos e gravação atômica (`9436e51` no cofre, `c9572d5` no IPC); remoção condicional (`11f5c7d`); a interface grava e remove com a revisão da própria leitura (`a9e2462`, `7811040`). O contrato difere da proposta acima (sem `mode`, sem `reason: "exists"` e sem `replaced`): ver Apêndice G.3. Testes em `tests/test_phase4d3_vault_atomic.py` e `tests/test_phase4d3_etapa8_ipc.py`. [conferência nativa pendente] |
 
 ### E.2 — Achados da preparação das conferências nativas, fora do escopo da Etapa 4
 
@@ -452,16 +453,16 @@ nesta etapa; cada item depende de decisão e autorização próprias.
 |---|---|---|---|
 | E2-1 | O servidor IPC lê o stdin com a codificação padrão do Windows (cp1252), e o host Rust escreve UTF-8. Caracteres como Á, Í, aspas curvas e vários emojis derrubam o Core (terminais incluídos); outros acentos chegam trocados ao cofre e às configurações, com resposta de sucesso. Anterior à 4D.3 | Alta | Corrigido em 16/11 (autorizado pelo operador): o servidor lê e escreve os handles reais em binário, sempre em UTF-8; linha com bytes inválidos recebe erro estruturado (-32700, `reason: "invalid_utf8"`) sem derrubar o servidor e sem registrar o conteúdo; resposta termina em `\n`. O cliente de verificação (`desktop/ipc/client.py`) também passou a usar UTF-8. Teste `tests/test_phase4d3_ipc_utf8.py` (falha no código anterior, passa no novo). Valores gravados com acento trocado antes da correção não são convertidos |
 | E2-2 | O build Windows não copiava `desktop/settings` para o pacote, então Perfil, Geral, Aparência, Terminal e Coordinator falhariam no aplicativo instalado (o artefato da Etapa 3, `4a8eaa4`, também não tinha a pasta) | Alta | Corrigido nesta etapa: uma linha no workflow e um teste que exige copiar todo pacote `desktop.*` importado pelo servidor |
-| E2-3 | Cofre ilegível ou falha da DPAPI aparece como cofre disponível, com erro não estruturado (em inglês, sem `field`/`reason`) e sem ação de recuperação na interface | Média | Registrado |
-| E2-4 | Valor formado só por espaços é aceito; valores não são aparados | Baixa | Registrado |
-| E2-5 | Baixa estimulação: a primeira pintura sai no modo padrão até o Core responder; falha de `settings_get` na abertura é silenciosa; a frase "Aplicado na interface" é fixa; o tema do terminal (xterm) não muda | Média | Registrado; critério de aceite a definir com o operador |
-| E2-6 | `profile.json` corrompido impede o aplicativo de iniciar; mudança de `schema_version` descarta as configurações sem migração; sem instância única | Média | Registrado |
-| E2-7 | O build de homologação tem a mesma versão do alpha publicado (`0.6.1-alpha.50`); a identificação é feita pelo SHA-256 do artefato | Média | Registrado |
+| E2-3 | Cofre ilegível ou falha da DPAPI aparece como cofre disponível, com erro não estruturado (em inglês, sem `field`/`reason`) e sem ação de recuperação na interface | Média | Registrado em 13/11. Corrigido e testado em 17-18/11 (Etapa 7): cofre ilegível ou truncado nunca aparece como disponível ou vazio e nunca é regravado; o erro é estruturado e em português (-32004, `reason: "unreadable"`); trava ocupada por outra janela é `busy` (-32006), não ilegível, e a interface oferece "Tentar novamente" (`9436e51`, `c9572d5`, `a9e2462`). Testes de regressão no backend (falha no `e4acb71`) e na interface com a forma que o host envia (`9af3e06`). Para o cofre ilegível, a interface só orienta recuperar o acesso; não há ação de recuperação no aplicativo. [conferência nativa pendente] |
+| E2-4 | Valor formado só por espaços é aceito; valores não são aparados | Baixa | Registrado em 13/11. Corrigido em `c9572d5` (Etapa 7, 17/11): valor vazio ou só com espaços é recusado (-32602, `reason: "invalid_value"`); espaços e quebras de linha em volta do valor são removidos antes de gravar. Teste em `tests/test_phase4d3_etapa7_ipc.py`. [conferência nativa pendente] |
+| E2-5 | Baixa estimulação: a primeira pintura sai no modo padrão até o Core responder; falha de `settings_get` na abertura é silenciosa; a frase "Aplicado na interface" é fixa; o tema do terminal (xterm) não muda | Média | Registrado em 13/11; critério de aceite a definir com o operador. Tratado nas Etapas 5 e 7: o tema do terminal vem dos tokens, inclusive na baixa estimulação, e muda no terminal aberto sem reiniciar (`7ddbfce`); a primeira pintura usa a aparência guardada da execução anterior, e só a área dos terminais espera as preferências, por no máximo 1,5 s (os terminais em si só são criados depois da resposta do `settings_get`: P3 aberto, Apêndice G.4); falha de `settings_get` vira aviso persistente com os padrões; "Aplicado" só aparece quando é verdade; baixa estimulação e movimento reduzido também param o cursor piscante (`a9e2462`). [conferência nativa pendente] |
+| E2-6 | `profile.json` corrompido impede o aplicativo de iniciar; mudança de `schema_version` descarta as configurações sem migração; sem instância única | Média | Registrado em 13/11. Corrigido e testado na Etapa 7 (`9436e51`, `9af3e06`): `profile.json` ilegível do perfil ativo vai para quarentena (`profile.json.corrupt-<data UTC>`, nunca sobrescrita) e o perfil é recriado vazio, com o mesmo nome; perfis inativos ilegíveis são ignorados; `active_profile.txt` vazio, ilegível ou apontando para perfil inexistente abre o perfil `default`. Esquema futuro ou incompatível fica somente leitura, com os padrões e sem tocar nos bytes; campos inválidos são listados e preservados até serem regravados; cópia `profile.json.pre-v1.bak` antes da primeira migração. Instância única não implementada (Apêndice G.4). [conferência nativa pendente] |
+| E2-7 | O build de homologação tem a mesma versão do alpha publicado (`0.6.1-alpha.50`); a identificação é feita pelo SHA-256 do artefato | Média | Registrado em 13/11. Persiste: o build de diagnóstico da Etapa 8 (`44328616887`, commit `7811040`, 18/11) também é `0.6.1-alpha.50` (instalador `AI Coordinator Desktop_0.6.1-alpha.50_x64-setup.exe`) e é identificado pelo SHA-256 (Apêndice G.6). Mostrar o commit no Sobre e no nome do artefato (O6 da ordem de correções de 17/11) não foi feito; destino na 4D.6 (Apêndice G.4) |
 | E2-8 | Sete pontos de `tests/test_phase4d2_desktop_alpha_integration.py` usam o diretório de perfis real do usuário | Média | Registrado |
 | E2-9 | Fidelidade visual: acento azul (`#89b4fa`) em vez do ciano da referência 01; superfícies Catppuccin; marca `>_` dentro do aplicativo, navegação Conversas/Monitoramento/Missões e indicadores circulares ainda não existem | Alta para a homologação visual | Registrado; depende de decisão do operador sobre etapa e escopo. Ícone da janela, do executável e dos atalhos trocado em 13/11 pela logo enviada pelo operador (círculo com `>_`), com título "AI Coordinator Desktop" e barra de título escura. Em 16/11: barra de título da janela principal em `#071017` (cor da barra no print de referência do operador; Windows 11) e a logo também no instalador e no desinstalador. Plano das Etapas 5 e 6 (fidelidade visual) entregue ao operador em 16/11 para aprovação, fora do repositório |
 | E2-10 | Com `-I`, o stderr do servidor IPC continua na codificação local; linhas de diagnóstico com acento chegam ao host como UTF-8 inválido e são descartadas pela leitura do stderr | Baixa | Registrado em 16/11 (revisão da correção do E2-1) |
-| E2-11 | Duas linhas ainda derrubam o servidor IPC (e o Core e os terminais junto): JSON muito aninhado dentro de 1 MB (`RecursionError`) e `method` que não é texto (`TypeError`). O host não envia nenhuma das duas | Média | Registrado em 16/11 (revisão da correção do E2-1) |
-| E2-12 | Um surrogate isolado escrito como escape JSON (`\ud800`) é aceito e gravado; a leitura seguinte devolve um valor que o host rejeita. O host não consegue enviar esse escape | Baixa | Registrado em 16/11 (revisão da correção do E2-1) |
+| E2-11 | Duas linhas ainda derrubam o servidor IPC (e o Core e os terminais junto): JSON muito aninhado dentro de 1 MB (`RecursionError`) e `method` que não é texto (`TypeError`). O host não envia nenhuma das duas | Média | Registrado em 16/11 (revisão da correção do E2-1). Severidade elevada para Alta pelo operador em 16/11. Vetor novo, reproduzido em 17/11 com o Python 3.11.9 empacotado: inteiro com mais de 4.300 dígitos em `params` ou no `id` (`ValueError`), com uma linha de 5 KB. Corrigido e testado em 17/11 (`e0f18fa`): profundidade até 64, inteiros até 128 dígitos, só números finitos (NaN e Infinity recusados), `method` só texto não vazio, `params` só objeto, quadro acima de 1 MB descartado até a quebra de linha; proteção geral (-32603 sem o conteúdo da linha) e resposta estruturada para linha vazia, só espaços, BOM e lotes (`c9572d5`); prova da proteção geral (`9af3e06`). Teste `tests/test_phase4d3_ipc_hardening.py`; sondas com o Python 3.11.9 empacotado em 18/11: 8/8 e 5/5, servidor vivo e ping respondido. Não testável pela interface (o host não envia essas linhas) |
+| E2-12 | Um surrogate isolado escrito como escape JSON (`\ud800`) é aceito e gravado; a leitura seguinte devolve um valor que o host rejeita. O host não consegue enviar esse escape | Baixa | Registrado em 16/11 (revisão da correção do E2-1). Corrigido em `c9572d5` (Etapa 7, 17/11): texto com surrogate isolado vindo de escape JSON, em chave ou valor, é recusado antes de qualquer gravação (-32600, `reason: "lone_surrogate"`), sem ecoar o conteúdo. Teste em `tests/test_phase4d3_etapa7_ipc.py`. Não testável pela interface (o host não envia esse escape) |
 
 ### E.3 — Limites aceitos no painel de credenciais
 
@@ -492,3 +493,176 @@ Dependências e limites:
 - A avaliação pode usar uma gravação curta da interação no site, se o operador enviar.
 - A implementação exige decisão própria do operador (etapa, escopo e critério de aceite), como qualquer item deste
   roadmap.
+
+## Apêndice G — Etapas 5 a 8 da 4D.3 e transição para a 4D.4 (17-18/11/2026)
+
+Registro do fechamento funcional da 4D.3 na branch `experimental/phase4d-m3-settings`, de `7ddbfce` a `7811040`
+(15 commits, nenhuma mudança em `src/`). Fontes: os próprios commits; o plano de continuidade 4D.3 → 4D.6 e a ordem
+única de correções, ambos de 17/11 e fora do repositório; as revisões independentes das Etapas 7 e 8; a avaliação do
+operador ao aprovar a Etapa 8 (18/11); a CI e o build listados em G.6.
+
+Termos usados:
+
+- corrigido e testado: coberto por testes automáticos e por revisão, fora do aplicativo instalado;
+- conferido no app nativo: visto no aplicativo Windows (Tauri e WebView2). A conferência nativa da Etapa 8 foi
+  interrompida em 18/11 sem resultado; onde ela falta está escrito [conferência nativa pendente].
+
+### G.1 — Situação dos defeitos e entregas das Etapas 5 a 8
+
+| Etapa | Commits | Conteúdo | Verificação |
+|---|---|---|---|
+| 5. Identidade e casca global (17/11) | `7ddbfce`, `8ea5963`, `3ffd57b`, `deafb5f` | Paleta da referência 01 e baixa estimulação por tokens; cabeçalho, navegação Conversas/Monitoramento/Missões e barra de status; F6/Shift+F6 entre regiões | Revisão independente em `deafb5f` |
+| 6. Painel do terminal (17/11) | `5bb562c`, `85a7ad5`, `e4acb71` | Identidade estável dos terminais (F10), estado real do painel, indicadores sem valores inventados | CI 44173217909, 9/9 |
+| 7. Categorias funcionais e teclado (17-18/11) | `e0f18fa`, `9436e51`, `c9572d5`, `a9e2462`, `9af3e06` | E2-11, E2-6, E.1, E2-3; métodos só leitura de Segurança, Agentes e Provedores; preferências aplicadas; atalhos globais | Revisão independente: 38 achados; 17 verificados por um segundo revisor (14 confirmados e corrigidos em `9af3e06`, 3 refutados); 21 P3 registrados. CI 44240056908, 9/9 |
+| 8. Fechamento funcional (18/11) | `11f5c7d`, `0790bfa`, `7811040` | Autorização ampla com confirmação, remoção condicional de credencial, chamadas ao Core fora da thread principal com prazo (R57-4), E/S de terminal ordenada | Revisão antes do build: achados P2 corrigidos antes do commit, P3 registrados (G.4). CI 44328607811 e 44328617103; build 44328616887 |
+
+Defeitos do ciclo, R57-4 e itens opcionais O1 a O4 da ordem de correções de 17/11:
+
+| Item | Severidade ou classe | Corrigido e testado | App nativo |
+|---|---|---|---|
+| F7 teclado preso no terminal | Bloqueante (operador, 16/11) | Etapa 5: F6/Shift+F6 saem do terminal e percorrem as regiões, sem parada de Tab vazia no painel, tecla de saída no nome acessível e na barra de status (`3ffd57b`); regiões da autorização e da inicialização (`deafb5f`); atalhos globais da 4D.3.5 (`a9e2462`). Vitest com 1 a 4 painéis; Tab, Esc, Shift+Tab e Ctrl+C conferidos byte a byte até `terminal_write` | [conferência nativa pendente] |
+| F10 identidade dos terminais | Alta (operador, 16/11) | Etapa 6: identidade pelo `session_id`, menor posição livre, fechar remove só a sessão daquele id (`5bb562c`); nomes que não se repetem na aba, estado real e foco (`85a7ad5`); fechamento que falha, ou que o host não confirma, mantém o painel (`85a7ad5`, `e4acb71`). 200 sequências aleatórias com cinco invariantes e ConPTY com `cmd.exe` reais no Windows; o teste novo falha em 90 de 205 casos no código anterior | [conferência nativa pendente] |
+| F11 CPU enganosa | Média (operador, 16/11) | Parcial: a barra de status mostra sempre "CPU: indisponível" e nenhum componente lê o percentual (`8ea5963`). O host ainda calcula e envia `cpu_usage_percent` (critério 2 do C4 não atendido); a medição real fica para a 4D.4.1 | [conferência nativa pendente] |
+| E2-11 linha malformada derruba o IPC | Alta (operador, 16/11) | `e0f18fa`, `c9572d5`, `9af3e06`, com o vetor novo de 17/11 (Apêndice E.2) | Não testável pela interface |
+| R57-4 leitura do IPC sem prazo | P1, antes da 4D.4.1 (plano de 17/11) | `0790bfa`: threads leitora e escritora; prazo contado desde o pedido da vez (30 s; 120 s para criar aba, criar sessão e restaurar sessões); -32007 `timeout` ou `disconnected`; resposta atrasada descartada pelo id; pedido acima de 1 MiB recusado no host. Testes estáticos em Python; o módulo `ipc_transport_tests` (8 testes) compila com `cargo check --tests`, mas não roda na CI; o transporte foi exercitado numa crate de rascunho contra um Core falso e contra o `server.py` real | [conferência nativa pendente] |
+| Terminal humano com teto de 256 MB (achado do operador no build 44328616887, 18/11) | P1 (bloqueia o uso principal do terminal; existente desde a 4D.2.1, `6e8c297`, também no alpha.50 instalado) | `68d63c8`: cada terminal rodava num Job Object com limite de 256 MB para a árvore inteira; Claude Code ("MemoryExhaustion", "Segmentation fault at address 0xBBADBEEF" com "Commit: 0.26 GB") e OpenCode ("memory allocation … failed", "Standalone server exited before reporting readiness") morriam ao iniciar, Codex e AGY cabiam. O terminal humano passa a rodar sem teto de memória, ainda no próprio Job Object e encerrado ao fechar; o agente governado mantém os 256 MB. Testes no Windows: 384 MB no terminal humano (falha no código anterior) e `MemoryError` no agente governado | Confirmado fora da janela (ConPTY real, código Python empacotado com `68d63c8`, perfil isolado): Claude Code e OpenCode interativos vivos após 15 s no terminal humano; os dois caem no agente governado. Na interface: [conferência nativa pendente] |
+| O1 token padrão `default-dev-token` | Baixa | `e0f18fa`: sem token o servidor IPC não inicia (sai com código 2). Teste em `tests/test_phase4d3_ipc_hardening.py` | [conferência nativa pendente] |
+| O2 comparação do token | Baixa | `e0f18fa`: `secrets.compare_digest`; método e token nunca vão para o diagnóstico | Sem efeito visível |
+| O3 (E2-10) stderr em UTF-8 | Baixa | Não feito (G.4) | — |
+| O4 (E2-12) surrogate isolado | Baixa | `c9572d5` (Apêndice E.2) | Não testável pela interface |
+
+Entregas das Etapas 7 e 8 por categoria de Configurações:
+
+| Categoria | Etapa 7 | Etapa 8 | App nativo |
+|---|---|---|---|
+| Perfil | Nome do perfil no cabeçalho (`a9e2462`); perfil ilegível em quarentena e recriado; seleção inválida abre o `default` (`9436e51`, `9af3e06`) | Erros estruturados de `profile_get_active` mostrados como texto (`0790bfa`, `7811040`) | [conferência nativa pendente] |
+| Geral | Abrir o último projeto (vale na próxima inicialização) e lista dos projetos autorizados para abrir com um clique; mapa de atalhos globais (`a9e2462`); sem "Salvar sessões" (`9af3e06`) | — | [conferência nativa pendente] |
+| Aparência | Densidade aplicada; cursor sem piscar na baixa estimulação e com movimento reduzido; primeira pintura com a aparência guardada (`a9e2462`) | — | [conferência nativa pendente] |
+| Terminal | Fonte, cursor e histórico aplicados ao terminal aberto, sem recriar sessões (`a9e2462`) | — | [conferência nativa pendente] |
+| Coordinator | Sem mudança de função: salvo e validado, não aplicado (o Desktop não executa missões); com configurações de outra versão, mostra os padrões (`9af3e06`) | — | [conferência nativa pendente] |
+| Agentes | Inventário só leitura (`discovery.agents` em `c9572d5`, painel em `a9e2462`): CLIs conhecidas pelo Core e presença do lançador, nomes de servidores MCP; nunca abre uma CLI nem devolve valores, argumentos, URLs ou tokens; Gemini CLI "não suportado" | — | [conferência nativa pendente] |
+| Provedores | Rotas de fallback só leitura (`providers.routes` em `c9572d5`, `9af3e06`); cotas indisponíveis até a 4D.4.3; cofre com gravação condicional e trava entre processos (E.1, E2-3, E2-4) | Remoção condicionada à revisão da lista (`11f5c7d`, `7811040`) | [conferência nativa pendente] |
+| Segurança | Política em vigor só leitura e revogação de diretórios com confirmação, recusada com terminal ativo nesta janela (`c9572d5`, `a9e2462`); textos corrigidos sobre o ambiente dos agentes e o alcance da revogação (`9af3e06`) | Diretório amplo só com confirmação explícita; selo "Acesso amplo" (`11f5c7d`, `7811040`) | [conferência nativa pendente] |
+| Sobre | — | Chamadas do atualizador e medição da árvore de processos fora da thread principal (`0790bfa`) | [conferência nativa pendente] |
+| Fora das categorias (Conversas e IPC) | E2-11 (`e0f18fa`, `c9572d5`) | R57-4 (`0790bfa`); uma leitura de saída por vez; escrita e redimensionamento um por vez em cada sessão (`7811040`) | E2-11 não testável pela interface; o resto: [conferência nativa pendente] |
+
+### G.2 — Mudanças de comportamento para validação do operador
+
+Nenhuma destas mudanças foi vista no app nativo: [conferência nativa pendente].
+
+| Mudança | Como fica | Commit |
+|---|---|---|
+| Sem o botão "Salvar sessões" | O botão sai da faixa da aba. Ele dizia "arquivados", mas o resultado do host era descartado: nada era exportado. Geral diz que exportar o histórico e restaurar sessões ainda não são suportados | `9af3e06` |
+| Ctrl+Shift+2 reservado | Ctrl+Shift+1 a 4 levam ao cabeçalho do painel 1 a 4. O `^@` (NUL) que o xterm enviava com Ctrl+Shift+2 não chega mais ao shell, também no teclado ABNT2; consequência da D12 | `a9e2462` |
+| Prazo do IPC | Cada chamada ao Core tem 30 s; criar aba, criar sessão e restaurar sessões têm 120 s. A espera na fila conta: algo digitado atrás de uma chamada longa pode falhar com o aviso "Erro de escrita no terminal: …" em vez de esperar, e o que foi digitado depois é descartado ("O que foi digitado depois disso não foi enviado."). Mensagens: "O Core não respondeu em N s. A operação pode ter sido concluída: confira antes de repetir." e "O Core encerrou a comunicação. Reinicie o aplicativo." | `0790bfa`, `7811040` |
+| Autorização ampla com confirmação | Raiz de disco ou volume, raiz de compartilhamento UNC, `/`, a pasta pessoal e qualquer pasta que a contenha pedem confirmação ("Autorizar {caminho} com acesso amplo?", Cancelar com o foco, Esc cancela, clique só depois de 600 ms). Incluir a pasta que contém a pessoal (ex.: `C:\Users`) é mais restrito que o pedido. Entradas amplas já gravadas continuam e ganham o selo "Acesso amplo" em Segurança | `11f5c7d`, `7811040` |
+| Revogação limpa o último projeto | Revogar um diretório também esquece o último projeto quando ele é esse diretório ou está dentro dele; a abertura automática deixa de reabri-lo | `9436e51` |
+| Perfil ilegível em quarentena | O `profile.json` ilegível do perfil ativo é copiado para `profile.json.corrupt-<data UTC>` e o perfil é recriado vazio, com o mesmo nome: sem projetos autorizados e sem configurações. A recuperação é informada uma vez, num aviso que fica na tela durante a sessão. Seleção de perfil inválida abre o `default` | `9436e51`, `9af3e06` |
+| Configurações de outra versão | Esquema futuro ou incompatível fica somente leitura; a interface usa e mostra os padrões desta versão e não grava por cima ("Esta versão usa os próprios padrões e não grava sobre elas.") | `9436e51`, `9af3e06` |
+| Leitura da saída pausa 5 s após timeout | Depois de um timeout, a leitura da saída dos terminais pausa 5 s para as ações do operador passarem. Com o Core encerrado, para de vez com o aviso "Os terminais pararam de atualizar: …" | `7811040` |
+| Core encerrado na inicialização | "Tentar novamente" não aparece, porque a mensagem manda reiniciar o aplicativo; no timeout o botão continua | `7811040` |
+| Timeout ao autorizar | "A autorização do projeto não foi confirmada: …" e a lista de projetos é relida; se o Core autorizou mesmo assim, o projeto aparece para abrir | `7811040` |
+| Terminal humano sem teto de memória | O terminal humano deixa de ter o limite de 256 MB por árvore de processos (ele já roda com as permissões do operador, sem isolamento); continua contido no próprio Job Object e é encerrado ao fechar. O agente governado mantém os 256 MB | `68d63c8` |
+
+### G.3 — Contrato do E.1: proposta × implementado
+
+O texto do E.1 fica como registro da proposta de 13/11. O contrato em vigor é o da coluna "Implementado".
+
+| Aspecto | Proposta do E.1 (13/11) | Implementado (`9436e51`, `c9572d5`, `11f5c7d`) |
+|---|---|---|
+| Como pedir a substituição | Parâmetro `mode`: `if_absent` ou `overwrite` | Sem `mode`. `vault.set_secret` sem `expected_revision` só cria; com a revisão lida, substitui só se o cofre ainda for aquela revisão e o nome existir |
+| Revisão | Não prevista | `vault.list_keys` devolve `{keys, revision}`; a revisão é o SHA-256 do `vault.enc` cifrado (64 caracteres hexadecimais) ou `absent` sem arquivo |
+| Nome já existe, sem confirmação | Erro com `reason: "exists"` | -32005 com `reason: "conflict"` ("Já existe uma credencial com este nome. Recarregue e confirme a substituição.") |
+| Cofre mudou desde a leitura | Não previsto | -32005 com `reason: "conflict"`; nada é gravado |
+| Resposta de sucesso | `replaced: true/false` | `{stored: true, key}`, sem `replaced` |
+| Trava | Trava de arquivo entre processos em volta de ler-alterar-gravar | Trava entre processos (`vault.enc.lock`, espera de até 10 s), arquivo temporário, fsync e `os.replace`; no Windows, novas tentativas curtas em violação de compartilhamento (cerca de 0,5 s). Trava ocupada: -32006 `busy`, nada alterado |
+| Cofre ilegível | Não previsto | Nunca tratado como vazio nem regravado: -32004 `unreadable` (E2-3) |
+| Remoção | Fora da proposta | `vault.delete_secret` aceita `expected_revision`: revisão diferente dá -32005 `conflict` e nada é removido; revisão inválida dá -32602 `invalid_value`; sem revisão, remove como antes (`11f5c7d`) |
+| Interface | Gravar com `if_absent` e enviar `overwrite` só depois da confirmação | Grava sem revisão quando o nome é novo; para substituir, pergunta e envia a revisão da leitura que mostrou o nome; conflito relê a lista na hora (`a9e2462`). A remoção leva a revisão da lista em que Remover foi clicado e, sem revisão conhecida, nada é removido (`7811040`) |
+
+### G.4 — Registro de riscos remanescentes
+
+Classes pelo critério do operador de 17/11: P0 corrigir já; P1 antes da fase que bloqueia; P2 acumular para a 4D.6;
+P3 revisão final. A classe vem da fonte indicada; "(proposta)" marca a classe que nenhuma fonte deu, a aprovar pelo
+operador.
+
+| Risco | Situação em 18/11 | Classe | Destino |
+|---|---|---|---|
+| Revogação entre janelas e ausência de instância única | Revogar confere só os terminais da própria janela: um terminal aberto em outra janela continua no diretório revogado; terminais novos são barrados em todas as janelas (teste em `9af3e06`), e `security.status` diz isso. Sem instância única (E2-6), cada execução abre outra janela com o seu Core; preferências gravadas numa janela podem ser sobrescritas por outra (mecanismo anterior à Etapa 7: a revisão confirmou que ele existe e por isso não o contou como achado da etapa). Avaliação nativa com duas janelas: [conferência nativa pendente] | Operador, 18/11: P1 de segurança, a confirmar nos cenários de revogação. Revisão da Etapa 7: P2 na lente de segurança, P3 no segundo revisor. Sem rebaixar até a avaliação | Avaliar os cenários de revogação antes de fixar a classe (operador, 18/11); correção estrutural (instância única, E2-6) sem etapa definida |
+| Prazo do IPC (R57-4) | Mitigado em `0790bfa` (G.1). Resta: um erro interno inesperado do Core, ainda na validação, volta com id nulo; o host descarta a linha e a chamada espera o prazo inteiro (30 s, ou 120 s nos métodos de terminal) antes de dizer que o Core não respondeu. Uma chamada que estoura o prazo ainda pode ser concluída no Core (a mensagem avisa). [conferência nativa pendente] | P3 (proposta) | Revisão final |
+| Comandos fora da thread principal | Resolvido em `0790bfa`: todo comando que chama o Core e a medição da árvore de processos rodam no pool de bloqueio. Resta o `bridge.shutdown()` da atualização num worker assíncrono (até cerca de 500 ms). [conferência nativa pendente] | P3 (revisão antes do build da Etapa 8) | Revisão final |
+| Raiz do disco autorizada | Tratado com confirmação explícita em `11f5c7d` e `7811040` (G.2); a pasta recusada nunca é gravada. Entradas amplas já gravadas continuam valendo, listadas em `broad_projects`. Para a pasta que contém a pessoal, os textos da interface podem ficar imprecisos (revisão antes do build). [conferência nativa pendente] | P3 (plano de 17/11) | Revisão final |
+| Remoção de credencial | Condicional desde `11f5c7d` e `7811040`. Sem revisão, o servidor ainda remove sem condição (compatibilidade); a interface sempre envia a revisão. A revisão `absent` (cofre ainda inexistente) seria recusada numa remoção; a interface não chega a esse caso. [conferência nativa pendente] | P3 (revisão da Etapa 7) | Revisão final |
+| Ordem de invokes do mesmo tick | Mitigado em `7811040`: uma escrita e um redimensionamento em andamento por sessão, e o que é digitado no meio vai junto logo depois. Escrita e redimensionamento seguem filas separadas, então a ordem entre os dois, disparados juntos, não é garantida (leitura do código). [conferência nativa pendente] | P3 (revisão antes do build da Etapa 8) | Revisão final |
+| Criação de aba que estoura o prazo | `terminal_create_tab` que passa de 120 s e termina depois deixa a aba impossível de criar ("Terminal operation failed") | P3 (revisão antes do build da Etapa 8) | Revisão final |
+| Mocks divergentes | Mocks e fixtures da interface divergem do host real em códigos, `reason`, formas e textos. Parte corrigida: E2-3 com a forma real (`9af3e06`); fixtures da conferência visual com as regras novas (`7811040`) | P3 (revisões das Etapas 7 e 8) | Revisão final |
+| R57-1 `Cargo.lock` não versionado | O `cargo check` local resolveu `tauri` 2.12.7, e o executável do build 44328616887 traz a mesma versão (caminhos `tauri-2.12.7` no binário); sem o arquivo, cada build resolve de novo | P2 (plano de 17/11) | 4D.6 (4D.6.3) |
+| E2-7 versão igual ao alpha | Persiste no build 44328616887 (`0.6.1-alpha.50`); O6 não feito | P2 (plano de 17/11) | 4D.6 |
+| E2-10 stderr | Diagnóstico do servidor IPC continua na codificação local; O3 não feito | P2 (plano de 17/11) | 4D.6 |
+| F11, parte do host | O host ainda calcula e envia `cpu_usage_percent`; a interface não usa | P2, absorvido (plano de 17/11) | 4D.4.1 |
+| E2-8, R57-2, R57-3, R57-5, R57-6, R57-7 | Sem mudança nas Etapas 5 a 8 (`updater:default` continua nas capabilities) | P2 (plano de 17/11) | 4D.6 |
+| Core-1 | Autorização humana fraca no Core (sondas P1 a P3 do 2º agente); DAG sem escalonador que respeite nós humanos | P1 da 4D.5 (plano de 17/11) | Antes da 4D.5; alterações do motor decididas e autorizadas à parte (operador, 17/11) |
+| Core-2 | Failover `running -> starting` no mesmo `run` | P1 da 4D.5 (plano de 17/11) | No registro até a 1.0.0 (operador, 17/11) |
+| Core-3 | AppContainer do worker sem rede (D4) | P1 da 4D.5, se houver despacho (plano de 17/11) | No registro até a 1.0.0 (operador, 17/11) |
+| Core-4 | Corrida do `icacls` e 293 ACEs órfãs, `emit` com acento, `security.md` acima do uso real, teste que consulta o ai-memory real, teste instável da 4C.2.4 | P2 (plano de 17/11) | 4D.6; ACLs órfãs no registro até a 1.0.0, remoção só com autorização do operador |
+| Outros P3 das revisões | Seguem abertos, entre outros: gravar um subcampo do orçamento de missão devolve ao padrão os outros já salvos; revogar uma subpasta sob pasta-pai autorizada responde `revoked: true` com o acesso mantido pela pasta-pai; Ctrl+Shift+2 (G.2); na abertura, os terminais só são criados depois da resposta do `settings_get` (até o prazo de 30 s do IPC), apesar do prazo de 1,5 s das preferências; "O Core não está em execução" volta sem `data.reason`, e a abertura oferece um "Tentar novamente" que não ajuda | P3 (revisões das Etapas 7 e 8) | Revisão final |
+| Defeito que só aparece no app instalado | Conferência nativa da Etapa 8 interrompida; Conferências 1 a 4 adiadas. O primeiro uso do app pelo operador já revelou um (teto de 256 MB no terminal humano, G.1, corrigido em `68d63c8`) | Risco do plano de 17/11, sem classe | Decisão do operador (G.5, item 5) |
+| Perfil real usado pelo build de diagnóstico | Aberto pelo Explorer (sem o ambiente isolado dos testes), o portátil usa o perfil real `~\.ai-coordinator`. Em 18/11 às 12:28 isso gravou `last_project` e regravou `D:\ai-coordinator` em `profile.json`, sem quarentena nem cópia `pre-v1` e sem credenciais no cofre. O alpha.50 instalado continua lendo o perfil (o `from_dict` dele ignora campos desconhecidos); se ele gravar, `last_project` some, sem outro efeito. As duas versões não devem ficar abertas ao mesmo tempo (o alpha.50 não tem a trava entre janelas). Os testes automatizados usam sempre perfil isolado | P3 (registro) | Até a 4D.6, quando a versão nova for instalada |
+| Pedido de melhoria do operador (18/11): escolha do shell | O selo `cmd.exe` do cabeçalho do terminal vira uma lista (`cmd.exe`, Windows PowerShell e, se instalado, PowerShell 7); trocar num terminal aberto reinicia aquele terminal depois de confirmação (o programa em execução é encerrado); shell padrão em Configurações → Terminal. Motivo: lançadores do operador são funções do PowerShell, que o `cmd.exe` não reconhece | Melhoria, sem classe de defeito | Depois do fechamento da 4D.3 (pedido do operador) |
+
+**Nenhum P0 conhecido em 18/11.** O plano de 17/11 não tinha P0 ativo, e as revisões independentes da Etapa 7
+(38 achados) e da Etapa 8 antes do build (achados P2 e P3) não classificaram nenhum achado como P0. Isso vale para o
+que foi testado fora do app nativo: [conferência nativa pendente]. Em 18/11 o operador disse que não confirmaria
+definitivamente os riscos restantes como não críticos antes de verificar os cenários de revogação de permissões; essa
+verificação ainda não foi feita.
+
+### G.5 — Proposta de exceção de governança para abrir a 4D.4
+
+Status: **proposta, pendente de aprovação do operador.** Exceção ao §7 nos mesmos termos do Apêndice B:
+
+1. A 4D.4 abre com a 4D.3 funcionalmente fechada: Etapas 5 a 8 commitadas até `68d63c8`, CI verde e um build de
+   diagnóstico (`44328616887`), conforme G.6.
+2. A homologação nativa completa da 4D.3 (Conferências 1 a 4 e todos os pontos com [conferência nativa pendente]
+   neste apêndice) e a homologação multiplataforma ficam para a 4D.6 (4D.6.1 e 4D.6.5).
+3. O Gate 4D.2 continua **não** declarado aprovado: a homologação operacional dos terminais no Windows segue
+   pendente (Apêndice B, item 2).
+4. O Gate 4D.3 também não é declarado aprovado: os três itens têm implementação no código e testes automáticos, sem
+   conferência nativa (tabela abaixo).
+5. A conferência curta no app, prevista para a Etapa 8, foi interrompida em 18/11 (só rodou o harness, G.6). Cabe ao
+   operador decidir se ela vem antes da abertura da 4D.4 ou vai para a 4D.6.
+6. Continuam valendo: branch experimental, sem merge na `main`; nenhuma tag, release, distribuição ou mudança no canal
+   de atualização; Core sem alteração (Core-1 a Core-4 com decisão própria); P1 corrigidos antes da fase que bloqueiam,
+   P2 acumulados para a 4D.6, P3 na revisão final.
+7. Origem: decisão 1 do plano de continuidade de 17/11, que recomenda a exceção nos termos do Apêndice B; o operador
+   condicionou a exceção ao fim da Etapa 8 (17/11).
+
+| Item do Gate 4D.3 | Código e testes (até `7811040`) | App nativo |
+|---|---|---|
+| 1. 9 categorias operacionais e validadas | As 9 mostram o estado verdadeiro (salvo, validado, aplicado, não suportado), com validação no backend (D3); Coordinator salvo e validado, não aplicado, porque o Desktop não executa missões | [conferência nativa pendente] |
+| 2. Credenciais só no cofre | DPAPI no Windows, gravação e remoção condicionais (G.3); sem cofre seguro, nada é gravado (D8) | [conferência nativa pendente] |
+| 3. Navegação só por teclado | F6/Shift+F6, atalhos globais e devolução de foco (Etapas 5 e 7), cobertos por Vitest | [conferência nativa pendente] |
+
+### G.6 — Evidências
+
+| Evidência | Identificação | Resultado |
+|---|---|---|
+| CI Verify | 44173217909 (Etapa 6) | 9/9 verde |
+| CI Verify | 44226255023 (`a9e2462`) | Falhou só no job da interface, no Linux (3 testes de revogação): o foco era movido num `requestAnimationFrame`, ficava um quadro no `<body>` e o Esc não chegava a Configurações. Corrigido em `9af3e06` com teste que falha no código anterior |
+| CI Verify | 44240056908 (`9af3e06`) | 9/9 verde |
+| CI Verify | 44328607811 (`7811040`, experimental) | Verde |
+| CI Verify | 44328617103 (`7811040`, branch temporária `feature/phase4d-m3-etapa8-diagnostico`) | Verde |
+| Build Desktop Alpha (Windows) | 44328616887 (`7811040`) | Sucesso na primeira tentativa; código Python empacotado idêntico ao do `7811040`. SHA-256 abaixo |
+| Testes locais, Etapa 7 | `9af3e06` | pytest das fases 4D 536/536; Vitest 361/361; `tsc` sem erros; sondas do E2-11 com o Python 3.11.9 empacotado sem queda |
+| Testes locais, Etapa 8 | `7811040` | pytest das fases 4D.1 a 4D.3 594/594 (23 arquivos); Vitest 403/403 (18 arquivos); `tsc` sem erros; `vite build` ok; `cargo check` limpo, só os 3 avisos anteriores (rustc 1.100.0, tauri 2.12.7, Rust isolado, fora da instalação do sistema); sondas do E2-11 com o Python 3.11.9 empacotado: `sonda_ipc.py` 8/8 e `sonda_e2_11.py` 5/5 |
+| Conferência nativa da Etapa 8 | Portátil do build 44328616887, perfil isolado | Interrompida em 18/11, por volta das 11h20; só rodou o harness do primeiro bloco (aberturas do app com captura da tela). Não é conferência: [conferência nativa pendente] |
+| CI Verify | 44346842439 (`68d63c8`) | 7 jobs verdes, inclusive os dois do Windows com os testes novos de memória; o job macOS do Python 3.11 foi cancelado porque o GitHub não alocou máquina ("The job was not acquired by Runner of type hosted even after multiple attempts") e o de artefatos foi pulado. Na reexecução dos jobs não concluídos: 9/9 verde |
+| Terminal com Claude Code e OpenCode (fora da janela) | `cli-no-terminal-68d63c8.json` | ConPTY real com o Python e o código empacotados (`68d63c8` aplicado), perfil isolado, ferramentas interativas por 15 s: terminal humano vivo nos dois casos; agente governado (256 MB) cai nos dois |
+| Pasta de evidências (fora do repositório) | `D:\ai-memory\auditoria\2026-11-18-4d3-etapa8` | `artefato-44328616887.sha256` (hashes do artefato); `instalacao-producao-antes.sha256` e `perfil-real-antes.sha256` (linha de base da instalação de produção e do perfil real, gravada antes da conferência); `n1-s0-harness` (capturas, textos e logs do harness) |
+| Revisões (fora do repositório) | Relatórios de trabalho de 17-18/11 | Revisão independente da Etapa 7 (38 achados) e relatórios da Etapa 8 antes do build (implementação, duas revisões, correções e bateria final) |
+
+SHA-256 do artefato do build 44328616887:
+
+- `ai-coordinator-desktop.exe`: `a5984ca46e730cf5150ca8a0d3cb4f34908d86343977e92f9f573afc43c152fb`
+- `ai-coordinator-desktop-alpha-portable.zip`: `559d50c162cd328b613f6c9eac568a52937b35e37f615da69a14f040b443db04`
+- `AI Coordinator Desktop_0.6.1-alpha.50_x64-setup.exe` (não executado):
+  `2ca454ab061949f19cb90f53fcaf63a7c700207d7789829b0e41eb5e8a401543`
