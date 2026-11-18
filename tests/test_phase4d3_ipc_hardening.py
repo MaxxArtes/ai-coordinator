@@ -54,6 +54,17 @@ BAD_LINES = [
     *[("params_" + name, request(params=value), -32602) for name, value in [
         ("list", []), ("null", None), ("number", 3), ("text", MARKER)]],
     ("token_type", request(session_token=[MARKER]), -32600),
+    # C3 residuals (E7-G10). A blank line is answered too: the host (main.rs, IpcBridge::exchange) writes exactly one
+    # serde_json line plus "\n" per request and reads exactly one line back, so it never sends a blank line and an
+    # answer to one cannot shift its request/response pairing. Other NDJSON peers must not send blank keep-alives.
+    ("empty_line", "", -32600),
+    ("spaces_only", " \t  ", -32600),
+    ("bom_only", "\ufeff", -32700),
+    ("bom_then_valid_json", "\ufeff" + request(), -32700),
+    ("batch_with_items", "[" + request() + "," + request(id="second") + "]", -32600),
+    # E2-12: only a JSON escape can carry an unpaired surrogate; it is refused before any handler stores it.
+    ("lone_surrogate_value", request(params={"value": "\ud800" + MARKER}), -32600),
+    ("lone_surrogate_key", request(params={"\udc00": MARKER}), -32600),
 ]
 
 @pytest.mark.parametrize("name,line,code", BAD_LINES, ids=[v[0] for v in BAD_LINES])
@@ -68,6 +79,8 @@ def test_malformed_line_is_rejected_then_ping_works_without_touching_sessions(na
     assert server.process_one() is True
     first, second = [json.loads(x) for x in writer.getvalue().splitlines()]
     assert first["error"]["code"] == code
+    assert first["error"]["data"]["field"] == "request" or code == -32602
+    assert isinstance(first["error"]["data"]["reason"], str) and first["error"]["data"]["reason"]
     assert second["id"] == "next" and second["result"]["status"] == "pong"
     assert manager.sessions == before
     manager.terminate_all.assert_not_called()
@@ -128,6 +141,7 @@ def test_all_malformed_vectors_preserve_a_real_child_terminal(tmp_path):
         for _name, line, code in BAD_LINES:
             answer = srv.send_raw((line + "\n").encode("utf-8"))
             assert answer["error"]["code"] == code
+            assert answer["error"]["data"]["reason"]
             srv.assert_alive()
             listing = srv.call("terminal.list_tabs")["result"]
             pane = listing["tabs"][0]["panes"]["0"]
@@ -151,6 +165,7 @@ def test_large_frames_are_drained_with_bounded_reads_and_the_next_request_surviv
     assert server.process_one() and server.process_one()
     error, ping = [json.loads(line) for line in writer.getvalue().splitlines()]
     assert error["error"]["code"] == -32001
+    assert error["error"]["data"] == {"field": "request", "reason": "payload_too_large"}
     assert ping["result"]["status"] == "pong"
     assert len(reader.sizes) > 2
 

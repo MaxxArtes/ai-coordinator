@@ -15,6 +15,7 @@ import io
 import json
 import os
 import queue
+import re
 import subprocess
 import sys
 import tempfile
@@ -190,7 +191,9 @@ def test_vault_stores_non_ascii_value_exactly(server):
     assert resp.get("error") is None, resp.get("error")
     assert resp["result"] == {"stored": True, "key": key}
     assert value not in json.dumps(resp, ensure_ascii=False)
-    assert server.call("vault.list_keys")["result"] == {"keys": [key]}
+    listed = server.call("vault.list_keys")["result"]
+    assert set(listed) == {"keys", "revision"} and listed["keys"] == [key]
+    assert re.fullmatch(r"[0-9a-f]{64}", listed["revision"])
 
     # Read back from the temporary vault with the same DPAPI user and profile entropy: the exact text was stored.
     assert Win32DPAPIVault("default", data_dir / "vault.enc").get_secret(key) == value

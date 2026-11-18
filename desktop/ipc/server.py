@@ -44,17 +44,38 @@ def _reject_json_constant(_text: str) -> None:
     raise ValueError("Non-JSON numeric constant")
 
 
-def _bounded_json_depth(value: Any) -> bool:
+def _encodable(text: str) -> bool:
+    if text.isascii():
+        return True
+    try:
+        text.encode("utf-8")
+        return True
+    except UnicodeEncodeError:
+        return False
+
+
+def _json_problem(value: Any) -> Optional[str]:
+    """None for a usable document, "max_depth" for excessive nesting, "lone_surrogate" for a string (key or value)
+    that only an escape such as \\ud800 can produce: it cannot be stored as UTF-8 nor read back by the host (E2-12)."""
     pending = [(value, 0)]
     while pending:
         item, depth = pending.pop()
+        if isinstance(item, str):
+            if not _encodable(item):
+                return "lone_surrogate"
+            continue
         if not isinstance(item, (dict, list)):
             continue
         if depth >= MAX_JSON_DEPTH:
-            return False
-        children = item.values() if isinstance(item, dict) else item
-        pending.extend((child, depth + 1) for child in children if isinstance(child, (dict, list)))
-    return True
+            return "max_depth"
+        if isinstance(item, dict):
+            if not all(_encodable(key) for key in item):
+                return "lone_surrogate"
+            children = item.values()
+        else:
+            children = item
+        pending.extend((child, depth + 1) for child in children if isinstance(child, (dict, list, str)))
+    return None
 
 
 def _safe_rpc_id(value: Any) -> bool:
@@ -65,6 +86,11 @@ def _safe_rpc_id(value: Any) -> bool:
 
 
 VAULT_UNAVAILABLE_CODE = -32004  # RPCErrorCode.VAULT_UNAVAILABLE
+VAULT_CONFLICT_CODE = -32005
+BUSY_CODE = -32006  # another window holds the profile or vault lock; nothing was changed
+PROFILE_BUSY_MESSAGE = "Outra janela está usando o perfil. Tente novamente."
+VAULT_BUSY_MESSAGE = "Outra janela está usando o cofre. Tente novamente."
+VAULT_STATUS_LOCK_TIMEOUT = 2.0
 
 
 class StructuredRPCError(Exception):
@@ -323,6 +349,11 @@ class SecureIPCServer:
         self.register("profile.get_active", self._handle_profile_get_active)
         self.register("profile.authorize_project", self._handle_profile_authorize_project)
         self.register("profile.list_authorized_projects", self._handle_profile_list_authorized_projects)
+        self.register("profile.revoke_project", self._handle_profile_revoke_project)
+        self.register("profile.remember_project", self._handle_profile_remember_project)
+        self.register("security.status", self._handle_security_status)
+        self.register("discovery.agents", self._handle_discovery_agents)
+        self.register("providers.routes", self._handle_providers_routes)
         self.register("terminal.create_tab", self._handle_terminal_create_tab)
         self.register("terminal.create_session", self._handle_terminal_create_session)
         self.register("terminal.write", self._handle_terminal_write)
@@ -396,7 +427,13 @@ class SecureIPCServer:
         return SettingsStore(self._get_terminal_manager().authorizer.profile_manager)
 
     def _handle_settings_get(self, _params: Dict[str, Any]) -> Dict[str, Any]:
-        return self._settings_store().snapshot()
+        from desktop.settings import SettingsValidationError
+
+        # Stored data is reported in the snapshot (read_only, stored_issue, invalid_fields), never as a failure.
+        try:
+            return self._settings_store().snapshot()
+        except SettingsValidationError as exc:
+            raise InvalidParamsError(str(exc), field=exc.field, reason=exc.reason) from None
 
     def _handle_settings_update(self, params: Dict[str, Any]) -> Dict[str, Any]:
         from desktop.settings import SettingsValidationError
@@ -413,26 +450,60 @@ class SecureIPCServer:
         return authorizer.get_vault(profile_name)
 
     def _vault_call(self, token: Optional[str], operation: Callable[[Any], Any]) -> Any:
-        from desktop.auth.vault import VaultUnavailableError
+        from desktop.auth.file_lock import FileLockTimeoutError
+        from desktop.auth.vault import (VaultBusyError, VaultConflictError, VaultError, VaultExistsError,
+                                        VaultUnavailableError)
 
         try:
             return operation(self._vault_for(token))
-        except VaultUnavailableError as exc:
-            raise StructuredRPCError(str(exc), field="vault", reason="unavailable", code=VAULT_UNAVAILABLE_CODE) from exc
+        except VaultUnavailableError:
+            raise StructuredRPCError("Cofre seguro indisponível nesta plataforma. Nenhuma credencial foi alterada.",
+                                     field="vault", reason="unavailable", code=VAULT_UNAVAILABLE_CODE) from None
+        except VaultExistsError:
+            raise StructuredRPCError("Já existe uma credencial com este nome. Recarregue e confirme a substituição.",
+                                     field="vault", reason="conflict", code=VAULT_CONFLICT_CODE) from None
+        except VaultConflictError:
+            raise StructuredRPCError("O cofre mudou desde a conferência. Recarregue e confirme novamente.",
+                                     field="vault", reason="conflict", code=VAULT_CONFLICT_CODE) from None
+        except (VaultBusyError, FileLockTimeoutError):
+            # FileLockTimeoutError is an OSError: it must be told apart before the generic "unreadable".
+            raise StructuredRPCError(VAULT_BUSY_MESSAGE, field="vault", reason="busy", code=BUSY_CODE) from None
+        except (VaultError, OSError, ValueError):
+            raise StructuredRPCError("Não foi possível ler ou gravar o cofre. Os dados existentes foram preservados.",
+                                     field="vault", reason="unreadable", code=VAULT_UNAVAILABLE_CODE) from None
 
     def _handle_vault_status(self, _params: Dict[str, Any], token: Optional[str] = None) -> Dict[str, Any]:
-        vault = self._vault_for(token)
-        return {"available": bool(vault.available), "backend": vault.backend_name}
+        from desktop.auth.file_lock import FileLockTimeoutError
+        from desktop.auth.vault import VaultBusyError, VaultError
+        vault = None
+        try:
+            vault = self._vault_for(token)
+            if not vault.available:
+                return {"available": False, "backend": vault.backend_name, "reason": "unavailable"}
+            # A backend that exists but cannot decrypt is not available. A short wait: status must not block the IPC.
+            vault.get_keys_snapshot(lock_timeout=VAULT_STATUS_LOCK_TIMEOUT)
+            return {"available": True, "backend": vault.backend_name}
+        except (VaultBusyError, FileLockTimeoutError):
+            return {"available": False, "backend": getattr(vault, "backend_name", "unknown"), "reason": "busy"}
+        except (VaultError, OSError, ValueError):
+            return {"available": False, "backend": "unreadable", "reason": "unreadable"}
 
     def _handle_vault_list_keys(self, _params: Dict[str, Any], token: Optional[str] = None) -> Dict[str, Any]:
-        return {"keys": self._vault_call(token, lambda vault: sorted(vault.list_keys()))}
+        return self._vault_call(token, lambda vault: vault.get_keys_snapshot())
 
     def _handle_vault_set_secret(self, params: Dict[str, Any], token: Optional[str] = None) -> Dict[str, Any]:
         key = validate_secret_key(params.get("key"))
         value = params.get("value")
-        if not isinstance(value, str) or not value:
+        # E2-4: spaces and line breaks around a pasted credential are never part of it; blank is not a credential.
+        if not isinstance(value, str) or not value.strip():
             raise InvalidParamsError("'value' deve ser um texto não vazio.", field="value", reason="invalid_value")
-        self._vault_call(token, lambda vault: vault.set_secret(key, value))
+        value = value.strip()
+        expected_revision = params.get("expected_revision")
+        if expected_revision is not None:
+            import re
+            if not isinstance(expected_revision, str) or not re.fullmatch(r"[0-9a-f]{64}", expected_revision):
+                raise InvalidParamsError("A revisão do cofre é inválida.", field="expected_revision", reason="invalid_value")
+        self._vault_call(token, lambda vault: vault.set_secret_conditional(key, value, expected_revision))
         return {"stored": True, "key": key}
 
     def _handle_vault_delete_secret(self, params: Dict[str, Any], token: Optional[str] = None) -> Dict[str, Any]:
@@ -444,25 +515,26 @@ class SecureIPCServer:
         mgr = self._get_terminal_manager()
         prof_mgr = mgr.authorizer.profile_manager
         active = prof_mgr.get_active_profile()
+        recovery = getattr(prof_mgr, "recovery", None)
         return {
             "name": active.name,
             "display_name": active.display_name,
             "authorized_projects": active.authorized_projects,
             "data_dir": active.data_dir,
+            "last_project": getattr(active, "last_project", None),
+            # E2-6: the active profile was unreadable, kept byte for byte (file name only) and recreated empty.
+            "recovery": dict(recovery) if isinstance(recovery, dict) else None,
         }
 
     def _handle_profile_authorize_project(self, params: Dict[str, Any], _token: Optional[str] = None) -> Dict[str, Any]:
         mgr = self._get_terminal_manager()
         prof_mgr = mgr.authorizer.profile_manager
+        path_obj = self._project_param(params)
+        if not path_obj.is_dir():
+            # Fixed text: the requested path is never echoed back.
+            raise InvalidParamsError("O diretório do projeto não existe ou não é uma pasta.",
+                                     field="project_path", reason="path_missing")
         active = prof_mgr.get_active_profile()
-        project_path = params.get("project_path")
-        if not project_path or not isinstance(project_path, str):
-            raise ValueError("Parameter 'project_path' must be a non-empty string")
-
-        path_obj = Path(project_path).resolve()
-        if not path_obj.exists() or not path_obj.is_dir():
-            raise ValueError(f"Project directory does not exist or is not a directory: {project_path}")
-
         prof_mgr.authorize_project(active.name, str(path_obj))
         active = prof_mgr.get_active_profile()
         return {
@@ -477,6 +549,82 @@ class SecureIPCServer:
         prof_mgr = mgr.authorizer.profile_manager
         active = prof_mgr.get_active_profile()
         return {"authorized_projects": active.authorized_projects}
+
+    @staticmethod
+    def _project_text(params: Dict[str, Any]) -> str:
+        path = params.get("project_path")
+        if not isinstance(path, str) or not path.strip() or "\x00" in path:
+            raise InvalidParamsError("Informe um diretório de projeto válido.", field="project_path", reason="invalid_value")
+        return path.strip()
+
+    @classmethod
+    def _project_param(cls, params: Dict[str, Any]) -> Path:
+        try:
+            return Path(cls._project_text(params)).resolve()
+        except (ValueError, OSError, RuntimeError):
+            raise InvalidParamsError("Diretório de projeto inválido.", field="project_path", reason="invalid_value") from None
+
+    def _handle_profile_revoke_project(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        from desktop.auth.profile import path_matches
+
+        mgr = self._get_terminal_manager()
+        profiles = mgr.authorizer.profile_manager
+        # The listed text is compared as is and resolved (os.path.normcase), like the authorization itself: an entry
+        # renamed only in letter case, replaced by a junction or written another way can still be revoked (K4).
+        requested = self._project_text(params)
+        self._project_param(params)
+
+        def refuse_with_sessions(matching: List[str]) -> None:
+            targets = [requested, *matching]
+            for session in mgr.sessions.values():
+                if any(path_matches(str(session.cwd), target, include_children=True) for target in targets):
+                    raise StructuredRPCError("Feche os terminais deste diretório antes de revogar a autorização.",
+                                             field="project_path", reason="active_sessions", code=-32003)
+
+        # Same lock order as creation: manager lock, then profile lock. Do not revoke a registered session's fence.
+        with mgr._lock:
+            active = profiles.get_active_profile()
+            revoked = profiles.revoke_project(active.name, requested, guard=refuse_with_sessions)
+            active = profiles.get_active_profile()
+        return {"revoked": revoked, "authorized_projects": active.authorized_projects,
+                "last_project": getattr(active, "last_project", None)}
+
+    def _handle_profile_remember_project(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        from desktop.auth.profile import ProfileValidationError
+        profiles = self._get_terminal_manager().authorizer.profile_manager
+        target = self._project_param(params)
+        if not target.is_dir():
+            raise InvalidParamsError("O diretório do projeto não está disponível.", field="project_path", reason="path_missing")
+        active = profiles.get_active_profile()
+        try:
+            profiles.remember_project(active.name, target)
+        except ProfileValidationError:
+            raise StructuredRPCError("O projeto deve estar autorizado antes de ser lembrado.",
+                                     field="project_path", reason="not_authorized", code=-32003) from None
+        return {"remembered": True, "last_project": str(target)}
+
+    def _handle_security_status(self, _params: Dict[str, Any]) -> Dict[str, Any]:
+        active = self._get_terminal_manager().authorizer.profile_manager.get_active_profile()
+        # Only what the Desktop really enforces (BE-14): sessions open only in authorized directories; nothing isolates
+        # the shell, and an agent opened here only gets an environment without credential variables.
+        return {"authorized_projects": active.authorized_projects, "policy": {
+            "project_fencing": True,
+            "human_terminal": "operator_permissions",
+            "governed_agent": "env_sanitized_only",
+            "human_terminal_filesystem_isolation": False,
+            "description": "A autorização limita os diretórios em que terminais podem ser abertos. O terminal humano usa "
+                           "as permissões do operador do sistema; não há isolamento de filesystem do shell. Agentes "
+                           "abertos pelo Desktop recebem apenas um ambiente sem variáveis de credenciais: não há sandbox "
+                           "nem política do Core aplicada a eles.",
+        }}
+
+    def _handle_discovery_agents(self, _params: Dict[str, Any]) -> Dict[str, Any]:
+        from desktop.ipc.discovery import agents_snapshot
+        return agents_snapshot()
+
+    def _handle_providers_routes(self, _params: Dict[str, Any]) -> Dict[str, Any]:
+        from desktop.ipc.discovery import routes_snapshot
+        return routes_snapshot()
 
     def _handle_terminal_get_output(self, params: Dict[str, Any]) -> Dict[str, Any]:
         mgr = self._get_terminal_manager()
@@ -540,11 +688,25 @@ class SecureIPCServer:
         self.handlers[method_name] = handler
 
     def handle_raw_payload(self, raw_line: Union[str, UndecodableLine]) -> Optional[RPCResponse]:
+        try:
+            return self._handle_payload(raw_line)
+        except Exception:
+            self.transport.log_diagnostic("IPC request rejected after unexpected validation failure (content omitted)")
+            return RPCResponse(id=None, error={"code": RPCErrorCode.INTERNAL_ERROR.value,
+                                              "message": "Internal error: request could not be processed",
+                                              "data": {"field": "request", "reason": "internal_error"}})
+
+    def _handle_payload(self, raw_line: Union[str, UndecodableLine]) -> Optional[RPCResponse]:
         if isinstance(raw_line, UndecodableLine):
             size, valid_utf8 = raw_line.size_bytes, False
         else:
             if not raw_line.strip():
-                return None
+                # Answered like any other bad line (E2-11/C3). The host (IpcBridge::exchange) writes exactly one
+                # serde_json line plus "\n" per request and then reads exactly one line, so it never sends a blank
+                # line and this answer cannot shift its request/response pairing.
+                return RPCResponse(id=None, error={"code": RPCErrorCode.INVALID_REQUEST.value,
+                                                  "message": "Invalid request: empty line",
+                                                  "data": {"field": "request", "reason": "empty_request"}})
             try:
                 size, valid_utf8 = len(raw_line.encode("utf-8")), True
             except UnicodeEncodeError:
@@ -559,6 +721,7 @@ class SecureIPCServer:
                 error={
                     "code": RPCErrorCode.PAYLOAD_TOO_LARGE.value,
                     "message": f"Payload exceeds {MAX_PAYLOAD_BYTES} bytes",
+                    "data": {"field": "request", "reason": "payload_too_large"},
                 },
             )
 
@@ -584,12 +747,20 @@ class SecureIPCServer:
                 "data": {"field": "request", "reason": "invalid_json"},
             })
 
-        if not _bounded_json_depth(data):
+        problem = _json_problem(data)
+        if problem == "max_depth":
             return RPCResponse(id=None, error={"code": RPCErrorCode.PARSE_ERROR.value,
-                                              "message": "Parse error: excessively complex JSON"})
+                                              "message": "Parse error: excessively complex JSON",
+                                              "data": {"field": "request", "reason": "max_depth"}})
+        if problem == "lone_surrogate":
+            # E2-12: valid JSON, but text that is not Unicode; never stored, never echoed.
+            return RPCResponse(id=None, error={"code": RPCErrorCode.INVALID_REQUEST.value,
+                                              "message": "Invalid request: text with an unpaired surrogate escape",
+                                              "data": {"field": "request", "reason": "lone_surrogate"}})
         if not isinstance(data, dict):
             return RPCResponse(id=None, error={"code": RPCErrorCode.INVALID_REQUEST.value,
-                                              "message": "Invalid request envelope"})
+                                              "message": "Invalid request envelope",
+                                              "data": {"field": "request", "reason": "invalid_envelope"}})
         identifier = data.get("id")
         method = data.get("method")
         token = data.get("session_token")
@@ -598,7 +769,8 @@ class SecureIPCServer:
                 or not isinstance(method, str) or not method or len(method) > MAX_RPC_IDENTIFIER_LENGTH
                 or (token is not None and not isinstance(token, str))):
             return RPCResponse(id=None, error={"code": RPCErrorCode.INVALID_REQUEST.value,
-                                              "message": "Invalid request envelope"})
+                                              "message": "Invalid request envelope",
+                                              "data": {"field": "request", "reason": "invalid_envelope"}})
         if not isinstance(data.get("params", {}), dict):
             return RPCResponse(id=identifier, error={
                 "code": RPCErrorCode.INVALID_PARAMS.value,
@@ -642,8 +814,18 @@ class SecureIPCServer:
         except Exception as e:
             # Arbitrary exception text may include a credential value. Known user errors get fixed messages only.
             from desktop.auth.authorizer import SecurityAuthorizationError
+            from desktop.auth.file_lock import FileLockTimeoutError
+            from desktop.auth.profile import ProfileError
             from desktop.terminal.manager import TerminalManagerError
 
+            if isinstance(e, FileLockTimeoutError):
+                return RPCResponse(id=req.id, error={"code": BUSY_CODE, "message": PROFILE_BUSY_MESSAGE,
+                                                     "data": {"field": "profile", "reason": "busy"}})
+            if isinstance(e, ProfileError):
+                # Every ProfileError message is a fixed text from desktop/auth/profile.py, never file content.
+                self.transport.log_diagnostic(f"IPC handler failed: {type(e).__name__} (content omitted)")
+                return RPCResponse(id=req.id, error={"code": RPCErrorCode.INTERNAL_ERROR.value, "message": str(e),
+                                                     "data": {"field": "profile", "reason": "profile_unreadable"}})
             message = "Internal error: operation could not be completed"
             if isinstance(e, SecurityAuthorizationError):
                 message = "Project not authorized or session invalid"

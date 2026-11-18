@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 import sys
 import tempfile
 from pathlib import Path
@@ -71,7 +72,7 @@ def test_get_reports_defaults_and_honest_states(env):
     assert cats["terminal"]["saved_fields"] == []
     assert all(c["applied"] is False for c in cats.values())  # D4: nothing claims to be applied yet
     assert cats["coordinator"]["application"] == "unsupported"
-    assert cats["aparencia"]["application"] == "pending_ui"
+    assert cats["aparencia"]["application"] == "interface"
     assert {"agentes", "provedores", "seguranca", "sobre"} <= set(snap["unsupported_categories"])
 
 
@@ -135,7 +136,7 @@ def test_mission_budget_uses_core_validator_and_is_not_presented_as_applied(env)
 def test_vault_without_secure_store_is_unavailable_with_dedicated_code(env, monkeypatch):
     monkeypatch.setattr(vault_mod.sys, "platform", "linux")
     status = call(env, "vault.status").result
-    assert status == {"available": False, "backend": "unavailable"}
+    assert status == {"available": False, "backend": "unavailable", "reason": "unavailable"}
 
     resp = call(env, "vault.set_secret", {"key": "OPENROUTER_API_KEY", "value": "sk-should-not-persist"})
     assert resp.error["code"] == RPCErrorCode.VAULT_UNAVAILABLE.value == -32004
@@ -154,7 +155,8 @@ def test_host_exposes_settings_and_vault_with_structured_errors():
 
     main_rs = (_repo_root / "desktop" / "src-tauri" / "src" / "main.rs").read_text(encoding="utf-8")
     handlers = main_rs[main_rs.index("generate_handler![") :]
-    for command in ("settings_get", "settings_update", "vault_status", "vault_list_keys", "vault_set_secret", "vault_delete_secret"):
+    for command in ("settings_get", "settings_update", "vault_status", "vault_list_keys", "vault_set_secret", "vault_delete_secret",
+                    "profile_revoke_project", "profile_remember_project", "security_status", "discovery_agents", "providers_routes"):
         assert re.search(rf"fn {command}\([^)]*\)\s*->\s*Result<Value, Value>", main_rs), command
         assert command in handlers, command
     structured = main_rs[main_rs.index("pub fn call_structured(") :]
@@ -169,7 +171,10 @@ def test_vault_on_windows_stores_and_lists_names_only(env):
     resp = call(env, "vault.set_secret", {"key": "OPENROUTER_API_KEY", "value": secret})
     assert resp.result == {"stored": True, "key": "OPENROUTER_API_KEY"}
     listed = call(env, "vault.list_keys")
-    assert listed.result == {"keys": ["OPENROUTER_API_KEY"]}
+    # Names plus the opaque ciphertext revision used to confirm a replacement (E.1); never a value.
+    assert set(listed.result) == {"keys", "revision"}
+    assert listed.result["keys"] == ["OPENROUTER_API_KEY"]
+    assert re.fullmatch(r"[0-9a-f]{64}", listed.result["revision"])
     # No IPC response ever carries the secret value.
     assert secret not in json.dumps(resp.to_dict() if hasattr(resp, "to_dict") else resp.result)
     assert secret not in json.dumps(listed.result)

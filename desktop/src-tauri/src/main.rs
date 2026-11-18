@@ -1156,13 +1156,47 @@ fn vault_list_keys(bridge: State<Arc<IpcBridge>>) -> Result<Value, Value> {
 }
 
 #[tauri::command]
-fn vault_set_secret(key: String, value: String, bridge: State<Arc<IpcBridge>>) -> Result<Value, Value> {
-    bridge.call_structured("vault.set_secret", json!({ "key": key, "value": value }))
+fn vault_set_secret(
+    key: String,
+    value: String,
+    expected_revision: Option<String>,
+    bridge: State<Arc<IpcBridge>>,
+) -> Result<Value, Value> {
+    bridge.call_structured(
+        "vault.set_secret",
+        json!({ "key": key, "value": value, "expected_revision": expected_revision }),
+    )
 }
 
 #[tauri::command]
 fn vault_delete_secret(key: String, bridge: State<Arc<IpcBridge>>) -> Result<Value, Value> {
     bridge.call_structured("vault.delete_secret", json!({ "key": key }))
+}
+
+// Etapa 7: authenticated desktop-layer operations; no Core engine changes.
+#[tauri::command]
+fn profile_revoke_project(project_path: String, bridge: State<Arc<IpcBridge>>) -> Result<Value, Value> {
+    bridge.call_structured("profile.revoke_project", json!({ "project_path": project_path }))
+}
+
+#[tauri::command]
+fn profile_remember_project(project_path: String, bridge: State<Arc<IpcBridge>>) -> Result<Value, Value> {
+    bridge.call_structured("profile.remember_project", json!({ "project_path": project_path }))
+}
+
+#[tauri::command]
+fn security_status(bridge: State<Arc<IpcBridge>>) -> Result<Value, Value> {
+    bridge.call_structured("security.status", json!({}))
+}
+
+#[tauri::command]
+fn discovery_agents(bridge: State<Arc<IpcBridge>>) -> Result<Value, Value> {
+    bridge.call_structured("discovery.agents", json!({}))
+}
+
+#[tauri::command]
+fn providers_routes(bridge: State<Arc<IpcBridge>>) -> Result<Value, Value> {
+    bridge.call_structured("providers.routes", json!({}))
 }
 
 fn main() {
@@ -1208,7 +1242,12 @@ fn main() {
             vault_status,
             vault_list_keys,
             vault_set_secret,
-            vault_delete_secret
+            vault_delete_secret,
+            profile_revoke_project,
+            profile_remember_project,
+            security_status,
+            discovery_agents,
+            providers_routes
         ])
         .run(tauri::generate_context!())
         .expect("error while running AI Coordinator Desktop");
