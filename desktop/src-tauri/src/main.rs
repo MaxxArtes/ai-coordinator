@@ -12,7 +12,9 @@ use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard};
+use std::time::{Duration, Instant};
 use sysinfo::{Pid, ProcessRefreshKind, System};
 use tauri::{Emitter, State};
 
@@ -95,11 +97,280 @@ pub struct ProcessTreeMetrics {
     pub cpu_usage_percent: f32,
 }
 
+// ---- Core IPC transport (Marco 4D.3, Etapa 8: L1/L2) ----
+// Every command that talks to the Core runs on the blocking pool (L1), so the window never waits for the Core.
+// One NDJSON stream serves all of them: callers take turns in arrival order (FifoLock), a writer thread owns the
+// Core's stdin, a reader thread owns its stdout, and each call waits a bounded time, counted from its start (the
+// wait for the turn included), for the response that carries its own id (L2). Params and response content are
+// never logged.
+
+/// Error code of a transport failure between this host and the Core (no answer in time, stream closed).
+const IPC_TRANSPORT_ERROR_CODE: i64 = -32007;
+
+/// Frame limit of the Core (MAX_PAYLOAD_BYTES in desktop/ipc/protocol.py): UTF-8 bytes of one request line.
+/// A larger request is refused here, because the Core answers it with a null id, which the bridge discards.
+const IPC_MAX_REQUEST_BYTES: usize = 1024 * 1024;
+
+/// The Core process is not running: it never started (no runtime found) or it was stopped for an update.
+const IPC_CORE_NOT_RUNNING: &str = "O Core não está em execução (runtime não iniciado ou já encerrado).";
+
+/// A blocking task that did not finish (panic or runtime shutting down). The join error itself is never shown:
+/// a panic message could quote request data.
+const IPC_TASK_FAILED_MESSAGE: &str = "Falha interna ao executar a chamada ao Core. Tente novamente.";
+
+/// How long one exchange waits for its response (L2): 120 s for the methods that start terminal processes.
+fn ipc_timeout_for(method: &str) -> Duration {
+    match method {
+        "terminal.create_tab" | "terminal.create_session" | "terminal.restore_sessions" => Duration::from_secs(120),
+        _ => Duration::from_secs(30),
+    }
+}
+
+/// Deadline of a call that starts now (L2): it covers the wait for the turn on the Core stream and the wait for
+/// the response, so no call waits longer than ipc_timeout_for(method) in all.
+fn ipc_deadline_for(method: &str) -> Instant {
+    Instant::now() + ipc_timeout_for(method)
+}
+
+/// Transport failure of one exchange. It never carries params nor response content.
+enum IpcFailure {
+    /// No response with the request's id within the wait (in seconds).
+    Timeout(u64),
+    /// The Core closed the stream: its process exited.
+    Disconnected,
+    /// The request exceeds the Core's frame limit; nothing was sent.
+    PayloadTooLarge,
+    /// Nothing to talk to, or the request could not be encoded (fixed text).
+    Unavailable(&'static str),
+}
+
+impl IpcFailure {
+    fn message(&self) -> String {
+        match self {
+            IpcFailure::Timeout(secs) => format!(
+                "O Core não respondeu em {} s. A operação pode ter sido concluída: confira antes de repetir.",
+                secs
+            ),
+            IpcFailure::Disconnected => "O Core encerrou a comunicação. Reinicie o aplicativo.".to_string(),
+            IpcFailure::PayloadTooLarge => {
+                "A requisição excede o limite de 1 MiB aceito pelo Core e não foi enviada.".to_string()
+            }
+            IpcFailure::Unavailable(text) => (*text).to_string(),
+        }
+    }
+
+    /// The {code, message, data} object of call_structured.
+    fn to_structured(&self) -> Value {
+        match self {
+            IpcFailure::Timeout(_) => json!({
+                "code": IPC_TRANSPORT_ERROR_CODE,
+                "message": self.message(),
+                "data": { "field": "ipc", "reason": "timeout" }
+            }),
+            IpcFailure::Disconnected => json!({
+                "code": IPC_TRANSPORT_ERROR_CODE,
+                "message": self.message(),
+                "data": { "field": "ipc", "reason": "disconnected" }
+            }),
+            // Same code and data the Core uses for an oversized frame (PAYLOAD_TOO_LARGE).
+            IpcFailure::PayloadTooLarge => json!({
+                "code": -32001,
+                "message": self.message(),
+                "data": { "field": "request", "reason": "payload_too_large" }
+            }),
+            IpcFailure::Unavailable(_) => json!({ "code": -32603, "message": self.message() }),
+        }
+    }
+}
+
+/// Command error of a blocking task that did not finish (L1), as text.
+fn ipc_task_failed() -> String {
+    IPC_TASK_FAILED_MESSAGE.to_string()
+}
+
+/// Command error of a blocking task that did not finish (L1), as a structured {code, message, data} object.
+fn ipc_task_failed_structured() -> Value {
+    json!({
+        "code": -32603,
+        "message": IPC_TASK_FAILED_MESSAGE,
+        "data": { "field": "ipc", "reason": "internal_error" }
+    })
+}
+
+/// Locks a mutex whose content stays consistent if another holder panicked (a channel end, queue counters):
+/// recovering keeps one panic from disabling every later IPC call.
+fn lock_unpoisoned<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// First come, first served lock for the Core stream (std's Mutex wakes waiters in no defined order). Commands
+/// run on the blocking pool (L1), so callers queued behind a slow call (a terminal starting, a Core that does
+/// not answer) are served in the order their blocking tasks asked for the turn. That is not necessarily the order
+/// in which the interface invoked them (the async dispatch can reorder two invokes of the same tick): the typing
+/// order is kept by the interface, which has at most one write and one resize in flight per session
+/// (desktop/src/components/terminalIo.ts). A panic while holding the turn passes it on (the guard is dropped on unwind).
+/// IPC calls wait with lock_until: the wait for the turn counts in their deadline (L2), so a Core that hangs
+/// answers every queued call with a timeout within its own deadline instead of one deadline per call ahead.
+struct FifoLock {
+    state: Mutex<FifoState>,
+    turn_changed: Condvar,
+}
+
+struct FifoState {
+    next_ticket: u64,
+    now_serving: u64,
+    // Tickets whose callers stopped waiting at their deadline (lock_until); the turn skips them.
+    abandoned: HashSet<u64>,
+}
+
+impl FifoState {
+    /// Passes the turn to the next ticket still waiting: abandoned tickets are skipped (and forgotten).
+    fn advance(&mut self) {
+        self.now_serving = self.now_serving.wrapping_add(1);
+        while self.abandoned.remove(&self.now_serving) {
+            self.now_serving = self.now_serving.wrapping_add(1);
+        }
+    }
+}
+
+struct FifoGuard<'a> {
+    lock: &'a FifoLock,
+}
+
+impl FifoLock {
+    fn new() -> Self {
+        FifoLock {
+            state: Mutex::new(FifoState {
+                next_ticket: 0,
+                now_serving: 0,
+                abandoned: HashSet::new(),
+            }),
+            turn_changed: Condvar::new(),
+        }
+    }
+
+    /// Waits for the turn without a limit. Only for the update freeze: every holder ahead of it gives the turn back
+    /// within its own deadline (lock_until), so this wait is bounded too.
+    fn lock(&self) -> FifoGuard<'_> {
+        let mut state = lock_unpoisoned(&self.state);
+        let ticket = state.next_ticket;
+        state.next_ticket = state.next_ticket.wrapping_add(1);
+        while state.now_serving != ticket {
+            state = self
+                .turn_changed
+                .wait(state)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+        }
+        FifoGuard { lock: self }
+    }
+
+    /// Waits for the turn until `deadline` (L2: the deadline of an IPC call starts before its wait for the turn).
+    /// None: the deadline passed first; the ticket is abandoned and the turn skips it, so nothing waits for this
+    /// caller. A turn that comes together with the deadline is kept (Some).
+    fn lock_until(&self, deadline: Instant) -> Option<FifoGuard<'_>> {
+        let mut state = lock_unpoisoned(&self.state);
+        let ticket = state.next_ticket;
+        state.next_ticket = state.next_ticket.wrapping_add(1);
+        loop {
+            if state.now_serving == ticket {
+                return Some(FifoGuard { lock: self });
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                // Not the turn (checked above under the same lock), so the turn has not stopped at this ticket:
+                // advance() skips it when the turn gets here. Waiters behind are unaffected (no wake-up needed).
+                state.abandoned.insert(ticket);
+                return None;
+            }
+            state = match self.turn_changed.wait_timeout(state, remaining) {
+                Ok((guard, _)) => guard,
+                Err(poisoned) => poisoned.into_inner().0,
+            };
+        }
+    }
+}
+
+impl Drop for FifoGuard<'_> {
+    fn drop(&mut self) {
+        let mut state = lock_unpoisoned(&self.lock.state);
+        state.advance();
+        drop(state);
+        self.lock.turn_changed.notify_all();
+    }
+}
+
+/// Writer thread (L2): owns the Core's stdin. Callers only queue lines, so a Core that stops reading can never
+/// block a caller inside a write (keeping the turn forever) nor shutdown(). The thread ends when the bridge
+/// drops the sender (shutdown) or a write fails; dropping `stdin` then closes the Core's input (EOF).
+fn spawn_request_writer(mut stdin: ChildStdin) -> Option<Sender<String>> {
+    let (tx, rx) = mpsc::channel::<String>();
+    std::thread::Builder::new()
+        .name("core-ipc-writer".into())
+        .spawn(move || {
+            for line in rx {
+                if stdin.write_all(line.as_bytes()).and_then(|_| stdin.flush()).is_err() {
+                    break;
+                }
+            }
+        })
+        .ok()
+        .map(|_| tx)
+}
+
+/// Reader thread (L2): owns the Core's stdout and forwards every line. It ends at the end of the stream (the
+/// Core exited) or on a read error, dropping the sender, so waiting and later exchanges see "disconnected".
+/// A line that is not UTF-8 cannot be a response and is skipped. Nothing is logged.
+fn spawn_response_reader(stdout: ChildStdout) -> Option<Receiver<String>> {
+    let (tx, rx) = mpsc::channel::<String>();
+    std::thread::Builder::new()
+        .name("core-ipc-reader".into())
+        .spawn(move || {
+            let mut reader = BufReader::new(stdout);
+            let mut buf = Vec::new();
+            loop {
+                buf.clear();
+                match reader.read_until(b'\n', &mut buf) {
+                    Ok(0) => break,
+                    Ok(_) => {
+                        if let Ok(line) = std::str::from_utf8(&buf) {
+                            if tx.send(line.to_owned()).is_err() {
+                                break; // the bridge is gone
+                            }
+                        }
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                    Err(_) => break,
+                }
+            }
+        })
+        .ok()
+        .map(|_| rx)
+}
+
+/// The response to request `id` when `line` is one: a JSON object whose "id" is this request's id. The bridge
+/// sends the id as a string and the Core echoes it as received; a number with the same value is accepted too.
+/// Anything else (late answer to a call that timed out, null id, notification, not JSON) is None.
+fn response_for(line: &str, id: u64, id_text: &str) -> Option<Value> {
+    let resp: Value = serde_json::from_str(line.trim()).ok()?;
+    let ours = match resp.get("id") {
+        Some(Value::String(text)) => text == id_text,
+        Some(Value::Number(number)) => number.as_u64() == Some(id),
+        _ => false,
+    };
+    if ours {
+        Some(resp)
+    } else {
+        None
+    }
+}
+
 pub struct IpcBridge {
     child: Mutex<Option<Child>>,
-    stdin: Mutex<Option<ChildStdin>>,
-    reader: Mutex<Option<BufReader<ChildStdout>>>,
-    io_lock: Mutex<()>,
+    // Request lines for the writer thread; None when the Core never started or after shutdown().
+    requests: Mutex<Option<Sender<String>>>,
+    // Response lines from the reader thread; only the holder of io_lock receives.
+    responses: Mutex<Option<Receiver<String>>>,
+    io_lock: FifoLock,
     update_frozen: AtomicBool,
     // Set once the Core Python runtime was deliberately stopped for installation.
     // From then on the only valid recovery is restarting the app (see updater_restart_app).
@@ -115,7 +386,7 @@ impl IpcBridge {
     pub fn new() -> Self {
         // Issue A: Ephemeral CSPRNG token generated via uuid v4
         let token = format!("desktop-token-{}", uuid::Uuid::new_v4());
-        let (py_path_str, child_proc, child_in, child_out) = match Self::resolve_paths() {
+        let (py_path_str, child_proc, requests, responses) = match Self::resolve_paths() {
             Ok((py_path, script_path)) => {
                 let mut cmd = Command::new(&py_path);
                 cmd.arg("-I")
@@ -135,10 +406,10 @@ impl IpcBridge {
                 match cmd.spawn() {
                     Ok(mut child) => {
                         if let Some(cin_handle) = child.stdin.take() {
-                            cin = Some(cin_handle);
+                            cin = spawn_request_writer(cin_handle);
                         }
                         if let Some(cout_handle) = child.stdout.take() {
-                            cout = Some(BufReader::new(cout_handle));
+                            cout = spawn_response_reader(cout_handle);
                         }
                         if let Some(cerr_handle) = child.stderr.take() {
                             std::thread::spawn(move || {
@@ -167,9 +438,9 @@ impl IpcBridge {
 
         IpcBridge {
             child: Mutex::new(child_proc),
-            stdin: Mutex::new(child_in),
-            reader: Mutex::new(child_out),
-            io_lock: Mutex::new(()),
+            requests: Mutex::new(requests),
+            responses: Mutex::new(responses),
+            io_lock: FifoLock::new(),
             update_frozen: AtomicBool::new(false),
             runtime_stopped_for_update: AtomicBool::new(false),
             update_in_progress: AtomicBool::new(false),
@@ -252,50 +523,87 @@ impl IpcBridge {
     }
 
     /// One request/response exchange with the Core IPC; returns the whole parsed response (result or error).
-    fn exchange(&self, method: &str, params: Value) -> Result<Value, String> {
+    /// The caller holds io_lock. `deadline` ends the call's wait (L2); it was taken when the call started, before
+    /// the wait for the turn, so it covers ipc_timeout_for(method) in all. Nothing is sent once it has passed (a
+    /// turn that came together with the deadline). Waits until then for the line carrying this request's id and
+    /// discards every other line. On timeout the turn is released by the caller and a later exchange drops the
+    /// late answer when it arrives.
+    fn exchange(&self, method: &str, params: Value, deadline: Instant) -> Result<Value, IpcFailure> {
         let id = self.seq.fetch_add(1, Ordering::SeqCst);
+        let id_text = id.to_string();
         let req = json!({
             "jsonrpc": "2.0",
-            "id": id.to_string(),
+            "id": &id_text,
             "method": method,
             "params": params,
             "session_token": &self.token
         });
 
-        let line = serde_json::to_string(&req).map_err(|e| e.to_string())?;
+        let mut line = serde_json::to_string(&req)
+            .map_err(|_| IpcFailure::Unavailable("Falha ao preparar a requisição para o Core."))?;
+        if line.len() > IPC_MAX_REQUEST_BYTES {
+            return Err(IpcFailure::PayloadTooLarge);
+        }
+        line.push('\n');
 
-        // 1. Write request line to child stdin
+        // Lock order: io_lock (caller) -> responses -> requests. shutdown() takes only requests, briefly.
+        let responses = lock_unpoisoned(&self.responses);
+        let Some(rx) = responses.as_ref() else {
+            return Err(IpcFailure::Unavailable(IPC_CORE_NOT_RUNNING));
+        };
+
+        // No time left to wait for an answer: the request is not sent (the Core never sees it).
+        if Instant::now() >= deadline {
+            return Err(self.deadline_failure(method));
+        }
+
+        // 1. Queue the request line for the writer thread (never blocks).
         {
-            let mut stdin_guard = self.stdin.lock().map_err(|e| e.to_string())?;
-            if let Some(stdin) = stdin_guard.as_mut() {
-                stdin.write_all(line.as_bytes()).map_err(|e| e.to_string())?;
-                stdin.write_all(b"\n").map_err(|e| e.to_string())?;
-                stdin.flush().map_err(|e| e.to_string())?;
-            } else {
-                return Err("IPC child stdin is not available: runtime is not initialized".to_string());
+            let requests = lock_unpoisoned(&self.requests);
+            let Some(tx) = requests.as_ref() else {
+                return Err(IpcFailure::Unavailable(IPC_CORE_NOT_RUNNING));
+            };
+            if tx.send(line).is_err() {
+                // The writer thread ended: the Core's input is closed.
+                return Err(IpcFailure::Disconnected);
             }
         }
 
-        // 2. Read single line response from child stdout
-        let mut resp_line = String::new();
-        {
-            let mut reader_guard = self.reader.lock().map_err(|e| e.to_string())?;
-            if let Some(reader) = reader_guard.as_mut() {
-                reader.read_line(&mut resp_line).map_err(|e| e.to_string())?;
-            } else {
-                return Err("IPC child stdout is not available: runtime is not initialized".to_string());
+        // 2. Wait until the deadline for the response with this id; other lines are dropped unread.
+        loop {
+            match rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+                Ok(candidate) => {
+                    if let Some(resp) = response_for(&candidate, id, &id_text) {
+                        return Ok(resp);
+                    }
+                }
+                Err(RecvTimeoutError::Timeout) => return Err(self.deadline_failure(method)),
+                Err(RecvTimeoutError::Disconnected) => return Err(IpcFailure::Disconnected),
             }
         }
-
-        if resp_line.trim().is_empty() {
-            return Err("Empty response received from Core IPC server".to_string());
-        }
-
-        serde_json::from_str(&resp_line).map_err(|e| e.to_string())
     }
 
+    /// Failure of a call whose deadline passed, waiting for the turn or for the response: Timeout with the
+    /// method's full wait (the "N s" of the message). A Core that exited while another process still holds its
+    /// stdout never closes the stream, so a Core that is down reports Disconnected instead.
+    fn deadline_failure(&self, method: &str) -> IpcFailure {
+        if self.core_runtime_down() {
+            IpcFailure::Disconnected
+        } else {
+            IpcFailure::Timeout(ipc_timeout_for(method).as_secs())
+        }
+    }
+
+    /// Exchange under a turn already held, with a deadline that starts now (update freeze).
     fn call_locked(&self, method: &str, params: Value) -> Result<Value, String> {
-        let resp = self.exchange(method, params)?;
+        self.call_locked_until(method, params, ipc_deadline_for(method))
+    }
+
+    /// Exchange under a turn already held, until the deadline the caller took when its call started.
+    fn call_locked_until(&self, method: &str, params: Value, deadline: Instant) -> Result<Value, String> {
+        let resp = self
+            .exchange(method, params, deadline)
+            .map_err(|failure| failure.message())?;
         if let Some(err) = resp.get("error") {
             if !err.is_null() {
                 let msg = err
@@ -312,13 +620,14 @@ impl IpcBridge {
     /// Like `call`, but keeps the Core's structured error object ({code, message, data}) so the UI can show
     /// which field was rejected and why (decision D3). Transport failures become an INTERNAL_ERROR object.
     pub fn call_structured(&self, method: &str, params: Value) -> Result<Value, Value> {
-        let _io_guard = self
-            .io_lock
-            .lock()
-            .map_err(|e| json!({ "code": -32603, "message": format!("IPC I/O mutex poisoned: {}", e) }))?;
+        // L2: the deadline starts before the wait for the turn (see FifoLock::lock_until).
+        let deadline = ipc_deadline_for(method);
+        let Some(_io_guard) = self.io_lock.lock_until(deadline) else {
+            return Err(self.deadline_failure(method).to_structured());
+        };
         let resp = self
-            .exchange(method, params)
-            .map_err(|msg| json!({ "code": -32603, "message": msg }))?;
+            .exchange(method, params, deadline)
+            .map_err(|failure| failure.to_structured())?;
         if let Some(err) = resp.get("error") {
             if !err.is_null() {
                 return Err(err.clone());
@@ -328,10 +637,11 @@ impl IpcBridge {
     }
 
     pub fn call(&self, method: &str, params: Value) -> Result<Value, String> {
-        let _io_guard = self
-            .io_lock
-            .lock()
-            .map_err(|e| format!("IPC I/O mutex poisoned: {}", e))?;
+        // L2: the deadline starts before the wait for the turn (see FifoLock::lock_until).
+        let deadline = ipc_deadline_for(method);
+        let Some(_io_guard) = self.io_lock.lock_until(deadline) else {
+            return Err(self.deadline_failure(method).message());
+        };
 
         if self.update_frozen.load(Ordering::SeqCst)
             && matches!(
@@ -345,22 +655,13 @@ impl IpcBridge {
             );
         }
 
-        self.call_locked(method, params)
+        self.call_locked_until(method, params, deadline)
     }
 
-    fn acquire_update_freeze(&self) -> (UpdateFreezeGuard<'_>, SessionInspection) {
-        let _io_guard = match self.io_lock.lock() {
-            Ok(g) => g,
-            Err(e) => {
-                return (
-                    UpdateFreezeGuard {
-                        bridge: self,
-                        committed: true,
-                    },
-                    SessionInspection::Unknown(format!("IPC I/O mutex poisoned: {}", e)),
-                );
-            }
-        };
+    /// Freezes session creation (host flag and Core) under io_lock and counts the sessions. Takes an owned Arc so
+    /// it can run on the blocking pool (L1) and hand back a guard that outlives the call.
+    fn acquire_update_freeze(self: Arc<Self>) -> (UpdateFreezeGuard, SessionInspection) {
+        let _io_guard = self.io_lock.lock();
 
         self.update_frozen.store(true, Ordering::SeqCst);
 
@@ -371,7 +672,7 @@ impl IpcBridge {
                     let _ = self.call_locked("system.unfreeze_update", json!({}));
                     return (
                         UpdateFreezeGuard {
-                            bridge: self,
+                            bridge: Arc::clone(&self),
                             committed: true,
                         },
                         SessionInspection::Unknown(
@@ -386,7 +687,7 @@ impl IpcBridge {
                     let _ = self.call_locked("system.unfreeze_update", json!({}));
                     return (
                         UpdateFreezeGuard {
-                            bridge: self,
+                            bridge: Arc::clone(&self),
                             committed: true,
                         },
                         insp,
@@ -395,7 +696,7 @@ impl IpcBridge {
 
                 (
                     UpdateFreezeGuard {
-                        bridge: self,
+                        bridge: Arc::clone(&self),
                         committed: false,
                     },
                     insp,
@@ -406,7 +707,7 @@ impl IpcBridge {
                 let _ = self.call_locked("system.unfreeze_update", json!({}));
                 (
                     UpdateFreezeGuard {
-                        bridge: self,
+                        bridge: Arc::clone(&self),
                         committed: true,
                     },
                     SessionInspection::Unknown(format!(
@@ -442,10 +743,9 @@ impl IpcBridge {
     }
 
     pub fn shutdown(&self) {
-        // Step 1: Drop stdin handle to send EOF to the Python IPC server
-        if let Ok(mut stdin_guard) = self.stdin.lock() {
-            let _ = stdin_guard.take();
-        }
+        // Step 1: Close the request channel: the writer thread ends and drops the Core's stdin, sending EOF to
+        // the Python IPC server. Never waits on a write in progress (the writer thread owns the pipe).
+        let _ = lock_unpoisoned(&self.requests).take();
 
         // Step 2: Gracefully wait for Python process to terminate its sessions via finally block
         if let Ok(mut guard) = self.child.lock() {
@@ -469,12 +769,13 @@ impl IpcBridge {
     }
 }
 
-struct UpdateFreezeGuard<'a> {
-    bridge: &'a IpcBridge,
+// Owns an Arc of the bridge so it can move into the blocking pool (L1) between the freeze and its release.
+struct UpdateFreezeGuard {
+    bridge: Arc<IpcBridge>,
     committed: bool,
 }
 
-impl<'a> UpdateFreezeGuard<'a> {
+impl UpdateFreezeGuard {
     fn commit(mut self) {
         self.committed = true;
     }
@@ -498,7 +799,7 @@ impl<'a> Drop for UpdateInProgressGuard<'a> {
     }
 }
 
-impl<'a> Drop for UpdateFreezeGuard<'a> {
+impl Drop for UpdateFreezeGuard {
     fn drop(&mut self) {
         if !self.committed {
             self.bridge.update_frozen.store(false, Ordering::SeqCst);
@@ -521,12 +822,23 @@ fn ping() -> &'static str {
     "pong"
 }
 
+// L1: every command below that reaches the Core is async and runs the blocking call on the blocking pool with
+// an Arc of the bridge (tauri::async_runtime::spawn_blocking), so the main (window) thread never waits for the
+// Core. A task that does not finish becomes the command's own error type, with a fixed text.
+
+// Async commands with borrowed state must return a Result (Tauri 2). It is always Ok: the interface receives
+// the same RuntimeStatus as before, and a Core that cannot be reached reads "indisponível".
 #[tauri::command]
-fn get_runtime_status(bridge: State<Arc<IpcBridge>>) -> RuntimeStatus {
+async fn get_runtime_status(bridge: State<'_, Arc<IpcBridge>>) -> Result<RuntimeStatus, String> {
     let is_isolated = !bridge.resolved_python.starts_with("UNAVAILABLE");
+    let python_path = bridge.resolved_python.clone();
     // Core and Python versions are reported by the running Core (system.status), never hard-coded;
     // app version and license come from this build's Cargo metadata.
-    let core_status = bridge.call("system.status", json!({})).ok();
+    let bridge = bridge.inner().clone();
+    let core_status = tauri::async_runtime::spawn_blocking(move || bridge.call("system.status", json!({})).ok())
+        .await
+        .ok()
+        .flatten();
     let core_field = |key: &str| -> Option<String> {
         core_status
             .as_ref()
@@ -534,7 +846,7 @@ fn get_runtime_status(bridge: State<Arc<IpcBridge>>) -> RuntimeStatus {
             .and_then(|v| v.as_str())
             .map(String::from)
     };
-    RuntimeStatus {
+    Ok(RuntimeStatus {
         core_version: core_field("version").unwrap_or_else(|| "indisponível".into()),
         python_version: core_field("python_version"),
         app_version: env!("CARGO_PKG_VERSION").into(),
@@ -542,13 +854,20 @@ fn get_runtime_status(bridge: State<Arc<IpcBridge>>) -> RuntimeStatus {
         host_os: std::env::consts::OS.into(),
         host_arch: std::env::consts::ARCH.into(),
         is_isolated,
-        python_path: bridge.resolved_python.clone(),
-    }
+        python_path,
+    })
 }
 
 // Issue D: Recursively measure all process tree descendants (children, grandchildren, WebView2 renderers)
 #[tauri::command]
-fn get_process_tree_metrics() -> ProcessTreeMetrics {
+async fn get_process_tree_metrics() -> Result<ProcessTreeMetrics, String> {
+    // Walking every process takes 50-235 ms: off the main thread, or the window stutters every 2 s (Etapa 8, L1).
+    tauri::async_runtime::spawn_blocking(measure_process_tree)
+        .await
+        .map_err(|_| IPC_TASK_FAILED_MESSAGE.to_string())
+}
+
+fn measure_process_tree() -> ProcessTreeMetrics {
     let mut sys = System::new();
     let current_pid = Pid::from_u32(std::process::id());
 
@@ -596,46 +915,66 @@ fn get_process_tree_metrics() -> ProcessTreeMetrics {
     }
 }
 
+// L3: structured errors ({code, message, data}) like the settings commands.
 #[tauri::command]
-fn profile_get_active(bridge: State<Arc<IpcBridge>>) -> Result<Value, String> {
-    bridge.call("profile.get_active", json!({}))
+async fn profile_get_active(bridge: State<'_, Arc<IpcBridge>>) -> Result<Value, Value> {
+    let bridge = bridge.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || bridge.call_structured("profile.get_active", json!({})))
+        .await
+        .unwrap_or_else(|_| Err(ipc_task_failed_structured()))
 }
 
+// L3: structured errors; `confirm_broad` (interface key confirmBroad) authorizes a broad directory (L5).
 #[tauri::command]
-fn profile_authorize_project(
+async fn profile_authorize_project(
     project_path: String,
-    bridge: State<Arc<IpcBridge>>,
-) -> Result<Value, String> {
-    bridge.call(
-        "profile.authorize_project",
-        json!({
-            "project_path": project_path
-        }),
-    )
+    confirm_broad: Option<bool>,
+    bridge: State<'_, Arc<IpcBridge>>,
+) -> Result<Value, Value> {
+    let bridge = bridge.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        bridge.call_structured(
+            "profile.authorize_project",
+            json!({
+                "project_path": project_path,
+                "confirm_broad": confirm_broad
+            }),
+        )
+    })
+    .await
+    .unwrap_or_else(|_| Err(ipc_task_failed_structured()))
 }
 
 #[tauri::command]
-fn profile_list_authorized_projects(bridge: State<Arc<IpcBridge>>) -> Result<Value, String> {
-    bridge.call("profile.list_authorized_projects", json!({}))
+async fn profile_list_authorized_projects(bridge: State<'_, Arc<IpcBridge>>) -> Result<Value, String> {
+    let bridge = bridge.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || bridge.call("profile.list_authorized_projects", json!({})))
+        .await
+        .unwrap_or_else(|_| Err(ipc_task_failed()))
 }
 
 #[tauri::command]
-fn terminal_create_tab(
+async fn terminal_create_tab(
     tab_id: String,
     project_path: String,
-    bridge: State<Arc<IpcBridge>>,
+    bridge: State<'_, Arc<IpcBridge>>,
 ) -> Result<Value, String> {
-    bridge.call(
-        "terminal.create_tab",
-        json!({
-            "tab_id": tab_id,
-            "project_path": project_path
-        }),
-    )
+    let bridge = bridge.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        bridge.call(
+            "terminal.create_tab",
+            json!({
+                "tab_id": tab_id,
+                "project_path": project_path
+            }),
+        )
+    })
+    .await
+    .unwrap_or_else(|_| Err(ipc_task_failed()))
 }
 
 #[tauri::command]
-fn terminal_create_session(
+async fn terminal_create_session(
     tab_id: String,
     pane_id: u32,
     kind: String,
@@ -644,98 +983,131 @@ fn terminal_create_session(
     cwd: Option<String>,
     cols: Option<u16>,
     rows: Option<u16>,
-    bridge: State<Arc<IpcBridge>>,
+    bridge: State<'_, Arc<IpcBridge>>,
 ) -> Result<Value, String> {
-    bridge.call(
-        "terminal.create_session",
-        json!({
-            "tab_id": tab_id,
-            "pane_id": pane_id,
-            "kind": kind,
-            "command": command,
-            "cwd": cwd,
-            "cols": cols.unwrap_or(80),
-            "rows": rows.unwrap_or(24)
-        }),
-    )
+    let bridge = bridge.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        bridge.call(
+            "terminal.create_session",
+            json!({
+                "tab_id": tab_id,
+                "pane_id": pane_id,
+                "kind": kind,
+                "command": command,
+                "cwd": cwd,
+                "cols": cols.unwrap_or(80),
+                "rows": rows.unwrap_or(24)
+            }),
+        )
+    })
+    .await
+    .unwrap_or_else(|_| Err(ipc_task_failed()))
 }
 
 #[tauri::command]
-fn terminal_write(
+async fn terminal_write(
     session_id: String,
     data: String,
-    bridge: State<Arc<IpcBridge>>,
+    bridge: State<'_, Arc<IpcBridge>>,
 ) -> Result<Value, String> {
-    bridge.call(
-        "terminal.write",
-        json!({
-            "session_id": session_id,
-            "data": data
-        }),
-    )
+    let bridge = bridge.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        bridge.call(
+            "terminal.write",
+            json!({
+                "session_id": session_id,
+                "data": data
+            }),
+        )
+    })
+    .await
+    .unwrap_or_else(|_| Err(ipc_task_failed()))
 }
 
 #[tauri::command]
-fn terminal_resize(
+async fn terminal_resize(
     session_id: String,
     cols: u16,
     rows: u16,
-    bridge: State<Arc<IpcBridge>>,
+    bridge: State<'_, Arc<IpcBridge>>,
 ) -> Result<Value, String> {
-    bridge.call(
-        "terminal.resize",
-        json!({
-            "session_id": session_id,
-            "cols": cols,
-            "rows": rows
-        }),
-    )
+    let bridge = bridge.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        bridge.call(
+            "terminal.resize",
+            json!({
+                "session_id": session_id,
+                "cols": cols,
+                "rows": rows
+            }),
+        )
+    })
+    .await
+    .unwrap_or_else(|_| Err(ipc_task_failed()))
 }
 
 #[tauri::command]
-fn terminal_get_output(
+async fn terminal_get_output(
     session_id: String,
     since_seq: Option<u64>,
-    bridge: State<Arc<IpcBridge>>,
+    bridge: State<'_, Arc<IpcBridge>>,
 ) -> Result<Value, String> {
-    bridge.call(
-        "terminal.get_output",
-        json!({
-            "session_id": session_id,
-            "since_seq": since_seq.unwrap_or(0)
-        }),
-    )
+    let bridge = bridge.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        bridge.call(
+            "terminal.get_output",
+            json!({
+                "session_id": session_id,
+                "since_seq": since_seq.unwrap_or(0)
+            }),
+        )
+    })
+    .await
+    .unwrap_or_else(|_| Err(ipc_task_failed()))
 }
 
 #[tauri::command]
-fn terminal_close_session(
+async fn terminal_close_session(
     session_id: String,
-    bridge: State<Arc<IpcBridge>>,
+    bridge: State<'_, Arc<IpcBridge>>,
 ) -> Result<Value, String> {
-    bridge.call(
-        "terminal.close_session",
-        json!({
-            "session_id": session_id
-        }),
-    )
+    let bridge = bridge.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        bridge.call(
+            "terminal.close_session",
+            json!({
+                "session_id": session_id
+            }),
+        )
+    })
+    .await
+    .unwrap_or_else(|_| Err(ipc_task_failed()))
 }
 
 #[tauri::command]
-fn terminal_save_sessions(
+async fn terminal_save_sessions(
     tab_id: String,
-    bridge: State<Arc<IpcBridge>>,
+    bridge: State<'_, Arc<IpcBridge>>,
 ) -> Result<Value, String> {
-    bridge.call(
-        "terminal.save_sessions",
-        json!({
-            "tab_id": tab_id
-        }),
-    )
+    let bridge = bridge.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        bridge.call(
+            "terminal.save_sessions",
+            json!({
+                "tab_id": tab_id
+            }),
+        )
+    })
+    .await
+    .unwrap_or_else(|_| Err(ipc_task_failed()))
 }
 
 #[tauri::command]
-fn terminal_list_tabs(bridge: State<Arc<IpcBridge>>) -> Result<Value, String> {
-    bridge.call("terminal.list_tabs", json!({}))
+async fn terminal_list_tabs(bridge: State<'_, Arc<IpcBridge>>) -> Result<Value, String> {
+    let bridge = bridge.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || bridge.call("terminal.list_tabs", json!({})))
+        .await
+        .unwrap_or_else(|_| Err(ipc_task_failed()))
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -870,8 +1242,12 @@ async fn updater_check(app: tauri::AppHandle, bridge: State<'_, Arc<IpcBridge>>)
 
     let current_version = app.package_info().version.to_string();
 
-    // Check active sessions count from Core IPC (fail-closed if check fails)
-    let (sessions_known, active_sessions_count, sessions_error) = match count_active_sessions(&bridge) {
+    // Check active sessions count from Core IPC (fail-closed if check fails), off the main thread (L1)
+    let sessions_bridge = bridge.inner().clone();
+    let inspection = tauri::async_runtime::spawn_blocking(move || count_active_sessions(&sessions_bridge))
+        .await
+        .unwrap_or_else(|_| SessionInspection::Unknown(IPC_TASK_FAILED_MESSAGE.to_string()));
+    let (sessions_known, active_sessions_count, sessions_error) = match inspection {
         SessionInspection::Known(n) => (true, n, None),
         SessionInspection::Unknown(why) => (false, 0, Some(why)),
     };
@@ -1010,8 +1386,12 @@ async fn updater_download_and_install(
 
     let force_update = force.unwrap_or(false);
 
-    // ETAPA 1 (Fail-Closed Pré-Download): Verificar se sessões estão ativas ou se inspeção falhou
-    let pre_insp = count_active_sessions(&bridge);
+    // ETAPA 1 (Fail-Closed Pré-Download): Verificar se sessões estão ativas ou se inspeção falhou.
+    // As chamadas ao Core desta função rodam no pool de bloqueio (L1); tarefa que não termina = estado desconhecido.
+    let sessions_bridge = bridge.inner().clone();
+    let pre_insp = tauri::async_runtime::spawn_blocking(move || count_active_sessions(&sessions_bridge))
+        .await
+        .unwrap_or_else(|_| SessionInspection::Unknown(IPC_TASK_FAILED_MESSAGE.to_string()));
     if let InstallGate::Block(reason) = evaluate_gate(pre_insp, force_update, expected_active_sessions) {
         return Err(UpdaterError::before_shutdown(&bridge, "SESSIONS_GATE_BLOCKED", reason));
     }
@@ -1056,10 +1436,29 @@ async fn updater_download_and_install(
         // Congela criação de novas abas/sessões no Rust e no Core Python (sob RLock) antes de contar.
         // Se a validação falhar, o congelamento é liberado explicitamente e uma falha ao descongelar
         // é informada ao usuário; UpdateFreezeGuard::drop permanece como rede de segurança.
-        let (freeze_guard, post_insp) = bridge.acquire_update_freeze();
+        let freeze_bridge = bridge.inner().clone();
+        let (freeze_guard, post_insp) =
+            match tauri::async_runtime::spawn_blocking(move || freeze_bridge.acquire_update_freeze()).await {
+                Ok(frozen) => frozen,
+                Err(_) => {
+                    // The task stopped (panic) before returning a guard. If it stopped after setting the host
+                    // flag, terminal creation stays blocked until the app restarts, hence the advice.
+                    return Err(UpdaterError::before_shutdown(
+                        &bridge,
+                        "PRE_INSTALL_GATE_BLOCKED",
+                        format!(
+                            "Revalidação pré-instalação bloqueada: {} Se a criação de terminais continuar bloqueada, feche e reabra o aplicativo.",
+                            IPC_TASK_FAILED_MESSAGE
+                        ),
+                    ));
+                }
+            };
         if let InstallGate::Block(reason) = evaluate_gate(post_insp, force_update, expected_active_sessions) {
             let mut message = format!("Revalidação pré-instalação bloqueada: {}", reason);
-            if let Err(e) = freeze_guard.release() {
+            let released = tauri::async_runtime::spawn_blocking(move || freeze_guard.release())
+                .await
+                .unwrap_or_else(|_| Err(ipc_task_failed()));
+            if let Err(e) = released {
                 message.push_str(&format!(
                     " Atenção: o Core não confirmou o descongelamento ({}). Se a criação de terminais continuar bloqueada, feche e reabra o aplicativo.",
                     e
@@ -1128,75 +1527,127 @@ fn updater_restart_app(app: tauri::AppHandle, bridge: State<Arc<IpcBridge>>) -> 
 // ---- Settings and vault (Marco 4D.3, Etapa 3): validation happens in the Core IPC; structured errors
 // reach the UI as {code, message, data}. Vault commands never return secret values. ----
 #[tauri::command]
-fn settings_get(bridge: State<Arc<IpcBridge>>) -> Result<Value, Value> {
-    bridge.call_structured("settings.get", json!({}))
+async fn settings_get(bridge: State<'_, Arc<IpcBridge>>) -> Result<Value, Value> {
+    let bridge = bridge.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || bridge.call_structured("settings.get", json!({})))
+        .await
+        .unwrap_or_else(|_| Err(ipc_task_failed_structured()))
 }
 
 #[tauri::command]
-fn settings_update(
+async fn settings_update(
     schema_version: u32,
     category: String,
     values: Value,
-    bridge: State<Arc<IpcBridge>>,
+    bridge: State<'_, Arc<IpcBridge>>,
 ) -> Result<Value, Value> {
-    bridge.call_structured(
-        "settings.update",
-        json!({ "schema_version": schema_version, "category": category, "values": values }),
-    )
+    let bridge = bridge.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        bridge.call_structured(
+            "settings.update",
+            json!({ "schema_version": schema_version, "category": category, "values": values }),
+        )
+    })
+    .await
+    .unwrap_or_else(|_| Err(ipc_task_failed_structured()))
 }
 
 #[tauri::command]
-fn vault_status(bridge: State<Arc<IpcBridge>>) -> Result<Value, Value> {
-    bridge.call_structured("vault.status", json!({}))
+async fn vault_status(bridge: State<'_, Arc<IpcBridge>>) -> Result<Value, Value> {
+    let bridge = bridge.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || bridge.call_structured("vault.status", json!({})))
+        .await
+        .unwrap_or_else(|_| Err(ipc_task_failed_structured()))
 }
 
 #[tauri::command]
-fn vault_list_keys(bridge: State<Arc<IpcBridge>>) -> Result<Value, Value> {
-    bridge.call_structured("vault.list_keys", json!({}))
+async fn vault_list_keys(bridge: State<'_, Arc<IpcBridge>>) -> Result<Value, Value> {
+    let bridge = bridge.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || bridge.call_structured("vault.list_keys", json!({})))
+        .await
+        .unwrap_or_else(|_| Err(ipc_task_failed_structured()))
 }
 
 #[tauri::command]
-fn vault_set_secret(
+async fn vault_set_secret(
     key: String,
     value: String,
     expected_revision: Option<String>,
-    bridge: State<Arc<IpcBridge>>,
+    bridge: State<'_, Arc<IpcBridge>>,
 ) -> Result<Value, Value> {
-    bridge.call_structured(
-        "vault.set_secret",
-        json!({ "key": key, "value": value, "expected_revision": expected_revision }),
-    )
+    let bridge = bridge.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        bridge.call_structured(
+            "vault.set_secret",
+            json!({ "key": key, "value": value, "expected_revision": expected_revision }),
+        )
+    })
+    .await
+    .unwrap_or_else(|_| Err(ipc_task_failed_structured()))
 }
 
+// L4: `expected_revision` (interface key expectedRevision) is the revision of the operator's own reading; a vault
+// changed since then is a conflict and nothing is removed (L6).
 #[tauri::command]
-fn vault_delete_secret(key: String, bridge: State<Arc<IpcBridge>>) -> Result<Value, Value> {
-    bridge.call_structured("vault.delete_secret", json!({ "key": key }))
+async fn vault_delete_secret(
+    key: String,
+    expected_revision: Option<String>,
+    bridge: State<'_, Arc<IpcBridge>>,
+) -> Result<Value, Value> {
+    let bridge = bridge.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        bridge.call_structured(
+            "vault.delete_secret",
+            json!({ "key": key, "expected_revision": expected_revision }),
+        )
+    })
+    .await
+    .unwrap_or_else(|_| Err(ipc_task_failed_structured()))
 }
 
 // Etapa 7: authenticated desktop-layer operations; no Core engine changes.
 #[tauri::command]
-fn profile_revoke_project(project_path: String, bridge: State<Arc<IpcBridge>>) -> Result<Value, Value> {
-    bridge.call_structured("profile.revoke_project", json!({ "project_path": project_path }))
+async fn profile_revoke_project(project_path: String, bridge: State<'_, Arc<IpcBridge>>) -> Result<Value, Value> {
+    let bridge = bridge.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        bridge.call_structured("profile.revoke_project", json!({ "project_path": project_path }))
+    })
+    .await
+    .unwrap_or_else(|_| Err(ipc_task_failed_structured()))
 }
 
 #[tauri::command]
-fn profile_remember_project(project_path: String, bridge: State<Arc<IpcBridge>>) -> Result<Value, Value> {
-    bridge.call_structured("profile.remember_project", json!({ "project_path": project_path }))
+async fn profile_remember_project(project_path: String, bridge: State<'_, Arc<IpcBridge>>) -> Result<Value, Value> {
+    let bridge = bridge.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        bridge.call_structured("profile.remember_project", json!({ "project_path": project_path }))
+    })
+    .await
+    .unwrap_or_else(|_| Err(ipc_task_failed_structured()))
 }
 
 #[tauri::command]
-fn security_status(bridge: State<Arc<IpcBridge>>) -> Result<Value, Value> {
-    bridge.call_structured("security.status", json!({}))
+async fn security_status(bridge: State<'_, Arc<IpcBridge>>) -> Result<Value, Value> {
+    let bridge = bridge.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || bridge.call_structured("security.status", json!({})))
+        .await
+        .unwrap_or_else(|_| Err(ipc_task_failed_structured()))
 }
 
 #[tauri::command]
-fn discovery_agents(bridge: State<Arc<IpcBridge>>) -> Result<Value, Value> {
-    bridge.call_structured("discovery.agents", json!({}))
+async fn discovery_agents(bridge: State<'_, Arc<IpcBridge>>) -> Result<Value, Value> {
+    let bridge = bridge.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || bridge.call_structured("discovery.agents", json!({})))
+        .await
+        .unwrap_or_else(|_| Err(ipc_task_failed_structured()))
 }
 
 #[tauri::command]
-fn providers_routes(bridge: State<Arc<IpcBridge>>) -> Result<Value, Value> {
-    bridge.call_structured("providers.routes", json!({}))
+async fn providers_routes(bridge: State<'_, Arc<IpcBridge>>) -> Result<Value, Value> {
+    let bridge = bridge.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || bridge.call_structured("providers.routes", json!({})))
+        .await
+        .unwrap_or_else(|_| Err(ipc_task_failed_structured()))
 }
 
 fn main() {
@@ -1251,4 +1702,224 @@ fn main() {
         ])
         .run(tauri::generate_context!())
         .expect("error while running AI Coordinator Desktop");
+}
+
+// Transport tests (L2 and the queue deadline of Etapa 8). They touch no Tauri API: the Verify suite cannot build
+// this binary, so they also run from a crate that compiles this transport section alone.
+#[cfg(test)]
+mod ipc_transport_tests {
+    use super::*;
+    use std::thread;
+
+    // Scheduling margin on top of a deadline.
+    const SLACK: Duration = Duration::from_millis(400);
+
+    fn wait_for_tickets(lock: &FifoLock, tickets: u64) {
+        let start = Instant::now();
+        while lock_unpoisoned(&lock.state).next_ticket < tickets {
+            assert!(start.elapsed() < Duration::from_secs(5), "as chamadas não entraram na fila");
+            thread::sleep(Duration::from_millis(2));
+        }
+    }
+
+    fn live_child() -> Child {
+        #[cfg(windows)]
+        let mut cmd = {
+            let mut c = Command::new("ping");
+            c.args(["-n", "60", "127.0.0.1"]);
+            c
+        };
+        #[cfg(not(windows))]
+        let mut cmd = {
+            let mut c = Command::new("sleep");
+            c.arg("60");
+            c
+        };
+        cmd.stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("processo que faz as vezes do Core")
+    }
+
+    /// A bridge wired to channels instead of a Core process: the test reads the request lines and writes replies.
+    fn fake_bridge(child: Option<Child>) -> (IpcBridge, Receiver<String>, Sender<String>) {
+        let (request_tx, request_rx) = mpsc::channel::<String>();
+        let (reply_tx, reply_rx) = mpsc::channel::<String>();
+        let bridge = IpcBridge {
+            child: Mutex::new(child),
+            requests: Mutex::new(Some(request_tx)),
+            responses: Mutex::new(Some(reply_rx)),
+            io_lock: FifoLock::new(),
+            update_frozen: AtomicBool::new(false),
+            runtime_stopped_for_update: AtomicBool::new(false),
+            update_in_progress: AtomicBool::new(false),
+            token: "token-de-teste".into(),
+            seq: AtomicU64::new(1),
+            resolved_python: String::new(),
+        };
+        (bridge, request_rx, reply_tx)
+    }
+
+    /// Answers each request after `delay` with {"method": <its method>} and the request's id, as the Core does.
+    fn answer_after(requests: Receiver<String>, replies: Sender<String>, delay: Duration) -> thread::JoinHandle<()> {
+        thread::spawn(move || {
+            for request in requests {
+                let request: Value = serde_json::from_str(request.trim()).expect("pedido em JSON");
+                thread::sleep(delay);
+                let reply = json!({
+                    "jsonrpc": "2.0",
+                    "id": request["id"].clone(),
+                    "result": { "method": request["method"].clone() }
+                });
+                if replies.send(format!("{}\n", reply)).is_err() {
+                    break;
+                }
+            }
+        })
+    }
+
+    #[test]
+    fn lock_until_gives_up_at_its_deadline_while_the_turn_is_held() {
+        let lock = FifoLock::new();
+        let _held = lock.lock();
+        let start = Instant::now();
+        assert!(lock.lock_until(start + Duration::from_millis(200)).is_none());
+        let waited = start.elapsed();
+        assert!(waited >= Duration::from_millis(200) && waited < Duration::from_millis(200) + SLACK, "{waited:?}");
+    }
+
+    #[test]
+    fn a_free_turn_is_kept_even_when_the_deadline_has_passed() {
+        let lock = FifoLock::new();
+        let past = Instant::now();
+        thread::sleep(Duration::from_millis(5));
+        let first = lock.lock_until(past);
+        assert!(first.is_some());
+        drop(first);
+        assert!(lock.lock_until(past).is_some());
+        assert!(lock_unpoisoned(&lock.state).abandoned.is_empty());
+    }
+
+    #[test]
+    fn abandoned_tickets_are_skipped_when_the_turn_moves_on() {
+        let lock = FifoLock::new();
+        let held = lock.lock();
+        assert!(lock.lock_until(Instant::now() + Duration::from_millis(30)).is_none());
+        assert!(lock.lock_until(Instant::now() + Duration::from_millis(30)).is_none());
+        assert_eq!(lock_unpoisoned(&lock.state).abandoned.len(), 2);
+        drop(held);
+        let start = Instant::now();
+        let next = lock.lock_until(start + Duration::from_secs(5));
+        assert!(next.is_some() && start.elapsed() < SLACK);
+        assert!(lock_unpoisoned(&lock.state).abandoned.is_empty());
+    }
+
+    #[test]
+    fn callers_still_waiting_keep_their_arrival_order() {
+        let lock = Arc::new(FifoLock::new());
+        let order = Arc::new(Mutex::new(Vec::new()));
+        let held = lock.lock();
+        let mut waiting = Vec::new();
+        for caller in 0..5u64 {
+            let (queue, served) = (Arc::clone(&lock), Arc::clone(&order));
+            // Caller 2 gives up early; the others wait long enough.
+            let patience = if caller == 2 { Duration::from_millis(50) } else { Duration::from_secs(10) };
+            waiting.push(thread::spawn(move || {
+                if let Some(_turn) = queue.lock_until(Instant::now() + patience) {
+                    lock_unpoisoned(&served).push(caller);
+                }
+            }));
+            wait_for_tickets(&lock, caller + 2);
+        }
+        thread::sleep(Duration::from_millis(150));
+        drop(held);
+        for caller in waiting {
+            caller.join().expect("chamada em espera");
+        }
+        assert_eq!(*lock_unpoisoned(&order), vec![0, 1, 3, 4]);
+    }
+
+    /// Finding #1 of Etapa 8: with the Core stuck, a queued call answered only after its own deadline plus the
+    /// deadline of every call ahead of it (hours with the output polling queued). Each one now answers by its own
+    /// deadline, wherever it stands in the queue, and the stream serves at once when the stuck call ends.
+    #[test]
+    fn a_stuck_call_does_not_add_the_deadlines_of_the_calls_ahead() {
+        let lock = Arc::new(FifoLock::new());
+        let stuck_for = Duration::from_millis(1500);
+        let patience = Duration::from_millis(300);
+        // The call the Core does not answer keeps the turn for longer than any deadline below.
+        let stuck = {
+            let queue = Arc::clone(&lock);
+            thread::spawn(move || {
+                let _turn = queue.lock();
+                thread::sleep(stuck_for);
+            })
+        };
+        wait_for_tickets(&lock, 1);
+        let mut polls = Vec::new();
+        for poll in 0..3u64 {
+            let queue = Arc::clone(&lock);
+            polls.push(thread::spawn(move || {
+                let start = Instant::now();
+                let served = queue.lock_until(start + patience).is_some();
+                (served, start.elapsed())
+            }));
+            wait_for_tickets(&lock, poll + 2);
+        }
+        let start = Instant::now();
+        let operator = lock.lock_until(start + patience).is_some();
+        let waited = start.elapsed();
+        assert!(!operator && waited < patience + SLACK, "a ação do operador esperou {waited:?}");
+        for poll in polls {
+            let (served, waited) = poll.join().expect("polling");
+            assert!(!served && waited < patience + SLACK, "{waited:?}");
+        }
+        stuck.join().expect("chamada presa");
+        let start = Instant::now();
+        assert!(lock.lock_until(start + Duration::from_secs(5)).is_some());
+        assert!(start.elapsed() < SLACK);
+    }
+
+    #[test]
+    fn nothing_is_sent_once_the_deadline_has_passed() {
+        let (bridge, requests, _replies) = fake_bridge(Some(live_child()));
+        let past = Instant::now();
+        thread::sleep(Duration::from_millis(5));
+        let failure = bridge.exchange("vault.status", json!({}), past).err().expect("prazo vencido");
+        assert!(matches!(failure, IpcFailure::Timeout(30)));
+        assert!(requests.try_recv().is_err(), "o pedido não pode chegar ao Core");
+    }
+
+    #[test]
+    fn a_timeout_frees_the_stream_and_the_late_answer_is_discarded() {
+        let (bridge, requests, replies) = fake_bridge(Some(live_child()));
+        let core = answer_after(requests, replies, Duration::from_millis(300));
+        let start = Instant::now();
+        let failure = bridge
+            .exchange("terminal.get_output", json!({}), start + Duration::from_millis(100))
+            .err()
+            .expect("prazo esgotado");
+        assert!(matches!(failure, IpcFailure::Timeout(30)));
+        assert!(start.elapsed() < Duration::from_millis(100) + SLACK);
+        let structured = failure.to_structured();
+        assert_eq!(structured["code"], json!(-32007));
+        assert_eq!(structured["data"], json!({ "field": "ipc", "reason": "timeout" }));
+        // The next call receives the late answer of the first one first and drops it.
+        let next = bridge.call_structured("settings.get", json!({})).expect("resposta da segunda chamada");
+        assert_eq!(next, json!({ "method": "settings.get" }));
+        drop(bridge);
+        core.join().expect("Core simulado");
+    }
+
+    #[test]
+    fn a_core_that_is_down_reports_disconnected_at_the_deadline() {
+        let (bridge, _requests, _replies) = fake_bridge(None);
+        let failure = bridge
+            .exchange("vault.status", json!({}), Instant::now() + Duration::from_millis(50))
+            .err()
+            .expect("sem Core");
+        assert!(matches!(failure, IpcFailure::Disconnected));
+        assert_eq!(failure.to_structured()["data"]["reason"], json!("disconnected"));
+    }
 }
