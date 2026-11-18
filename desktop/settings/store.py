@@ -3,16 +3,20 @@
 - Schema v1 lives in the desktop layer; the Core has no JSON Schema. Where the Core has a validator it is reused
   (FlightBudget.from_dict for mission budgets) and the desktop adds ranges. The Core itself is not modified.
 - Unknown, invalid or incompatible input is rejected with SettingsValidationError(field, reason); nothing is saved.
+- Stored data never makes reading fail (E2-6): future or malformed envelopes are read-only, and invalid stored
+  fields are reported and kept until the operator writes them.
 - Every category reports its state: saved fields, validated, applied, and how it is applied:
-  "pending_ui" (stored and validated; the interface applies it in a later stage) or "unsupported" (stored and
+  "interface" (stored and validated; the running interface applies supported preferences) or "unsupported" (stored and
   validated, but nothing in the desktop applies it yet, e.g. mission budgets before the Missões milestone).
 - Secrets never go here: credentials use the profile vault (vault.* IPC), never the plain-text profile settings.
 """
 
 from __future__ import annotations
 
+import copy
+
 from dataclasses import dataclass
-from typing import Any, Callable, Dict, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 SCHEMA_VERSION = 1
 
@@ -63,10 +67,10 @@ FIELDS: Dict[str, Dict[str, FieldSpec]] = {
 }
 
 APPLICATION = {
-    "perfil": "pending_ui",
-    "geral": "pending_ui",
-    "aparencia": "pending_ui",
-    "terminal": "pending_ui",
+    "perfil": "interface",
+    "geral": "interface",
+    "aparencia": "interface",
+    "terminal": "interface",
     "coordinator": "unsupported",
 }
 
@@ -128,38 +132,122 @@ def _validate_field(path: str, spec: FieldSpec, value: Any) -> Any:
     raise AssertionError(f"unknown field kind {spec.kind}")
 
 
+STORED_ISSUE_MESSAGES = {
+    "incompatible_version": "As configurações foram gravadas por outra versão e estão protegidas. Os padrões estão em uso "
+                            "e nada será alterado.",
+    "invalid_envelope": "As configurações salvas não estão no formato esperado e foram protegidas. Os padrões estão em "
+                        "uso e nada será alterado.",
+    "invalid_fields": "Alguns valores salvos são inválidos. O padrão é usado para eles, e o valor salvo é preservado até "
+                      "você gravar o campo.",
+}
+READ_ONLY_MESSAGE = "As configurações foram gravadas por outra versão e estão protegidas. Nada foi alterado."
+PRE_V1_BACKUP_SUFFIX = "pre-v1.bak"
+
+
+@dataclass
+class _StoredState:
+    """What the stored envelope allows: the migrated envelope to write (None when read-only) and values to show."""
+
+    envelope: Optional[Dict[str, Any]]
+    values: Dict[str, Any]
+    version: Optional[int]
+    migration_required: bool
+    read_only_reason: Optional[str]  # None | "incompatible_version" | "invalid_stored_value"
+
+
 class SettingsStore:
-    """Reads and writes the validated settings of the active profile (DesktopProfile.settings)."""
+    """Version 1 with lossless legacy migration and read-only protection for future or malformed envelopes.
+
+    Reading never fails because of stored data: a future schema or a malformed envelope is reported read-only, and an
+    invalid stored field is reported in `invalid_fields` with its default shown, while its stored value is kept until
+    the operator writes that field.
+    """
 
     def __init__(self, profile_manager: Any) -> None:
         self.profile_manager = profile_manager
 
-    def _stored(self) -> Tuple[str, Dict[str, Dict[str, Any]], Optional[int]]:
-        profile = self.profile_manager.get_active_profile()
-        raw = profile.settings if isinstance(profile.settings, dict) else {}
+    @staticmethod
+    def _inspect(raw: Any) -> _StoredState:
+        if not isinstance(raw, dict):
+            return _StoredState(None, {}, None, False, "invalid_stored_value")
         version = raw.get("schema_version")
-        values = raw.get("values") if version == SCHEMA_VERSION and isinstance(raw.get("values"), dict) else {}
-        return profile.name, values, version
+        if version is not None and (type(version) is not int or version not in (0, SCHEMA_VERSION)):
+            shown = raw.get("values") if isinstance(raw.get("values"), dict) else {}
+            return _StoredState(None, copy.deepcopy(shown), version if type(version) is int else None, False,
+                                "incompatible_version")
+        envelope = copy.deepcopy(raw)
+        if "values" in raw:
+            if not isinstance(raw["values"], dict):
+                return _StoredState(None, {}, version, False, "invalid_stored_value")
+            stored = copy.deepcopy(raw["values"])
+        elif version == SCHEMA_VERSION:
+            # Version 1 without its values object: written by something else; protect it instead of guessing.
+            return _StoredState(None, {}, version, False, "invalid_stored_value")
+        else:
+            # Legacy flat known categories are moved into the envelope; unrelated extensions stay at the root.
+            stored = {name: envelope.pop(name) for name in FIELDS if name in envelope}
+        if any(name in stored and not isinstance(stored[name], dict) for name in FIELDS):
+            return _StoredState(None, stored, version, False, "invalid_stored_value")
+        envelope["schema_version"] = SCHEMA_VERSION
+        envelope["values"] = stored
+        return _StoredState(envelope, stored, version, bool(raw) and version != SCHEMA_VERSION, None)
+
+    @staticmethod
+    def _category_view(category: str, saved: Dict[str, Any]) -> Tuple[Dict[str, Any], List[str]]:
+        values, invalid = {}, []
+        for name, spec in FIELDS[category].items():
+            default = _default_budget() if spec.kind == "flight_budget" else spec.default
+            if name not in saved:
+                values[name] = default
+                continue
+            if spec.kind == "text" and saved[name] is None and spec.default is None:
+                values[name] = None
+                continue
+            stored = saved[name]
+            if spec.kind == "flight_budget" and isinstance(stored, dict):
+                # Future budget extensions survive storage; only recognized fields reach this UI/Core contract.
+                stored = {key: value for key, value in stored.items() if key in _BUDGET_LIMITS}
+            try:
+                values[name] = _validate_field(f"{category}.{name}", spec, stored)
+            except SettingsValidationError:
+                values[name] = default
+                invalid.append(name)
+        return values, invalid
 
     def snapshot(self) -> Dict[str, Any]:
-        _, stored, stored_version = self._stored()
-        categories: Dict[str, Any] = {}
+        profile = self.profile_manager.get_active_profile()
+        state = self._inspect(profile.settings)
+        read_only = state.read_only_reason is not None
+        categories = {}
+        any_invalid = False
         for category, fields in FIELDS.items():
-            saved = stored.get(category, {}) if isinstance(stored.get(category), dict) else {}
-            values = {}
-            for name, spec in fields.items():
-                default = _default_budget() if spec.kind == "flight_budget" else spec.default
-                values[name] = saved.get(name, default)
+            saved = state.values.get(category, {})
+            if not isinstance(saved, dict):
+                saved = {}
+            values, invalid = self._category_view(category, saved)
+            any_invalid = any_invalid or bool(invalid)
             categories[category] = {
                 "values": values,
-                "saved_fields": sorted(k for k in saved if k in fields),
-                "validated": True,
-                "applied": False,
+                "saved_fields": sorted(name for name in saved if name in fields),
+                "invalid_fields": invalid,
+                "validated": not invalid and not read_only,
+                "applied": False,  # Only the interface can confirm application to mounted components.
                 "application": APPLICATION[category],
             }
+        if state.read_only_reason == "incompatible_version":
+            issue = {"reason": "incompatible_version", "message": STORED_ISSUE_MESSAGES["incompatible_version"]}
+        elif read_only:
+            issue = {"reason": "invalid_stored_value", "message": STORED_ISSUE_MESSAGES["invalid_envelope"]}
+        elif any_invalid:
+            issue = {"reason": "invalid_stored_value", "message": STORED_ISSUE_MESSAGES["invalid_fields"]}
+        else:
+            issue = None
         return {
             "schema_version": SCHEMA_VERSION,
-            "stored_schema_version": stored_version,
+            "stored_schema_version": state.version,
+            "read_only": read_only,
+            "stored_issue": issue,
+            "migration": {"required": state.migration_required, "from_version": state.version, "to_version": SCHEMA_VERSION},
             "categories": categories,
             "unsupported_categories": dict(UNSUPPORTED_CATEGORIES),
         }
@@ -168,28 +256,42 @@ class SettingsStore:
         if not isinstance(payload, dict):
             _fail("params", "Parâmetros de configuração inválidos.")
         version = payload.get("schema_version")
-        if version != SCHEMA_VERSION:
+        if type(version) is not int or version != SCHEMA_VERSION:
             _fail("schema_version", f"Versão de esquema incompatível: esperado {SCHEMA_VERSION}.", "incompatible_version")
         category = payload.get("category")
+        if not isinstance(category, str):
+            _fail("category", "Categoria inválida.", "unknown_category")
         if category in UNSUPPORTED_CATEGORIES:
             _fail("category", UNSUPPORTED_CATEGORIES[category], "unsupported_category")
         if category not in FIELDS:
-            _fail("category", f"Categoria desconhecida: {category!r}.", "unknown_category")
+            _fail("category", "Categoria desconhecida.", "unknown_category")
         values = payload.get("values")
         if not isinstance(values, dict) or not values:
             _fail("values", "'values' deve ser um objeto com ao menos um campo.")
-
         fields = FIELDS[category]
-        validated: Dict[str, Any] = {}
+        validated = {}
         for name, value in values.items():
-            path = f"{category}.{name}"
             if name not in fields:
-                _fail(path, f"Campo desconhecido: {path}.", "unknown_field")
-            validated[name] = _validate_field(path, fields[name], value)
+                _fail(f"{category}.{name}", "Campo desconhecido.", "unknown_field")
+            validated[name] = _validate_field(f"{category}.{name}", fields[name], value)
 
-        # Persist only after every field validated (all-or-nothing).
-        profile_name, stored, _ = self._stored()
-        merged = {cat: dict(vals) for cat, vals in stored.items() if cat in FIELDS and isinstance(vals, dict)}
-        merged.setdefault(category, {}).update(validated)
-        self.profile_manager.update_settings(profile_name, {"schema_version": SCHEMA_VERSION, "values": merged})
+        profile_name = self.profile_manager.get_active_profile().name
+        def merge(current):
+            state = self._inspect(current)
+            if state.envelope is None:
+                _fail("settings", READ_ONLY_MESSAGE, "read_only_stored_schema")
+            if state.migration_required:
+                # Before the first write that migrates legacy (v0 or flat) settings, keep the old file once.
+                self.profile_manager.backup_profile_file(profile_name, PRE_V1_BACKUP_SUFFIX)
+            envelope = state.envelope
+            saved = envelope["values"].setdefault(category, {})
+            # Only the fields being written are replaced; other stored fields, valid or not, stay exactly as they are.
+            for name, value in validated.items():
+                if fields[name].kind == "flight_budget" and isinstance(saved.get(name), dict):
+                    saved[name] = {**saved[name], **value}
+                else:
+                    saved[name] = value
+            return envelope
+
+        self.profile_manager.mutate_settings(profile_name, merge)
         return self.snapshot()
