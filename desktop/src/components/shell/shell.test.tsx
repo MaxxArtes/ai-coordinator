@@ -1,6 +1,6 @@
 import React from "react";
 import { describe, expect, it, vi } from "vitest";
-import { render, screen } from "@testing-library/react";
+import { fireEvent, render, screen, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { AppHeader } from "./AppHeader";
 import { AuthorizationScreen } from "./AuthorizationScreen";
@@ -99,6 +99,45 @@ describe("AuthorizationScreen", () => {
     // Without a note, only the hint.
     rerender(<AuthorizationScreen profileName="default" inputPath="" onInputPathChange={vi.fn()} onSubmit={vi.fn()} />);
     expect(screen.getByLabelText("Caminho do projeto no host")).toHaveAccessibleDescription("O diretório precisa existir neste computador.");
+  });
+
+  it("pergunta de diretório amplo: Cancelar em foco, o resto travado, Esc cancela e a resposta só vale armada", async () => {
+    const user = userEvent.setup();
+    const onOpenProject = vi.fn();
+    const onSubmit = vi.fn();
+    const onConfirm = vi.fn();
+    const onCancel = vi.fn();
+    const props = {
+      profileName: "default",
+      authorizedProjects: ["D:\\proj"],
+      inputPath: "C:\\",
+      onInputPathChange: vi.fn(),
+      onSubmit,
+      onOpenProject,
+      onConfirmBroadScope: onConfirm,
+      onCancelBroadScope: onCancel,
+    };
+    const { rerender } = render(<AuthorizationScreen {...props} broadScopePath={"C:\\"} />);
+    const question = screen.getByRole("alertdialog", { name: "Autorizar C:\\ com acesso amplo?" });
+    expect(within(question).getByRole("button", { name: "Cancelar" })).toHaveFocus();
+    expect(screen.getByRole("button", { name: "Abrir D:\\proj" })).toHaveAttribute("aria-disabled", "true");
+    await user.click(screen.getByRole("button", { name: "Abrir D:\\proj" }));
+    expect(onOpenProject).not.toHaveBeenCalled();
+    fireEvent.submit(screen.getByRole("form", { name: "Autorizar outro diretório" }));
+    expect(onSubmit).not.toHaveBeenCalled();
+
+    // A pointer click right away belongs to the gesture that opened the question.
+    fireEvent.click(within(question).getByRole("button", { name: "Autorizar acesso amplo" }), { detail: 1 });
+    expect(onConfirm).not.toHaveBeenCalled();
+    await user.keyboard("{Escape}");
+    expect(onCancel).toHaveBeenCalledTimes(1);
+    rerender(<AuthorizationScreen {...props} broadScopePath={null} />);
+    expect(screen.getByLabelText("Caminho do projeto no host")).toHaveFocus();
+    expect(screen.queryByRole("alertdialog")).not.toBeInTheDocument();
+
+    // Without a question, Escape does nothing here.
+    await user.keyboard("{Escape}");
+    expect(onCancel).toHaveBeenCalledTimes(1);
   });
 
   it("propaga a digitação para o estado do aplicativo", async () => {

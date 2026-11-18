@@ -15,6 +15,7 @@ vi.mock("xterm-addon-fit", async () => ({ FitAddon: (await import("./test/fakeXt
 
 import { App, PREFERENCES_DEADLINE_MS } from "./App";
 import { FakeResizeObserver, resetXterm, xtermLog } from "./test/fakeXterm";
+import { CONFIRM_ARM_DELAY_MS, armingClock } from "./components/ui/InlineConfirmation";
 
 const METRICS = { host_pid: 4242, host_ram_bytes: 61_027_123, total_tree_ram_bytes: 134_637_159, cpu_usage_percent: 37.5 };
 
@@ -31,6 +32,21 @@ function appSettings(overrides: Record<string, any> = {}): any {
 }
 
 type HostSession = { pane_id: number; alive: boolean; exit_code: number | null; tab?: string; cwd?: string };
+
+/** Directories the simulated host treats as broad (L5): a disk root, a share root and a home folder. */
+const BROAD = new Set(["C:\\", "\\\\servidor\\pasta", "C:\\Users\\ana"]);
+const BROAD_MESSAGE = "Este diretório dá acesso amplo (raiz do disco ou pasta pessoal inteira). Confirme explicitamente para autorizar.";
+/** The transport failures of the Tauri host (L2), as call_structured sends them. */
+const TIMEOUT_30 = {
+  code: -32007,
+  message: "O Core não respondeu em 30 s. A operação pode ter sido concluída: confira antes de repetir.",
+  data: { field: "ipc", reason: "timeout" },
+};
+const DISCONNECTED = {
+  code: -32007,
+  message: "O Core encerrou a comunicação. Reinicie o aplicativo.",
+  data: { field: "ipc", reason: "disconnected" },
+};
 
 interface HostOptions {
   preview?: boolean;
@@ -82,10 +98,18 @@ function host({ preview = false, authorized = true, metricsFail = false, setting
       case "profile_remember_project":
         return { remembered: true, last_project: args?.projectPath };
       case "profile_authorize_project":
+        // Like the host (L5): a broad directory needs confirm_broad, which only true satisfies.
+        if (BROAD.has(args.projectPath) && args.confirmBroad !== true) {
+          throw { code: -32602, message: BROAD_MESSAGE, data: { field: "project_path", reason: "broad_scope" } };
+        }
         if (!state.authorized.includes(args.projectPath)) state.authorized.push(args.projectPath);
         return { success: true, profile_name: "default", project_path: args.projectPath, authorized_projects: [...state.authorized] };
       case "security_status":
-        return { authorized_projects: [...state.authorized], policy: { project_fencing: true, human_terminal: "operator_permissions" } };
+        return {
+          authorized_projects: [...state.authorized],
+          broad_projects: state.authorized.filter((p) => BROAD.has(p)),
+          policy: { project_fencing: true, human_terminal: "operator_permissions" },
+        };
       case "profile_revoke_project": {
         if (Array.from(registry.values()).some((s) => s.cwd === args.projectPath)) {
           throw { code: -32003, message: "Feche os terminais deste diretório antes de revogar a autorização.", data: { field: "project_path", reason: "active_sessions" } };
@@ -869,5 +893,356 @@ describe("App — preferências, atalhos e revogação (Etapa 7)", () => {
     await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
     expect(screen.getByRole("region", { name: "Terminal 01" })).toBeInTheDocument();
     expect(bar()).toHaveTextContent("proj");
+  });
+});
+
+describe("App — diretório amplo e falhas de transporte (Etapa 8, L2/L3/L7)", () => {
+  // The arm delay's clock is under the test's control: a pointer click only answers after it.
+  let now = 0;
+  beforeEach(() => {
+    now = 10_000;
+    vi.spyOn(armingClock, "now").mockImplementation(() => now);
+  });
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  const authorizeCalls = () => callsOf("profile_authorize_project");
+
+  async function askBroad(user: ReturnType<typeof userEvent.setup>, path = "C:\\") {
+    const input = await screen.findByLabelText("Caminho do projeto no host");
+    await user.clear(input);
+    await user.type(input, path);
+    await user.click(screen.getByRole("button", { name: "Autorizar diretório e iniciar terminal" }));
+    return screen.findByRole("alertdialog", { name: `Autorizar ${path} com acesso amplo?` });
+  }
+
+  it("a pergunta é explícita, com a resposta segura em foco; Cancelar não autoriza e devolve o foco ao caminho", async () => {
+    const user = userEvent.setup();
+    host({ authorized: false });
+    renderApp();
+    const question = await askBroad(user);
+    expect(question).toHaveAccessibleDescription(/raiz de um disco ou de um compartilhamento, ou a sua pasta pessoal inteira/);
+    const cancel = within(question).getByRole("button", { name: "Cancelar" });
+    await waitFor(() => expect(cancel).toHaveFocus());
+    // The question is the message: no failure banner, and nothing was authorized.
+    expect(document.body.textContent).not.toMatch(/Falha na autorização/);
+    expect(authorizeCalls()).toEqual([{ projectPath: "C:\\" }]);
+    // While it is open nothing else starts, and the path it is about cannot change under it.
+    const input = screen.getByLabelText("Caminho do projeto no host");
+    expect(input).toHaveAttribute("readonly");
+    expect(screen.getByRole("button", { name: "Autorizar diretório e iniciar terminal" })).toHaveAttribute("aria-disabled", "true");
+    fireEvent.submit(screen.getByRole("form", { name: "Autorizar diretório" }));
+    expect(authorizeCalls()).toHaveLength(1);
+
+    await user.click(cancel);
+    expect(screen.queryByRole("alertdialog")).toBeNull();
+    expect(input).toHaveFocus();
+    expect(input).not.toHaveAttribute("readonly");
+    expect(authorizeCalls()).toEqual([{ projectPath: "C:\\" }]);
+    expect(count("terminal_create_tab")).toBe(0);
+    expect(xtermLog.created).toHaveLength(0);
+  });
+
+  it("Esc responde Cancelar: nada é autorizado e o foco volta ao caminho", async () => {
+    const user = userEvent.setup();
+    host({ authorized: false });
+    renderApp();
+    const question = await askBroad(user, "\\\\servidor\\pasta");
+    await waitFor(() => expect(within(question).getByRole("button", { name: "Cancelar" })).toHaveFocus());
+    await user.keyboard("{Escape}");
+    expect(screen.queryByRole("alertdialog")).toBeNull();
+    expect(screen.getByLabelText("Caminho do projeto no host")).toHaveFocus();
+    expect(authorizeCalls()).toEqual([{ projectPath: "\\\\servidor\\pasta" }]);
+    expect(count("terminal_create_tab")).toBe(0);
+  });
+
+  it("confirmar pelo teclado repete o pedido com confirmBroad: true e abre o terminal no diretório", async () => {
+    const user = userEvent.setup();
+    host({ authorized: false });
+    renderApp();
+    const question = await askBroad(user, "C:\\Users\\ana");
+    await waitFor(() => expect(within(question).getByRole("button", { name: "Cancelar" })).toHaveFocus());
+    await user.tab(); // a deliberate move from the safe answer; keyboard activation is not delayed
+    expect(within(question).getByRole("button", { name: "Autorizar acesso amplo" })).toHaveFocus();
+    await user.keyboard("{Enter}");
+    await connected();
+    expect(authorizeCalls()).toEqual([{ projectPath: "C:\\Users\\ana" }, { projectPath: "C:\\Users\\ana", confirmBroad: true }]);
+    expect(callsOf("terminal_create_tab")).toEqual([{ tabId: "tab-main", projectPath: "C:\\Users\\ana" }]);
+    expect(screen.queryByRole("alertdialog")).toBeNull();
+  });
+
+  it("um clique de ponteiro antes do atraso de armar não responde; depois dele, responde uma vez só", async () => {
+    const user = userEvent.setup();
+    host({ authorized: false });
+    renderApp();
+    const question = await askBroad(user);
+    const answer = within(question).getByRole("button", { name: "Autorizar acesso amplo" });
+    expect(answer).toHaveClass("btn--arming");
+    fireEvent.click(answer, { detail: 1 });
+    fireEvent.click(answer, { detail: 2 });
+    expect(authorizeCalls()).toHaveLength(1);
+    expect(screen.getByRole("alertdialog")).toBe(question);
+
+    now += CONFIRM_ARM_DELAY_MS + 1;
+    act(() => {
+      fireEvent.click(answer, { detail: 1 });
+      fireEvent.click(answer, { detail: 1 }); // a second activation before React renders again
+    });
+    await connected();
+    expect(authorizeCalls()).toEqual([{ projectPath: "C:\\" }, { projectPath: "C:\\", confirmBroad: true }]);
+    expect(count("terminal_create_tab")).toBe(1);
+  });
+
+  it("Enter mantido pressionado no campo abre a pergunta uma vez e não a responde nem a cancela", async () => {
+    const user = userEvent.setup();
+    host({ authorized: false });
+    renderApp();
+    const input = await screen.findByLabelText("Caminho do projeto no host");
+    await user.type(input, "C:\\");
+    await user.keyboard("{Enter>8/}");
+    const question = await screen.findByRole("alertdialog");
+    await waitFor(() => expect(within(question).getByRole("button", { name: "Cancelar" })).toHaveFocus());
+    await user.keyboard("{Enter>6/}"); // held on Cancelar: one real press answers it, the repeats do not resubmit
+    expect(screen.queryByRole("alertdialog")).toBeNull();
+    expect(authorizeCalls()).toEqual([{ projectPath: "C:\\" }]);
+  });
+
+  it("um diretório comum não pergunta nada e não envia confirmBroad", async () => {
+    const user = userEvent.setup();
+    host({ authorized: false });
+    renderApp();
+    await user.type(await screen.findByLabelText("Caminho do projeto no host"), "D:\\novo");
+    await user.click(screen.getByRole("button", { name: "Autorizar diretório e iniciar terminal" }));
+    await connected();
+    expect(authorizeCalls()).toEqual([{ projectPath: "D:\\novo" }]);
+    expect(screen.queryByRole("alertdialog")).toBeNull();
+  });
+
+  it("erro estruturado na autorização (L3): a mensagem do host, sem pergunta", async () => {
+    const user = userEvent.setup();
+    host({
+      authorized: false,
+      fail: {
+        profile_authorize_project: {
+          code: -32602,
+          message: "O diretório do projeto não existe ou não é uma pasta.",
+          data: { field: "project_path", reason: "path_missing" },
+        },
+      },
+    });
+    renderApp();
+    await user.type(await screen.findByLabelText("Caminho do projeto no host"), "D:\\sumiu");
+    await user.click(screen.getByRole("button", { name: "Autorizar diretório e iniciar terminal" }));
+    expect(await screen.findByText("Falha na autorização do projeto: O diretório do projeto não existe ou não é uma pasta.")).toBeInTheDocument();
+    expect(screen.queryByRole("alertdialog")).toBeNull();
+    expect(document.body.textContent).not.toMatch(/\[object Object\]/);
+  });
+
+  it("autorização sem resposta (timeout): não declara falha nem sucesso, e relê a lista para conferir", async () => {
+    const user = userEvent.setup();
+    let reads = 0;
+    host({
+      authorized: false,
+      fail: { profile_authorize_project: TIMEOUT_30 },
+      extra: {
+        // The request went through on the Core after all: the next reading lists it.
+        profile_get_active: () => ({ name: "default", display_name: null, last_project: null, authorized_projects: reads++ === 0 ? [] : ["D:\\novo"] }),
+      },
+    });
+    renderApp();
+    await user.type(await screen.findByLabelText("Caminho do projeto no host"), "D:\\novo");
+    await user.click(screen.getByRole("button", { name: "Autorizar diretório e iniciar terminal" }));
+    expect(
+      await screen.findByText(
+        "A autorização do projeto não foi confirmada: O Core não respondeu em 30 s. A operação pode ter sido concluída: confira antes de repetir."
+      )
+    ).toBeInTheDocument();
+    expect(document.body.textContent).not.toMatch(/Falha na autorização/);
+    expect(await screen.findByRole("button", { name: "Abrir D:\\novo" })).toBeInTheDocument();
+    expect(count("profile_get_active")).toBe(2);
+    expect(count("terminal_create_tab")).toBe(0);
+  });
+
+  it("inicialização com profile_get_active sem resposta: a falha diz o motivo e Tentar novamente refaz a conexão", async () => {
+    const user = userEvent.setup();
+    let stuck = true;
+    host({
+      extra: {
+        profile_get_active: () => {
+          if (stuck) throw TIMEOUT_30;
+          return { name: "default", authorized_projects: ["D:\\proj"], last_project: null };
+        },
+      },
+    });
+    renderApp();
+    const alert = (await screen.findByText("Falha na inicialização da Alpha técnica")).closest("[role=alert]")!;
+    expect(alert).toHaveTextContent("O Core não respondeu em 30 s. A operação pode ter sido concluída: confira antes de repetir.");
+    expect(document.body.textContent).not.toMatch(/\[object Object\]/);
+    stuck = false;
+    await user.click(screen.getByRole("button", { name: "Tentar novamente" }));
+    await connected();
+  });
+
+  it("inicialização com o Core encerrado (disconnected): pede reiniciar e não oferece Tentar novamente", async () => {
+    host({ fail: { profile_get_active: DISCONNECTED } });
+    renderApp();
+    const alert = (await screen.findByText("Falha na inicialização da Alpha técnica")).closest("[role=alert]")!;
+    expect(alert).toHaveTextContent("O Core encerrou a comunicação. Reinicie o aplicativo.");
+    expect(screen.queryByRole("button", { name: "Tentar novamente" })).toBeNull();
+  });
+
+  it("o mesmo vale quando um comando de texto (call) devolve a mensagem fixa de canal encerrado", async () => {
+    host({ fail: { get_runtime_status: "O Core encerrou a comunicação. Reinicie o aplicativo." } });
+    renderApp();
+    const alert = (await screen.findByText("Falha na inicialização da Alpha técnica")).closest("[role=alert]")!;
+    expect(alert).toHaveTextContent("O Core encerrou a comunicação. Reinicie o aplicativo.");
+    expect(screen.queryByRole("button", { name: "Tentar novamente" })).toBeNull();
+    expect(count("profile_get_active")).toBe(0);
+  });
+
+  it("terminal sem resposta ao criar (texto de call): a mensagem do host aparece como está", async () => {
+    const user = userEvent.setup();
+    let created = 0;
+    host();
+    const original = invoke.getMockImplementation()!;
+    invoke.mockImplementation(async (cmd: string, args?: any) => {
+      if (cmd === "terminal_create_session" && created++ > 0) {
+        throw "O Core não respondeu em 120 s. A operação pode ter sido concluída: confira antes de repetir.";
+      }
+      return original(cmd, args);
+    });
+    renderApp();
+    await connected();
+    await user.click(screen.getByRole("button", { name: /Novo terminal/ }));
+    expect(
+      await screen.findByText("Falha ao criar terminal: O Core não respondeu em 120 s. A operação pode ter sido concluída: confira antes de repetir.")
+    ).toBeInTheDocument();
+  });
+
+  it("Segurança marca o diretório amplo autorizado com confirmação", async () => {
+    const user = userEvent.setup();
+    host({ authorized: false });
+    renderApp();
+    const question = await askBroad(user);
+    await waitFor(() => expect(within(question).getByRole("button", { name: "Cancelar" })).toHaveFocus());
+    await user.tab();
+    await user.keyboard("{Enter}");
+    await connected();
+
+    await user.click(screen.getByRole("button", { name: "Configurações" }));
+    const dialog = await screen.findByRole("dialog");
+    await user.click(within(dialog).getByRole("tab", { name: /^Segurança/ }));
+    const panel = within(dialog).getByRole("tabpanel", { name: /Segurança/ });
+    const item = (await within(panel).findByRole("button", { name: "Revogar C:\\" })).closest("li")!;
+    expect(within(item).getByText("Acesso amplo")).toBeInTheDocument();
+    expect(within(panel).getByText(/1 diretório autorizado dá acesso amplo/)).toBeInTheDocument();
+  });
+});
+
+describe("App — tráfego do terminal depois do L1/L2 (Etapa 8)", () => {
+  const wait = (ms: number) =>
+    act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, ms));
+    });
+
+  it("leitura de saída lenta: nunca duas ao mesmo tempo, e a saída aparece uma vez só", async () => {
+    host();
+    let release: (value: unknown) => void = () => undefined;
+    let first = true;
+    const original = invoke.getMockImplementation()!;
+    invoke.mockImplementation(async (cmd: string, args?: any) => {
+      if (cmd === "terminal_get_output") {
+        if (first) {
+          first = false;
+          return new Promise((resolve) => (release = resolve));
+        }
+        return { raw: "", next_seq: args.sinceSeq };
+      }
+      return original(cmd, args);
+    });
+    renderApp();
+    await connected();
+    await waitFor(() => expect(count("terminal_get_output")).toBe(1));
+    await wait(400); // five ticks: none starts while the first reading is in flight
+    expect(callsOf("terminal_get_output")).toEqual([{ sessionId: "sess-1", sinceSeq: 0 }]);
+    await act(async () => release({ raw: "C:\\proj>", next_seq: 2 }));
+    await waitFor(() => expect(callsOf("terminal_get_output")).toContainEqual({ sessionId: "sess-1", sinceSeq: 2 }));
+    await wait(200);
+    expect(xtermLog.created[0].written.filter((chunk) => chunk === "C:\\proj>")).toHaveLength(1);
+    expect(callsOf("terminal_get_output").filter((c) => c.sinceSeq === 0)).toHaveLength(1);
+  });
+
+  it("teclas digitadas com uma escrita pendente vão depois dela, na ordem e juntas, nunca duas escritas ao mesmo tempo", async () => {
+    host();
+    const releases: Array<() => void> = [];
+    const original = invoke.getMockImplementation()!;
+    invoke.mockImplementation(async (cmd: string, args?: any) => {
+      if (cmd === "terminal_write") return new Promise((resolve) => releases.push(() => resolve({ ok: true })));
+      return original(cmd, args);
+    });
+    renderApp();
+    await connected();
+    const term = xtermLog.created[0];
+    act(() => {
+      term.emit("l");
+      term.emit("s");
+      term.emit("\r");
+    });
+    await wait(50);
+    expect(callsOf("terminal_write")).toEqual([{ sessionId: "sess-1", data: "l" }]);
+    await act(async () => releases[0]());
+    await waitFor(() => expect(count("terminal_write")).toBe(2));
+    expect(callsOf("terminal_write")[1]).toEqual({ sessionId: "sess-1", data: "s\r" });
+    await act(async () => releases[1]());
+    act(() => term.emit("x"));
+    await waitFor(() => expect(count("terminal_write")).toBe(3));
+    expect(callsOf("terminal_write")[2]).toEqual({ sessionId: "sess-1", data: "x" });
+  });
+
+  it("escrita sem resposta: o que foi digitado depois não é enviado, e a mensagem diz isso", async () => {
+    host();
+    let fail: (err: unknown) => void = () => undefined;
+    const original = invoke.getMockImplementation()!;
+    invoke.mockImplementation(async (cmd: string, args?: any) => {
+      if (cmd === "terminal_write") return new Promise((_resolve, reject) => (fail = reject));
+      return original(cmd, args);
+    });
+    renderApp();
+    await connected();
+    const term = xtermLog.created[0];
+    act(() => {
+      term.emit("rm ");
+      term.emit("-r x\r");
+    });
+    await waitFor(() => expect(count("terminal_write")).toBe(1)); // the invoke is reached after a dynamic import
+    await act(async () => fail(TIMEOUT_30.message));
+    expect(
+      await screen.findByText(
+        "Erro de escrita no terminal: O Core não respondeu em 30 s. A operação pode ter sido concluída: confira antes de repetir. O que foi digitado depois disso não foi enviado."
+      )
+    ).toBeInTheDocument();
+    await wait(50);
+    expect(callsOf("terminal_write")).toEqual([{ sessionId: "sess-1", data: "rm " }]);
+  });
+
+  it("Core encerrado durante a leitura de saída: a leitura para, o terminal fica e a mensagem pede reiniciar", async () => {
+    host();
+    const original = invoke.getMockImplementation()!;
+    invoke.mockImplementation(async (cmd: string, args?: any) => {
+      if (cmd === "terminal_get_output") throw "O Core encerrou a comunicação. Reinicie o aplicativo.";
+      return original(cmd, args);
+    });
+    renderApp();
+    await connected();
+    expect(
+      await screen.findByText("Os terminais pararam de atualizar: O Core encerrou a comunicação. Reinicie o aplicativo.")
+    ).toBeInTheDocument();
+    await waitFor(() => expect(screen.getByTestId("connection-notice")).toHaveTextContent("Conexão: Falha"));
+    const reads = count("terminal_get_output");
+    await wait(400);
+    expect(count("terminal_get_output")).toBe(reads);
+    expect(reads).toBe(1);
+    expect(screen.getByRole("region", { name: "Terminal 01" })).toBeInTheDocument();
   });
 });

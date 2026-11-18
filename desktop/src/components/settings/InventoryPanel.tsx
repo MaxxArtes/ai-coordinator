@@ -5,6 +5,8 @@
  * - Security policy in plain Portuguese (K7): a label and yes/no or a description, never the internal keys.
  * - Revoking an authorized directory is the only mutation: explicit confirmation, focus kept inside Configurações,
  *   and the App is told, so a revoked open project is not used again (K4).
+ * - Authorized entries the host reports as broad (disk or share root, the whole home folder: L5/L7) are marked, with
+ *   what that means; they were confirmed, or stored before the confirmation existed, and nothing changes them here.
  */
 import React, { useEffect, useId, useLayoutEffect, useRef, useState } from "react";
 import {
@@ -13,6 +15,7 @@ import {
   getRoutes,
   getSecurityStatus,
   revokeProject,
+  samePath,
   type AgentsSnapshot,
   type CallTauri,
   type RevokeResult,
@@ -274,6 +277,10 @@ export const InventoryPanel: React.FC<InventoryPanelProps> = ({ kind, active, is
     const unknown = Object.keys(policy).filter((key) => !POLICY_TEXT_KEYS.has(key) && !POLICY_ITEMS.some((item) => item.key === key));
     const description = typeof policy.description === "string" ? policy.description : "";
     const projects = security.authorized_projects ?? [];
+    // Stored text as the host lists it; compared like the host does on Windows, so a casing difference never hides one.
+    const broadList = Array.isArray(security.broad_projects) ? security.broad_projects : [];
+    const isBroad = (path: string) => broadList.some((entry) => entry === path || samePath(entry, path));
+    const broadCount = projects.filter(isBroad).length;
     return (
       <>
         <h4>Política de acesso (somente leitura)</h4>
@@ -297,10 +304,25 @@ export const InventoryPanel: React.FC<InventoryPanelProps> = ({ kind, active, is
           Diretórios autorizados
         </h4>
         {projects.length === 0 && <p>Nenhum diretório autorizado.</p>}
+        {broadCount > 0 && (
+          <p className="settings__note">
+            {broadCount === 1
+              ? "1 diretório autorizado dá acesso amplo (raiz de um disco ou compartilhamento, ou a pasta pessoal inteira): os terminais podem abrir qualquer pasta dentro dele"
+              : `${broadCount} diretórios autorizados dão acesso amplo (raiz de um disco ou compartilhamento, ou a pasta pessoal inteira): os terminais podem abrir qualquer pasta dentro deles`}
+            , com as permissões do seu usuário do Windows. Se não for necessário, revogue e autorize só a pasta do projeto.
+          </p>
+        )}
         <ul>
           {projects.map((path) => (
             <li key={path}>
               <span className="settings__path">{path}</span>{" "}
+              {isBroad(path) && (
+                <>
+                  <span className="badge badge--warn">
+                    Acesso amplo
+                  </span>{" "}
+                </>
+              )}
               <button
                 type="button"
                 className="btn btn--sm btn--ghost-danger"

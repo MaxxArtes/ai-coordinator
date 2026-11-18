@@ -6,6 +6,7 @@ import { SettingsDialog } from "./components/settings/SettingsDialog";
 import { SETTINGS_CATEGORIES, type SettingsCategoryId } from "./components/settings/categories";
 import {
   applyInterfaceSettings,
+  authorizeProject,
   errorText,
   getActiveProfile,
   getSettings,
@@ -14,6 +15,7 @@ import {
   rememberProject,
   samePath,
   settingsInUse,
+  toStructuredError,
   type BackedCategory,
   type ProfileRecovery,
   type RevokeResult,
@@ -31,6 +33,7 @@ import { MainViews } from "./components/shell/PlannedView";
 import { StatusBar } from "./components/shell/StatusBar";
 import { findEntry, findRegions, installGlobalShortcuts } from "./components/shell/shortcuts";
 import { lowestFreeSlot, paneFromSession } from "./components/terminalIdentity";
+import { createSerialSender, mergeWrites, useTerminalOutput } from "./components/terminalIo";
 import { activeCountText, resolvePaneState, useTerminalStates, type PaneState } from "./components/useTerminalStates";
 import { NoticeBanner, type NoticeTone } from "./components/shell/NoticeBanner";
 import { AuthorizationScreen } from "./components/shell/AuthorizationScreen";
@@ -72,6 +75,14 @@ export const App: React.FC = () => {
   const [isAuthorizing, setIsAuthorizing] = useState<boolean>(false);
   // Why the project screen is shown instead of a terminal; empty on a clean install.
   const [authNote, setAuthNote] = useState<string>("");
+  // A directory the host refused as broad (L5), waiting for the operator's explicit answer (L7). The ref is read by
+  // the handlers, so a double activation or a cancel in the same instant never sends a confirmation twice.
+  const [broadScopePath, setBroadScopePathState] = useState<string | null>(null);
+  const broadScopeRef = useRef<string | null>(null);
+  const setBroadScopePath = useCallback((path: string | null) => {
+    broadScopeRef.current = path;
+    setBroadScopePathState(path);
+  }, []);
   const [starting, setStarting] = useState<boolean>(false);
   const startingRef = useRef<boolean>(false);
   const [inputPath, setInputPath] = useState<string>("");
@@ -93,6 +104,8 @@ export const App: React.FC = () => {
   const [profileRecovery, setProfileRecovery] = useState<ProfileRecovery | null>(null);
   // Incremented by "Tentar novamente" after a failed start: the connection effect runs again.
   const [initAttempt, setInitAttempt] = useState<number>(0);
+  // False when the Core closed the communication (L2): trying again in this window cannot help, only a restart.
+  const [initRetryable, setInitRetryable] = useState<boolean>(true);
   const acceptSettings = useCallback((next: SettingsSnapshot) => {
     applyInterfaceSettings(next);
     setSettings(next);
@@ -229,16 +242,33 @@ export const App: React.FC = () => {
     }
   }, []);
 
+  // Keystrokes reach the host in the order they were typed: one terminal_write in flight per session, what is typed
+  // meanwhile goes right after it in one piece (since L1 two invokes can reach the Core in either order).
+  const [terminalWriter] = useState(() =>
+    createSerialSender<string>({
+      deliver: (sessionId, data) => callTauri("terminal_write", { sessionId, data }),
+      merge: mergeWrites,
+      keepQueuedOnError: false,
+      onError: (_sessionId, err, dropped) =>
+        showNotice(`Erro de escrita no terminal: ${errorText(err)}${dropped ? " O que foi digitado depois disso não foi enviado." : ""}`),
+    })
+  );
+  // Only the last size matters: one terminal_resize in flight per session, the latest size right after it.
+  const [terminalResizer] = useState(() =>
+    createSerialSender<{ cols: number; rows: number }>({
+      deliver: (sessionId, { cols, rows }) => callTauri("terminal_resize", { sessionId, cols, rows }),
+      merge: (_queued, next) => next,
+      keepQueuedOnError: true,
+      // Resize errors can be safely ignored during pane disposal
+    })
+  );
+
   // Write keystroke to backend with zero stale closure bugs
   const handleWrite = useCallback(
-    async (sessionId: string, data: string) => {
+    (sessionId: string, data: string) => {
       if (isTauriRef.current) {
         if (endedRef.current.has(sessionId)) return; // the process ended: nothing to write to
-        try {
-          await callTauri("terminal_write", { sessionId, data });
-        } catch (err: any) {
-          showNotice(`Erro de escrita no terminal: ${err?.message || err}`);
-        }
+        terminalWriter.send(sessionId, data);
       } else {
         // Preview mode local echo & simulated response
         const term = termsRef.current.get(sessionId);
@@ -255,21 +285,15 @@ export const App: React.FC = () => {
         }
       }
     },
-    [callTauri]
+    [terminalWriter]
   );
 
   // Resize handler with live ref
   const handleResize = useCallback(
-    async (sessionId: string, cols: number, rows: number) => {
-      if (isTauriRef.current) {
-        try {
-          await callTauri("terminal_resize", { sessionId, cols, rows });
-        } catch {
-          // Resize errors can be safely ignored during pane disposal
-        }
-      }
+    (sessionId: string, cols: number, rows: number) => {
+      if (isTauriRef.current) terminalResizer.send(sessionId, { cols, rows });
     },
-    [callTauri]
+    [terminalResizer]
   );
 
   // Close pane handler with live ref
@@ -279,9 +303,9 @@ export const App: React.FC = () => {
         try {
           const result = await callTauri("terminal_close_session", { sessionId });
           if (result?.closed !== true) throw new Error("O host não confirmou o fechamento");
-        } catch (err: any) {
+        } catch (err) {
           // The pane stays: removing it would leave a process the interface no longer shows nor closes (F10).
-          showNotice(`Erro ao fechar sessão: ${err?.message || err}. O terminal continua aberto.`);
+          showNotice(`Erro ao fechar sessão: ${errorText(err)}. O terminal continua aberto.`);
           return;
         }
       }
@@ -333,9 +357,8 @@ export const App: React.FC = () => {
 
         focusAfterRef.current = { sessionId: newPane.sessionId };
         setPanes((prev) => [...prev, newPane]);
-      } catch (err: any) {
-        const msg = err?.message || String(err);
-        showNotice(`Falha ao criar terminal: ${msg}`);
+      } catch (err) {
+        showNotice(`Falha ao criar terminal: ${errorText(err)}`);
       }
     },
     [panes, projectPath, ensureTabCreated, callTauri]
@@ -354,14 +377,27 @@ export const App: React.FC = () => {
     setStarting(false);
   };
 
-  // Authorize project directory and start session
+  // The authorized list as the host has it now (after an answer that never came, the request may have gone through).
+  const refreshAuthorizedProjects = useCallback(async () => {
+    try {
+      const profile = await getActiveProfile(callTauri);
+      if (Array.isArray(profile?.authorized_projects)) setAuthorizedProjects(profile.authorized_projects);
+    } catch {
+      // The notice already tells the operator to check before repeating.
+    }
+  }, [callTauri]);
+
+  // Authorize project directory and start session. `confirmBroad` only carries the operator's explicit yes to the
+  // broad-directory question (L7); it is never sent on a first request.
   const handleAuthorizeAndStart = useCallback(
-    async (dirToAuthorize: string) => {
+    async (dirToAuthorize: string, confirmBroad = false) => {
       const requested = dirToAuthorize.trim();
       if (!requested) {
         showNotice("Informe um caminho de diretório válido.");
         return;
       }
+      // An open question is answered first (Cancelar or the explicit yes), never bypassed by another request.
+      if (broadScopeRef.current !== null) return;
       if (!beginStart()) return;
       try {
         if (!isTauriRef.current) {
@@ -374,12 +410,24 @@ export const App: React.FC = () => {
         }
         let canonical: string;
         try {
-          const res = await callTauri("profile_authorize_project", { projectPath: requested });
-          if (!res || !res.success) throw new Error("Resposta inesperada do autorizador.");
+          const res = await authorizeProject(callTauri, requested, confirmBroad);
+          if (!res || res.success !== true || typeof res.project_path !== "string") throw new Error("Resposta inesperada do autorizador.");
           canonical = res.project_path;
           if (Array.isArray(res.authorized_projects)) setAuthorizedProjects(res.authorized_projects);
         } catch (err) {
-          showNotice(`Falha na autorização do projeto: ${errorText(err)}`);
+          const error = toStructuredError(err);
+          if (error.reason === "broad_scope" && !confirmBroad) {
+            // Nothing was authorized: the question itself says why (no error banner) and waits for an answer.
+            setBroadScopePath(requested);
+            return;
+          }
+          if (error.reason === "timeout") {
+            // The host may have authorized it after all: the list is re-read, so the chooser shows what is true.
+            showNotice(`A autorização do projeto não foi confirmada: ${errorText(error)}`);
+            void refreshAuthorizedProjects();
+            return;
+          }
+          showNotice(`Falha na autorização do projeto: ${errorText(error)}`);
           return;
         }
         setIsAuthorizing(false);
@@ -395,12 +443,26 @@ export const App: React.FC = () => {
         endStart();
       }
     },
-    [callTauri, showNotice, startProject, showProjectScreen]
+    [callTauri, showNotice, startProject, showProjectScreen, setBroadScopePath, refreshAuthorizedProjects]
   );
+
+  // The explicit yes to the broad-directory question: the same request again, now with confirmBroad (L7).
+  const handleConfirmBroadScope = useCallback(() => {
+    const path = broadScopeRef.current;
+    if (path === null || startingRef.current) return;
+    setBroadScopePath(null);
+    void handleAuthorizeAndStart(path, true);
+  }, [handleAuthorizeAndStart, setBroadScopePath]);
+
+  const handleCancelBroadScope = useCallback(() => {
+    if (startingRef.current) return;
+    setBroadScopePath(null);
+  }, [setBroadScopePath]);
 
   // Open a project that is already authorized, without authorizing it again.
   const handleOpenAuthorized = useCallback(
     async (path: string) => {
+      if (broadScopeRef.current !== null) return; // the open question is answered first
       if (!beginStart()) return;
       setIsAuthorizing(false);
       setConnectionStatus("connecting");
@@ -438,6 +500,7 @@ export const App: React.FC = () => {
 
     async function init() {
       setConnectionStatus("connecting");
+      setInitRetryable(true);
       try {
         let pingRes: string | null = null;
         try {
@@ -525,6 +588,7 @@ export const App: React.FC = () => {
         if (!mounted) return;
         setPreferencesLoading(false);
         setConnectionStatus("failed");
+        setInitRetryable(toStructuredError(err).reason !== "disconnected");
         showNotice(`Erro de inicialização da Alpha: ${errorText(err)}`);
       }
     }
@@ -556,43 +620,24 @@ export const App: React.FC = () => {
     return () => clearInterval(interval);
   }, [isTauri, callTauri]);
 
-  // Output polling loop with raw chunk stream preservation for xterm.js
-  useEffect(() => {
-    if (!isTauri || panes.length === 0) return;
-
-    const interval = setInterval(async () => {
-      for (const pane of panes) {
-        const sinceSeq = lastSeqRef.current.get(pane.sessionId) || 0;
-        try {
-          const out = await callTauri("terminal_get_output", {
-            sessionId: pane.sessionId,
-            sinceSeq,
-          });
-
-          if (out) {
-            const term = termsRef.current.get(pane.sessionId);
-            if (term) {
-              // Raw PTY chunk stream preserves exact CR, LF, ANSI escapes, prompts
-              if (typeof out.raw === "string" && out.raw.length > 0) {
-                term.write(out.raw);
-              } else if (Array.isArray(out.lines) && out.lines.length > 0) {
-                for (const line of out.lines) {
-                  term.writeln(line);
-                }
-              }
-            }
-            if (typeof out.next_seq === "number") {
-              lastSeqRef.current.set(pane.sessionId, out.next_seq);
-            }
-          }
-        } catch {
-          // Polling errors for closing sessions are swallowed
-        }
-      }
-    }, 80);
-
-    return () => clearInterval(interval);
-  }, [isTauri, panes, callTauri]);
+  // Output polling: never two readings at once, each answer written only for the position it was asked from (no
+  // repeated output), a pause after a timeout, and a stop when the Core closed the communication.
+  const handleOutputDisconnected = useCallback(
+    (err: unknown) => {
+      setInitRetryable(false);
+      setConnectionStatus("failed");
+      showNotice(`Os terminais pararam de atualizar: ${errorText(err)}`);
+    },
+    [showNotice]
+  );
+  useTerminalOutput({
+    enabled: isTauri,
+    callTauri,
+    sessionIds: panes.map((p) => p.sessionId),
+    terms: termsRef,
+    lastSeq: lastSeqRef,
+    onDisconnected: handleOutputDisconnected,
+  });
 
   // Silent background check for updates upon connection
   useEffect(() => {
@@ -721,9 +766,12 @@ export const App: React.FC = () => {
       note={authNote}
       inputPath={inputPath}
       onInputPathChange={setInputPath}
-      onSubmit={handleAuthorizeAndStart}
+      onSubmit={(path) => void handleAuthorizeAndStart(path)}
       onOpenProject={handleOpenAuthorized}
       busy={starting}
+      broadScopePath={broadScopePath}
+      onConfirmBroadScope={handleConfirmBroadScope}
+      onCancelBroadScope={handleCancelBroadScope}
     />
   ) : connectionStatus === "connecting" && panes.length === 0 ? (
     <StartupStatus state="connecting" />
@@ -731,10 +779,14 @@ export const App: React.FC = () => {
     <StartupStatus
       state="failed"
       detail={notice}
-      onRetry={() => {
-        setNotice("");
-        setInitAttempt((n) => n + 1);
-      }}
+      onRetry={
+        initRetryable
+          ? () => {
+              setNotice("");
+              setInitAttempt((n) => n + 1);
+            }
+          : undefined
+      }
     />
   ) : (
     // No "Salvar sessões": the host only builds the sanitized history in memory and nothing writes it to a file yet

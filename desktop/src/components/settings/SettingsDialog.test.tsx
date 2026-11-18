@@ -422,7 +422,12 @@ describe("SettingsDialog — confirmação no cofre (Provedores)", () => {
         if (!exists) keys.push(args!.key);
         return { stored: true, key: args!.key };
       },
+      // L6: with a revision, only from that exact revision (another one is a conflict and nothing is removed).
       vault_delete_secret: (args) => {
+        const revision = args!.expectedRevision;
+        if (revision !== undefined && revision !== revisionOf(keys)) {
+          throw { code: -32005, message: "O cofre mudou desde a conferência. Recarregue e confirme novamente.", data: { field: "vault", reason: "conflict" } };
+        }
         const i = keys.indexOf(args!.key);
         if (i >= 0) keys.splice(i, 1);
         return { deleted: i >= 0, key: args!.key };
@@ -855,7 +860,11 @@ describe("SettingsDialog — confirmação no cofre (Provedores)", () => {
     expect(within(panel).queryByText(/removida do cofre/)).not.toBeInTheDocument();
     await act(async () => remove.gate.release());
 
-    expect(callTauri).toHaveBeenCalledWith("vault_delete_secret", { key: "OPENROUTER_API_KEY" });
+    // The revision of the list on which Remover was chosen (L4).
+    expect(callTauri).toHaveBeenCalledWith("vault_delete_secret", {
+      key: "OPENROUTER_API_KEY",
+      expectedRevision: revisionOf(["GEMINI_API_KEY", "OPENROUTER_API_KEY"]),
+    });
     expect(calls(callTauri, "vault_delete_secret")).toHaveLength(1);
     expect(await within(panel).findByText("Credencial OPENROUTER_API_KEY removida do cofre.")).toHaveAttribute("role", "status");
     expect(within(panel).queryByText("OPENROUTER_API_KEY")).not.toBeInTheDocument();
@@ -891,13 +900,18 @@ describe("SettingsDialog — confirmação no cofre (Provedores)", () => {
     expect(calls(callTauri, "vault_delete_secret")).toHaveLength(1);
   });
 
-  it("informa quando a credencial confirmada para remoção já não estava no cofre", async () => {
+  it("informa quando o host diz que a credencial confirmada para remoção já não estava no cofre", async () => {
     const keys = ["OPENROUTER_API_KEY"];
-    const callTauri = makeCallTauri(vaultHandlers(keys));
+    const callTauri = makeCallTauri(
+      vaultHandlers(keys, {
+        vault_delete_secret: (args) => {
+          keys.length = 0;
+          return { deleted: false, key: args!.key };
+        },
+      })
+    );
     const { user, panel } = openProvedores(callTauri);
     await user.click(await within(panel).findByRole("button", { name: "Remover a credencial OPENROUTER_API_KEY" }));
-
-    keys.length = 0; // removed elsewhere while the confirmation was open
     passArmDelay();
     await user.click(within(panel).getByRole("button", { name: "Remover credencial" }));
     expect(
@@ -905,6 +919,78 @@ describe("SettingsDialog — confirmação no cofre (Provedores)", () => {
     ).toBeInTheDocument();
     expect(within(panel).queryByText(/removida do cofre/)).not.toBeInTheDocument();
     expect(await within(panel).findByText("Nenhuma credencial gravada.")).toBeInTheDocument();
+  });
+
+  it("remoção sobre uma lista desatualizada (L6): conflito, nada removido, a lista é relida e a nova revisão vale na próxima", async () => {
+    const keys = ["GEMINI_API_KEY", "OPENROUTER_API_KEY"];
+    const callTauri = makeCallTauri(vaultHandlers(keys));
+    const { user, panel } = openProvedores(callTauri);
+    await user.click(await within(panel).findByRole("button", { name: "Remover a credencial OPENROUTER_API_KEY" }));
+    const seen = revisionOf(keys);
+
+    keys.push("OPENAI_API_KEY"); // another window writes while the question is open
+    const listed = calls(callTauri, "vault_list_keys").length;
+    passArmDelay();
+    await user.click(within(panel).getByRole("button", { name: "Remover credencial" }));
+
+    const alert = await within(panel).findByRole("alert");
+    expect(alert).toHaveTextContent("Não foi possível remover a credencial OPENROUTER_API_KEY.");
+    expect(alert).toHaveTextContent("O cofre mudou desde a leitura desta lista; nada foi removido. A lista foi relida");
+    expect(calls(callTauri, "vault_delete_secret")).toEqual([["vault_delete_secret", { key: "OPENROUTER_API_KEY", expectedRevision: seen }]]);
+    expect(keys).toContain("OPENROUTER_API_KEY");
+    expect(within(panel).queryByText(/removida do cofre/)).not.toBeInTheDocument();
+    // Re-read at once, like a conflict on a save: the other window's credential shows up.
+    await waitFor(() => expect(calls(callTauri, "vault_list_keys").length).toBe(listed + 1));
+    expect(await within(panel).findByText("OPENAI_API_KEY")).toBeInTheDocument();
+    expect(within(panel).getByRole("heading", { name: "Credenciais no cofre" })).toHaveFocus();
+
+    // The next removal is decided on the list just read, so it goes through.
+    await user.click(within(panel).getByRole("button", { name: "Remover a credencial OPENROUTER_API_KEY" }));
+    passArmDelay();
+    await user.click(within(panel).getByRole("button", { name: "Remover credencial" }));
+    expect(await within(panel).findByText("Credencial OPENROUTER_API_KEY removida do cofre.")).toBeInTheDocument();
+    expect(calls(callTauri, "vault_delete_secret")[1][1]).toEqual({
+      key: "OPENROUTER_API_KEY",
+      expectedRevision: revisionOf(["GEMINI_API_KEY", "OPENAI_API_KEY", "OPENROUTER_API_KEY"]),
+    });
+    expect(keys.sort()).toEqual(["GEMINI_API_KEY", "OPENAI_API_KEY"]);
+  });
+
+  it("lista sem revisão conhecida (a releitura falhou): não remove às cegas e relê", async () => {
+    const keys = ["GEMINI_API_KEY", "OPENROUTER_API_KEY"];
+    const state = { failList: false };
+    const callTauri = makeCallTauri(
+      vaultHandlers(keys, {
+        vault_list_keys: () => {
+          if (state.failList) throw { code: -32010, message: "Cofre indisponível.", data: { field: "vault", reason: "unavailable" } };
+          return { keys: [...keys].sort() };
+        },
+        vault_delete_secret: (args) => {
+          keys.splice(keys.indexOf(args!.key), 1);
+          state.failList = true; // the reload after this removal fails: the list shown has no revision
+          return { deleted: true, key: args!.key };
+        },
+      })
+    );
+    const { user, panel } = openProvedores(callTauri);
+    await user.click(await within(panel).findByRole("button", { name: "Remover a credencial OPENROUTER_API_KEY" }));
+    passArmDelay();
+    await user.click(within(panel).getByRole("button", { name: "Remover credencial" }));
+    expect(await within(panel).findByText("Credencial OPENROUTER_API_KEY removida do cofre.")).toBeInTheDocument();
+
+    state.failList = false;
+    await user.click(within(panel).getByRole("button", { name: "Remover a credencial GEMINI_API_KEY" }));
+    passArmDelay();
+    await user.click(within(panel).getByRole("button", { name: "Remover credencial" }));
+    expect(await within(panel).findByRole("alert")).toHaveTextContent("Não foi possível conferir a revisão desta lista; nada foi removido.");
+    expect(calls(callTauri, "vault_delete_secret")).toHaveLength(1);
+    expect(keys).toEqual(["GEMINI_API_KEY"]);
+    // Read again: the next attempt has a revision and goes through.
+    await user.click(within(panel).getByRole("button", { name: "Remover a credencial GEMINI_API_KEY" }));
+    passArmDelay();
+    await user.click(within(panel).getByRole("button", { name: "Remover credencial" }));
+    expect(await within(panel).findByText("Credencial GEMINI_API_KEY removida do cofre.")).toBeInTheDocument();
+    expect(calls(callTauri, "vault_delete_secret")[1][1]).toEqual({ key: "GEMINI_API_KEY", expectedRevision: revisionOf(["GEMINI_API_KEY"]) });
   });
 
   it("um clique de ponteiro que pertence ao gesto que abriu a pergunta não a responde", async () => {

@@ -306,3 +306,40 @@ describe("InventoryPanel — revogação (K4)", () => {
     expect(status).toBeEmptyDOMElement();
   });
 });
+
+describe("InventoryPanel — diretórios amplos (L5/L7)", () => {
+  const withBroad = (projects: string[], broad?: string[]): SecurityStatus => ({
+    ...security(projects),
+    ...(broad ? { broad_projects: broad } : {}),
+  });
+
+  it("marca só as entradas que o host diz amplas e explica o que isso significa", async () => {
+    renderPanel("seguranca", host({ security_status: () => withBroad(["C:\\", "D:\\proj"], ["C:\\"]) }));
+    const broadItem = (await screen.findByRole("button", { name: "Revogar C:\\" })).closest("li")!;
+    const plainItem = screen.getByRole("button", { name: "Revogar D:\\proj" }).closest("li")!;
+    expect(within(broadItem).getByText("Acesso amplo")).toHaveClass("badge", "badge--warn");
+    expect(within(plainItem).queryByText("Acesso amplo")).not.toBeInTheDocument();
+    expect(screen.getByText(/^1 diretório autorizado dá acesso amplo/)).toHaveTextContent(
+      "1 diretório autorizado dá acesso amplo (raiz de um disco ou compartilhamento, ou a pasta pessoal inteira): os terminais podem abrir qualquer pasta dentro dele, com as permissões do seu usuário do Windows. Se não for necessário, revogue e autorize só a pasta do projeto."
+    );
+    // A mark, not an alarm: nothing is announced as an error, and nothing was changed.
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+  });
+
+  it("várias entradas amplas (raiz de compartilhamento, pasta pessoal) e a mesma entrada com outra grafia", async () => {
+    renderPanel(
+      "seguranca",
+      host({ security_status: () => withBroad(["\\\\servidor\\pasta", "c:\\users\\ana", "D:\\proj"], ["\\\\servidor\\pasta", "C:\\Users\\Ana"]) })
+    );
+    await screen.findByRole("button", { name: "Revogar D:\\proj" });
+    expect(screen.getAllByText("Acesso amplo")).toHaveLength(2);
+    expect(screen.getByText(/^2 diretórios autorizados dão acesso amplo/)).toHaveTextContent("qualquer pasta dentro deles,");
+  });
+
+  it("host anterior (sem broad_projects) ou nenhuma entrada ampla: nada é marcado", async () => {
+    renderPanel("seguranca", host({ security_status: () => withBroad(["C:\\", "D:\\proj"]) }));
+    await screen.findByRole("button", { name: "Revogar C:\\" });
+    expect(screen.queryByText("Acesso amplo")).not.toBeInTheDocument();
+    expect(screen.queryByText(/acesso amplo \(raiz/)).not.toBeInTheDocument();
+  });
+});

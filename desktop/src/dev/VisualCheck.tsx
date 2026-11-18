@@ -117,6 +117,7 @@ const ROUTES: RoutesSnapshot = {
 };
 const SECURITY: SecurityStatus = {
   authorized_projects: [`${PROJECT}-fixture`],
+  broad_projects: [],
   policy: {
     project_fencing: true,
     human_terminal: "operator_permissions",
@@ -129,30 +130,131 @@ interface Fakes {
   settings?: SettingsSnapshot;
   vault?: VaultStatus;
   vaultKeys?: string[];
+  /** The vault "changes in another window" after every reading: a removal always meets a conflict (L6). */
+  vaultChangesElsewhere?: boolean;
   agents?: AgentsSnapshot;
   routes?: RoutesSnapshot;
   security?: SecurityStatus;
 }
 
+/** Fixture rule of the host's broad directories (L5): a disk root, a share root or a home folder. */
+const isBroadFixture = (path: string) => /^[A-Za-z]:\\?$/.test(path) || /^\\\\[^\\]+\\[^\\]+\\?$/.test(path) || /^[A-Za-z]:\\Users\\[^\\]+\\?$/i.test(path);
+
+/** The host's transport failures (L2), with their fixed texts. */
+const CORE_TIMEOUT = "O Core não respondeu em 30 s. A operação pode ter sido concluída: confira antes de repetir.";
+const CORE_CLOSED = "O Core encerrou a comunicação. Reinicie o aplicativo.";
+
+/** Fixture vault revision: 64 hex digits, changed by every write (the host's is a hash of the encrypted file). */
+const fixtureRevision = (generation: number) => generation.toString(16).padStart(64, "0");
+
 function fakeTauri(check: UpdateCheckResult, fakes: Fakes = {}) {
   const security = { ...(fakes.security ?? SECURITY) };
-  return async (cmd: string, args?: Record<string, any>) => {
+  const vaultKeys = [...(fakes.vaultKeys ?? [])];
+  let vaultGeneration = 1;
+  const conflict = { code: -32005, message: "O cofre mudou desde a conferência. Recarregue e confirme novamente.", data: { field: "vault", reason: "conflict" } };
+  return async (cmd: string, args?: Record<string, any>): Promise<any> => {
     if (cmd === "updater_get_channel_info") return { current_version: "0.6.1-alpha.50", channel: "alpha" };
     if (cmd === "updater_check") return check;
     if (cmd === "settings_get") return fakes.settings ?? snapshot();
     if (cmd === "vault_status") return fakes.vault ?? { available: false, backend: "unavailable", reason: "unavailable" };
-    if (cmd === "vault_list_keys") return { keys: fakes.vaultKeys ?? [], revision: "f".repeat(64) };
+    if (cmd === "vault_list_keys") {
+      const answer = { keys: [...vaultKeys].sort(), revision: fixtureRevision(vaultGeneration) };
+      if (fakes.vaultChangesElsewhere) vaultGeneration++;
+      return answer;
+    }
+    if (cmd === "vault_set_secret" || cmd === "vault_delete_secret") {
+      // Fixture only, in memory: the same revision rule as the host (L6); no value is kept or shown.
+      const exists = vaultKeys.includes(args?.key);
+      const revision = args?.expectedRevision;
+      if (revision !== undefined ? revision !== fixtureRevision(vaultGeneration) : cmd === "vault_set_secret" && exists) throw conflict;
+      vaultGeneration++;
+      if (cmd === "vault_set_secret") {
+        if (!exists) vaultKeys.push(args?.key);
+        return { stored: true, key: args?.key };
+      }
+      if (exists) vaultKeys.splice(vaultKeys.indexOf(args?.key), 1);
+      return { deleted: exists, key: args?.key };
+    }
     if (cmd === "discovery_agents") return fakes.agents ?? AGENTS;
     if (cmd === "providers_routes") return fakes.routes ?? ROUTES;
     if (cmd === "security_status") return security;
     if (cmd === "profile_revoke_project") {
       // Fixture only: the list shrinks on screen; nothing on disk is touched.
       security.authorized_projects = security.authorized_projects.filter((p) => p !== args?.projectPath);
+      security.broad_projects = (security.broad_projects ?? []).filter((p) => p !== args?.projectPath);
       return { revoked: true, authorized_projects: security.authorized_projects, last_project: null };
+    }
+    if (cmd === "profile_authorize_project") {
+      // Fixture only (L5/L7): a broad directory needs confirmBroad: true; nothing on disk is touched.
+      const path = String(args?.projectPath ?? "");
+      if (isBroadFixture(path) && args?.confirmBroad !== true) {
+        throw {
+          code: -32602,
+          message: "Este diretório dá acesso amplo (raiz do disco ou pasta pessoal inteira). Confirme explicitamente para autorizar.",
+          data: { field: "project_path", reason: "broad_scope" },
+        };
+      }
+      if (!security.authorized_projects.includes(path)) security.authorized_projects = [...security.authorized_projects, path];
+      if (isBroadFixture(path)) security.broad_projects = [...(security.broad_projects ?? []), path];
+      return { success: true, profile_name: "default", project_path: path, authorized_projects: security.authorized_projects };
+    }
+    if (cmd === "profile_get_active") {
+      return { name: "default", display_name: null, last_project: null, authorized_projects: security.authorized_projects, recovery: null };
     }
     throw new Error(`comando indisponível na conferência visual: ${cmd}`);
   };
 }
+
+/**
+ * The authorization screen driven by the fixture host: a broad directory asks first (L7), Cancelar authorizes nothing,
+ * the explicit yes repeats the request with confirmBroad. The outcome is only described: no terminal is started.
+ */
+const BroadAuthorizationFixture: React.FC<{ initialPath?: string }> = ({ initialPath = "C:\\" }) => {
+  const [call] = useState(() => fakeTauri(CHECK_BASE));
+  const [inputPath, setInputPath] = useState(initialPath);
+  const [question, setQuestion] = useState<string | null>(initialPath);
+  const [busy, setBusy] = useState(false);
+  const [outcome, setOutcome] = useState("");
+  const [authorized, setAuthorized] = useState<string[]>([]);
+  const authorize = async (path: string, confirmBroad: boolean) => {
+    setBusy(true);
+    setOutcome("");
+    try {
+      const result = await call("profile_authorize_project", { projectPath: path, ...(confirmBroad ? { confirmBroad: true } : {}) });
+      setAuthorized(result.authorized_projects);
+      setOutcome(`FIXTURE: ${path} autorizado${confirmBroad ? " com acesso amplo confirmado" : ""}; nenhum terminal é aberto nesta conferência.`);
+    } catch (err: any) {
+      if (err?.data?.reason === "broad_scope" && !confirmBroad) setQuestion(path);
+      else setOutcome(`Falha na autorização do projeto: ${err?.message ?? "erro"}`);
+    } finally {
+      setBusy(false);
+    }
+  };
+  return (
+    <Shell
+      connection="authorizing"
+      metrics={null}
+      notices={outcome ? <NoticeBanner message={outcome} tone="info" onDismiss={() => setOutcome("")} /> : undefined}
+    >
+      <AuthorizationScreen
+        profileName="default"
+        authorizedProjects={authorized}
+        inputPath={inputPath}
+        onInputPathChange={setInputPath}
+        onSubmit={(path) => void authorize(path.trim(), false)}
+        onOpenProject={() => setOutcome("FIXTURE: abrir um projeto não inicia terminal nesta conferência.")}
+        busy={busy}
+        broadScopePath={question}
+        onConfirmBroadScope={() => {
+          const path = question;
+          setQuestion(null);
+          if (path) void authorize(path, true);
+        }}
+        onCancelBroadScope={() => setQuestion(null)}
+      />
+    </Shell>
+  );
+};
 
 /** A full-width band (not a badge): everything below it is fixture data. */
 const FixtureBanner: React.FC = () => (
@@ -369,6 +471,32 @@ const VIEWS: Record<string, () => React.ReactElement> = {
     <SettingsView check={CHECK_BASE} category="agentes" fakes={{ agents: { ...AGENTS, mcp_servers: [], mcp_complete: false, source: "unreadable" } }} />
   ),
   "e7-seguranca": () => <SettingsView check={CHECK_BASE} category="seguranca" />,
+  "e8-autorizacao-ampla": () => <BroadAuthorizationFixture />,
+  "e8-autorizacao-ampla-pasta-pessoal": () => <BroadAuthorizationFixture initialPath={"C:\\Users\\voce"} />,
+  "e8-seguranca-ampla": () => (
+    <SettingsView
+      check={CHECK_BASE}
+      category="seguranca"
+      fakes={{ security: { ...SECURITY, authorized_projects: ["C:\\", `${PROJECT}-fixture`], broad_projects: ["C:\\"] } }}
+    />
+  ),
+  "e8-provedores-conflito-remocao": () => (
+    <SettingsView
+      check={CHECK_BASE}
+      category="provedores"
+      fakes={{ vault: { available: true, backend: "dpapi" }, vaultKeys: ["OPENROUTER_API_KEY", "FIXTURE_API_KEY"], vaultChangesElsewhere: true }}
+    />
+  ),
+  "e8-core-sem-resposta": () => (
+    <Shell connection="failed" metrics={null}>
+      <StartupStatus state="failed" detail={`Erro de inicialização da Alpha: ${CORE_TIMEOUT}`} onRetry={() => undefined} />
+    </Shell>
+  ),
+  "e8-core-encerrado": () => (
+    <Shell connection="failed" metrics={null}>
+      <StartupStatus state="failed" detail={`Erro de inicialização da Alpha: ${CORE_CLOSED}`} />
+    </Shell>
+  ),
   "e7-configuracoes-protegidas": () => (
     <SettingsView
       check={CHECK_BASE}

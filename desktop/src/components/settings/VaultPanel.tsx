@@ -11,11 +11,14 @@
  * - Leaving the panel cancels whatever was not sent to the vault yet: a check in flight, an open confirmation.
  * - A failure is shown where it happened (a removal: in the list; a save: in or under the form), and what could
  *   not be read from the vault is reported apart from the outcome of a save or removal.
+ * - A removal carries the revision of the list the operator saw when choosing Remover (L4/L6): if the vault changed
+ *   since then, nothing is removed and the list is re-read.
  * - A conflict (another writer changed the vault) re-reads the list and its revision at once; a vault in use by another
  *   window says so and offers to try again (K3).
  */
 import React, { useCallback, useEffect, useId, useRef, useState } from "react";
 import { Icon } from "../ui/Icon";
+import { InlineConfirmation, ignoreRepeatedEnter, useArmedAnswer } from "../ui/InlineConfirmation";
 import {
   deleteVaultSecret,
   errorText,
@@ -39,19 +42,17 @@ const BACKEND_LABEL: Record<string, string> = { dpapi: "DPAPI do Windows", aes_g
 
 const CONFLICT_TEXT = "O cofre mudou desde a conferência; nada foi sobrescrito. A lista foi relida: grave de novo para conferir e confirmar.";
 const NO_REVISION_TEXT = "Não foi possível conferir a revisão do cofre; nada foi gravado. Grave de novo para conferir.";
+const REMOVE_CONFLICT_TEXT = "O cofre mudou desde a leitura desta lista; nada foi removido. A lista foi relida: confira e remova de novo, se ainda quiser.";
+const REMOVE_NO_REVISION_TEXT = "Não foi possível conferir a revisão desta lista; nada foi removido. A lista foi relida: remova de novo para conferir.";
+
+// The arm delay and its clock are shared by every inline question (ui/InlineConfirmation); kept importable from here.
+export { CONFIRM_ARM_DELAY_MS, armingClock } from "../ui/InlineConfirmation";
 
 /**
- * A pointer click only answers a confirmation after this long: the destructive button can appear under the
- * pointer that opened the question, and the second click of a double click must not answer it unread.
- * Keyboard activation is not delayed (the focus starts on Cancelar).
+ * A destructive vault operation waiting for the operator's explicit confirmation. A removal keeps the revision of the
+ * list on which Remover was chosen (undefined when that list did not come with one).
  */
-export const CONFIRM_ARM_DELAY_MS = 600;
-
-/** Clock of the arm delay. Monotonic: a correction of the system time must not leave a question unanswerable. */
-export const armingClock = { now: (): number => performance.now() };
-
-/** A destructive vault operation waiting for the operator's explicit confirmation. */
-type PendingConfirmation = { kind: "replace" | "delete"; name: string };
+type PendingConfirmation = { kind: "replace"; name: string } | { kind: "delete"; name: string; revision?: string };
 
 /** What the panel is doing with the vault right now; "checking" reads key names only and writes nothing. */
 type BusyState = false | { kind: "checking" | "saving" | "deleting"; name: string };
@@ -86,45 +87,17 @@ interface VaultConfirmationProps {
 /** Inline confirmation inside the panel; it shows the credential name only, never a value. */
 const VaultConfirmation: React.FC<VaultConfirmationProps> = ({ pending, idBase, cancelRef, onCancel, onConfirm }) => {
   const text = CONFIRMATION_TEXT[pending.kind];
-  // Shows the arm delay: until it has passed, the destructive answer looks unavailable to the pointer.
-  const [armed, setArmed] = useState(false);
-  useEffect(() => {
-    const timer = window.setTimeout(() => setArmed(true), CONFIRM_ARM_DELAY_MS);
-    return () => window.clearTimeout(timer);
-  }, []);
   return (
-    <div
-      className="callout callout--warn"
-      role="alertdialog"
-      aria-labelledby={`${idBase}-confirm-title`}
-      aria-describedby={`${idBase}-confirm-body`}
-    >
-      <p id={`${idBase}-confirm-title`} className="callout__title">
-        <Icon name="alert" size="sm" />
-        <span>{text.title(pending.name)}</span>
-      </p>
-      <p id={`${idBase}-confirm-body`} className="callout__body">
-        {text.body}
-      </p>
-      <div className="row-end">
-        <button ref={cancelRef} type="button" className="btn btn--sm btn--ghost" onClick={onCancel}>
-          Cancelar
-        </button>
-        <button
-          type="button"
-          className={armed ? "btn btn--sm btn--danger" : "btn btn--sm btn--danger btn--arming"}
-          onClick={onConfirm}
-        >
-          {text.action}
-        </button>
-      </div>
-    </div>
+    <InlineConfirmation
+      idBase={idBase}
+      title={text.title(pending.name)}
+      body={text.body}
+      action={text.action}
+      cancelRef={cancelRef}
+      onCancel={onCancel}
+      onConfirm={onConfirm}
+    />
   );
-};
-
-/** Holding Enter down must not walk through the panel (submit, cancel, submit again…): only real presses count. */
-const ignoreRepeatedEnter = (event: React.KeyboardEvent) => {
-  if (event.key === "Enter" && event.repeat) event.preventDefault();
 };
 
 export const VaultPanel: React.FC<VaultPanelProps> = ({ category, active, isTauri, callTauri }) => {
@@ -148,10 +121,10 @@ export const VaultPanel: React.FC<VaultPanelProps> = ({ category, active, isTaur
   const submittedRef = useRef<{ name: string; value: string; revision: string } | null>(null);
   // Changes whenever the panel is left or unmounted: a check still in flight then asks and writes nothing.
   const generationRef = useRef(0);
-  // Moment from which a pointer click may answer the open confirmation.
-  const armedAtRef = useRef(0);
-  // Moment of the last pointer click on the destructive answer of the open confirmation.
-  const lastAnswerClickRef = useRef<number | null>(null);
+  // Revision of the read whose keys are on screen; undefined when the list shown did not come from one read.
+  const keysRevisionRef = useRef<string | undefined>(undefined);
+  // Pointer gate of the open confirmation (arm delay, multi-click).
+  const answerGate = useArmedAnswer();
 
   const nameInputRef = useRef<HTMLInputElement>(null);
   const secretInputRef = useRef<HTMLInputElement>(null);
@@ -171,8 +144,7 @@ export const VaultPanel: React.FC<VaultPanelProps> = ({ category, active, isTaur
   };
 
   const openConfirmation = (next: PendingConfirmation) => {
-    armedAtRef.current = armingClock.now() + CONFIRM_ARM_DELAY_MS;
-    lastAnswerClickRef.current = null;
+    answerGate.arm();
     setPending(next);
   };
 
@@ -182,17 +154,28 @@ export const VaultPanel: React.FC<VaultPanelProps> = ({ category, active, isTaur
     return { keys: next.keys, revision: typeof next.revision === "string" ? next.revision : undefined };
   }, [callTauri]);
 
+  // The list on screen and the revision it was read at always change together.
+  const showKeys = useCallback((next: string[], revision: string | undefined) => {
+    keysRevisionRef.current = revision;
+    setKeys(next);
+  }, []);
+
   const refresh = useCallback(async () => {
     // Only the load state: the outcome of a save or removal is not wiped by coming back to the panel.
     setLoadFailure(null);
     try {
       const st = await getVaultStatus(callTauri);
       setStatus(st);
-      setKeys(st.available ? (await readKeys()).keys : []);
+      if (st.available) {
+        const read = await readKeys();
+        showKeys(read.keys, read.revision);
+      } else {
+        showKeys([], undefined);
+      }
     } catch (err) {
       setLoadFailure(err as StructuredError);
     }
-  }, [callTauri]);
+  }, [callTauri, readKeys, showKeys]);
 
   useEffect(() => {
     if (active && isTauri) void refresh();
@@ -259,8 +242,10 @@ export const VaultPanel: React.FC<VaultPanelProps> = ({ category, active, isTaur
   // operation is known to have done instead of an error unrelated to its outcome.
   const reloadKeys = async (known: (shown: string[]) => string[]) => {
     try {
-      setKeys((await readKeys()).keys);
+      const read = await readKeys();
+      showKeys(read.keys, read.revision);
     } catch {
+      keysRevisionRef.current = undefined; // what is shown now was not read at any known revision
       setKeys(known);
     }
   };
@@ -304,18 +289,31 @@ export const VaultPanel: React.FC<VaultPanelProps> = ({ category, active, isTaur
     }
   };
 
-  const removeSecret = async (name: string) => {
+  const removeSecret = async (name: string, revision: string | undefined) => {
     setBusy({ kind: "deleting", name });
     setFailure(null);
     setNotice(null);
     // The Remover button of this credential is about to go away: park the focus on the list heading.
     focusNextRef.current = keysHeadingRef.current;
     try {
+      if (!revision) {
+        // Without the revision of the list the operator saw, nothing is removed blindly: it is read again instead.
+        setFailure({ error: { code: -32005, message: REMOVE_NO_REVISION_TEXT, reason: "conflict" }, source: "remove", name });
+        await reloadKeys((shown) => shown);
+        return;
+      }
       let deleted: boolean;
       try {
-        ({ deleted } = await deleteVaultSecret(callTauri, name));
+        ({ deleted } = await deleteVaultSecret(callTauri, name, revision));
       } catch (err) {
-        setFailure({ error: err as StructuredError, source: "remove", name });
+        const error = err as StructuredError;
+        if (error.reason === "conflict") {
+          // Another writer changed the vault after this list was read: nothing was removed, the list is re-read.
+          setFailure({ error: { ...error, message: REMOVE_CONFLICT_TEXT }, source: "remove", name });
+          await reloadKeys((shown) => shown);
+          return;
+        }
+        setFailure({ error, source: "remove", name });
         return;
       }
       setNotice(
@@ -373,7 +371,7 @@ export const VaultPanel: React.FC<VaultPanelProps> = ({ category, active, isTaur
         focusAfterSave(submitRef.current);
         return;
       }
-      setKeys(current.keys);
+      showKeys(current.keys, current.revision);
       if (current.keys.includes(name)) {
         if (!current.revision) {
           setFailure({ error: { code: -32005, message: NO_REVISION_TEXT, reason: "conflict" }, source: "save", name });
@@ -396,7 +394,8 @@ export const VaultPanel: React.FC<VaultPanelProps> = ({ category, active, isTaur
     setNotice(null);
     focusNextRef.current = null;
     returnFocusRef.current = trigger;
-    openConfirmation({ kind: "delete", name });
+    // The revision of the list on which Remover was chosen: the removal is decided on what the operator saw.
+    openConfirmation({ kind: "delete", name, revision: keysRevisionRef.current });
   };
 
   // Cancelar keeps the typed name and value in the form, so the operator can change the name without retyping
@@ -419,7 +418,7 @@ export const VaultPanel: React.FC<VaultPanelProps> = ({ category, active, isTaur
     returnFocusRef.current = null;
     setPending(null);
     try {
-      if (current.kind === "delete") await removeSecret(current.name);
+      if (current.kind === "delete") await removeSecret(current.name, current.revision);
       else if (submitted && submitted.name === current.name) await writeSecret(submitted.name, submitted.value, true, submitted.revision);
     } finally {
       operationRef.current = false;
@@ -427,16 +426,8 @@ export const VaultPanel: React.FC<VaultPanelProps> = ({ category, active, isTaur
   };
 
   const handleConfirmClick = (event: React.MouseEvent<HTMLButtonElement>) => {
-    // Keyboard activation (detail 0) is not delayed. A pointer click must not answer the question as part of
-    // the gesture that opened it (see CONFIRM_ARM_DELAY_MS): not before the question is armed, and not as the
-    // next click of a multi-click that started before that. Insisting on the armed button does get through.
-    if (event.detail > 0) {
-      const now = armingClock.now();
-      const previous = lastAnswerClickRef.current;
-      lastAnswerClickRef.current = now;
-      if (now < armedAtRef.current) return;
-      if (event.detail > 1 && (previous === null || previous < armedAtRef.current)) return;
-    }
+    // A pointer click must not answer the question as part of the gesture that opened it (ui/InlineConfirmation).
+    if (!answerGate.accepts(event)) return;
     void confirmPending();
   };
 

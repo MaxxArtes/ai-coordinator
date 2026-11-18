@@ -91,7 +91,17 @@ export interface RoutesSnapshot {
 
 export interface SecurityStatus {
   authorized_projects: string[];
+  /** Authorized entries that open a whole disk, share or home folder (L5), with their stored text; absent on older hosts. */
+  broad_projects?: string[];
   policy: Record<string, boolean | string>;
+}
+
+export interface AuthorizeResult {
+  success: boolean;
+  profile_name?: string;
+  /** The directory as the host stored it (canonical). */
+  project_path: string;
+  authorized_projects: string[];
 }
 
 export interface RevokeResult {
@@ -121,27 +131,49 @@ export interface ActiveProfile {
   recovery?: ProfileRecovery | null;
 }
 
+/** Error code of a transport failure between the Tauri host and the Core (L2). */
+export const IPC_TRANSPORT_ERROR_CODE = -32007;
+
+/**
+ * The commands that still answer with plain text (L2: `call()`) report a transport failure with the same fixed text as
+ * the structured ones: it is recognized here, so the reason is known whatever the command's error type.
+ */
+const DISCONNECTED_MESSAGE = "O Core encerrou a comunicação. Reinicie o aplicativo.";
+const TIMEOUT_MESSAGE = /^O Core não respondeu em \d+ s\. /;
+function transportReason(message: string): "timeout" | "disconnected" | undefined {
+  if (message === DISCONNECTED_MESSAGE) return "disconnected";
+  return TIMEOUT_MESSAGE.test(message) ? "timeout" : undefined;
+}
+
 /** Normalizes any rejection (Core structured error, transport failure, plain string) without echoing inputs. */
 export function toStructuredError(err: unknown): StructuredError {
   const e = err as any;
   if (e && typeof e === "object" && typeof e.message === "string") {
+    const reason = e.data?.reason ?? e.reason ?? transportReason(e.message);
     return {
-      code: typeof e.code === "number" ? e.code : -32603,
+      code: typeof e.code === "number" ? e.code : reason === "timeout" || reason === "disconnected" ? IPC_TRANSPORT_ERROR_CODE : -32603,
       message: e.message,
       field: e.data?.field ?? e.field,
-      reason: e.data?.reason ?? e.reason,
+      reason,
     };
   }
-  return { code: -32603, message: typeof err === "string" ? err : "Falha inesperada na comunicação com o Core." };
+  if (typeof err === "string") {
+    const reason = transportReason(err);
+    return reason ? { code: IPC_TRANSPORT_ERROR_CODE, message: err, field: "ipc", reason } : { code: -32603, message: err };
+  }
+  return { code: -32603, message: "Falha inesperada na comunicação com o Core." };
 }
 
-/** Texts for the reasons the host reports (K3). The host message wins when it says more than a generic failure. */
+/** Texts for the reasons the host reports (K3, L2). The host message wins when it says more than a generic failure. */
 const REASON_TEXT: Record<string, string> = {
   busy: "Outra janela está usando o perfil ou o cofre. Tente novamente.",
   profile_unreadable: "O perfil não pôde ser lido. Os dados foram preservados.",
   read_only_stored_schema: "As configurações foram gravadas por outra versão e estão protegidas. Nada foi alterado.",
   conflict: "O cofre mudou desde a conferência. Nada foi sobrescrito.",
   unreadable: "Não foi possível ler ou gravar o cofre. Os dados existentes foram preservados.",
+  timeout: "O Core não respondeu a tempo. A operação pode ter sido concluída: confira antes de repetir.",
+  disconnected: DISCONNECTED_MESSAGE,
+  broad_scope: "Este diretório dá acesso amplo (raiz do disco ou pasta pessoal inteira). Confirme explicitamente para autorizar.",
 };
 
 /** What to show for an error: the host message, or the reason's fixed text when the message is generic or missing. */
@@ -174,10 +206,18 @@ export const listVaultKeys = (callTauri: CallTauri) => getVaultKeysSnapshot(call
 export const setVaultSecret = (callTauri: CallTauri, key: string, value: string, expectedRevision?: string) =>
   call<{ stored: boolean; key: string }>(callTauri, "vault_set_secret", { key, value, ...(expectedRevision !== undefined ? { expectedRevision } : {}) });
 
-export const deleteVaultSecret = (callTauri: CallTauri, key: string) =>
-  call<{ deleted: boolean; key: string }>(callTauri, "vault_delete_secret", { key });
+/** With the revision of the operator's own reading, a vault changed since then is a conflict and nothing is removed (L4/L6). */
+export const deleteVaultSecret = (callTauri: CallTauri, key: string, expectedRevision?: string) =>
+  call<{ deleted: boolean; key: string }>(callTauri, "vault_delete_secret", { key, ...(expectedRevision !== undefined ? { expectedRevision } : {}) });
 
 export const getActiveProfile = (callTauri: CallTauri) => call<ActiveProfile>(callTauri, "profile_get_active");
+
+/**
+ * Authorizes a project directory. A broad one (disk or share root, the whole home folder) is refused with reason
+ * "broad_scope" unless `confirmBroad` carries the operator's explicit yes (L5/L7); the flag is sent only then.
+ */
+export const authorizeProject = (callTauri: CallTauri, projectPath: string, confirmBroad = false) =>
+  call<AuthorizeResult>(callTauri, "profile_authorize_project", { projectPath, ...(confirmBroad ? { confirmBroad: true } : {}) });
 export const getAgents = (callTauri: CallTauri) => call<AgentsSnapshot>(callTauri, "discovery_agents");
 export const getRoutes = (callTauri: CallTauri) => call<RoutesSnapshot>(callTauri, "providers_routes");
 export const getSecurityStatus = (callTauri: CallTauri) => call<SecurityStatus>(callTauri, "security_status");
