@@ -1,27 +1,42 @@
 /**
- * Typed access to the settings and vault commands (Marco 4D.3, Etapa 4).
+ * Typed access to the settings, vault, profile and inventory commands (Marco 4D.3, Etapas 4 e 7).
  * Validation is authoritative in the Core IPC; the UI only mirrors ranges for input hints.
  * Vault calls never return secret values, and nothing here logs request payloads.
  */
+
+import { TERMINAL_SETTINGS_EVENT, validInt } from "./terminalPreferences";
 
 export type CallTauri = (cmd: string, args?: Record<string, any>) => Promise<any>;
 
 export const SCHEMA_VERSION = 1;
 
 export type BackedCategory = "perfil" | "geral" | "aparencia" | "terminal" | "coordinator";
-export type Application = "pending_ui" | "unsupported";
+export type Application = "interface" | "unsupported";
 
 export interface CategorySnapshot {
   values: Record<string, any>;
   saved_fields: string[];
+  /** True only without invalid stored fields and without a protected (read-only) schema. */
   validated: boolean;
   applied: boolean;
   application: Application;
+  /** Fields whose stored value is invalid: `values` shows the default and the stored value stays untouched. */
+  invalid_fields?: string[];
+}
+
+export interface StoredIssue {
+  reason: "incompatible_version" | "invalid_stored_value";
+  /** Fixed, safe text from the host; never a stored value. */
+  message: string;
 }
 
 export interface SettingsSnapshot {
   schema_version: number;
   stored_schema_version: number | null;
+  /** Saved by another (future or incompatible) version, or not an object: nothing can be written. */
+  read_only?: boolean;
+  stored_issue?: StoredIssue | null;
+  migration?: { required: boolean; from_version: number | null; to_version: number };
   categories: Record<BackedCategory, CategorySnapshot>;
   unsupported_categories: Record<string, string>;
 }
@@ -36,6 +51,74 @@ export interface StructuredError {
 export interface VaultStatus {
   available: boolean;
   backend: string;
+  reason?: "unavailable" | "unreadable" | "busy" | string;
+}
+
+export interface AgentInfo {
+  name: string;
+  client: string;
+  available: boolean;
+  reason?: string;
+  worker_headless?: boolean;
+  coordinator_headless?: boolean;
+}
+
+/** discovery.agents: names and capabilities only, never a configuration value. */
+export interface AgentsSnapshot {
+  agents: AgentInfo[];
+  mcp_servers: string[];
+  /** False when some MCP source could not be read: the list may be incomplete. */
+  mcp_complete: boolean;
+  source: "configured" | "packaged_defaults" | "unreadable" | string;
+  unsupported: { name: string; reason: string }[];
+}
+
+export interface RouteCandidate {
+  client: string;
+  model: string;
+  effort?: string;
+}
+
+/** providers.routes: routing model identifiers only. */
+export interface RoutesSnapshot {
+  routes: { category: string; candidates: RouteCandidate[] }[];
+  available: boolean;
+  source: "configured" | "packaged_defaults" | "unreadable" | string;
+  reason?: string;
+  quota_status: "unknown" | string;
+  quota_milestone: string;
+}
+
+export interface SecurityStatus {
+  authorized_projects: string[];
+  policy: Record<string, boolean | string>;
+}
+
+export interface RevokeResult {
+  revoked: boolean;
+  authorized_projects: string[];
+  last_project: string | null;
+}
+
+export interface RememberResult {
+  remembered: boolean;
+  last_project: string;
+}
+
+/** The active profile was unreadable: it was quarantined (copied byte for byte) and recreated empty. */
+export interface ProfileRecovery {
+  reason: "profile_unreadable" | string;
+  /** File name only, never a path. */
+  backup_file: string;
+  message: string;
+}
+
+export interface ActiveProfile {
+  name: string;
+  display_name?: string | null;
+  authorized_projects: string[];
+  last_project?: string | null;
+  recovery?: ProfileRecovery | null;
 }
 
 /** Normalizes any rejection (Core structured error, transport failure, plain string) without echoing inputs. */
@@ -45,11 +128,27 @@ export function toStructuredError(err: unknown): StructuredError {
     return {
       code: typeof e.code === "number" ? e.code : -32603,
       message: e.message,
-      field: e.data?.field,
-      reason: e.data?.reason,
+      field: e.data?.field ?? e.field,
+      reason: e.data?.reason ?? e.reason,
     };
   }
   return { code: -32603, message: typeof err === "string" ? err : "Falha inesperada na comunicação com o Core." };
+}
+
+/** Texts for the reasons the host reports (K3). The host message wins when it says more than a generic failure. */
+const REASON_TEXT: Record<string, string> = {
+  busy: "Outra janela está usando o perfil ou o cofre. Tente novamente.",
+  profile_unreadable: "O perfil não pôde ser lido. Os dados foram preservados.",
+  read_only_stored_schema: "As configurações foram gravadas por outra versão e estão protegidas. Nada foi alterado.",
+  conflict: "O cofre mudou desde a conferência. Nada foi sobrescrito.",
+  unreadable: "Não foi possível ler ou gravar o cofre. Os dados existentes foram preservados.",
+};
+
+/** What to show for an error: the host message, or the reason's fixed text when the message is generic or missing. */
+export function errorText(err: unknown): string {
+  const e = toStructuredError(err);
+  const generic = !e.message.trim() || /^internal error/i.test(e.message);
+  return generic && e.reason && REASON_TEXT[e.reason] ? REASON_TEXT[e.reason] : e.message;
 }
 
 async function call<T>(callTauri: CallTauri, cmd: string, args?: Record<string, any>): Promise<T> {
@@ -67,22 +166,91 @@ export const updateSettings = (callTauri: CallTauri, category: BackedCategory, v
 
 export const getVaultStatus = (callTauri: CallTauri) => call<VaultStatus>(callTauri, "vault_status");
 
-export const listVaultKeys = (callTauri: CallTauri) =>
-  call<{ keys: string[] }>(callTauri, "vault_list_keys").then((r) => r.keys);
+export const getVaultKeysSnapshot = (callTauri: CallTauri) =>
+  call<{ keys: string[]; revision?: string }>(callTauri, "vault_list_keys");
+export const listVaultKeys = (callTauri: CallTauri) => getVaultKeysSnapshot(callTauri).then((r) => r.keys);
 
-export const setVaultSecret = (callTauri: CallTauri, key: string, value: string) =>
-  call<{ stored: boolean; key: string }>(callTauri, "vault_set_secret", { key, value });
+/** Without a revision: create only if absent. With a revision: replace only that exact revision. */
+export const setVaultSecret = (callTauri: CallTauri, key: string, value: string, expectedRevision?: string) =>
+  call<{ stored: boolean; key: string }>(callTauri, "vault_set_secret", { key, value, ...(expectedRevision !== undefined ? { expectedRevision } : {}) });
 
 export const deleteVaultSecret = (callTauri: CallTauri, key: string) =>
   call<{ deleted: boolean; key: string }>(callTauri, "vault_delete_secret", { key });
 
-/** Settings the interface applies itself; everything else is only saved and validated for now (D4). */
-export const APPLIED_BY_INTERFACE: ReadonlySet<string> = new Set(["aparencia.stimulation"]);
+export const getActiveProfile = (callTauri: CallTauri) => call<ActiveProfile>(callTauri, "profile_get_active");
+export const getAgents = (callTauri: CallTauri) => call<AgentsSnapshot>(callTauri, "discovery_agents");
+export const getRoutes = (callTauri: CallTauri) => call<RoutesSnapshot>(callTauri, "providers_routes");
+export const getSecurityStatus = (callTauri: CallTauri) => call<SecurityStatus>(callTauri, "security_status");
+export const revokeProject = (callTauri: CallTauri, projectPath: string) =>
+  call<RevokeResult>(callTauri, "profile_revoke_project", { projectPath });
+export const rememberProject = (callTauri: CallTauri, projectPath: string) =>
+  call<RememberResult>(callTauri, "profile_remember_project", { projectPath });
 
-/** Applies interface-level preferences to the document. Returns the keys that are now really applied. */
-export function applyInterfaceSettings(snapshot: SettingsSnapshot | null, root: HTMLElement = document.documentElement): string[] {
+/** Same comparison as the host on Windows (os.path.normcase): separators and letter case do not matter. */
+const normPath = (p: string) => p.replace(/\//g, "\\").replace(/\\+$/, "").toLowerCase();
+export const samePath = (a: string | null | undefined, b: string | null | undefined): boolean =>
+  !!a && !!b && normPath(a) === normPath(b);
+/** `child` is `parent` or lies below it. */
+export const pathWithin = (child: string, parent: string): boolean =>
+  samePath(child, parent) || normPath(child).startsWith(`${normPath(parent)}\\`);
+
+/** Settings the interface applies itself; everything else is only saved and validated for now (D4). */
+export const APPLIED_BY_INTERFACE: ReadonlySet<string> = new Set([
+  "perfil.display_name", "aparencia.stimulation", "aparencia.density",
+  "terminal.font_size", "terminal.cursor_blink", "terminal.scrollback_lines",
+]);
+
+/** Saved now, used only by the next start of the application. */
+export const APPLIED_ON_NEXT_START: ReadonlySet<string> = new Set(["geral.open_last_project_on_start"]);
+
+/** Stored fields of a category whose value is invalid (names as the host reports them). */
+export const invalidFieldsOf = (snapshot: SettingsSnapshot | null | undefined, category: BackedCategory): string[] =>
+  Array.isArray(snapshot?.categories?.[category]?.invalid_fields) ? snapshot!.categories[category].invalid_fields! : [];
+
+/** Only a loaded, validated and writable category can be said to be in effect. */
+export const categoryInEffect = (snapshot: SettingsSnapshot | null | undefined, category: BackedCategory): boolean =>
+  !!snapshot && !snapshot.read_only && snapshot.categories?.[category]?.validated === true && invalidFieldsOf(snapshot, category).length === 0;
+
+const APPEARANCE_CACHE_KEY = "ai-coordinator.appearance.v1";
+const APPEARANCE_KEYS = ["stimulation", "density", "terminalFontSize", "terminalScrollback", "terminalCursorBlink"] as const;
+
+/**
+ * Applies interface-level preferences to the document (null: the defaults). The applied appearance is also kept in
+ * this window's storage, only so the next start paints with it before the host answers (never a source of truth).
+ */
+export function applyInterfaceSettings(snapshot: SettingsSnapshot | null, root: HTMLElement = document.documentElement): void {
   const stimulation = snapshot?.categories?.aparencia?.values?.stimulation;
   if (stimulation === "low") root.dataset.stimulation = "low";
   else delete root.dataset.stimulation;
-  return snapshot ? ["aparencia.stimulation"] : [];
+  root.dataset.density = snapshot?.categories?.aparencia?.values?.density === "compact" ? "compact" : "comfortable";
+  const terminal = snapshot?.categories?.terminal?.values;
+  root.dataset.terminalFontSize = String(validInt(terminal?.font_size, 10, 24, 13));
+  root.dataset.terminalScrollback = String(validInt(terminal?.scrollback_lines, 100, 1000, 1000));
+  root.dataset.terminalCursorBlink = String(terminal?.cursor_blink !== false);
+  try {
+    const cached: Record<string, string> = {};
+    for (const key of APPEARANCE_KEYS) if (root.dataset[key] !== undefined) cached[key] = root.dataset[key]!;
+    root.ownerDocument.defaultView?.localStorage.setItem(APPEARANCE_CACHE_KEY, JSON.stringify(cached));
+  } catch {
+    // Storage blocked or full: the next start paints with the defaults until the host answers.
+  }
+  root.ownerDocument.defaultView?.dispatchEvent(new Event(TERMINAL_SETTINGS_EVENT));
+}
+
+/** Synchronous, before the first frame: the last applied appearance, validated; anything odd is ignored. */
+export function restoreCachedAppearance(root: HTMLElement = document.documentElement): void {
+  try {
+    const raw = root.ownerDocument.defaultView?.localStorage.getItem(APPEARANCE_CACHE_KEY);
+    const cached = raw ? JSON.parse(raw) : null;
+    if (!cached || typeof cached !== "object") return;
+    if (cached.stimulation === "low") root.dataset.stimulation = "low";
+    if (cached.density === "compact" || cached.density === "comfortable") root.dataset.density = cached.density;
+    const font = validInt(Number(cached.terminalFontSize), 10, 24, 0);
+    if (font) root.dataset.terminalFontSize = String(font);
+    const scrollback = validInt(Number(cached.terminalScrollback), 100, 1000, 0);
+    if (scrollback) root.dataset.terminalScrollback = String(scrollback);
+    if (cached.terminalCursorBlink === "true" || cached.terminalCursorBlink === "false") root.dataset.terminalCursorBlink = cached.terminalCursorBlink;
+  } catch {
+    // Unreadable cache: the defaults stay until the host answers.
+  }
 }

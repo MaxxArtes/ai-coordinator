@@ -1674,3 +1674,82 @@
     background: var(--c-term-fg);
   }
 }
+
+/* Only the terminals wait for the preferences, and only up to the deadline (App.tsx PREFERENCES_DEADLINE_MS): the shell
+   and its startup state paint at once, with the appearance cached from the previous run. Never a blank window. */
+.app[data-preferences-loading="true"] .terminal-pane__mount { visibility: hidden; }
+
+/* Persistent application state (preferences not loaded, protected settings, recovered profile). The live region
+   stays mounted while empty and then takes no space. */
+.system-notices {
+  flex: 0 0 auto;
+}
+
+.notice--warn {
+  background: var(--c-warn-bg);
+  border-color: var(--c-warn-border);
+}
+
+.notice--warn .notice__icon {
+  color: var(--c-warn);
+}
+
+.notice__stack {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-1);
+  min-width: 0;
+}
+
+.notice__title {
+  margin: 0;
+  font-weight: var(--fw-semibold);
+}
+
+.notice__body {
+  margin: 0;
+  overflow-wrap: anywhere;
+  user-select: text;
+}
+
+.notice__body code {
+  font-family: var(--font-mono);
+}
+
+/* Project chooser on the authorization screen: long paths wrap inside their button. */
+.authorization__projects {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-2);
+  margin: 0 0 var(--sp-4);
+  padding: 0;
+  list-style: none;
+}
+
+.authorization__projects .btn {
+  max-width: 100%;
+  white-space: normal;
+  overflow-wrap: anywhere;
+  text-align: left;
+}
+
+.authorization__subtitle {
+  margin: 0 0 var(--sp-2);
+  font-size: var(--fs-sm);
+  font-weight: var(--fw-semibold);
+  color: var(--c-fg);
+}
+
+.startup-status + .btn {
+  margin-top: var(--sp-4);
+}
+.app-header__operator {
+  max-width: 8rem;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: var(--fs-xs);
+  color: var(--c-fg-muted);
+}
+
+.settings__path { overflow-wrap: anywhere; }

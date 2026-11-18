@@ -39,11 +39,24 @@ const AVAILABLE: UpdateCheckResult = { ...UP_TO_DATE, available: true, latest_ve
 
 type Handler = (args?: Record<string, any>) => unknown;
 
+/** Like the host: the revision is 64 hex digits and changes whenever the set of keys changes. */
+function revisionOf(keys: string[]): string {
+  let hash = 0x811c9dc5;
+  for (const ch of [...keys].sort().join("|")) {
+    hash ^= ch.charCodeAt(0);
+    hash = Math.imul(hash, 16777619) >>> 0;
+  }
+  return hash.toString(16).padStart(8, "0").repeat(8);
+}
+const REV_OPENROUTER = revisionOf(["OPENROUTER_API_KEY"]);
+
 function makeCallTauri(handlers: Record<string, Handler>) {
   return vi.fn(async (cmd: string, args?: Record<string, any>) => {
     const handler = handlers[cmd];
     if (!handler) throw new Error(`comando Tauri inesperado: ${cmd}`);
-    return handler(args);
+    const answer: any = await handler(args);
+    return cmd === "vault_list_keys" && answer && typeof answer === "object" && !("revision" in answer)
+      ? { ...answer, revision: revisionOf(answer.keys) } : answer;
   });
 }
 
@@ -53,10 +66,10 @@ function snapshotWith(overrides: Partial<Record<string, any>> = {}): SettingsSna
     stored_schema_version: null,
     unsupported_categories: {},
     categories: {
-      perfil: { values: { display_name: null }, saved_fields: [], validated: true, applied: false, application: "pending_ui" },
-      geral: { values: { open_last_project_on_start: true }, saved_fields: [], validated: true, applied: false, application: "pending_ui" },
-      aparencia: { values: { stimulation: "standard", density: "comfortable" }, saved_fields: [], validated: true, applied: false, application: "pending_ui" },
-      terminal: { values: { font_size: 13, cursor_blink: true, scrollback_lines: 1000 }, saved_fields: [], validated: true, applied: false, application: "pending_ui" },
+      perfil: { values: { display_name: null }, saved_fields: [], validated: true, applied: false, application: "interface" },
+      geral: { values: { open_last_project_on_start: true }, saved_fields: [], validated: true, applied: false, application: "interface" },
+      aparencia: { values: { stimulation: "standard", density: "comfortable" }, saved_fields: [], validated: true, applied: false, application: "interface" },
+      terminal: { values: { font_size: 13, cursor_blink: true, scrollback_lines: 1000 }, saved_fields: [], validated: true, applied: false, application: "interface" },
       coordinator: {
         values: { flight_budget: { max_steps: 50, max_elapsed_seconds: 3600, max_uncheckpointed_steps: 10, max_worker_calls: 15 } },
         saved_fields: [],
@@ -73,6 +86,15 @@ function snapshotWith(overrides: Partial<Record<string, any>> = {}): SettingsSna
 function updaterHandlers(check: UpdateCheckResult): Record<string, Handler> {
   return {
     settings_get: () => snapshotWith(),
+    discovery_agents: () => ({
+      agents: [{ name: "Codex", client: "codex", available: false, reason: "Launcher indisponível ou configuração ilegível." }],
+      mcp_servers: [],
+      mcp_complete: true,
+      source: "configured",
+      unsupported: [{ name: "Gemini CLI", reason: "Exige contrato novo no Core." }],
+    }),
+    providers_routes: () => ({ routes: [], available: true, source: "configured", quota_status: "unknown", quota_milestone: "4D.4.3" }),
+    security_status: () => ({ authorized_projects: [], policy: { project_fencing: true } }),
     vault_status: () => ({ available: false, backend: "unavailable" }),
     updater_get_channel_info: () => ({ current_version: "0.6.1-alpha.50", channel: "alpha" }),
     updater_check: () => check,
@@ -137,15 +159,15 @@ describe("SettingsDialog — estrutura e navegação", () => {
     expect(perfil).toHaveFocus();
   });
 
-  it("não apresenta como operacional nenhuma categoria ainda sem backend (D4)", async () => {
+  it("Agentes e Segurança usam leitura real, sem controles de configuração fictícios (D4)", async () => {
     const { user } = renderSettings(makeCallTauri(updaterHandlers(UP_TO_DATE)), { initialCategory: "perfil" });
     for (const label of ["Agentes", "Segurança"]) {
       await user.click(screen.getByRole("tab", { name: new RegExp(label) }));
       const panel = screen.getByRole("tabpanel", { name: new RegExp(label) });
-      expect(within(panel).getByText("Ainda não configurável nesta versão experimental")).toBeInTheDocument();
+      expect(await within(panel).findByRole("button", { name: /^Recarregar/ })).toBeInTheDocument();
       expect(within(panel).queryByRole("textbox")).not.toBeInTheDocument();
       expect(within(panel).queryByRole("checkbox")).not.toBeInTheDocument();
-      expect(within(panel).queryByRole("button")).not.toBeInTheDocument();
+      expect(within(panel).queryByRole("button", { name: /^Salvar$/ })).not.toBeInTheDocument();
     }
   });
 
@@ -156,7 +178,7 @@ describe("SettingsDialog — estrutura e navegação", () => {
     expect(within(panel).queryByRole("textbox")).not.toBeInTheDocument();
     expect(panel.querySelector("input[type=password]")).toBeNull();
     await user.click(screen.getByRole("tab", { name: /Agentes/ }));
-    expect(within(screen.getByRole("tabpanel", { name: /Agentes/ })).getByText("Gemini CLI")).toBeInTheDocument();
+    expect(await within(screen.getByRole("tabpanel", { name: /Agentes/ })).findByText(/Gemini CLI: não suportado/)).toBeInTheDocument();
   });
 });
 
@@ -260,8 +282,7 @@ describe("SettingsDialog — configurações integradas (Etapa 4)", () => {
     const panel = screen.getByRole("tabpanel", { name: /Terminal/ });
     expect(await within(panel).findByDisplayValue("13")).toBeInTheDocument();
     expect(within(panel).getByText("Padrão (não salvo)")).toBeInTheDocument();
-    expect(within(panel).getByText("Aplicação pendente")).toBeInTheDocument();
-    expect(within(panel).queryByText("Aplicado")).not.toBeInTheDocument();
+    expect(within(panel).getByText("Aplicado")).toBeInTheDocument();
   });
 
   it("salva Aparência e só declara aplicado o modo de baixa estimulação, que é aplicado de fato", async () => {
@@ -298,8 +319,8 @@ describe("SettingsDialog — configurações integradas (Etapa 4)", () => {
     });
     expect(await within(panel).findByText("Salvo")).toBeInTheDocument();
     expect(within(panel).getByText("Validado no backend")).toBeInTheDocument();
-    expect(within(panel).getByText("Aplicação parcial")).toBeInTheDocument();
-    expect(within(panel).getByText(/Aplicado na interface: estimulação visual\. Demais campos: aplicação pendente\./)).toBeInTheDocument();
+    expect(within(panel).getByText("Aplicado")).toBeInTheDocument();
+    expect(within(panel).getByText("Salvo e validado no backend. Aplicado na interface.")).toBeInTheDocument();
     expect(document.documentElement.dataset.stimulation).toBe("low");
   });
 
@@ -391,8 +412,14 @@ describe("SettingsDialog — confirmação no cofre (Provedores)", () => {
       ...updaterHandlers(UP_TO_DATE),
       vault_status: () => ({ available: true, backend: "dpapi" }),
       vault_list_keys: () => ({ keys: [...keys].sort() }),
+      // The host contract: no revision creates only an absent name; a revision replaces only that exact revision.
       vault_set_secret: (args) => {
-        if (!keys.includes(args!.key)) keys.push(args!.key);
+        const exists = keys.includes(args!.key);
+        const revision = args!.expectedRevision;
+        if (revision === undefined ? exists : !exists || revision !== revisionOf(keys)) {
+          throw { code: -32005, message: "O cofre mudou desde a conferência. Recarregue e confirme novamente.", data: { field: "vault", reason: "conflict" } };
+        }
+        if (!exists) keys.push(args!.key);
         return { stored: true, key: args!.key };
       },
       vault_delete_secret: (args) => {
@@ -425,6 +452,9 @@ describe("SettingsDialog — confirmação no cofre (Provedores)", () => {
   }
 
   const calls = (callTauri: Calls, cmd: string) => callTauri.mock.calls.filter(([c]) => c === cmd);
+  // Provedores also shows the fallback routes, with a live region of their own: only the vault's are counted here.
+  const vaultStatuses = (panel: HTMLElement) =>
+    within(panel).getAllByRole("status").filter((el) => !el.closest('section[aria-label="Rotas de fallback"]'));
 
   async function fill(user: User, panel: HTMLElement, name: string, value = SECRET) {
     await user.click(await within(panel).findByLabelText(/Nome/));
@@ -473,7 +503,7 @@ describe("SettingsDialog — confirmação no cofre (Provedores)", () => {
 
     passArmDelay();
     await user.click(within(confirmation).getByRole("button", { name: "Substituir credencial" }));
-    expect(callTauri).toHaveBeenCalledWith("vault_set_secret", { key: "OPENROUTER_API_KEY", value: SECRET });
+    expect(callTauri).toHaveBeenCalledWith("vault_set_secret", { key: "OPENROUTER_API_KEY", value: SECRET, expectedRevision: REV_OPENROUTER });
     expect(calls(callTauri, "vault_set_secret")).toHaveLength(1);
     expect(await within(panel).findByText(/Credencial OPENROUTER_API_KEY substituída no cofre/)).toBeInTheDocument();
     expect(within(panel).queryByRole("alertdialog")).not.toBeInTheDocument();
@@ -567,7 +597,7 @@ describe("SettingsDialog — confirmação no cofre (Provedores)", () => {
     const confirmation = await within(panel).findByRole("alertdialog", { name: "Substituir a credencial OPENROUTER_API_KEY?" });
     passArmDelay();
     await user.click(within(confirmation).getByRole("button", { name: "Substituir credencial" }));
-    expect(callTauri).toHaveBeenCalledWith("vault_set_secret", { key: "OPENROUTER_API_KEY", value: SECRET });
+    expect(callTauri).toHaveBeenCalledWith("vault_set_secret", { key: "OPENROUTER_API_KEY", value: SECRET, expectedRevision: REV_OPENROUTER });
   });
 
   it("não grava quando não consegue conferir a lista do cofre antes", async () => {
@@ -637,7 +667,7 @@ describe("SettingsDialog — confirmação no cofre (Provedores)", () => {
     passArmDelay();
     await user.click(within(confirmation).getByRole("button", { name: "Substituir credencial" }));
     await within(panel).findByText(/Credencial OPENROUTER_API_KEY substituída no cofre/);
-    expect(calls(callTauri, "vault_set_secret")).toEqual([["vault_set_secret", { key: "OPENROUTER_API_KEY", value: SECRET }]]);
+    expect(calls(callTauri, "vault_set_secret")).toEqual([["vault_set_secret", { key: "OPENROUTER_API_KEY", value: SECRET, expectedRevision: REV_OPENROUTER }]]);
 
     // New name: same rule, there is just no question.
     await fill(user, panel, "OPENAI_API_KEY");
@@ -648,7 +678,9 @@ describe("SettingsDialog — confirmação no cofre (Provedores)", () => {
     expect(valor).toHaveValue(SECRET);
     await act(async () => list.gate.release());
     await within(panel).findByText(/Credencial OPENAI_API_KEY gravada no cofre/);
+    // A new name is create-only: no revision is sent (with one, the host would refuse it as a conflict).
     expect(calls(callTauri, "vault_set_secret")[1]).toEqual(["vault_set_secret", { key: "OPENAI_API_KEY", value: SECRET }]);
+    expect(calls(callTauri, "vault_set_secret")[1][1]).not.toHaveProperty("expectedRevision");
   });
 
   it("sair do painel durante a conferência cancela o envio: nada é perguntado nem gravado", async () => {
@@ -918,7 +950,8 @@ describe("SettingsDialog — confirmação no cofre (Provedores)", () => {
     expect(checking).toHaveAttribute("aria-disabled", "true");
     expect(checking).toBeEnabled();
     expect(checking).toHaveFocus();
-    expect(within(panel).getByRole("status")).toHaveTextContent("Conferindo o cofre…");
+    expect(vaultStatuses(panel)).toHaveLength(1);
+    expect(vaultStatuses(panel)[0]).toHaveTextContent("Conferindo o cofre…");
     expect(within(panel).queryByRole("button", { name: "Gravando…" })).not.toBeInTheDocument();
     expect(calls(callTauri, "vault_set_secret")).toHaveLength(0);
 
@@ -1112,7 +1145,7 @@ describe("SettingsDialog — confirmação no cofre (Provedores)", () => {
     passArmDelay();
     await user.click(within(confirmation).getByRole("button", { name: "Substituir credencial" }));
     await within(panel).findByText(/Credencial OPENROUTER_API_KEY substituída no cofre/);
-    expect(calls(callTauri, "vault_set_secret")).toEqual([["vault_set_secret", { key: "OPENROUTER_API_KEY", value: SECRET }]]);
+    expect(calls(callTauri, "vault_set_secret")).toEqual([["vault_set_secret", { key: "OPENROUTER_API_KEY", value: SECRET, expectedRevision: REV_OPENROUTER }]]);
   });
 
   it("se a remoção dá certo mas a lista não pode ser relida, tira a credencial da lista e não mostra erro", async () => {
@@ -1221,7 +1254,245 @@ describe("SettingsDialog — confirmação no cofre (Provedores)", () => {
   it("sem cofre disponível não há formulário nem uma segunda região de estado", async () => {
     const { panel } = openProvedores(makeCallTauri(updaterHandlers(UP_TO_DATE)));
     expect(await within(panel).findByText(/Armazenamento persistente de credenciais indisponível/)).toBeInTheDocument();
-    expect(within(panel).getAllByRole("status")).toHaveLength(1);
+    expect(vaultStatuses(panel)).toHaveLength(1);
     expect(within(panel).queryByLabelText("Valor")).not.toBeInTheDocument();
+  });
+
+  it("conflito de revisão: nada é sobrescrito, a lista é relida na hora e a mensagem diz o que fazer", async () => {
+    const keys = ["OPENROUTER_API_KEY"];
+    const callTauri = makeCallTauri(vaultHandlers(keys));
+    const { user, panel } = openProvedores(callTauri);
+    await submit(user, panel, "OPENROUTER_API_KEY");
+    const confirmation = await within(panel).findByRole("alertdialog");
+    keys.push("GEMINI_API_KEY"); // another window writes while the question is open: the revision changes
+    const listed = calls(callTauri, "vault_list_keys").length;
+    passArmDelay();
+    await user.click(within(confirmation).getByRole("button", { name: "Substituir credencial" }));
+
+    const alert = await within(panel).findByRole("alert");
+    expect(alert).toHaveTextContent("O cofre mudou desde a conferência; nada foi sobrescrito. A lista foi relida: grave de novo para conferir e confirmar.");
+    await waitFor(() => expect(calls(callTauri, "vault_list_keys")).toHaveLength(listed + 1));
+    expect(await within(panel).findByText("GEMINI_API_KEY")).toBeInTheDocument();
+    expect(calls(callTauri, "vault_set_secret")).toEqual([["vault_set_secret", { key: "OPENROUTER_API_KEY", value: SECRET, expectedRevision: REV_OPENROUTER }]]);
+    expect(within(panel).queryByText(/substituída no cofre/)).not.toBeInTheDocument();
+    // A new attempt reads the new revision and the write goes through.
+    await user.click(within(panel).getByRole("button", { name: "Gravar no cofre" }));
+    const again = await within(panel).findByRole("alertdialog");
+    passArmDelay();
+    await user.click(within(again).getByRole("button", { name: "Substituir credencial" }));
+    expect(await within(panel).findByText(/Credencial OPENROUTER_API_KEY substituída no cofre/)).toBeInTheDocument();
+    expect(calls(callTauri, "vault_set_secret")[1][1]).toEqual({ key: "OPENROUTER_API_KEY", value: SECRET, expectedRevision: revisionOf(keys) });
+  });
+
+  it("a revisão usada é a da própria conferência, mesmo com outra leitura terminando depois", async () => {
+    const keys = ["OPENROUTER_API_KEY"];
+    // While `hold` is set, every read waits; the answers are then given in a chosen order.
+    const reads = { hold: false, waiting: [] as Array<(answer: unknown) => void> };
+    const callTauri = makeCallTauri(
+      vaultHandlers(keys, {
+        vault_list_keys: () =>
+          reads.hold ? new Promise((resolve) => reads.waiting.push(resolve)) : { keys: [...keys].sort() },
+      })
+    );
+    const { user, panel } = openProvedores(callTauri);
+    await within(panel).findByText("OPENROUTER_API_KEY");
+    // Leaving and coming back starts a refresh that is still in flight when the operator submits.
+    await user.click(screen.getByRole("tab", { name: /Perfil/ }));
+    reads.hold = true;
+    await user.click(screen.getByRole("tab", { name: /Provedores/ }));
+    await waitFor(() => expect(reads.waiting).toHaveLength(1));
+    await submit(user, panel, "OPENROUTER_API_KEY");
+    await waitFor(() => expect(reads.waiting).toHaveLength(2));
+    reads.hold = false;
+    // The check answers first, the late refresh right behind it with an older list (another revision).
+    await act(async () => {
+      reads.waiting[1]({ keys: [...keys] });
+      reads.waiting[0]({ keys: ["OPENROUTER_API_KEY", "VELHA_API_KEY"] });
+    });
+    const confirmation = await within(panel).findByRole("alertdialog");
+    passArmDelay();
+    await user.click(within(confirmation).getByRole("button", { name: "Substituir credencial" }));
+    expect(await within(panel).findByText(/Credencial OPENROUTER_API_KEY substituída no cofre/)).toBeInTheDocument();
+    expect(calls(callTauri, "vault_set_secret")[0][1]).toEqual({ key: "OPENROUTER_API_KEY", value: SECRET, expectedRevision: REV_OPENROUTER });
+  });
+
+  it("cofre em uso por outra janela: diz isso, nada é lido nem gravado, e tentar de novo funciona", async () => {
+    const state = { busy: true };
+    const callTauri = makeCallTauri(
+      vaultHandlers(["OPENROUTER_API_KEY"], {
+        vault_status: () => (state.busy ? { available: false, backend: "dpapi", reason: "busy" } : { available: true, backend: "dpapi" }),
+      })
+    );
+    const { user, panel } = openProvedores(callTauri);
+    expect(await within(panel).findByText("Cofre em uso por outra janela")).toBeInTheDocument();
+    expect(within(panel).getByText("Cofre em uso")).toBeInTheDocument();
+    expect(within(panel).queryByLabelText("Valor")).not.toBeInTheDocument();
+    expect(calls(callTauri, "vault_list_keys")).toHaveLength(0);
+    state.busy = false;
+    await user.click(within(panel).getByRole("button", { name: "Tentar novamente" }));
+    expect(await within(panel).findByLabelText("Valor")).toBeInTheDocument();
+    expect(within(panel).getByText("OPENROUTER_API_KEY")).toBeInTheDocument();
+  });
+
+  it("falha de leitura por trava ocupada: mostra a mensagem do host e oferece tentar de novo", async () => {
+    const state = { busy: true };
+    const callTauri = makeCallTauri(
+      vaultHandlers([], {
+        vault_status: () => {
+          if (state.busy) throw { code: -32010, message: "Outra janela está usando o perfil/cofre. Tente novamente.", data: { field: "vault", reason: "busy" } };
+          return { available: true, backend: "dpapi" };
+        },
+      })
+    );
+    const { user, panel } = openProvedores(callTauri);
+    const alert = await within(panel).findByRole("alert");
+    expect(alert).toHaveTextContent("Não foi possível ler o cofre.");
+    expect(alert).toHaveTextContent("Outra janela está usando o perfil/cofre. Tente novamente.");
+    state.busy = false;
+    await user.click(within(alert).getByRole("button", { name: "Tentar novamente" }));
+    expect(await within(panel).findByText("Nenhuma credencial gravada.")).toBeInTheDocument();
+    expect(within(panel).queryByText("Não foi possível ler o cofre.")).not.toBeInTheDocument();
+  });
+});
+
+describe("SettingsDialog — estados honestos das configurações (K1)", () => {
+  beforeEach(() => vi.clearAllMocks());
+
+  const READ_ONLY = {
+    read_only: true,
+    stored_issue: { reason: "incompatible_version", message: "O esquema salvo não é compatível com esta versão. Os dados foram preservados." },
+  };
+
+  it("configurações de outra versão: aviso, campos somente leitura, sem 'Aplicado' e nada é enviado", async () => {
+    const callTauri = makeCallTauri({
+      ...updaterHandlers(UP_TO_DATE),
+      settings_get: () => ({ ...snapshotWith(), ...READ_ONLY }),
+      settings_update: () => {
+        throw new Error("não deveria gravar");
+      },
+    });
+    const { user } = renderSettings(callTauri, { initialCategory: "terminal" });
+    const panel = screen.getByRole("tabpanel", { name: /Terminal/ });
+    expect(await within(panel).findByText("Configurações protegidas")).toBeInTheDocument();
+    expect(within(panel).getByText(READ_ONLY.stored_issue.message)).toBeInTheDocument();
+    expect(within(panel).getByText("Protegido: somente leitura")).toBeInTheDocument();
+    expect(within(panel).queryByText("Aplicado")).not.toBeInTheDocument();
+
+    const font = within(panel).getByLabelText("Tamanho da fonte");
+    expect(font).toHaveAttribute("readonly");
+    await user.type(font, "9");
+    expect(font).toHaveValue(13);
+    const blink = within(panel).getByRole("checkbox", { name: "Cursor piscante" });
+    expect(blink).toHaveAttribute("aria-readonly", "true");
+    await user.click(blink);
+    expect(blink).toBeChecked();
+    expect(within(panel).getByRole("button", { name: "Salvar" })).toBeDisabled();
+    expect(within(panel).getAllByText("Somente leitura: configurações de outra versão, protegidas.")).toHaveLength(3);
+    expect(callTauri.mock.calls.filter(([cmd]) => cmd === "settings_update")).toHaveLength(0);
+  });
+
+  it("campo salvo inválido: mostra o padrão sem o valor salvo, não declara aplicado e só o envia depois de alterado", async () => {
+    const invalid = snapshotWith({ terminal: { saved_fields: ["font_size"], validated: false, invalid_fields: ["font_size"] } });
+    const saved = snapshotWith({ terminal: { values: { font_size: 15, cursor_blink: true, scrollback_lines: 1000 }, saved_fields: ["cursor_blink", "font_size", "scrollback_lines"] } });
+    const responses = [invalid, saved];
+    const callTauri = makeCallTauri({ ...updaterHandlers(UP_TO_DATE), settings_get: () => invalid, settings_update: () => responses.shift() });
+    const { user } = renderSettings(callTauri, { initialCategory: "terminal" });
+    const panel = screen.getByRole("tabpanel", { name: /Terminal/ });
+    expect(await within(panel).findByText("1 campo com valor salvo inválido")).toBeInTheDocument();
+    expect(within(panel).getByText("Valores inválidos: usando o padrão")).toBeInTheDocument();
+    expect(within(panel).queryByText("Aplicado")).not.toBeInTheDocument();
+    expect(within(panel).queryByText("Validado no backend")).not.toBeInTheDocument();
+    const font = within(panel).getByLabelText("Tamanho da fonte");
+    expect(font).toHaveValue(13);
+    expect(font).toHaveAccessibleDescription(/Valor salvo inválido: usando o padrão/);
+
+    // Saving the other fields keeps the invalid stored value: font_size is not sent.
+    await user.click(within(panel).getByRole("button", { name: "Salvar" }));
+    await waitFor(() => expect(callTauri.mock.calls.filter(([cmd]) => cmd === "settings_update")).toHaveLength(1));
+    expect(callTauri.mock.calls.find(([cmd]) => cmd === "settings_update")![1]).toEqual({
+      schemaVersion: 1,
+      category: "terminal",
+      values: { cursor_blink: true, scrollback_lines: 1000 },
+    });
+    expect(await within(panel).findByText(/Campos com valor salvo inválido continuam preservados/)).toBeInTheDocument();
+
+    // Once changed, the field replaces the stored value.
+    await user.clear(font);
+    await user.type(font, "15");
+    await user.click(within(panel).getByRole("button", { name: "Salvar" }));
+    await waitFor(() => expect(callTauri.mock.calls.filter(([cmd]) => cmd === "settings_update")).toHaveLength(2));
+    expect(callTauri.mock.calls.filter(([cmd]) => cmd === "settings_update")[1][1]).toEqual({
+      schemaVersion: 1,
+      category: "terminal",
+      values: { font_size: 15, cursor_blink: true, scrollback_lines: 1000 },
+    });
+    expect(await within(panel).findByText("Aplicado")).toBeInTheDocument();
+  });
+
+  it("um único campo inválido e intocado: nada é enviado e isso é dito", async () => {
+    const invalid = snapshotWith({ perfil: { saved_fields: ["display_name"], validated: false, invalid_fields: ["perfil.display_name"] } });
+    const callTauri = makeCallTauri({ ...updaterHandlers(UP_TO_DATE), settings_get: () => invalid });
+    const { user } = renderSettings(callTauri, { initialCategory: "perfil" });
+    const panel = screen.getByRole("tabpanel", { name: /Perfil/ });
+    await within(panel).findByText("1 campo com valor salvo inválido");
+    await user.click(within(panel).getByRole("button", { name: "Salvar" }));
+    expect(await within(panel).findByText(/Nada foi enviado/)).toBeInTheDocument();
+    expect(callTauri.mock.calls.filter(([cmd]) => cmd === "settings_update")).toHaveLength(0);
+  });
+
+  it("sem carregar as configurações nenhum selo diz 'Aplicado'", async () => {
+    const callTauri = makeCallTauri({
+      ...updaterHandlers(UP_TO_DATE),
+      settings_get: () => {
+        throw { code: -32602, message: "O esquema salvo não é compatível com esta versão. Os dados foram preservados.", data: { field: "schema_version", reason: "incompatible_version" } };
+      },
+    });
+    renderSettings(callTauri, { initialCategory: "terminal" });
+    const panel = screen.getByRole("tabpanel", { name: /Terminal/ });
+    expect(await within(panel).findByText("Não foi possível carregar as configurações")).toBeInTheDocument();
+    expect(within(panel).getByText("Não aplicado: configurações não carregadas")).toBeInTheDocument();
+    expect(within(panel).getAllByText("Não aplicado: as configurações não foram carregadas.")).toHaveLength(3);
+    expect(within(panel).queryByText("Aplicado")).not.toBeInTheDocument();
+    expect(within(panel).queryByText("Aplicado na interface.")).not.toBeInTheDocument();
+  });
+
+  it("Geral: a preferência de início vale na próxima inicialização, e o mapa de atalhos diz a verdade", async () => {
+    renderSettings(makeCallTauri(updaterHandlers(UP_TO_DATE)), { initialCategory: "geral" });
+    const panel = screen.getByRole("tabpanel", { name: /Geral/ });
+    expect(await within(panel).findByText("Aplicado na próxima inicialização")).toBeInTheDocument();
+    expect(within(panel).getByText("Vale a partir da próxima inicialização.")).toBeInTheDocument();
+    expect(within(panel).queryByText("Aplicado")).not.toBeInTheDocument();
+    expect(within(panel).queryByText("Aplicado na interface.")).not.toBeInTheDocument();
+    for (const keys of ["Ctrl+,", "Ctrl+Shift+1…4", "Ctrl+Shift+PageUp / PageDown", "F6 / Shift+F6", "Abas de projeto"]) {
+      expect(within(panel).getByText(keys)).toBeInTheDocument();
+    }
+    expect(within(panel).getByText(/Uma aba por janela nesta versão/)).toBeInTheDocument();
+  });
+
+  it("Terminal: o histórico avisa que reduzir descarta linhas dos terminais abertos", async () => {
+    renderSettings(makeCallTauri(updaterHandlers(UP_TO_DATE)), { initialCategory: "terminal" });
+    const panel = screen.getByRole("tabpanel", { name: /Terminal/ });
+    expect(await within(panel).findByLabelText("Linhas de histórico")).toHaveAccessibleDescription(
+      /Reduzir descarta na hora as linhas mais antigas dos terminais abertos/
+    );
+    expect(within(panel).getByRole("checkbox", { name: "Cursor piscante" })).toHaveAccessibleDescription(/baixa estimulação/);
+  });
+
+  it("Esc na pergunta de revogação cancela sem fechar Configurações", async () => {
+    const callTauri = makeCallTauri({
+      ...updaterHandlers(UP_TO_DATE),
+      security_status: () => ({ authorized_projects: ["D:\\proj"], policy: { project_fencing: true } }),
+      profile_revoke_project: () => ({ revoked: true, authorized_projects: [], last_project: null }),
+    });
+    const { user, onClose } = renderSettings(callTauri, { initialCategory: "seguranca" });
+    const panel = screen.getByRole("tabpanel", { name: /Segurança/ });
+    await user.click(await within(panel).findByRole("button", { name: "Revogar D:\\proj" }));
+    expect(within(panel).getByRole("alertdialog")).toBeInTheDocument();
+    await user.keyboard("{Escape}");
+    expect(within(panel).queryByRole("alertdialog")).not.toBeInTheDocument();
+    expect(onClose).not.toHaveBeenCalled();
+    expect(callTauri.mock.calls.filter(([cmd]) => cmd === "profile_revoke_project")).toHaveLength(0);
+    await user.keyboard("{Escape}");
+    expect(onClose).toHaveBeenCalledTimes(1);
   });
 });

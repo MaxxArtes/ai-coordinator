@@ -2,9 +2,18 @@
  * F6 regions and the reload guard (Etapa 5, decision 9), on markup shaped like the real shell: header, tab strip and
  * 1 to 4 panes in Conversas, or the temporary view in Monitoramento. The real App is covered in App.views.test.tsx.
  */
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import userEvent from "@testing-library/user-event";
-import { currentRegion, cycleRegion, findRegions, installGlobalShortcuts, terminalKeyFilter } from "./shortcuts";
+import {
+  currentRegion,
+  cycleRegion,
+  findRegions,
+  handleGlobalKeydown,
+  installGlobalShortcuts,
+  SHORTCUT_LABELS,
+  shellShortcut,
+  terminalKeyFilter,
+} from "./shortcuts";
 
 type View = "conversas" | "monitoramento";
 
@@ -253,5 +262,115 @@ describe("reload guard", () => {
     buildShell(1);
     document.getElementById("save")!.focus();
     expect(press(key, init).defaultPrevented).toBe(false);
+  });
+});
+
+/** A keydown as the browser builds it; `code` is the physical key, `key` what the layout types. */
+const keydown = (key: string, code: string, init: KeyboardEventInit = {}) =>
+  new KeyboardEvent("keydown", { key, code, bubbles: true, cancelable: true, ...init });
+
+describe("application shortcuts (Etapa 7)", () => {
+  const INTERCEPTED: Array<[string, KeyboardEvent, string]> = [
+    ["Ctrl+Shift+1", keydown("!", "Digit1", { ctrlKey: true, shiftKey: true }), "Digit1"],
+    ["Ctrl+Shift+2", keydown("@", "Digit2", { ctrlKey: true, shiftKey: true }), "Digit2"],
+    ["Ctrl+Shift+3", keydown("#", "Digit3", { ctrlKey: true, shiftKey: true }), "Digit3"],
+    ["Ctrl+Shift+4", keydown("$", "Digit4", { ctrlKey: true, shiftKey: true }), "Digit4"],
+    ["Ctrl+Shift+PageUp", keydown("PageUp", "PageUp", { ctrlKey: true, shiftKey: true }), "PageUp"],
+    ["Ctrl+Shift+PageDown", keydown("PageDown", "PageDown", { ctrlKey: true, shiftKey: true }), "PageDown"],
+    ["Ctrl+, (vírgula da linha de letras)", keydown(",", "Comma", { ctrlKey: true }), "settings"],
+  ];
+  const SHELL_KEYS: Array<[string, KeyboardEvent]> = [
+    ["Tab", keydown("Tab", "Tab")],
+    ["Shift+Tab", keydown("Tab", "Tab", { shiftKey: true })],
+    ["Esc", keydown("Escape", "Escape")],
+    ["Ctrl+C", keydown("c", "KeyC", { ctrlKey: true })],
+    ["Ctrl+3", keydown("3", "Digit3", { ctrlKey: true })],
+    ["Alt+1", keydown("1", "Digit1", { altKey: true })],
+    ["AltGr+2 (Ctrl+Alt no Windows)", keydown("²", "Digit2", { ctrlKey: true, altKey: true })],
+    ["AltGr+Shift+1", keydown("¹", "Digit1", { ctrlKey: true, altKey: true, shiftKey: true })],
+    ["Ctrl+vírgula do teclado numérico (ABNT2)", keydown(",", "NumpadDecimal", { ctrlKey: true })],
+    ["Ctrl+M no AZERTY (digita vírgula)", keydown(",", "KeyM", { ctrlKey: true })],
+    ["Ctrl+Shift+5", keydown("%", "Digit5", { ctrlKey: true, shiftKey: true })],
+    ["Meta+Ctrl+Shift+1", keydown("!", "Digit1", { ctrlKey: true, shiftKey: true, metaKey: true })],
+    ["PageUp sozinho", keydown("PageUp", "PageUp")],
+    ["Shift+PageUp (rolagem do terminal)", keydown("PageUp", "PageUp", { shiftKey: true })],
+  ];
+
+  it.each(INTERCEPTED)("%s is an application shortcut and never reaches the shell", (_, event, id) => {
+    expect(shellShortcut(event)).toBe(id);
+    expect(terminalKeyFilter(event)).toBe(false);
+    expect(event.defaultPrevented).toBe(true);
+  });
+
+  it.each(SHELL_KEYS)("%s stays with the shell", (_, event) => {
+    expect(shellShortcut(event)).toBeNull();
+    expect(terminalKeyFilter(event)).toBe(true);
+    expect(event.defaultPrevented).toBe(false);
+  });
+
+  it("the filter refuses the shortcut on keyup too, but cancels the browser action on keydown only", () => {
+    const up = new KeyboardEvent("keyup", { key: ",", code: "Comma", ctrlKey: true, cancelable: true });
+    expect(terminalKeyFilter(up)).toBe(false);
+    expect(up.defaultPrevented).toBe(false);
+  });
+
+  function actions() {
+    return { openSettings: vi.fn(), focusPane: vi.fn(), cycleView: vi.fn() };
+  }
+
+  it("each shortcut calls its action once and cancels the browser action", () => {
+    buildShell(2);
+    const a = actions();
+    const fire = (event: KeyboardEvent) => {
+      handleGlobalKeydown(event, "root", a);
+      return event.defaultPrevented;
+    };
+    expect(fire(keydown(",", "Comma", { ctrlKey: true }))).toBe(true);
+    expect(fire(keydown("@", "Digit2", { ctrlKey: true, shiftKey: true }))).toBe(true);
+    expect(fire(keydown("PageUp", "PageUp", { ctrlKey: true, shiftKey: true }))).toBe(true);
+    expect(fire(keydown("PageDown", "PageDown", { ctrlKey: true, shiftKey: true }))).toBe(true);
+    expect(a.openSettings).toHaveBeenCalledTimes(1);
+    expect(a.focusPane).toHaveBeenCalledWith(1);
+    expect(a.cycleView.mock.calls).toEqual([[-1], [1]]);
+  });
+
+  it("with a dialog open (#root inert) no shortcut runs and the key is left alone", () => {
+    buildShell(2);
+    document.getElementById("root")!.setAttribute("inert", "");
+    const a = actions();
+    for (const event of INTERCEPTED.map(([, e]) => keydown(e.key, e.code, { ctrlKey: e.ctrlKey, shiftKey: e.shiftKey }))) {
+      handleGlobalKeydown(event, "root", a);
+      expect(event.defaultPrevented).toBe(false);
+    }
+    expect(a.openSettings).not.toHaveBeenCalled();
+    expect(a.focusPane).not.toHaveBeenCalled();
+    expect(a.cycleView).not.toHaveBeenCalled();
+  });
+
+  it("a shortcut held down runs once: the repeats are cancelled and ignored", () => {
+    buildShell(2);
+    const a = actions();
+    const repeat = keydown(",", "Comma", { ctrlKey: true, repeat: true });
+    handleGlobalKeydown(repeat, "root", a);
+    expect(repeat.defaultPrevented).toBe(true);
+    expect(a.openSettings).not.toHaveBeenCalled();
+    handleGlobalKeydown(keydown("@", "Digit2", { ctrlKey: true, shiftKey: true, repeat: true }), "root", a);
+    expect(a.focusPane).not.toHaveBeenCalled();
+  });
+
+  it("the keys that stay with the shell call no action", () => {
+    buildShell(2);
+    const a = actions();
+    for (const [, event] of SHELL_KEYS) handleGlobalKeydown(keydown(event.key, event.code, event), "root", a);
+    expect(a.openSettings).not.toHaveBeenCalled();
+    expect(a.focusPane).not.toHaveBeenCalled();
+    expect(a.cycleView).not.toHaveBeenCalled();
+  });
+
+  it("the keyboard map lists what exists and says that project tabs have no shortcut yet", () => {
+    const keys = SHORTCUT_LABELS.map(([k]) => k);
+    expect(keys).toEqual(expect.arrayContaining(["Ctrl+,", "Ctrl+Shift+1…4", "Ctrl+Shift+PageUp / PageDown", "F6 / Shift+F6", "F5 / Ctrl+R"]));
+    const tabs = SHORTCUT_LABELS.find(([k]) => k === "Abas de projeto");
+    expect(tabs?.[1]).toMatch(/Uma aba por janela/);
   });
 });

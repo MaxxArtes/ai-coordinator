@@ -14,7 +14,8 @@
  * - Theme from the design tokens, changed live (low stimulation, Windows contrast themes) without a restart.
  * - Size: no fit and no PTY resize while the box has no area (a hidden view, a minimized window); the PTY is told
  *   only when the columns or rows really change.
- * - Keyboard: one Tab stop per terminal; F6/Shift+F6 leave the terminal (every other key goes to the shell); the pane
+ * - Keyboard: one Tab stop per terminal; F6/Shift+F6 leave the terminal and the application shortcuts (Ctrl+,
+ *   Ctrl+Shift+1…4, Ctrl+Shift+PageUp/PageDown) are held back; every other key goes to the shell; the pane
  *   has a focus region in its header, the F6 entry, from which Enter, Space or a click enters the terminal.
  *
  * Marco 4D.3, Etapa 6:
@@ -26,6 +27,7 @@
 import React, { useEffect, useId, useRef } from "react";
 import { Terminal } from "xterm";
 import { FitAddon } from "xterm-addon-fit";
+import { reducedMotionQuery, terminalPreferences, TERMINAL_SETTINGS_EVENT } from "./settings/terminalPreferences";
 import { Icon } from "./ui/Icon";
 import { terminalKeyFilter } from "./shell/shortcuts";
 import { applyXtermAppearance, readXtermAppearance, watchXtermTheme } from "../styles/xtermTheme";
@@ -114,19 +116,17 @@ export const TerminalPane: React.FC<TerminalPaneProps> = ({
     // 1. Initialize xterm with the palette of the design tokens (standard, low stimulation or Windows contrast theme)
     const appearance = readXtermAppearance();
     const term = new Terminal({
-      cursorBlink: true,
+      ...terminalPreferences(),
       cursorStyle: "bar",
-      fontSize: 13,
       fontFamily: "'Cascadia Code', 'Fira Code', 'Consolas', monospace",
       theme: appearance.theme,
       minimumContrastRatio: appearance.minimumContrastRatio,
-      scrollback: 1000, // Aligned with bounded buffer (1000 lines)
       allowProposedApi: true,
     });
 
     const fitAddon = new FitAddon();
     term.loadAddon(fitAddon);
-    // F6/Shift+F6 leave the terminal (shell/shortcuts.ts); every other key goes to the shell.
+    // F6/Shift+F6 and the application shortcuts are held back (shell/shortcuts.ts); every other key goes to the shell.
     term.attachCustomKeyEventHandler(terminalKeyFilter);
 
     term.open(container);
@@ -172,12 +172,28 @@ export const TerminalPane: React.FC<TerminalPaneProps> = ({
     });
 
     observer.observe(container);
+    // Font, cursor and history change on the same terminal: no new xterm, no new process. Lowering the history
+    // trims the oldest lines at once (xterm Buffer.resize); only a changed option is assigned.
+    const updatePreferences = () => {
+      const next = terminalPreferences();
+      if (term.options.fontSize !== next.fontSize) term.options.fontSize = next.fontSize;
+      if (term.options.cursorBlink !== next.cursorBlink) term.options.cursorBlink = next.cursorBlink;
+      if (term.options.scrollback !== next.scrollback) term.options.scrollback = next.scrollback;
+      const box = container.getBoundingClientRect();
+      if (hasArea(box.width, box.height)) { fitAddon.fit(); syncSize(); }
+    };
+    window.addEventListener(TERMINAL_SETTINGS_EVENT, updatePreferences);
+    // The system preference for reduced motion can change while the app runs: the cursor follows it.
+    const motion = reducedMotionQuery();
+    motion?.addEventListener?.("change", updatePreferences);
 
     // Initial resize sync
     syncSize();
 
     return () => {
       stopTheme();
+      window.removeEventListener(TERMINAL_SETTINGS_EVENT, updatePreferences);
+      motion?.removeEventListener?.("change", updatePreferences);
       if (onMountRef.current) {
         onMountRef.current(sessionId, null);
       }

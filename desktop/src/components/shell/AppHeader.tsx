@@ -26,6 +26,8 @@ export interface RuntimeMetrics {
 export interface AppHeaderProps {
   /** Real application version (package metadata); empty or invalid shows nothing. */
   appVersion: string;
+  /** Name of the active profile: the display name saved in Perfil, else the profile name. */
+  displayName?: string | null;
   isTauri: boolean;
   connectionStatus: ConnectionStatus;
   /** True only after a real updater_check answered "available". */
@@ -69,6 +71,7 @@ export function formatVersion(raw: string | null | undefined): string | null {
 
 export const AppHeader: React.FC<AppHeaderProps> = ({
   appVersion,
+  displayName,
   isTauri,
   connectionStatus,
   hasUpdateAvailable,
@@ -98,6 +101,12 @@ export const AppHeader: React.FC<AppHeaderProps> = ({
       {nav}
 
       <div className="app-header__end">
+        {displayName && (
+          <span className="app-header__operator" title={`Perfil: ${displayName}`}>
+            <span className="sr-only">Perfil: </span>
+            {displayName}
+          </span>
+        )}
         <button
           type="button"
           onClick={onOpenSettings}

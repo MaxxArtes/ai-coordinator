@@ -12,7 +12,8 @@ import { AboutPanel } from "./AboutPanel";
 import { CategoryPanel } from "./CategoryPanel";
 import { SettingsForm } from "./SettingsForm";
 import { VaultPanel } from "./VaultPanel";
-import { getSettings, type BackedCategory, type SettingsSnapshot, type StructuredError } from "./api";
+import { InventoryPanel } from "./InventoryPanel";
+import { errorText, getSettings, type BackedCategory, type RevokeResult, type SettingsSnapshot } from "./api";
 import { SETTINGS_CATEGORIES, type SettingsCategoryId } from "./categories";
 
 export interface SettingsDialogProps {
@@ -28,6 +29,8 @@ export interface SettingsDialogProps {
   callTauri: (cmd: string, args?: Record<string, any>) => Promise<any>;
   /** Called with every settings snapshot loaded or saved, so the app applies interface-level preferences. */
   onSettingsChanged?: (snapshot: SettingsSnapshot) => void;
+  /** Called after a directory authorization was revoked in Segurança. */
+  onAuthorizationChanged?: (result: RevokeResult) => void;
 }
 
 export const SettingsDialog: React.FC<SettingsDialogProps> = ({ open, ...rest }) =>
@@ -43,6 +46,7 @@ const SettingsDialogContent: React.FC<Omit<SettingsDialogProps, "open">> = ({
   metrics,
   callTauri,
   onSettingsChanged,
+  onAuthorizationChanged,
 }) => {
   const [snapshot, setSnapshot] = useState<SettingsSnapshot | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
@@ -60,7 +64,7 @@ const SettingsDialogContent: React.FC<Omit<SettingsDialogProps, "open">> = ({
     let alive = true;
     getSettings(callTauri)
       .then((next) => alive && acceptSnapshot(next))
-      .catch((err: StructuredError) => alive && setLoadError(err.message));
+      .catch((err) => alive && setLoadError(errorText(err)));
     return () => {
       alive = false;
     };
@@ -165,7 +169,18 @@ const SettingsDialogContent: React.FC<Omit<SettingsDialogProps, "open">> = ({
                 onSaved={acceptSnapshot}
               />
             ) : category.backend === "vault" ? (
-              <VaultPanel category={category} active={active === category.id} isTauri={isTauri} callTauri={callTauri} />
+              <>
+                <VaultPanel category={category} active={active === category.id} isTauri={isTauri} callTauri={callTauri} />
+                <InventoryPanel kind="provedores" active={active === category.id} isTauri={isTauri} callTauri={callTauri} />
+              </>
+            ) : category.id === "agentes" || category.id === "seguranca" ? (
+              <InventoryPanel
+                kind={category.id}
+                active={active === category.id}
+                isTauri={isTauri}
+                callTauri={callTauri}
+                onAuthorizationChanged={onAuthorizationChanged}
+              />
             ) : (
               <CategoryPanel category={category} />
             )}

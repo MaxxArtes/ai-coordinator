@@ -5,9 +5,11 @@
  *   terminal can be reached with the keyboard alone, without depending on the close button.
  * - Region = [data-f6-region] ("header" | "strip" | "pane" | "view"); entry = the [data-f6-entry] element inside it
  *   (or the region itself). A region inside [inert] or [hidden], or without an available entry, is skipped.
- * - Inside a terminal, F6 and Shift+F6 are held back from the shell; Tab, Shift+Tab, Esc, Ctrl+C and every other key
- *   still go to the shell.
+ * - Inside a terminal, F6/Shift+F6 and the application shortcuts (Ctrl+, · Ctrl+Shift+1…4 · Ctrl+Shift+PageUp/PageDown,
+ *   Etapa 7) are held back from the shell; Tab, Shift+Tab, Esc, Ctrl+C, Ctrl+digit, Alt+digit, AltGr and every other
+ *   key still go to the shell.
  * - The same listener cancels F5, Ctrl+R and Ctrl+Shift+R: reloading the page would lose every terminal.
+ * - There is one project tab per window in this version (decision D5): the view switch is the tab switch.
  */
 export const F6_REGION_ATTRIBUTE = "data-f6-region";
 export const F6_ENTRY_ATTRIBUTE = "data-f6-entry";
@@ -32,13 +34,13 @@ export function isReloadKey(event: KeyboardEvent): boolean {
 }
 
 /**
- * xterm custom key handler (attachCustomKeyEventHandler). Returns false for F6/Shift+F6 on keydown, keypress and
- * keyup: on keyup xterm would otherwise pull the focus back (xterm Terminal.ts:1086-1088). The browser action is
- * cancelled on keydown only, because xterm does not cancel an event its handler refused (Terminal.ts:985-986). The
- * propagation is not stopped: the event reaches the window listener, which moves to the next region.
+ * xterm custom key handler (attachCustomKeyEventHandler). Returns false for F6/Shift+F6 and the application shortcuts
+ * (shellShortcut) on keydown, keypress and keyup: on keyup xterm would otherwise pull the focus back (xterm
+ * Terminal.ts:1086-1088). The browser action is cancelled on keydown only, because xterm does not cancel an event its
+ * handler refused (Terminal.ts:985-986). The propagation is not stopped: the event reaches the window listener.
  */
 export function terminalKeyFilter(event: KeyboardEvent): boolean {
-  if (!isRegionKey(event)) return true;
+  if (!isRegionKey(event) && !shellShortcut(event)) return true;
   if (event.type === "keydown") event.preventDefault();
   return false;
 }
@@ -87,12 +89,53 @@ export function cycleRegion(direction: 1 | -1, root: Document | HTMLElement = do
   return false;
 }
 
-export function handleGlobalKeydown(event: KeyboardEvent, appRootId = "root"): void {
+export interface ShortcutActions {
+  openSettings: () => void;
+  focusPane: (index: number) => void;
+  cycleView: (direction: 1 | -1) => void;
+}
+
+/**
+ * Application shortcut of a key event, or null. By physical key (event.code), so the numeric keypad comma (ABNT2) and
+ * layouts where another key types "," stay with the shell. AltGr (Ctrl+Alt on Windows) and Meta never match.
+ */
+export function shellShortcut(event: KeyboardEvent): string | null {
+  if (!event.ctrlKey || event.altKey || event.metaKey) return null;
+  if (event.shiftKey && /^Digit[1-4]$/.test(event.code)) return event.code;
+  if (!event.shiftKey && event.code === "Comma") return "settings";
+  if (event.shiftKey && (event.key === "PageUp" || event.key === "PageDown")) return event.key;
+  return null;
+}
+
+/** The keyboard map shown in Configurações → Geral: only what exists in this version. */
+export const SHORTCUT_LABELS: ReadonlyArray<readonly [string, string]> = [
+  ["F6 / Shift+F6", "Próxima região / região anterior (sai do terminal)"],
+  ["Ctrl+Shift+1…4", "Focar o cabeçalho do painel na posição 1 a 4; Enter entra no terminal"],
+  ["Enter / Espaço", "No cabeçalho do painel: entrar no terminal"],
+  ["Ctrl+Shift+PageUp / PageDown", "Vista anterior / próxima vista (Conversas, Monitoramento, Missões)"],
+  ["Setas, Home, End", "Trocar de vista na navegação e de categoria em Configurações"],
+  ["Ctrl+,", "Abrir Configurações"],
+  ["Esc", "Fechar o diálogo; dentro do terminal, enviar ao shell"],
+  ["F5 / Ctrl+R", "Bloqueados: recarregar a janela perderia os terminais"],
+  ["Abas de projeto", "Uma aba por janela nesta versão; não há atalho de troca de abas"],
+];
+
+export function handleGlobalKeydown(event: KeyboardEvent, appRootId = "root", actions?: ShortcutActions): void {
   if (isReloadKey(event)) {
     event.preventDefault(); // also with a dialog open and while the key repeats
     return;
   }
-  // defaultPrevented is not checked: inside a terminal the filter above has already cancelled the F6.
+  const shortcut = shellShortcut(event);
+  if (shortcut && actions) {
+    if (document.getElementById(appRootId)?.hasAttribute("inert")) return;
+    event.preventDefault();
+    if (event.repeat) return;
+    if (shortcut === "settings") actions.openSettings();
+    else if (shortcut.startsWith("Digit")) actions.focusPane(Number(shortcut.slice(-1)) - 1);
+    else actions.cycleView(shortcut === "PageUp" ? -1 : 1);
+    return;
+  }
+  // defaultPrevented is not checked: xterm already cancelled F6.
   if (!isRegionKey(event)) return;
   if (document.getElementById(appRootId)?.hasAttribute("inert")) return; // a dialog is open (Dialog.tsx)
   event.preventDefault();
@@ -101,8 +144,8 @@ export function handleGlobalKeydown(event: KeyboardEvent, appRootId = "root"): v
 }
 
 /** One listener, in the bubbling phase of the window, installed once by the App. Returns its removal. */
-export function installGlobalShortcuts(target: Window = window): () => void {
-  const listener = (event: KeyboardEvent) => handleGlobalKeydown(event);
+export function installGlobalShortcuts(target: Window = window, actions?: ShortcutActions): () => void {
+  const listener = (event: KeyboardEvent) => handleGlobalKeydown(event, "root", actions);
   target.addEventListener("keydown", listener);
   return () => target.removeEventListener("keydown", listener);
 }

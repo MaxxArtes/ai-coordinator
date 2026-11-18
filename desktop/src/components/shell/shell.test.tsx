@@ -20,6 +20,58 @@ describe("AuthorizationScreen", () => {
     expect(onSubmit).toHaveBeenCalledWith("D:\\proj");
   });
 
+  it("não promete o que a política não faz: o terminal usa as permissões do usuário, sem isolamento", () => {
+    render(<AuthorizationScreen profileName="default" inputPath="" onInputPathChange={vi.fn()} onSubmit={vi.fn()} />);
+    expect(document.body.textContent).toMatch(/não há isolamento do sistema de arquivos/);
+    expect(document.body.textContent).not.toMatch(/proteger o sistema de arquivos|contenção atômica/);
+    expect(screen.getByText(/Nenhum projeto está autorizado/)).toBeInTheDocument();
+  });
+
+  it("com projetos autorizados é a escolha de projeto: um clique abre, e autorizar outro continua possível", async () => {
+    const user = userEvent.setup();
+    const onOpenProject = vi.fn();
+    const onSubmit = vi.fn();
+    const { rerender } = render(
+      <AuthorizationScreen
+        profileName="default"
+        authorizedProjects={["D:\\proj", "D:\\outro"]}
+        note="A abertura automática do último projeto está desligada (Configurações → Geral)."
+        inputPath=""
+        onInputPathChange={vi.fn()}
+        onSubmit={onSubmit}
+        onOpenProject={onOpenProject}
+      />
+    );
+    expect(screen.getByRole("heading", { name: "Escolha o projeto" })).toBeInTheDocument();
+    expect(screen.queryByText(/Nenhum projeto está autorizado/)).not.toBeInTheDocument();
+    expect(screen.getByText(/abertura automática do último projeto está desligada/)).toBeInTheDocument();
+    const first = screen.getByRole("button", { name: "Abrir D:\\proj" });
+    expect(first).toHaveFocus();
+    expect(first).toHaveAttribute("data-f6-entry");
+    await user.click(screen.getByRole("button", { name: "Abrir D:\\outro" }));
+    expect(onOpenProject).toHaveBeenCalledWith("D:\\outro");
+    expect(screen.getByRole("form", { name: "Autorizar outro diretório" })).toBeInTheDocument();
+
+    // While one opens, nothing else starts (aria-disabled keeps the focus where it is).
+    rerender(
+      <AuthorizationScreen
+        profileName="default"
+        authorizedProjects={["D:\\proj"]}
+        inputPath="D:\\novo"
+        onInputPathChange={vi.fn()}
+        onSubmit={onSubmit}
+        onOpenProject={onOpenProject}
+        busy
+      />
+    );
+    const open = screen.getByRole("button", { name: "Abrir D:\\proj" });
+    expect(open).toHaveAttribute("aria-disabled", "true");
+    await user.click(open);
+    await user.click(screen.getByRole("button", { name: "Autorizar diretório e iniciar terminal" }));
+    expect(onOpenProject).toHaveBeenCalledTimes(1);
+    expect(onSubmit).not.toHaveBeenCalled();
+  });
+
   it("propaga a digitação para o estado do aplicativo", async () => {
     const user = userEvent.setup();
     const onChange = vi.fn();
@@ -51,6 +103,14 @@ describe("StartupStatus", () => {
   it("mostra a falha de inicialização como alerta com o detalhe recebido", () => {
     render(<StartupStatus state="failed" detail="runtime ausente" />);
     expect(screen.getByRole("alert")).toHaveTextContent("runtime ausente");
+  });
+
+  it("na falha oferece tentar de novo (recarregar a janela está bloqueado)", async () => {
+    const user = userEvent.setup();
+    const onRetry = vi.fn();
+    render(<StartupStatus state="failed" detail="perfil ocupado" onRetry={onRetry} />);
+    await user.click(screen.getByRole("button", { name: "Tentar novamente" }));
+    expect(onRetry).toHaveBeenCalledTimes(1);
   });
 
   it("mostra a conexão em andamento como status", () => {

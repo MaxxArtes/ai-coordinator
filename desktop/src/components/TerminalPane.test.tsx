@@ -99,6 +99,7 @@ vi.mock("xterm-addon-fit", () => ({ FitAddon: h.FakeFitAddon }));
 
 import { hasArea, TerminalPane, type TerminalPaneProps } from "./TerminalPane";
 import { TerminalGrid } from "./TerminalGrid";
+import { applyInterfaceSettings, type SettingsSnapshot } from "./settings/api";
 
 class FakeResizeObserver {
   callback: ResizeObserverCallback;
@@ -508,5 +509,78 @@ describe("TerminalPane identity, state and footer (Etapa 6)", () => {
     render(<TerminalPane {...props({ kind: "governed_agent" })} />);
     expect(screen.getByRole("region", { name: "Agente 07" })).toHaveTextContent("07 · Agente");
     expect(screen.getByRole("region", { name: "Agente 07" })).toHaveTextContent("Agente governado");
+  });
+});
+
+describe("TerminalPane preferences (Etapa 7)", () => {
+  const root = document.documentElement;
+  const settingsWith = (terminal: Record<string, unknown>, stimulation = "standard") =>
+    ({
+      categories: { aparencia: { values: { stimulation, density: "comfortable" } }, terminal: { values: terminal } },
+    }) as unknown as SettingsSnapshot;
+
+  afterEach(() => {
+    for (const key of ["terminalFontSize", "terminalScrollback", "terminalCursorBlink", "stimulation", "density"]) delete root.dataset[key];
+    delete (window as { matchMedia?: unknown }).matchMedia;
+  });
+
+  it("starts with the saved font, cursor and history", () => {
+    root.dataset.terminalFontSize = "18";
+    root.dataset.terminalScrollback = "500";
+    root.dataset.terminalCursorBlink = "false";
+    render(<TerminalPane {...props()} />);
+    expect(term().options).toMatchObject({ fontSize: 18, scrollback: 500, cursorBlink: false });
+  });
+
+  it("a change applies to the live terminal: same xterm, never disposed nor mounted again, input still flows", () => {
+    const p = props();
+    render(<TerminalPane {...p} />);
+    const t = term();
+    expect(t.options).toMatchObject({ fontSize: 13, scrollback: 1000, cursorBlink: true });
+    act(() => applyInterfaceSettings(settingsWith({ font_size: 20, scrollback_lines: 300, cursor_blink: false })));
+    expect(h.state.terms).toHaveLength(1);
+    expect(t.disposed).toBe(false);
+    expect(t.options).toMatchObject({ fontSize: 20, scrollback: 300, cursorBlink: false });
+    expect(p.onMount).toHaveBeenCalledTimes(1);
+    t.dataListeners.forEach((fn: (d: string) => void) => fn("dir\r"));
+    expect(p.onWrite).toHaveBeenCalledWith("session-1", "dir\r");
+    // Values the host would never send fall back to the defaults instead of reaching xterm.
+    act(() => applyInterfaceSettings(settingsWith({ font_size: 99, scrollback_lines: 5, cursor_blink: true })));
+    expect(t.options).toMatchObject({ fontSize: 13, scrollback: 1000, cursorBlink: true });
+    expect(h.state.terms).toHaveLength(1);
+  });
+
+  it("low stimulation keeps the cursor steady, and gives the blink back when it is turned off", () => {
+    render(<TerminalPane {...props()} />);
+    act(() => applyInterfaceSettings(settingsWith({ cursor_blink: true }, "low")));
+    expect(term().options.cursorBlink).toBe(false);
+    act(() => applyInterfaceSettings(settingsWith({ cursor_blink: true }, "standard")));
+    expect(term().options.cursorBlink).toBe(true);
+    expect(h.state.terms).toHaveLength(1);
+  });
+
+  it("the system's reduced motion keeps the cursor steady, followed live", () => {
+    let reduce = true;
+    const listeners: Array<() => void> = [];
+    Object.defineProperty(window, "matchMedia", {
+      configurable: true,
+      writable: true,
+      value: (query: string) => ({
+        media: query,
+        get matches() {
+          return query.includes("reduced-motion") && reduce;
+        },
+        addEventListener: (_: string, fn: () => void) => {
+          if (query.includes("reduced-motion")) listeners.push(fn);
+        },
+        removeEventListener: () => undefined,
+      }),
+    });
+    render(<TerminalPane {...props()} />);
+    expect(term().options.cursorBlink).toBe(false);
+    reduce = false;
+    act(() => listeners.forEach((fn) => fn()));
+    expect(term().options.cursorBlink).toBe(true);
+    expect(h.state.terms).toHaveLength(1);
   });
 });

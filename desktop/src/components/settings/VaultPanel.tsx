@@ -6,18 +6,21 @@
  * - Replacing an existing credential or removing one asks for an explicit confirmation first: the vault keeps
  *   no history, so the previous value cannot be recovered by the application afterwards. The question is
  *   decided on the key list read from the vault right before writing, and it is bound to the name and value
- *   that were submitted. Known limit: the vault has no "write only if absent" operation, so another writer
- *   can still create the key between that read and the write (closing this needs a backend change).
+ *   that were submitted and to the revision of the encrypted vault. Conditional writes reject another writer's
+ *   changes instead of overwriting them; a new name uses create-only semantics under the backend lock.
  * - Leaving the panel cancels whatever was not sent to the vault yet: a check in flight, an open confirmation.
  * - A failure is shown where it happened (a removal: in the list; a save: in or under the form), and what could
  *   not be read from the vault is reported apart from the outcome of a save or removal.
+ * - A conflict (another writer changed the vault) re-reads the list and its revision at once; a vault in use by another
+ *   window says so and offers to try again (K3).
  */
 import React, { useCallback, useEffect, useId, useRef, useState } from "react";
 import { Icon } from "../ui/Icon";
 import {
   deleteVaultSecret,
+  errorText,
   getVaultStatus,
-  listVaultKeys,
+  getVaultKeysSnapshot,
   setVaultSecret,
   type CallTauri,
   type StructuredError,
@@ -33,6 +36,9 @@ export interface VaultPanelProps {
 }
 
 const BACKEND_LABEL: Record<string, string> = { dpapi: "DPAPI do Windows", aes_gcm: "AES-GCM com senha mestra" };
+
+const CONFLICT_TEXT = "O cofre mudou desde a conferência; nada foi sobrescrito. A lista foi relida: grave de novo para conferir e confirmar.";
+const NO_REVISION_TEXT = "Não foi possível conferir a revisão do cofre; nada foi gravado. Grave de novo para conferir.";
 
 /**
  * A pointer click only answers a confirmation after this long: the destructive button can appear under the
@@ -139,7 +145,7 @@ export const VaultPanel: React.FC<VaultPanelProps> = ({ category, active, isTaur
   // Same value as `pending`, readable synchronously by the guards (a state read would be one render late).
   const pendingRef = useRef<PendingConfirmation | null>(null);
   // Name and value exactly as submitted, kept only while the "replace?" question is open.
-  const submittedRef = useRef<{ name: string; value: string } | null>(null);
+  const submittedRef = useRef<{ name: string; value: string; revision: string } | null>(null);
   // Changes whenever the panel is left or unmounted: a check still in flight then asks and writes nothing.
   const generationRef = useRef(0);
   // Moment from which a pointer click may answer the open confirmation.
@@ -170,13 +176,19 @@ export const VaultPanel: React.FC<VaultPanelProps> = ({ category, active, isTaur
     setPending(next);
   };
 
+  // Keys and revision of one and the same read: a concurrent read never lends its revision to another decision.
+  const readKeys = useCallback(async () => {
+    const next = await getVaultKeysSnapshot(callTauri);
+    return { keys: next.keys, revision: typeof next.revision === "string" ? next.revision : undefined };
+  }, [callTauri]);
+
   const refresh = useCallback(async () => {
     // Only the load state: the outcome of a save or removal is not wiped by coming back to the panel.
     setLoadFailure(null);
     try {
       const st = await getVaultStatus(callTauri);
       setStatus(st);
-      setKeys(st.available ? await listVaultKeys(callTauri) : []);
+      setKeys(st.available ? (await readKeys()).keys : []);
     } catch (err) {
       setLoadFailure(err as StructuredError);
     }
@@ -247,13 +259,13 @@ export const VaultPanel: React.FC<VaultPanelProps> = ({ category, active, isTaur
   // operation is known to have done instead of an error unrelated to its outcome.
   const reloadKeys = async (known: (shown: string[]) => string[]) => {
     try {
-      setKeys(await listVaultKeys(callTauri));
+      setKeys((await readKeys()).keys);
     } catch {
       setKeys(known);
     }
   };
 
-  const writeSecret = async (name: string, value: string, replacing: boolean) => {
+  const writeSecret = async (name: string, value: string, replacing: boolean, revision?: string) => {
     setBusy({ kind: "saving", name });
     setFailure(null);
     setNotice(null);
@@ -261,9 +273,16 @@ export const VaultPanel: React.FC<VaultPanelProps> = ({ category, active, isTaur
     if (replacing) focusNextRef.current = submitRef.current;
     try {
       try {
-        await setVaultSecret(callTauri, name, value);
+        await setVaultSecret(callTauri, name, value, revision);
       } catch (err) {
         const error = err as StructuredError;
+        if (error.reason === "conflict") {
+          // Another writer got there first: what is on screen is stale, so it is re-read right away.
+          setFailure({ error: { ...error, message: CONFLICT_TEXT }, source: "save", name });
+          focusAfterSave(submitRef.current);
+          await reloadKeys((shown) => shown);
+          return;
+        }
         setFailure({ error, source: "save", name });
         // Keeps the focus inside Configurações: on the field the backend rejected, else on Gravar.
         focusAfterSave(
@@ -335,10 +354,10 @@ export const VaultPanel: React.FC<VaultPanelProps> = ({ category, active, isTaur
       setFailure(null);
       setNotice(null);
       // Decide on a fresh list: the one on screen may be stale if the vault changed since it was loaded.
-      let current: string[] | null = null;
+      let current: { keys: string[]; revision?: string } | null = null;
       let checkError: StructuredError | null = null;
       try {
-        current = await listVaultKeys(callTauri);
+        current = await readKeys();
       } catch (err) {
         checkError = err as StructuredError;
       }
@@ -354,9 +373,14 @@ export const VaultPanel: React.FC<VaultPanelProps> = ({ category, active, isTaur
         focusAfterSave(submitRef.current);
         return;
       }
-      setKeys(current);
-      if (current.includes(name)) {
-        submittedRef.current = { name, value };
+      setKeys(current.keys);
+      if (current.keys.includes(name)) {
+        if (!current.revision) {
+          setFailure({ error: { code: -32005, message: NO_REVISION_TEXT, reason: "conflict" }, source: "save", name });
+          focusAfterSave(submitRef.current);
+          return;
+        }
+        submittedRef.current = { name, value, revision: current.revision };
         openConfirmation({ kind: "replace", name });
         return;
       }
@@ -396,7 +420,7 @@ export const VaultPanel: React.FC<VaultPanelProps> = ({ category, active, isTaur
     setPending(null);
     try {
       if (current.kind === "delete") await removeSecret(current.name);
-      else if (submitted && submitted.name === current.name) await writeSecret(submitted.name, submitted.value, true);
+      else if (submitted && submitted.name === current.name) await writeSecret(submitted.name, submitted.value, true, submitted.revision);
     } finally {
       operationRef.current = false;
     }
@@ -465,7 +489,7 @@ export const VaultPanel: React.FC<VaultPanelProps> = ({ category, active, isTaur
         <h3 className="settings__heading">{category.label}</h3>
         <div className="settings__badges">
           {status?.available && <span className="badge badge--ok">Cofre: {BACKEND_LABEL[status.backend] ?? status.backend}</span>}
-          {unavailable && <span className="badge badge--unsupported">Armazenamento indisponível</span>}
+          {unavailable && <span className="badge badge--unsupported">{status?.reason === "busy" ? "Cofre em uso" : "Armazenamento indisponível"}</span>}
           <span className="badge badge--unsupported">Uso pelos provedores: não suportado nesta versão</span>
         </div>
       </div>
@@ -482,7 +506,12 @@ export const VaultPanel: React.FC<VaultPanelProps> = ({ category, active, isTaur
           <p className="callout__title">
             <span>Não foi possível ler o cofre.</span>
           </p>
-          <p className="callout__body callout__body--mono">{loadFailure.message}</p>
+          <p className="callout__body callout__body--mono">{errorText(loadFailure)}</p>
+          <div className="row-end">
+            <button type="button" className="btn btn--sm" onClick={() => void refresh()}>
+              Tentar novamente
+            </button>
+          </div>
         </div>
       )}
 
@@ -490,12 +519,28 @@ export const VaultPanel: React.FC<VaultPanelProps> = ({ category, active, isTaur
         <div className="callout callout--warn" role="status">
           <p className="callout__title">
             <Icon name="shield" size="sm" />
-            <span>Armazenamento persistente de credenciais indisponível nesta plataforma</span>
+            <span>
+              {status?.reason === "unreadable"
+                ? "Cofre ilegível: credenciais preservadas"
+                : status?.reason === "busy"
+                  ? "Cofre em uso por outra janela"
+                  : "Armazenamento persistente de credenciais indisponível nesta plataforma"}
+            </span>
           </p>
           <p className="callout__body">
-            Não há cofre seguro do sistema integrado (DPAPI no Windows; Keychain e Secret Service estão planejados
-            para a 4D.6). Nenhuma credencial é gravada neste computador.
+            {status?.reason === "unreadable"
+              ? "O cofre existente não pôde ser lido. Nenhum valor será gravado ou sobrescrito; recupere o acesso ao cofre antes de continuar."
+              : status?.reason === "busy"
+                ? "Outra janela está usando o cofre agora. Nada foi lido nem gravado. Tente novamente em instantes."
+                : "Não há cofre seguro do sistema integrado (DPAPI no Windows; Keychain e Secret Service estão planejados para a 4D.6). Nenhuma credencial é gravada neste computador."}
           </p>
+          {status?.reason === "busy" && (
+            <div className="row-end">
+              <button type="button" className="btn btn--sm" onClick={() => void refresh()}>
+                Tentar novamente
+              </button>
+            </div>
+          )}
         </div>
       )}
 
@@ -511,7 +556,7 @@ export const VaultPanel: React.FC<VaultPanelProps> = ({ category, active, isTaur
                 <p className="callout__title">
                   <span>Não foi possível remover a credencial {removeFailure.name}.</span>
                 </p>
-                <p className="callout__body callout__body--mono">{removeFailure.error.message}</p>
+                <p className="callout__body callout__body--mono">{errorText(removeFailure.error)}</p>
               </div>
             )}
             {keys.length === 0 ? (
@@ -615,7 +660,7 @@ export const VaultPanel: React.FC<VaultPanelProps> = ({ category, active, isTaur
 
           {saveFailure && (
             <div ref={failureRef} className="callout callout--error" role="alert">
-              <p className="callout__body callout__body--mono">{saveFailure.error.message}</p>
+              <p className="callout__body callout__body--mono">{errorText(saveFailure.error)}</p>
             </div>
           )}
           {/* Mounted for as long as the vault is usable, so progress and outcome are announced as changes of

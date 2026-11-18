@@ -1,0 +1,308 @@
+/**
+ * Agentes, rotas de fallback and Segurança (Etapa 7) with the host's real answer shapes (desktop/ipc/discovery.py and
+ * server.py): what could not be read is said, the policy is in plain Portuguese, and revoking a directory is confirmed,
+ * keeps the focus inside the panel and tells the App.
+ */
+import React from "react";
+import { act, render, screen, waitFor, within } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
+import { describe, expect, it, vi } from "vitest";
+import { InventoryPanel } from "./InventoryPanel";
+import type { AgentsSnapshot, RoutesSnapshot, SecurityStatus } from "./api";
+
+type Handler = (args?: Record<string, any>) => unknown;
+
+function host(handlers: Record<string, Handler>) {
+  return vi.fn(async (cmd: string, args?: Record<string, any>) => {
+    const handler = handlers[cmd];
+    if (!handler) throw new Error(`comando inesperado: ${cmd}`);
+    return handler(args);
+  });
+}
+
+const calls = (callTauri: ReturnType<typeof host>, cmd: string) => callTauri.mock.calls.filter(([c]) => c === cmd);
+
+const AGENTS: AgentsSnapshot = {
+  agents: [
+    { name: "Codex", client: "codex", available: true, reason: "Launcher encontrado; autenticação e cota não verificadas." },
+    { name: "AGY", client: "agy", available: false, reason: "Launcher indisponível ou configuração ilegível." },
+  ],
+  mcp_servers: ["docs"],
+  mcp_complete: true,
+  source: "configured",
+  unsupported: [{ name: "Gemini CLI", reason: "Exige um novo contrato de cliente no Core." }],
+};
+
+const ROUTES: RoutesSnapshot = {
+  routes: [{ category: "codigo", candidates: [{ client: "codex", model: "modelo-a", effort: "high" }, { client: "agy", model: "modelo-b" }] }],
+  available: true,
+  source: "configured",
+  quota_status: "unknown",
+  quota_milestone: "4D.4.3",
+};
+
+const POLICY = {
+  project_fencing: true,
+  human_terminal: "operator_permissions",
+  governed_agent: "env_sanitized_only",
+  human_terminal_filesystem_isolation: false,
+  description: "A autorização limita a abertura de projetos. O terminal humano usa as permissões do operador do sistema.",
+};
+
+function security(projects: string[], policy: Record<string, boolean | string> = POLICY): SecurityStatus {
+  return { authorized_projects: [...projects], policy };
+}
+
+function renderPanel(kind: "agentes" | "provedores" | "seguranca", callTauri: ReturnType<typeof host>, onAuthorizationChanged = vi.fn()) {
+  render(<InventoryPanel kind={kind} active isTauri callTauri={callTauri} onAuthorizationChanged={onAuthorizationChanged} />);
+  return { onAuthorizationChanged, user: userEvent.setup() };
+}
+
+describe("InventoryPanel — inventário honesto (K6)", () => {
+  it("rotas ilegíveis: diz que não puderam ser lidas, nunca uma lista vazia", async () => {
+    const callTauri = host({
+      providers_routes: () => ({
+        routes: [],
+        available: false,
+        source: "unreadable",
+        reason: "Configuração de rotas ilegível; nada foi alterado.",
+        quota_status: "unknown",
+        quota_milestone: "4D.4.3",
+      }),
+    });
+    renderPanel("provedores", callTauri);
+    expect(await screen.findByRole("alert")).toHaveTextContent("Configuração de rotas ilegível; nada foi alterado.");
+    expect(screen.queryByText(/Nenhuma rota/)).not.toBeInTheDocument();
+    expect(screen.queryByRole("list")).not.toBeInTheDocument();
+    expect(screen.getByText(/Cotas: indisponíveis até a 4D\.4\.3/)).toBeInTheDocument();
+  });
+
+  it("rotas padrão empacotadas: diz a origem; candidatos só com cliente, modelo e esforço", async () => {
+    renderPanel("provedores", host({ providers_routes: () => ({ ...ROUTES, source: "packaged_defaults" }) }));
+    expect(await screen.findByText("Rotas padrão empacotadas (nenhum routes.json do usuário).")).toBeInTheDocument();
+    expect(screen.getByRole("listitem")).toHaveTextContent("codigo: codex / modelo-a / high → agy / modelo-b");
+  });
+
+  it("sem rotas configuradas: diz isso, sem alerta", async () => {
+    renderPanel("provedores", host({ providers_routes: () => ({ ...ROUTES, routes: [] }) }));
+    expect(await screen.findByText("Nenhuma rota de fallback configurada.")).toBeInTheDocument();
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+  });
+
+  it("MCP incompleto: avisa que a lista pode estar incompleta e não afirma que não há servidores", async () => {
+    renderPanel("agentes", host({ discovery_agents: () => ({ ...AGENTS, mcp_servers: [], mcp_complete: false }) }));
+    expect(await screen.findByText("Lista de MCP incompleta: alguma fonte não pôde ser lida.")).toBeInTheDocument();
+    expect(screen.queryByText(/Nenhum servidor MCP encontrado/)).not.toBeInTheDocument();
+  });
+
+  it("MCP completo e vazio: diz que nenhum foi encontrado", async () => {
+    renderPanel("agentes", host({ discovery_agents: () => ({ ...AGENTS, mcp_servers: [] }) }));
+    expect(await screen.findByText("Nenhum servidor MCP encontrado nas fontes consultadas.")).toBeInTheDocument();
+    expect(screen.queryByText(/incompleta/)).not.toBeInTheDocument();
+  });
+
+  it("configuração do Core ilegível: os launchers aparecem como não verificados, com o motivo", async () => {
+    const unreadable = { ...AGENTS, source: "unreadable", agents: AGENTS.agents.map((a) => ({ ...a, available: false, reason: "Launcher indisponível ou configuração ilegível." })) };
+    renderPanel("agentes", host({ discovery_agents: () => unreadable }));
+    expect(await screen.findByText(/Configuração do Core ilegível: a disponibilidade dos launchers não foi verificada/)).toBeInTheDocument();
+    expect(screen.getByText("Codex").closest("li")).toHaveTextContent("indisponível — Launcher indisponível ou configuração ilegível.");
+  });
+
+  it("agentes: disponibilidade e motivo de cada um, só nomes de MCP", async () => {
+    renderPanel("agentes", host({ discovery_agents: () => AGENTS }));
+    expect((await screen.findByText("Codex")).closest("li")).toHaveTextContent("disponível — Launcher encontrado");
+    expect(screen.getByText("AGY").closest("li")).toHaveTextContent("indisponível");
+    expect(screen.getByText("docs")).toBeInTheDocument();
+    expect(screen.getByText(/Gemini CLI: não suportado/)).toBeInTheDocument();
+  });
+
+  it("a recarga descarta respostas antigas e fica travada enquanto lê", async () => {
+    const answers: Array<(value: RoutesSnapshot) => void> = [];
+    const callTauri = host({ providers_routes: () => new Promise<RoutesSnapshot>((resolve) => answers.push(resolve)) });
+    const { user } = renderPanel("provedores", callTauri);
+    const reload = screen.getByRole("button", { name: "Recarregar rotas de fallback" });
+    expect(reload).toHaveAttribute("aria-disabled", "true");
+    expect(reload).toBeEnabled(); // never a real `disabled`: the focus would drop out of the dialog
+    expect(screen.getByRole("status")).toHaveTextContent("Carregando…");
+    await user.click(reload); // ignored while the first read is in flight
+    expect(calls(callTauri, "providers_routes")).toHaveLength(1);
+    await act(async () => answers[0]({ ...ROUTES, routes: [{ category: "primeira", candidates: [] }] }));
+    expect(await screen.findByText("primeira")).toBeInTheDocument();
+
+    await user.click(reload);
+    await waitFor(() => expect(calls(callTauri, "providers_routes")).toHaveLength(2));
+    expect(screen.getByRole("status")).toHaveTextContent("Carregando…");
+    await act(async () => answers[1]({ ...ROUTES, routes: [{ category: "segunda", candidates: [] }] }));
+    expect(await screen.findByText("segunda")).toBeInTheDocument();
+    expect(reload).not.toHaveAttribute("aria-disabled");
+  });
+
+  it("uma resposta que chega depois de sair do painel é descartada", async () => {
+    let answer: (value: RoutesSnapshot) => void = () => undefined;
+    const callTauri = host({ providers_routes: () => new Promise<RoutesSnapshot>((resolve) => (answer = resolve)) });
+    const view = render(<InventoryPanel kind="provedores" active isTauri callTauri={callTauri} />);
+    view.rerender(<InventoryPanel kind="provedores" active={false} isTauri callTauri={callTauri} />);
+    await act(async () => answer({ ...ROUTES, routes: [{ category: "velha", candidates: [] }] }));
+    expect(screen.queryByText("velha")).not.toBeInTheDocument();
+  });
+});
+
+describe("InventoryPanel — política em português (K7)", () => {
+  it("rótulos e valores legíveis, nunca as chaves internas", async () => {
+    renderPanel("seguranca", host({ security_status: () => security(["D:\\proj"]) }));
+    const terms = await screen.findAllByRole("term");
+    expect(terms.map((t) => t.textContent)).toEqual([
+      "Só diretórios autorizados podem ser abertos como projeto",
+      "Permissões do terminal humano",
+      "Isolamento de arquivos do terminal humano",
+      "Agentes governados abertos pelo Desktop",
+    ]);
+    expect(screen.getAllByRole("definition").map((d) => d.textContent)).toEqual([
+      "Sim",
+      "as do seu usuário do Windows (sem sandbox)",
+      "Não",
+      "só recebem um ambiente filtrado (variáveis de segredo removidas); sem sandbox",
+    ]);
+    expect(screen.getByText(POLICY.description)).toBeInTheDocument();
+    const text = document.body.textContent ?? "";
+    for (const raw of ["project_fencing", "human_terminal", "operator_permissions", "governed_agent", "env_sanitized_only", "description", "true", "false"]) {
+      expect(text).not.toContain(raw);
+    }
+  });
+
+  it("valor ou item desconhecido é dito desconhecido, sem mostrar a chave crua", async () => {
+    renderPanel(
+      "seguranca",
+      host({ security_status: () => security([], { project_fencing: true, governed_agent: "novo_modo", sandbox_level: "strict" }) })
+    );
+    expect(await screen.findByText("Valor não reconhecido por esta versão da interface")).toBeInTheDocument();
+    expect(screen.getByText("1 item da política não é reconhecido por esta versão da interface.")).toBeInTheDocument();
+    expect(document.body.textContent).not.toMatch(/novo_modo|sandbox_level|strict/);
+  });
+});
+
+describe("InventoryPanel — revogação (K4)", () => {
+  function revokeHost(projects: string[], revoke: (args: { projectPath: string; list: string[] }) => unknown) {
+    const list = [...projects];
+    const callTauri = host({
+      security_status: () => security(list),
+      profile_revoke_project: (args) => revoke({ projectPath: args?.projectPath, list }),
+    });
+    return { callTauri, list };
+  }
+
+  it("pergunta antes de revogar; Cancelar não chama nada e devolve o foco ao botão que abriu", async () => {
+    const { callTauri } = revokeHost(["D:\\proj", "D:\\outro"], () => ({ revoked: true, authorized_projects: [], last_project: null }));
+    const { user } = renderPanel("seguranca", callTauri);
+    const revogar = await screen.findByRole("button", { name: "Revogar D:\\proj" });
+    await user.click(revogar);
+    const dialog = screen.getByRole("alertdialog", { name: "Revogar a autorização de D:\\proj?" });
+    expect(dialog).toHaveAccessibleDescription(/Arquivos e histórico não são apagados/);
+    expect(within(dialog).getByRole("button", { name: "Cancelar" })).toHaveFocus();
+    expect(calls(callTauri, "profile_revoke_project")).toHaveLength(0);
+    // Everything else waits for the answer, without a real `disabled` that would drop the focus.
+    expect(screen.getByRole("button", { name: "Revogar D:\\outro" })).toHaveAttribute("aria-disabled", "true");
+    await user.click(screen.getByRole("button", { name: "Revogar D:\\outro" }));
+    expect(screen.getByRole("alertdialog", { name: "Revogar a autorização de D:\\proj?" })).toBeInTheDocument();
+
+    await user.click(within(dialog).getByRole("button", { name: "Cancelar" }));
+    expect(screen.queryByRole("alertdialog")).not.toBeInTheDocument();
+    await waitFor(() => expect(revogar).toHaveFocus());
+    expect(calls(callTauri, "profile_revoke_project")).toHaveLength(0);
+  });
+
+  it("Esc cancela a pergunta e devolve o foco", async () => {
+    const { callTauri } = revokeHost(["D:\\proj"], () => ({ revoked: true, authorized_projects: [], last_project: null }));
+    const { user } = renderPanel("seguranca", callTauri);
+    const revogar = await screen.findByRole("button", { name: "Revogar D:\\proj" });
+    await user.click(revogar);
+    await user.keyboard("{Escape}");
+    expect(screen.queryByRole("alertdialog")).not.toBeInTheDocument();
+    await waitFor(() => expect(revogar).toHaveFocus());
+    expect(calls(callTauri, "profile_revoke_project")).toHaveLength(0);
+  });
+
+  it("confirmar revoga uma vez, anuncia, relê a lista, avisa o App e leva o foco ao título da lista", async () => {
+    let release: () => void = () => undefined;
+    const { callTauri } = revokeHost(["D:\\proj", "D:\\outro"], ({ projectPath, list }) => {
+      return new Promise((resolve) => {
+        release = () => {
+          list.splice(list.indexOf(projectPath), 1);
+          resolve({ revoked: true, authorized_projects: [...list], last_project: null });
+        };
+      });
+    });
+    const { user, onAuthorizationChanged } = renderPanel("seguranca", callTauri);
+    await user.click(await screen.findByRole("button", { name: "Revogar D:\\proj" }));
+    const confirm = screen.getByRole("button", { name: "Confirmar revogação" });
+    await user.click(confirm);
+    await user.click(confirm); // a second activation while the first is in flight is ignored
+    expect(screen.getByRole("status")).toHaveTextContent("Revogando…");
+    expect(confirm).toHaveAttribute("aria-disabled", "true");
+    expect(confirm).toBeEnabled();
+    await act(async () => release());
+
+    expect(calls(callTauri, "profile_revoke_project")).toEqual([["profile_revoke_project", { projectPath: "D:\\proj" }]]);
+    expect(await screen.findByText("Autorização de D:\\proj revogada. Arquivos e histórico foram preservados.")).toHaveAttribute("role", "status");
+    expect(onAuthorizationChanged).toHaveBeenCalledWith({ revoked: true, authorized_projects: ["D:\\outro"], last_project: null });
+    expect(screen.queryByRole("button", { name: "Revogar D:\\proj" })).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Revogar D:\\outro" })).toBeInTheDocument();
+    expect(calls(callTauri, "security_status")).toHaveLength(2);
+    await waitFor(() => expect(screen.getByRole("heading", { name: "Diretórios autorizados" })).toHaveFocus());
+  });
+
+  it("recusa por sessões ativas: mostra o motivo, mantém a pergunta com o foco em Cancelar e não muda nada", async () => {
+    const { callTauri } = revokeHost(["D:\\proj"], () => {
+      throw {
+        code: -32003,
+        message: "Feche os terminais deste diretório antes de revogar a autorização.",
+        data: { field: "project_path", reason: "active_sessions" },
+      };
+    });
+    const { user, onAuthorizationChanged } = renderPanel("seguranca", callTauri);
+    await user.click(await screen.findByRole("button", { name: "Revogar D:\\proj" }));
+    await user.click(screen.getByRole("button", { name: "Confirmar revogação" }));
+    expect(await screen.findByRole("alert")).toHaveTextContent("Feche os terminais deste diretório antes de revogar a autorização.");
+    const dialog = screen.getByRole("alertdialog");
+    await waitFor(() => expect(within(dialog).getByRole("button", { name: "Cancelar" })).toHaveFocus());
+    expect(screen.getByRole("button", { name: "Revogar D:\\proj" })).toBeInTheDocument();
+    expect(onAuthorizationChanged).not.toHaveBeenCalled();
+    expect(calls(callTauri, "security_status")).toHaveLength(1);
+  });
+
+  it("perfil ocupado por outra janela: mostra a mensagem e permite tentar de novo", async () => {
+    let busy = true;
+    const { callTauri } = revokeHost(["D:\\proj"], ({ projectPath, list }) => {
+      if (busy) throw { code: -32603, message: "Outra janela está usando o perfil/cofre. Tente novamente.", data: { field: "profile", reason: "busy" } };
+      list.splice(list.indexOf(projectPath), 1);
+      return { revoked: true, authorized_projects: [...list], last_project: null };
+    });
+    const { user } = renderPanel("seguranca", callTauri);
+    await user.click(await screen.findByRole("button", { name: "Revogar D:\\proj" }));
+    await user.click(screen.getByRole("button", { name: "Confirmar revogação" }));
+    expect(await screen.findByRole("alert")).toHaveTextContent("Outra janela está usando o perfil/cofre. Tente novamente.");
+    busy = false;
+    await user.click(screen.getByRole("button", { name: "Confirmar revogação" }));
+    expect(await screen.findByText(/revogada/)).toBeInTheDocument();
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+  });
+
+  it("revogação não confirmada pelo host: diz isso e relê a lista", async () => {
+    const { callTauri } = revokeHost(["D:\\proj"], () => ({ revoked: false, authorized_projects: ["D:\\proj"], last_project: null }));
+    const { user, onAuthorizationChanged } = renderPanel("seguranca", callTauri);
+    await user.click(await screen.findByRole("button", { name: "Revogar D:\\proj" }));
+    await user.click(screen.getByRole("button", { name: "Confirmar revogação" }));
+    expect(await screen.findByRole("alert")).toHaveTextContent("A revogação não foi confirmada; a lista foi relida.");
+    expect(onAuthorizationChanged).not.toHaveBeenCalled();
+    expect(calls(callTauri, "security_status")).toHaveLength(2);
+    expect(screen.queryByText(/revogada\./)).not.toBeInTheDocument();
+  });
+
+  it("a região de estado existe antes de qualquer aviso (é anunciada ao mudar)", async () => {
+    renderPanel("seguranca", host({ security_status: () => security([]) }));
+    const status = screen.getByRole("status");
+    expect(await screen.findByText("Nenhum diretório autorizado.")).toBeInTheDocument();
+    expect(screen.getByRole("status")).toBe(status);
+    expect(status).toBeEmptyDOMElement();
+  });
+});

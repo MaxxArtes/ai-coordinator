@@ -81,8 +81,7 @@ export const SETTINGS_CATEGORIES: SettingsCategory[] = [
     id: "agentes",
     label: "Agentes",
     summary: "Descoberta de CLIs locais de agentes e servidores MCP.",
-    state: "planned",
-    stage: "etapa futura",
+    state: "available",
     items: [
       { label: "CLIs conhecidas pelo Core (Codex, Claude Code, OpenCode, AGY)" },
       { label: "Gemini CLI", unsupported: "Exige um novo contrato de cliente no Core, fora do escopo da 4D.3." },
@@ -92,7 +91,7 @@ export const SETTINGS_CATEGORIES: SettingsCategory[] = [
   {
     id: "provedores",
     label: "Provedores",
-    summary: "Credenciais no cofre do perfil. Limites de cota e rotas de fallback serão integrados depois.",
+    summary: "Credenciais no cofre do perfil e rotas de fallback em leitura. Cotas indisponíveis até a 4D.4.3.",
     state: "available",
     backend: "vault",
     items: [],
@@ -100,10 +99,13 @@ export const SETTINGS_CATEGORIES: SettingsCategory[] = [
   {
     id: "seguranca",
     label: "Segurança",
-    summary: "Permissões de sandbox, diretórios autorizados e políticas de acesso.",
-    state: "planned",
-    stage: "etapa futura",
-    items: [{ label: "Diretórios autorizados (listar e revogar)" }, { label: "Permissões de sandbox" }, { label: "Políticas de acesso" }],
+    summary: "Política de acesso em vigor (sem sandbox nesta versão) e diretórios autorizados.",
+    state: "available",
+    items: [
+      { label: "Diretórios autorizados (listar e revogar)" },
+      { label: "Política de acesso (somente leitura)" },
+      { label: "Sandbox do terminal", unsupported: "Não existe nesta versão: o terminal usa as permissões do seu usuário." },
+    ],
   },
   {
     id: "sobre",

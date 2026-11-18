@@ -25,11 +25,19 @@ import { PaneIndicators } from "../components/indicators/PaneIndicators";
 import { INDICATOR_KINDS, type IndicatorReading } from "../components/indicators/readings";
 import { AuthorizationScreen } from "../components/shell/AuthorizationScreen";
 import { NoticeBanner } from "../components/shell/NoticeBanner";
+import { SystemNotices } from "../components/shell/SystemNotices";
 import { StartupStatus } from "../components/shell/StartupStatus";
 import { SettingsDialog } from "../components/settings/SettingsDialog";
 import type { SettingsCategoryId } from "../components/settings/categories";
 import type { UpdateCheckResult } from "../components/settings/UpdatesSection";
-import { applyInterfaceSettings, type SettingsSnapshot, type VaultStatus } from "../components/settings/api";
+import {
+  applyInterfaceSettings,
+  type AgentsSnapshot,
+  type RoutesSnapshot,
+  type SecurityStatus,
+  type SettingsSnapshot,
+  type VaultStatus,
+} from "../components/settings/api";
 
 const params = new URLSearchParams(window.location.search);
 const view = params.get("view") ?? "app-preview";
@@ -71,12 +79,12 @@ const CHECK_BASE: UpdateCheckResult = {
   runtime_stopped: false,
 };
 
-function snapshot(overrides: Record<string, any> = {}): SettingsSnapshot {
+function snapshot(overrides: Record<string, any> = {}, top: Partial<SettingsSnapshot> = {}): SettingsSnapshot {
   const categories: any = {
-    perfil: { values: { display_name: null }, saved_fields: [], validated: true, applied: false, application: "pending_ui" },
-    geral: { values: { open_last_project_on_start: true }, saved_fields: [], validated: true, applied: false, application: "pending_ui" },
-    aparencia: { values: { stimulation: "standard", density: "comfortable" }, saved_fields: [], validated: true, applied: false, application: "pending_ui" },
-    terminal: { values: { font_size: 13, cursor_blink: true, scrollback_lines: 1000 }, saved_fields: [], validated: true, applied: false, application: "pending_ui" },
+    perfil: { values: { display_name: null }, saved_fields: [], validated: true, applied: false, application: "interface", invalid_fields: [] },
+    geral: { values: { open_last_project_on_start: true }, saved_fields: [], validated: true, applied: false, application: "interface", invalid_fields: [] },
+    aparencia: { values: { stimulation: "standard", density: "comfortable" }, saved_fields: [], validated: true, applied: false, application: "interface", invalid_fields: [] },
+    terminal: { values: { font_size: 13, cursor_blink: true, scrollback_lines: 1000 }, saved_fields: [], validated: true, applied: false, application: "interface", invalid_fields: [] },
     coordinator: {
       values: { flight_budget: { max_steps: 20, max_elapsed_seconds: 1800, max_uncheckpointed_steps: 5, max_worker_calls: 10 } },
       saved_fields: ["flight_budget"],
@@ -86,22 +94,62 @@ function snapshot(overrides: Record<string, any> = {}): SettingsSnapshot {
     },
   };
   for (const [k, v] of Object.entries(overrides)) categories[k] = { ...categories[k], ...v };
-  return { schema_version: 1, stored_schema_version: 1, unsupported_categories: {}, categories };
+  return { schema_version: 1, stored_schema_version: 1, read_only: false, stored_issue: null, unsupported_categories: {}, categories, ...top };
 }
+
+/** Fixture shapes of the host's discovery, routes and security answers (desktop/ipc/discovery.py, server.py). */
+const AGENTS: AgentsSnapshot = {
+  agents: [
+    { name: "Codex", client: "codex", available: true, reason: "Launcher encontrado; autenticação e cota não verificadas." },
+    { name: "Claude Code", client: "claude", available: false, reason: "Launcher indisponível ou configuração ilegível." },
+  ],
+  mcp_servers: ["exemplo-fixture"],
+  mcp_complete: true,
+  source: "configured",
+  unsupported: [{ name: "Gemini CLI", reason: "Exige um novo contrato de cliente no Core." }],
+};
+const ROUTES: RoutesSnapshot = {
+  routes: [{ category: "fixture", candidates: [{ client: "codex", model: "modelo-fixture", effort: "medium" }] }],
+  available: true,
+  source: "packaged_defaults",
+  quota_status: "unknown",
+  quota_milestone: "4D.4.3",
+};
+const SECURITY: SecurityStatus = {
+  authorized_projects: [`${PROJECT}-fixture`],
+  policy: {
+    project_fencing: true,
+    human_terminal: "operator_permissions",
+    human_terminal_filesystem_isolation: false,
+    description: "FIXTURE: a autorização limita a abertura de projetos; o terminal usa as permissões do operador.",
+  },
+};
 
 interface Fakes {
   settings?: SettingsSnapshot;
   vault?: VaultStatus;
   vaultKeys?: string[];
+  agents?: AgentsSnapshot;
+  routes?: RoutesSnapshot;
+  security?: SecurityStatus;
 }
 
 function fakeTauri(check: UpdateCheckResult, fakes: Fakes = {}) {
-  return async (cmd: string) => {
+  const security = { ...(fakes.security ?? SECURITY) };
+  return async (cmd: string, args?: Record<string, any>) => {
     if (cmd === "updater_get_channel_info") return { current_version: "0.6.1-alpha.50", channel: "alpha" };
     if (cmd === "updater_check") return check;
     if (cmd === "settings_get") return fakes.settings ?? snapshot();
-    if (cmd === "vault_status") return fakes.vault ?? { available: false, backend: "unavailable" };
-    if (cmd === "vault_list_keys") return { keys: fakes.vaultKeys ?? [] };
+    if (cmd === "vault_status") return fakes.vault ?? { available: false, backend: "unavailable", reason: "unavailable" };
+    if (cmd === "vault_list_keys") return { keys: fakes.vaultKeys ?? [], revision: "f".repeat(64) };
+    if (cmd === "discovery_agents") return fakes.agents ?? AGENTS;
+    if (cmd === "providers_routes") return fakes.routes ?? ROUTES;
+    if (cmd === "security_status") return security;
+    if (cmd === "profile_revoke_project") {
+      // Fixture only: the list shrinks on screen; nothing on disk is touched.
+      security.authorized_projects = security.authorized_projects.filter((p) => p !== args?.projectPath);
+      return { revoked: true, authorized_projects: security.authorized_projects, last_project: null };
+    }
     throw new Error(`comando indisponível na conferência visual: ${cmd}`);
   };
 }
@@ -298,6 +346,96 @@ const VIEWS: Record<string, () => React.ReactElement> = {
     <SettingsView check={CHECK_BASE} category="provedores" fakes={{ vault: { available: true, backend: "dpapi" }, vaultKeys: ["OPENROUTER_API_KEY"] }} />
   ),
   "e4-provedores-indisponivel": () => <SettingsView check={CHECK_BASE} category="provedores" />,
+  "e7-provedores-cofre-ocupado": () => (
+    <SettingsView check={CHECK_BASE} category="provedores" fakes={{ vault: { available: false, backend: "dpapi", reason: "busy" } }} />
+  ),
+  "e7-rotas-ilegiveis": () => (
+    <SettingsView
+      check={CHECK_BASE}
+      category="provedores"
+      fakes={{
+        routes: {
+          routes: [],
+          available: false,
+          source: "unreadable",
+          reason: "Configuração de rotas ilegível; nada foi alterado.",
+          quota_status: "unknown",
+          quota_milestone: "4D.4.3",
+        },
+      }}
+    />
+  ),
+  "e7-agentes": () => <SettingsView check={CHECK_BASE} category="agentes" />,
+  "e7-agentes-mcp-incompleto": () => (
+    <SettingsView check={CHECK_BASE} category="agentes" fakes={{ agents: { ...AGENTS, mcp_servers: [], mcp_complete: false, source: "unreadable" } }} />
+  ),
+  "e7-seguranca": () => <SettingsView check={CHECK_BASE} category="seguranca" />,
+  "e7-configuracoes-protegidas": () => (
+    <SettingsView
+      check={CHECK_BASE}
+      category="terminal"
+      fakes={{
+        settings: snapshot(
+          {},
+          {
+            read_only: true,
+            stored_issue: { reason: "incompatible_version", message: "O esquema salvo não é compatível com esta versão. Os dados foram preservados." },
+          },
+        ),
+      }}
+    />
+  ),
+  "e7-campos-invalidos": () => (
+    <SettingsView
+      check={CHECK_BASE}
+      category="terminal"
+      fakes={{ settings: snapshot({ terminal: { saved_fields: ["font_size"], validated: false, invalid_fields: ["font_size"] } }) }}
+    />
+  ),
+  "e7-escolha-de-projeto": () => (
+    <Shell connection="authorizing" metrics={null}>
+      <AuthorizationScreen
+        profileName="default"
+        authorizedProjects={[PROJECT, `${PROJECT}-fixture`]}
+        note="A abertura automática do último projeto está desligada (Configurações → Geral)."
+        inputPath=""
+        onInputPathChange={() => undefined}
+        onSubmit={() => undefined}
+        onOpenProject={() => undefined}
+      />
+    </Shell>
+  ),
+  "e7-avisos-persistentes": () => (
+    <Shell
+      connection="connected"
+      notices={
+        <SystemNotices
+          notices={[
+            {
+              id: "profile-recovery",
+              tone: "warn",
+              title: "Perfil ilegível recriado: sem projetos autorizados e sem configurações",
+              body: (
+                <>
+                  FIXTURE: o perfil ativo não pôde ser lido. Cópia preservada no diretório do perfil:{" "}
+                  <code>profile.json.corrupt-20261117T120000Z</code>
+                </>
+              ),
+            },
+            {
+              id: "settings-load",
+              tone: "error",
+              title: "Preferências não carregadas: usando os padrões",
+              body: "FIXTURE: o esquema salvo não é compatível com esta versão. Nada foi sobrescrito.",
+              action: { label: "Abrir Configurações", onClick: () => undefined },
+            },
+          ]}
+        />
+      }
+    >
+      <StartupStatus state="connecting" />
+    </Shell>
+  ),
   "update-runtime-stopped": () => (
     <SettingsView check={{ ...CHECK_BASE, available: false, runtime_stopped: true, sessions_known: false, sessions_error: "IPC child stdin is not available" }} />
   ),

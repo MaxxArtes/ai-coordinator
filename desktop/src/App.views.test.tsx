@@ -13,18 +13,54 @@ vi.mock("@tauri-apps/api/event", () => ({ listen: vi.fn(async () => () => {}) })
 vi.mock("xterm", async () => ({ Terminal: (await import("./test/fakeXterm")).FakeTerminal }));
 vi.mock("xterm-addon-fit", async () => ({ FitAddon: (await import("./test/fakeXterm")).FakeFitAddon }));
 
-import { App } from "./App";
+import { App, PREFERENCES_DEADLINE_MS } from "./App";
 import { FakeResizeObserver, resetXterm, xtermLog } from "./test/fakeXterm";
 
 const METRICS = { host_pid: 4242, host_ram_bytes: 61_027_123, total_tree_ram_bytes: 134_637_159, cpu_usage_percent: 37.5 };
 
-type HostSession = { pane_id: number; alive: boolean; exit_code: number | null };
+function appSettings(overrides: Record<string, any> = {}): any {
+  const values: Record<string, any> = {
+    perfil: { display_name: null }, geral: { open_last_project_on_start: true },
+    aparencia: { stimulation: "standard", density: "comfortable" },
+    terminal: { font_size: 13, cursor_blink: true, scrollback_lines: 1000 }, coordinator: {},
+  };
+  for (const [kind, value] of Object.entries(overrides)) values[kind] = { ...values[kind], ...value };
+  return { schema_version: 1, stored_schema_version: 1, unsupported_categories: {}, categories: Object.fromEntries(
+    Object.entries(values).map(([kind, v]) => [kind, { values: v, saved_fields: Object.keys(v), validated: true, applied: false, application: kind === "coordinator" ? "unsupported" : "interface" }])
+  ) };
+}
 
-/** Simulated host. Like the fixed manager (F10): a taken slot is never reused; the lowest free one is used instead. */
-function host({ preview = false, authorized = true, metricsFail = false } = {}) {
+type HostSession = { pane_id: number; alive: boolean; exit_code: number | null; tab?: string; cwd?: string };
+
+interface HostOptions {
+  preview?: boolean;
+  authorized?: boolean;
+  metricsFail?: boolean;
+  /** settings_get answer (appSettings() by default). */
+  settings?: Record<string, any>;
+  /** Fields merged into the profile_get_active answer. */
+  profile?: Record<string, any>;
+  /** Commands that reject with the given error. */
+  fail?: Record<string, unknown>;
+  /** Commands answered by a custom handler (before everything else). */
+  extra?: Record<string, (args?: any) => unknown>;
+}
+
+/**
+ * Simulated host. Like the fixed manager (F10): a taken slot is never reused; the lowest free one is used instead.
+ * Like the real one, a tab id cannot be created twice, and a revocation is refused while a session is registered there.
+ */
+function host({ preview = false, authorized = true, metricsFail = false, settings, profile = {}, fail = {}, extra = {} }: HostOptions = {}) {
   let sessions = 0;
   const registry = new Map<string, HostSession>();
+  const tabs = new Map<string, string>();
+  const state = {
+    settings: settings ?? appSettings(),
+    authorized: (profile.authorized_projects as string[] | undefined) ?? (authorized ? ["D:\\proj"] : []),
+  };
   invoke.mockImplementation(async (cmd: string, args?: any) => {
+    if (cmd in extra) return extra[cmd](args);
+    if (cmd in fail) throw fail[cmd];
     switch (cmd) {
       case "ping":
         if (preview) throw new Error("sem host Tauri");
@@ -32,8 +68,37 @@ function host({ preview = false, authorized = true, metricsFail = false } = {}) 
       case "get_runtime_status":
         return { core_version: "0.6.0", app_version: "0.6.1-alpha.50", host_os: "windows", is_isolated: true, python_path: "C:\\app\\python.exe" };
       case "profile_get_active":
-        return { authorized_projects: authorized ? ["D:\\proj"] : [] };
+        return { name: "default", display_name: null, last_project: null, ...profile, authorized_projects: [...state.authorized] };
+      case "settings_get":
+        return state.settings;
+      case "settings_update": {
+        const category = state.settings.categories[args.category];
+        state.settings = {
+          ...state.settings,
+          categories: { ...state.settings.categories, [args.category]: { ...category, values: { ...category.values, ...args.values } } },
+        };
+        return state.settings;
+      }
+      case "profile_remember_project":
+        return { remembered: true, last_project: args?.projectPath };
+      case "profile_authorize_project":
+        if (!state.authorized.includes(args.projectPath)) state.authorized.push(args.projectPath);
+        return { success: true, profile_name: "default", project_path: args.projectPath, authorized_projects: [...state.authorized] };
+      case "security_status":
+        return { authorized_projects: [...state.authorized], policy: { project_fencing: true, human_terminal: "operator_permissions" } };
+      case "profile_revoke_project": {
+        if (Array.from(registry.values()).some((s) => s.cwd === args.projectPath)) {
+          throw { code: -32003, message: "Feche os terminais deste diretório antes de revogar a autorização.", data: { field: "project_path", reason: "active_sessions" } };
+        }
+        const before = state.authorized.length;
+        state.authorized = state.authorized.filter((p) => p !== args.projectPath);
+        return { revoked: state.authorized.length < before, authorized_projects: [...state.authorized], last_project: null };
+      }
       case "terminal_create_tab":
+        if (tabs.has(args.tabId)) throw new Error(`Tab with ID '${args.tabId}' already exists`);
+        if (!state.authorized.includes(args.projectPath)) throw new Error("Project not authorized or session invalid");
+        tabs.set(args.tabId, args.projectPath);
+        return { tab_id: args.tabId };
       case "terminal_resize":
       case "terminal_write":
         return { ok: true };
@@ -41,17 +106,19 @@ function host({ preview = false, authorized = true, metricsFail = false } = {}) 
         registry.delete(args?.sessionId);
         return { closed: true };
       case "terminal_create_session": {
-        const taken = new Set(Array.from(registry.values()).map((r) => r.pane_id));
+        if (!tabs.has(args?.tabId)) throw new Error(`Tab '${args?.tabId}' does not exist`);
+        const inTab = Array.from(registry.values()).filter((r) => (r.tab ?? "tab-main") === args.tabId);
+        const taken = new Set(inTab.map((r) => r.pane_id));
         const slot = !taken.has(args?.paneId) ? args?.paneId : [0, 1, 2, 3].find((n) => !taken.has(n));
         if (slot === undefined) throw new Error("aba cheia");
         sessions++;
         const id = `sess-${sessions}`;
-        registry.set(id, { pane_id: slot, alive: true, exit_code: null });
+        registry.set(id, { pane_id: slot, alive: true, exit_code: null, tab: args.tabId, cwd: args.cwd });
         return {
           session_id: id,
           pane_id: slot,
           command: ["C:\\Windows\\System32\\cmd.exe", "/k", "SEGREDO"],
-          cwd: "D:\\proj",
+          cwd: args.cwd,
           pid: 1000 + sessions,
           is_alive: true,
           created_at: "2026-11-17T12:00:00Z",
@@ -59,14 +126,14 @@ function host({ preview = false, authorized = true, metricsFail = false } = {}) 
       }
       case "terminal_list_tabs":
         return {
-          tabs: [
-            {
-              tab_id: "tab-main",
-              panes: Object.fromEntries(
-                Array.from(registry.entries()).map(([id, r]) => [String(r.pane_id), { session_id: id, is_alive: r.alive, exit_code: r.exit_code }]),
-              ),
-            },
-          ],
+          tabs: Array.from(new Set(["tab-main", ...tabs.keys()])).map((tabId) => ({
+            tab_id: tabId,
+            panes: Object.fromEntries(
+              Array.from(registry.entries())
+                .filter(([, r]) => (r.tab ?? "tab-main") === tabId)
+                .map(([id, r]) => [String(r.pane_id), { session_id: id, is_alive: r.alive, exit_code: r.exit_code }]),
+            ),
+          })),
         };
       case "terminal_get_output":
         return { raw: "", next_seq: 0 };
@@ -434,5 +501,297 @@ describe("App views", () => {
       await new Promise((resolve) => setTimeout(resolve, 50));
     });
     expect(document.body.textContent).not.toMatch(/conectad|v0\.6\.0/i);
+  });
+});
+
+const notices = () => screen.getByTestId("system-notices");
+const callsOf = (cmd: string) => invoke.mock.calls.filter((c) => c[0] === cmd).map((c) => c[1]);
+const indexOf = (cmd: string) => invoke.mock.calls.findIndex((c) => c[0] === cmd);
+
+describe("App — inicialização que nunca trava (E2-6, K1, K2, K5)", () => {
+  afterEach(() => {
+    for (const key of ["terminalFontSize", "terminalScrollback", "terminalCursorBlink", "stimulation", "density"]) {
+      delete document.documentElement.dataset[key];
+    }
+  });
+
+  it("settings_get falhando: o terminal abre com os padrões e o motivo fica visível até carregar", async () => {
+    const user = userEvent.setup();
+    const reason = "O esquema salvo não é compatível com esta versão. Os dados foram preservados.";
+    host({ fail: { settings_get: { code: -32602, message: reason, data: { field: "schema_version", reason: "incompatible_version" } } } });
+    renderApp();
+    await connected();
+    expect(count("terminal_create_session")).toBe(1);
+    expect(xtermLog.created[0].options).toMatchObject({ fontSize: 13, scrollback: 1000, cursorBlink: true });
+    expect(notices()).toHaveTextContent("Preferências não carregadas: usando os padrões");
+    expect(notices()).toHaveTextContent(reason);
+    expect(document.body.textContent).not.toMatch(/Erro de inicialização/);
+    // A transient message does not replace it, and it has no dismiss button: it lasts while the cause lasts.
+    expect(within(notices()).queryByRole("button", { name: /Dispensar/ })).toBeNull();
+    await user.click(within(notices()).getByRole("button", { name: "Abrir Configurações" }));
+    expect(await screen.findByRole("dialog", { name: "Configurações" })).toBeInTheDocument();
+  });
+
+  it("profile_remember_project falhando não impede o terminal e é chamado só depois da sessão", async () => {
+    host({ fail: { profile_remember_project: { code: -32602, message: "O diretório do projeto não está disponível.", data: { reason: "path_missing" } } } });
+    renderApp();
+    await connected();
+    expect(count("terminal_create_session")).toBe(1);
+    await waitFor(() => expect(count("profile_remember_project")).toBe(1));
+    expect(indexOf("profile_remember_project")).toBeGreaterThan(indexOf("terminal_create_session"));
+    expect(await screen.findByText(/O terminal abriu, mas o projeto não foi lembrado/)).toBeInTheDocument();
+    expect(screen.getByRole("region", { name: "Terminal 01" })).toBeInTheDocument();
+  });
+
+  it("abertura automática desligada com projetos autorizados: a tela diz a verdade e abre um com um clique", async () => {
+    const user = userEvent.setup();
+    host({
+      settings: appSettings({ geral: { open_last_project_on_start: false } }),
+      profile: { authorized_projects: ["D:\\proj", "D:\\outro"] },
+    });
+    renderApp();
+    expect(await screen.findByRole("heading", { name: "Escolha o projeto" })).toBeInTheDocument();
+    expect(screen.getByText(/abertura automática do último projeto está desligada/)).toBeInTheDocument();
+    expect(document.body.textContent).not.toMatch(/Nenhum projeto está autorizado/);
+    expect(count("terminal_create_tab")).toBe(0);
+    // Authorizing another directory is still offered.
+    expect(screen.getByLabelText("Caminho do projeto no host")).toBeInTheDocument();
+
+    await user.click(screen.getByRole("button", { name: "Abrir D:\\outro" }));
+    await connected();
+    expect(callsOf("terminal_create_tab")).toEqual([{ tabId: "tab-main", projectPath: "D:\\outro" }]);
+    expect(count("profile_authorize_project")).toBe(0);
+    expect(bar()).toHaveTextContent("outro");
+  });
+
+  it("abre o último projeto quando ele está entre os autorizados (mesma comparação do host)", async () => {
+    host({ profile: { authorized_projects: ["D:\\proj", "D:\\outro"], last_project: "d:/OUTRO" } });
+    renderApp();
+    await connected();
+    expect(callsOf("terminal_create_tab")).toEqual([{ tabId: "tab-main", projectPath: "D:\\outro" }]);
+  });
+
+  it("o último projeto não abre: mostra a escolha com o motivo, não um beco sem saída", async () => {
+    host({ extra: { terminal_create_tab: () => { throw new Error("Project not authorized or session invalid"); } } });
+    renderApp();
+    expect(await screen.findByText(/Não foi possível abrir D:\\proj: Project not authorized/)).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Abrir D:\\proj" })).toBeInTheDocument();
+    expect(xtermLog.created).toHaveLength(0);
+  });
+
+  it("perfil recuperado: aviso persistente com o nome da cópia, sem caminho", async () => {
+    host({
+      authorized: false,
+      profile: {
+        recovery: {
+          reason: "profile_unreadable",
+          backup_file: "profile.json.corrupt-20261117T120000Z",
+          message: "O perfil estava ilegível e foi recriado.",
+        },
+      },
+    });
+    renderApp();
+    await screen.findByLabelText("Caminho do projeto no host");
+    expect(notices()).toHaveTextContent("Perfil ilegível recriado: sem projetos autorizados e sem configurações");
+    expect(notices()).toHaveTextContent("O perfil estava ilegível e foi recriado.");
+    expect(within(notices()).getByText("profile.json.corrupt-20261117T120000Z").tagName).toBe("CODE");
+  });
+
+  it("configurações de outra versão: aviso persistente e o terminal abre", async () => {
+    host({
+      settings: {
+        ...appSettings(),
+        read_only: true,
+        stored_issue: { reason: "incompatible_version", message: "O esquema salvo não é compatível com esta versão. Os dados foram preservados." },
+      },
+    });
+    renderApp();
+    await connected();
+    expect(notices()).toHaveTextContent("Configurações de outra versão: protegidas, somente leitura");
+  });
+
+  it("campos salvos inválidos: o aviso diz onde, nunca o valor salvo", async () => {
+    const settings = appSettings();
+    settings.categories.terminal = { ...settings.categories.terminal, validated: false, invalid_fields: ["font_size"] };
+    host({ settings });
+    renderApp();
+    await connected();
+    expect(notices()).toHaveTextContent("Preferências salvas inválidas: usando o padrão nesses campos");
+    expect(notices()).toHaveTextContent("Terminal (1 campo)");
+  });
+
+  it("falha de inicialização (perfil ocupado): Tentar novamente refaz a conexão", async () => {
+    const user = userEvent.setup();
+    let busy = true;
+    host({
+      extra: {
+        profile_get_active: () => {
+          if (busy) throw { code: -32603, message: "Outra janela está usando o perfil/cofre. Tente novamente.", data: { reason: "busy" } };
+          return { name: "default", authorized_projects: ["D:\\proj"], last_project: null };
+        },
+      },
+    });
+    renderApp();
+    const alert = await screen.findByText("Falha na inicialização da Alpha técnica");
+    expect(alert.closest("[role=alert]")).toHaveTextContent("Outra janela está usando o perfil/cofre. Tente novamente.");
+    busy = false;
+    await user.click(screen.getByRole("button", { name: "Tentar novamente" }));
+    await connected();
+    expect(count("ping")).toBe(2);
+    expect(count("terminal_create_tab")).toBe(1);
+  });
+
+  it("primeira pintura: a janela nunca fica em branco e o prazo libera a área dos terminais", async () => {
+    host({ extra: { settings_get: () => new Promise(() => {}) } });
+    renderApp();
+    const app = document.querySelector(".app")!;
+    expect(app).toHaveAttribute("data-preferences-loading", "true");
+    expect(await screen.findByText(/Inicializando runtime do Core/)).toBeInTheDocument();
+    expect(screen.getByRole("banner")).toBeInTheDocument();
+    await waitFor(() => expect(app).not.toHaveAttribute("data-preferences-loading"), { timeout: PREFERENCES_DEADLINE_MS + 2500 });
+  }, 10000);
+
+  it("nome no cabeçalho: com contexto para leitor de tela; sem nome de exibição, o nome do perfil", async () => {
+    host({ profile: { name: "trabalho" } });
+    renderApp();
+    await connected();
+    const name = document.querySelector(".app-header__operator")!;
+    expect(name).toHaveTextContent("Perfil: trabalho");
+    expect(name).toHaveAttribute("title", "Perfil: trabalho");
+    expect(name.querySelector(".sr-only")).toHaveTextContent("Perfil:");
+  });
+
+  it("com nome de exibição salvo, é ele que aparece", async () => {
+    host({ settings: appSettings({ perfil: { display_name: "Ana" } }), profile: { name: "trabalho" } });
+    renderApp();
+    await connected();
+    expect(document.querySelector(".app-header__operator")).toHaveTextContent("Perfil: Ana");
+  });
+});
+
+describe("App — preferências, atalhos e revogação (Etapa 7)", () => {
+  afterEach(() => {
+    for (const key of ["terminalFontSize", "terminalScrollback", "terminalCursorBlink", "stimulation", "density"]) {
+      delete document.documentElement.dataset[key];
+    }
+  });
+
+  it("fonte, cursor e histórico salvos chegam ao xterm; mudar em Configurações aplica ao vivo sem recriar nada", async () => {
+    const user = userEvent.setup();
+    host({ settings: appSettings({ terminal: { font_size: 18, scrollback_lines: 500, cursor_blink: false } }) });
+    renderApp();
+    await connected();
+    const term = xtermLog.created[0];
+    expect(term.options).toMatchObject({ fontSize: 18, scrollback: 500, cursorBlink: false });
+
+    await user.click(screen.getByRole("button", { name: "Configurações" }));
+    const dialog = await screen.findByRole("dialog");
+    await user.click(within(dialog).getByRole("tab", { name: /^Terminal/ }));
+    const panel = within(dialog).getByRole("tabpanel", { name: /Terminal/ });
+    const font = await within(panel).findByLabelText("Tamanho da fonte");
+    await waitFor(() => expect(font).toHaveValue(18));
+    await user.clear(font);
+    await user.type(font, "20");
+    await user.click(within(panel).getByRole("button", { name: "Salvar" }));
+    await waitFor(() => expect(term.options.fontSize).toBe(20));
+    expect(term.options).toMatchObject({ scrollback: 500, cursorBlink: false });
+    expect(xtermLog.created).toHaveLength(1);
+    expect(xtermLog.disposed).toBe(0);
+    expect(count("terminal_create_session")).toBe(1);
+    expect(count("terminal_close_session")).toBe(0);
+  });
+
+  it("baixa estimulação desliga o cursor piscante do terminal aberto", async () => {
+    host({ settings: appSettings({ aparencia: { stimulation: "low" } }) });
+    renderApp();
+    await connected();
+    expect(xtermLog.created[0].options.cursorBlink).toBe(false);
+  });
+
+  it("atalhos no App real: Ctrl+Shift+2 foca o painel 2, Ctrl+, abre Geral, PageDown troca a vista; nada vai ao shell", async () => {
+    const user = userEvent.setup();
+    host();
+    renderApp();
+    await connected();
+    await user.click(screen.getByRole("button", { name: /Novo terminal/ }));
+    await waitFor(() => expect(xtermLog.created).toHaveLength(2));
+
+    const textarea = xtermLog.created[0].textarea!;
+    textarea.focus();
+    fireEvent.keyDown(textarea, { key: "@", code: "Digit2", ctrlKey: true, shiftKey: true });
+    await waitFor(() => expect(document.activeElement).toHaveAttribute("aria-label", "Terminal 02, 2 de 2"));
+
+    xtermLog.created[1].textarea!.focus();
+    fireEvent.keyDown(xtermLog.created[1].textarea!, { key: ",", code: "Comma", ctrlKey: true });
+    const dialog = await screen.findByRole("dialog", { name: "Configurações" });
+    expect(within(dialog).getByRole("tab", { name: /^Geral/ })).toHaveAttribute("aria-selected", "true");
+    // With the dialog open the application shortcuts do nothing.
+    fireEvent.keyDown(document.activeElement ?? document.body, { key: "PageDown", code: "PageDown", ctrlKey: true, shiftKey: true });
+    expect(screen.getByRole("tab", { name: /^Conversas/, hidden: true })).toHaveAttribute("aria-selected", "true");
+    await user.keyboard("{Escape}");
+    await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+
+    fireEvent.keyDown(document.activeElement ?? document.body, { key: "PageDown", code: "PageDown", ctrlKey: true, shiftKey: true });
+    await waitFor(() => expect(screen.getByRole("tab", { name: /^Monitoramento/ })).toHaveAttribute("aria-selected", "true"));
+    await waitFor(() => expect(document.activeElement).toBe(screen.getByRole("tab", { name: /^Monitoramento/ })));
+    fireEvent.keyDown(document.activeElement!, { key: "PageUp", code: "PageUp", ctrlKey: true, shiftKey: true });
+    await waitFor(() => expect(screen.getByRole("tab", { name: /^Conversas/ })).toHaveAttribute("aria-selected", "true"));
+
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    });
+    expect(count("terminal_write")).toBe(0);
+    expect(xtermLog.created).toHaveLength(2);
+  });
+
+  it("revogar o projeto aberto sem terminais volta à tela de projetos; o próximo projeto usa uma aba nova", async () => {
+    const user = userEvent.setup();
+    host();
+    renderApp();
+    await connected();
+    await user.click(screen.getByRole("button", { name: "Fechar Terminal 01" }));
+    await waitFor(() => expect(screen.queryByRole("region", { name: "Terminal 01" })).toBeNull());
+
+    await user.click(screen.getByRole("button", { name: "Configurações" }));
+    const dialog = await screen.findByRole("dialog");
+    await user.click(within(dialog).getByRole("tab", { name: /^Segurança/ }));
+    const panel = within(dialog).getByRole("tabpanel", { name: /Segurança/ });
+    await user.click(await within(panel).findByRole("button", { name: "Revogar D:\\proj" }));
+    await user.click(within(panel).getByRole("button", { name: "Confirmar revogação" }));
+    expect(await within(panel).findByText(/Autorização de D:\\proj revogada/)).toBeInTheDocument();
+    await user.keyboard("{Escape}");
+    await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+
+    expect(await screen.findByText(/A autorização de D:\\proj foi revogada/)).toBeInTheDocument();
+    expect(bar()).not.toHaveTextContent("proj");
+    await user.type(screen.getByLabelText("Caminho do projeto no host"), "D:\\novo");
+    await user.click(screen.getByRole("button", { name: "Autorizar diretório e iniciar terminal" }));
+    await waitFor(() => expect(screen.getByRole("region", { name: /^Terminal \d+$/ })).toBeInTheDocument());
+    const tabs = callsOf("terminal_create_tab");
+    expect(tabs).toEqual([
+      { tabId: "tab-main", projectPath: "D:\\proj" },
+      { tabId: "tab-2", projectPath: "D:\\novo" },
+    ]);
+    expect(callsOf("terminal_create_session").at(-1)).toMatchObject({ tabId: "tab-2", cwd: "D:\\novo" });
+    expect(document.body.textContent).not.toMatch(/Falha ao criar|already exists/);
+  });
+
+  it("com terminais abertos no projeto, a revogação é recusada e o App não muda", async () => {
+    const user = userEvent.setup();
+    host();
+    renderApp();
+    await connected();
+    await user.click(screen.getByRole("button", { name: "Configurações" }));
+    const dialog = await screen.findByRole("dialog");
+    await user.click(within(dialog).getByRole("tab", { name: /^Segurança/ }));
+    const panel = within(dialog).getByRole("tabpanel", { name: /Segurança/ });
+    await user.click(await within(panel).findByRole("button", { name: "Revogar D:\\proj" }));
+    await user.click(within(panel).getByRole("button", { name: "Confirmar revogação" }));
+    expect(await within(panel).findByRole("alert")).toHaveTextContent("Feche os terminais deste diretório antes de revogar a autorização.");
+    await user.keyboard("{Escape}");
+    await user.keyboard("{Escape}");
+    await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+    expect(screen.getByRole("region", { name: "Terminal 01" })).toBeInTheDocument();
+    expect(bar()).toHaveTextContent("proj");
   });
 });

@@ -149,6 +149,12 @@ describe("CSS and component rules", () => {
     expect(decl(find(COMPONENT_RULES, ".app__main > *"), "grid-area")).toEqual(["1 / 1"]);
   });
 
+  it("waiting for the preferences never blanks the window: only the terminal mounts wait (Etapa 7, FE-11)", () => {
+    const hiding = COMPONENT_RULES.filter((r) => r.selector.includes("data-preferences-loading"));
+    expect(hiding.map((r) => r.selector)).toEqual(['.app[data-preferences-loading="true"] .terminal-pane__mount']);
+    expect(decl(hiding, "visibility")).toEqual(["hidden"]);
+  });
+
   it("the terminal padding is inside .xterm, where FitAddon accounts for it", () => {
     expect(decl(find(COMPONENT_RULES, ".terminal-pane__mount"), "padding")).toEqual(["0"]);
     expect(decl(find(COMPONENT_RULES, ".terminal-pane__mount > .xterm"), "padding")).toEqual(["var(--term-pad)"]);

@@ -22,6 +22,7 @@ export const CATEGORY_FIELDS: Record<BackedCategory, UiField[]> = {
       key: "open_last_project_on_start",
       label: "Abrir o último projeto autorizado ao iniciar",
       kind: "bool",
+      hint: "Desligado, a inicialização mostra os projetos autorizados para você escolher.",
     },
   ],
   aparencia: [
@@ -46,8 +47,13 @@ export const CATEGORY_FIELDS: Record<BackedCategory, UiField[]> = {
   ],
   terminal: [
     { key: "font_size", label: "Tamanho da fonte", kind: "int", min: 10, max: 24 },
-    { key: "cursor_blink", label: "Cursor piscante", kind: "bool" },
-    { key: "scrollback_lines", label: "Linhas de histórico", kind: "int", min: 100, max: 1000, hint: "Limite do buffer: 1.000 linhas." },
+    {
+      key: "cursor_blink",
+      label: "Cursor piscante",
+      kind: "bool",
+      hint: "A baixa estimulação e a preferência do sistema por movimento reduzido mantêm o cursor fixo.",
+    },
+    { key: "scrollback_lines", label: "Linhas de histórico", kind: "int", min: 100, max: 1000, hint: "Limite do buffer: 1.000 linhas. Reduzir descarta na hora as linhas mais antigas dos terminais abertos." },
   ],
   coordinator: [
     { key: "max_steps", parent: "flight_budget", label: "Passos máximos por missão", kind: "int", min: 1, max: 1000 },

@@ -3,8 +3,21 @@ import { TerminalGrid } from "./components/TerminalGrid";
 import { TerminalPaneData } from "./components/TerminalPane";
 import { Terminal } from "xterm";
 import { SettingsDialog } from "./components/settings/SettingsDialog";
-import type { SettingsCategoryId } from "./components/settings/categories";
-import { applyInterfaceSettings, getSettings } from "./components/settings/api";
+import { SETTINGS_CATEGORIES, type SettingsCategoryId } from "./components/settings/categories";
+import {
+  applyInterfaceSettings,
+  errorText,
+  getActiveProfile,
+  getSettings,
+  invalidFieldsOf,
+  pathWithin,
+  rememberProject,
+  samePath,
+  type BackedCategory,
+  type ProfileRecovery,
+  type RevokeResult,
+  type SettingsSnapshot,
+} from "./components/settings/api";
 import {
   AppHeader,
   connectionLabel,
@@ -21,6 +34,18 @@ import { activeCountText, resolvePaneState, useTerminalStates, type PaneState } 
 import { NoticeBanner, type NoticeTone } from "./components/shell/NoticeBanner";
 import { AuthorizationScreen } from "./components/shell/AuthorizationScreen";
 import { StartupStatus } from "./components/shell/StartupStatus";
+import { SystemNotices, type SystemNotice } from "./components/shell/SystemNotices";
+
+/**
+ * Longest wait for the preferences before the terminal area is shown with the defaults. The rest of the shell is never
+ * hidden: it paints at once with the appearance cached from the previous run (main.tsx).
+ */
+export const PREFERENCES_DEADLINE_MS = 1500;
+
+const BACKED: BackedCategory[] = ["perfil", "geral", "aparencia", "terminal", "coordinator"];
+
+/** The open project is still usable when it, or a directory above it, is authorized (same rule as the host). */
+const stillAuthorized = (project: string, authorized: string[]): boolean => authorized.some((dir) => pathWithin(project, dir));
 
 export const App: React.FC = () => {
   const [isTauri, setIsTauri] = useState<boolean>(false);
@@ -31,13 +56,23 @@ export const App: React.FC = () => {
   const [metrics, setMetrics] = useState<RuntimeMetrics | null>(null);
   // The last metrics reading failed: the previous value stops being shown as a measurement.
   const [metricsFailed, setMetricsFailed] = useState<boolean>(false);
+  // One project tab per window (D5). A new id is used only when another project replaces a revoked one: the host
+  // keeps a tab bound to the project it was created with.
   const [activeTab, setActiveTab] = useState<string>("tab-main");
-  // The main view is separate from activeTab: switching views never re-runs the connection effect, which depends
-  // on activeTab and would recreate the tab and its sessions.
+  const activeTabRef = useRef<string>("tab-main");
+  const tabSeqRef = useRef<number>(1);
+  const tabProjectRef = useRef<Map<string, string>>(new Map());
+  // The main view is separate from activeTab: switching views never re-runs the connection effect.
   const [mainView, setMainView] = useState<MainViewId>("conversas");
   const [projectPath, setProjectPath] = useState<string>("");
+  const projectPathRef = useRef<string>("");
+  projectPathRef.current = projectPath;
   const [authorizedProjects, setAuthorizedProjects] = useState<string[]>([]);
   const [isAuthorizing, setIsAuthorizing] = useState<boolean>(false);
+  // Why the project screen is shown instead of a terminal; empty on a clean install.
+  const [authNote, setAuthNote] = useState<string>("");
+  const [starting, setStarting] = useState<boolean>(false);
+  const startingRef = useRef<boolean>(false);
   const [inputPath, setInputPath] = useState<string>("");
   const [panes, setPanes] = useState<TerminalPaneData[]>([]);
   const [notice, setNotice] = useState<string>("");
@@ -48,6 +83,26 @@ export const App: React.FC = () => {
   const [latestAvailableVersion, setLatestAvailableVersion] = useState<string>("");
   // Read from the host (get_runtime_status / updater_get_channel_info); empty until known.
   const [appVersion, setAppVersion] = useState<string>("");
+  const [settings, setSettings] = useState<SettingsSnapshot | null>(null);
+  // settings_get failed at start: the defaults are in use and this stays visible until a load succeeds.
+  const [settingsLoadError, setSettingsLoadError] = useState<string | null>(null);
+  const [preferencesLoading, setPreferencesLoading] = useState(true);
+  const [profileName, setProfileName] = useState<string>("");
+  const [profileDisplayName, setProfileDisplayName] = useState<string>("");
+  const [profileRecovery, setProfileRecovery] = useState<ProfileRecovery | null>(null);
+  // Incremented by "Tentar novamente" after a failed start: the connection effect runs again.
+  const [initAttempt, setInitAttempt] = useState<number>(0);
+  const acceptSettings = useCallback((next: SettingsSnapshot) => {
+    applyInterfaceSettings(next);
+    setSettings(next);
+    setSettingsLoadError(null);
+  }, []);
+
+  // Never a blank window: whatever happens to the preferences, the terminal area is shown after the deadline.
+  useEffect(() => {
+    const timer = window.setTimeout(() => setPreferencesLoading(false), PREFERENCES_DEADLINE_MS);
+    return () => window.clearTimeout(timer);
+  }, []);
 
   const termsRef = useRef<Map<string, Terminal>>(new Map());
   const lastSeqRef = useRef<Map<string, number>>(new Map());
@@ -72,8 +127,26 @@ export const App: React.FC = () => {
     if (previous !== null && previous !== connectionText) setConnectionNotice(`Conexão: ${connectionText}`);
   }, [connectionText]);
 
-  // F6/Shift+F6 between regions and the F5/Ctrl+R/Ctrl+Shift+R guard: a single listener on the window.
-  useEffect(() => installGlobalShortcuts(window), []);
+  const openSettings = useCallback((category: SettingsCategoryId) => {
+    setSettingsCategory(category);
+    setIsSettingsOpen(true);
+  }, []);
+
+  // F6/Shift+F6 between regions, the application shortcuts and the F5/Ctrl+R guard: one listener on the window.
+  const shortcutActionsRef = useRef({
+    openSettings: () => openSettings("geral"),
+    focusPane: (index: number) => {
+      if (index >= panesRef.current.length) return;
+      setMainView("conversas");
+      requestAnimationFrame(() => document.querySelectorAll<HTMLElement>(".terminal-pane__focus-region")[index]?.focus());
+    },
+    cycleView: (direction: 1 | -1) => {
+      const views: MainViewId[] = ["conversas", "monitoramento", "missoes"];
+      setMainView((previous) => views[(views.indexOf(previous) + direction + views.length) % views.length]);
+      requestAnimationFrame(() => document.querySelector<HTMLElement>('.main-nav [aria-selected="true"]')?.focus());
+    },
+  });
+  useEffect(() => installGlobalShortcuts(window, shortcutActionsRef.current), []);
 
   // Direct invocation without swallowing errors
   const callTauri = useCallback(async (cmd: string, args?: Record<string, any>): Promise<any> => {
@@ -94,9 +167,50 @@ export const App: React.FC = () => {
         await callTauri("terminal_create_tab", { tabId, projectPath: path });
       }
       createdTabsRef.current.add(tabId);
+      tabProjectRef.current.set(tabId, path);
     },
     [callTauri]
   );
+
+  /**
+   * Opens a terminal in an authorized project. Remembering the project for the next start is a convenience that runs
+   * after the terminal exists and never blocks it (K5); a failure there is only reported.
+   */
+  const startProject = useCallback(
+    async (dir: string, alive: () => boolean = () => true): Promise<void> => {
+      let tabId = activeTabRef.current;
+      const bound = tabProjectRef.current.get(tabId);
+      if (bound !== undefined && !samePath(bound, dir)) tabId = `tab-${++tabSeqRef.current}`;
+      await ensureTabCreated(tabId, dir);
+      const sess = await callTauri("terminal_create_session", {
+        tabId,
+        paneId: 0,
+        kind: "human_terminal",
+        cwd: dir,
+        cols: 80,
+        rows: 24,
+      });
+      if (!alive()) return;
+      if (!sess || !sess.session_id) throw new Error("Sessão inicial não retornou session_id válido");
+      activeTabRef.current = tabId;
+      setActiveTab(tabId);
+      setProjectPath(dir);
+      setIsAuthorizing(false);
+      setAuthNote("");
+      setPanes([paneFromSession(sess, takeNumber(), tabId, 0)]);
+      setConnectionStatus("connected");
+      void rememberProject(callTauri, dir).catch((err) => {
+        if (alive()) showNotice(`O terminal abriu, mas o projeto não foi lembrado para a próxima inicialização: ${errorText(err)}`, "info");
+      });
+    },
+    [callTauri, ensureTabCreated, showNotice]
+  );
+
+  const showProjectScreen = useCallback((note: string) => {
+    setAuthNote(note);
+    setIsAuthorizing(true);
+    setConnectionStatus("authorizing");
+  }, []);
 
   // Terminal mount callback
   const handleMount = useCallback((sessionId: string, term: Terminal | null) => {
@@ -226,68 +340,100 @@ export const App: React.FC = () => {
     [panes, projectPath, ensureTabCreated, callTauri]
   );
 
+  // One project open at a time: a second click while one is opening is ignored.
+  const beginStart = (): boolean => {
+    if (startingRef.current) return false;
+    startingRef.current = true;
+    setStarting(true);
+    setNotice("");
+    return true;
+  };
+  const endStart = () => {
+    startingRef.current = false;
+    setStarting(false);
+  };
+
   // Authorize project directory and start session
   const handleAuthorizeAndStart = useCallback(
     async (dirToAuthorize: string) => {
-      if (!dirToAuthorize.trim()) {
+      const requested = dirToAuthorize.trim();
+      if (!requested) {
         showNotice("Informe um caminho de diretório válido.");
         return;
       }
+      if (!beginStart()) return;
       try {
-        setNotice("");
-        if (isTauriRef.current) {
-          const res = await callTauri("profile_authorize_project", { projectPath: dirToAuthorize.trim() });
-          if (!res || !res.success) {
-            throw new Error("Resposta inesperada do autorizador.");
-          }
-          const canonical = res.project_path;
-          setAuthorizedProjects(res.authorized_projects);
-          setProjectPath(canonical);
-          setIsAuthorizing(false);
-          setConnectionStatus("connecting");
-
-          // Step 1: Create tab in Core
-          await callTauri("terminal_create_tab", {
-            tabId: activeTab,
-            projectPath: canonical,
-          });
-          createdTabsRef.current.add(activeTab);
-
-          // Step 2: Create initial session
-          const sess = await callTauri("terminal_create_session", {
-            tabId: activeTab,
-            paneId: 0,
-            kind: "human_terminal",
-            cwd: canonical,
-            cols: 80,
-            rows: 24,
-          });
-
-          if (sess && sess.session_id) {
-            setPanes([paneFromSession(sess, takeNumber(), activeTab, 0)]);
-            setConnectionStatus("connected");
-          } else {
-            throw new Error("Sessão inicial não retornou session_id válido");
-          }
-        } else {
+        if (!isTauriRef.current) {
           // Preview mode fallback
-          setAuthorizedProjects([dirToAuthorize.trim()]);
-          setProjectPath(dirToAuthorize.trim());
+          setAuthorizedProjects([requested]);
+          setProjectPath(requested);
           setIsAuthorizing(false);
           setConnectionStatus("connected");
+          return;
         }
-      } catch (err: any) {
-        const msg = err?.message || String(err);
-        showNotice(`Falha na autorização do projeto: ${msg}`);
-        setConnectionStatus("authorizing");
+        let canonical: string;
+        try {
+          const res = await callTauri("profile_authorize_project", { projectPath: requested });
+          if (!res || !res.success) throw new Error("Resposta inesperada do autorizador.");
+          canonical = res.project_path;
+          if (Array.isArray(res.authorized_projects)) setAuthorizedProjects(res.authorized_projects);
+        } catch (err) {
+          showNotice(`Falha na autorização do projeto: ${errorText(err)}`);
+          return;
+        }
+        setIsAuthorizing(false);
+        setConnectionStatus("connecting");
+        try {
+          await startProject(canonical);
+        } catch (err) {
+          // The authorization itself went through: it is not reported as a failed authorization.
+          showNotice(`Diretório autorizado, mas o terminal não abriu: ${errorText(err)}`);
+          showProjectScreen("");
+        }
+      } finally {
+        endStart();
       }
     },
-    [activeTab, callTauri]
+    [callTauri, showNotice, startProject, showProjectScreen]
+  );
+
+  // Open a project that is already authorized, without authorizing it again.
+  const handleOpenAuthorized = useCallback(
+    async (path: string) => {
+      if (!beginStart()) return;
+      setIsAuthorizing(false);
+      setConnectionStatus("connecting");
+      try {
+        await startProject(path);
+      } catch (err) {
+        showNotice(`Não foi possível abrir ${path}: ${errorText(err)}`);
+        showProjectScreen("");
+      } finally {
+        endStart();
+      }
+    },
+    [showNotice, startProject, showProjectScreen]
+  );
+
+  // A directory was revoked in Configurações → Segurança. When it was the open project and no terminal is left there
+  // (the host refuses otherwise), the App goes back to the project screen instead of using a revoked directory.
+  const handleAuthorizationChanged = useCallback(
+    (result: RevokeResult) => {
+      const list = Array.isArray(result?.authorized_projects) ? result.authorized_projects : [];
+      setAuthorizedProjects(list);
+      const open = projectPathRef.current;
+      if (open && !stillAuthorized(open, list) && panesRef.current.length === 0) {
+        setProjectPath("");
+        showProjectScreen(`A autorização de ${open} foi revogada. Escolha outro projeto ou autorize um diretório.`);
+      }
+    },
+    [showProjectScreen]
   );
 
   // Initialize runtime connection and check project authorization
   useEffect(() => {
     let mounted = true;
+    const alive = () => mounted;
 
     async function init() {
       setConnectionStatus("connecting");
@@ -309,50 +455,47 @@ export const App: React.FC = () => {
           if (mounted && st) setStatus(st);
           if (mounted && st?.app_version) setAppVersion(st.app_version);
 
-          // Query active profile and authorized projects
-          const profInfo = await callTauri("profile_get_active");
-          const authList: string[] = Array.isArray(profInfo?.authorized_projects)
-            ? profInfo.authorized_projects
-            : [];
-          if (mounted) setAuthorizedProjects(authList);
-
-          if (authList.length > 0) {
-            // Already has authorized project, select first
-            const activeDir = authList[0];
-            if (mounted) setProjectPath(activeDir);
-
-            // Step 1: Ensure Tab is created in Core before creating session
-            await callTauri("terminal_create_tab", {
-              tabId: activeTab,
-              projectPath: activeDir,
-            });
-            createdTabsRef.current.add(activeTab);
-
-            // Step 2: Create initial session
-            const sess = await callTauri("terminal_create_session", {
-              tabId: activeTab,
-              paneId: 0,
-              kind: "human_terminal",
-              cwd: activeDir,
-              cols: 80,
-              rows: 24,
-            });
-
+          // Preferences before the first terminal. A failure never blocks the start (E2-6): the defaults are used,
+          // nothing is overwritten and the reason stays visible.
+          let initialSettings: SettingsSnapshot | null = null;
+          try {
+            initialSettings = await getSettings(callTauri);
+          } catch (err) {
             if (!mounted) return;
-            if (sess && sess.session_id) {
-              setPanes([paneFromSession(sess, takeNumber(), activeTab, 0)]);
-              setConnectionStatus("connected");
-            } else {
-              throw new Error("Sessão inicial não retornou session_id válido");
+            applyInterfaceSettings(null);
+            setSettingsLoadError(errorText(err));
+          }
+          if (!mounted) return;
+          if (initialSettings) acceptSettings(initialSettings);
+          setPreferencesLoading(false);
+
+          // Query active profile and authorized projects
+          const profInfo = await getActiveProfile(callTauri);
+          if (!mounted) return;
+          const authList: string[] = Array.isArray(profInfo?.authorized_projects) ? profInfo.authorized_projects : [];
+          setAuthorizedProjects(authList);
+          setProfileName(typeof profInfo?.name === "string" ? profInfo.name : "");
+          setProfileDisplayName(typeof profInfo?.display_name === "string" ? profInfo.display_name : "");
+          setProfileRecovery(profInfo?.recovery && typeof profInfo.recovery === "object" ? profInfo.recovery : null);
+
+          const autoOpen = initialSettings?.categories?.geral?.values?.open_last_project_on_start !== false;
+          if (authList.length > 0 && autoOpen) {
+            const activeDir = authList.find((p) => samePath(p, profInfo.last_project)) ?? authList[0];
+            try {
+              await startProject(activeDir, alive);
+            } catch (err) {
+              if (!mounted) return;
+              // The project cannot be opened (removed, unplugged…): the chooser, not a dead end.
+              showProjectScreen(`Não foi possível abrir ${activeDir}: ${errorText(err)}`);
             }
           } else {
-            // Clean install: no authorized project yet. Prompt operator explicitly
-            if (!mounted) return;
-            setIsAuthorizing(true);
-            setConnectionStatus("authorizing");
+            showProjectScreen(
+              authList.length > 0 ? "A abertura automática do último projeto está desligada (Configurações → Geral)." : ""
+            );
           }
         } else {
           // Preview mode in standard browser
+          setPreferencesLoading(false);
           isTauriRef.current = false;
           setIsTauri(false);
           setStatus({
@@ -368,7 +511,7 @@ export const App: React.FC = () => {
           setPanes([
             {
               sessionId: mockSessionId,
-              tabId: activeTab,
+              tabId: activeTabRef.current,
               paneId: 0,
               kind: "human_terminal",
               number: takeNumber(),
@@ -376,11 +519,11 @@ export const App: React.FC = () => {
           ]);
           setConnectionStatus("connected");
         }
-      } catch (err: any) {
+      } catch (err) {
         if (!mounted) return;
+        setPreferencesLoading(false);
         setConnectionStatus("failed");
-        const msg = err?.message || String(err);
-        showNotice(`Erro de inicialização da Alpha: ${msg}`);
+        showNotice(`Erro de inicialização da Alpha: ${errorText(err)}`);
       }
     }
 
@@ -389,7 +532,7 @@ export const App: React.FC = () => {
     return () => {
       mounted = false;
     };
-  }, [activeTab, callTauri]);
+  }, [callTauri, initAttempt]);
 
   // Periodic metrics refresh
   useEffect(() => {
@@ -471,15 +614,6 @@ export const App: React.FC = () => {
     }
   }, [isTauri, connectionStatus, callTauri]);
 
-  // Saved interface preferences (e.g. low-stimulation mode) are applied as soon as the host answers.
-  useEffect(() => {
-    if (!isTauri) return;
-    getSettings(callTauri)
-      .then((snapshot) => applyInterfaceSettings(snapshot))
-      .catch(() => {
-        // Defaults stay in place; Configurações shows the load error when opened.
-      });
-  }, [isTauri, callTauri]);
 
   // Save session layout
   const handleSaveSessions = useCallback(
@@ -521,20 +655,88 @@ export const App: React.FC = () => {
     el?.focus();
   }, [panes]);
 
+  // Persistent state the operator must see; never replaced by a transient notice.
+  const systemNotices = useMemo<SystemNotice[]>(() => {
+    const list: SystemNotice[] = [];
+    if (profileRecovery) {
+      list.push({
+        id: "profile-recovery",
+        tone: "warn",
+        title: "Perfil ilegível recriado: sem projetos autorizados e sem configurações",
+        body: (
+          <>
+            {profileRecovery.message || "O perfil ativo não pôde ser lido e foi recriado."} Arquivo da cópia, na
+            pasta do perfil: <code>{profileRecovery.backup_file}</code>
+          </>
+        ),
+      });
+    }
+    const toSettings = { label: "Abrir Configurações", onClick: () => openSettings("perfil") };
+    if (settingsLoadError) {
+      list.push({
+        id: "settings-load",
+        tone: "error",
+        title: "Preferências não carregadas: usando os padrões",
+        body: `${settingsLoadError} Nada foi sobrescrito.`,
+        action: toSettings,
+      });
+    } else if (settings?.read_only) {
+      list.push({
+        id: "settings-read-only",
+        tone: "warn",
+        title: "Configurações de outra versão: protegidas, somente leitura",
+        body: `${settings.stored_issue?.message || "As configurações foram gravadas por outra versão e estão protegidas."} Esta versão segue com os próprios valores e não grava sobre elas.`,
+        action: toSettings,
+      });
+    } else if (settings) {
+      const invalid = BACKED.map((category) => [category, invalidFieldsOf(settings, category).length] as const).filter(([, n]) => n > 0);
+      if (invalid.length > 0 || settings.stored_issue) {
+        const labels = invalid.map(([category, n]) => {
+          const label = SETTINGS_CATEGORIES.find((c) => c.id === category)?.label ?? category;
+          return `${label} (${n} ${n === 1 ? "campo" : "campos"})`;
+        });
+        list.push({
+          id: "settings-invalid",
+          tone: "warn",
+          title: "Preferências salvas inválidas: usando o padrão nesses campos",
+          body: [
+            settings.stored_issue?.message || "Os valores salvos ficam preservados.",
+            labels.length ? `Em: ${labels.join(", ")}.` : "",
+          ]
+            .filter(Boolean)
+            .join(" "),
+          action: toSettings,
+        });
+      }
+    }
+    return list;
+  }, [profileRecovery, settingsLoadError, settings, openSettings]);
+
   const isAuthorizingView = isAuthorizing || connectionStatus === "authorizing";
 
-  // Conversas shows the authorization and startup screens too; the navigation stays available on all of them.
+  // Conversas shows the project and startup screens too; the navigation stays available on all of them.
   const conversasContent = isAuthorizingView ? (
     <AuthorizationScreen
-      profileName="default"
+      profileName={profileName || "perfil ativo"}
+      authorizedProjects={authorizedProjects}
+      note={authNote}
       inputPath={inputPath}
       onInputPathChange={setInputPath}
       onSubmit={handleAuthorizeAndStart}
+      onOpenProject={handleOpenAuthorized}
+      busy={starting}
     />
   ) : connectionStatus === "connecting" && panes.length === 0 ? (
     <StartupStatus state="connecting" />
   ) : connectionStatus === "failed" && panes.length === 0 ? (
-    <StartupStatus state="failed" detail={notice} />
+    <StartupStatus
+      state="failed"
+      detail={notice}
+      onRetry={() => {
+        setNotice("");
+        setInitAttempt((n) => n + 1);
+      }}
+    />
   ) : (
     <TerminalGrid
       tabId={activeTab}
@@ -550,24 +752,25 @@ export const App: React.FC = () => {
     />
   );
 
+  const headerName = settings?.categories?.perfil?.values?.display_name || profileDisplayName || profileName || null;
+
   return (
-    <div className="app">
+    <div className="app" data-preferences-loading={preferencesLoading || undefined}>
       <AppHeader
         appVersion={appVersion}
+        displayName={headerName}
         isTauri={isTauri}
         connectionStatus={connectionStatus}
         hasUpdateAvailable={hasUpdateAvailable}
         latestAvailableVersion={latestAvailableVersion}
-        onOpenSettings={() => {
-          setSettingsCategory(hasUpdateAvailable ? "sobre" : "perfil");
-          setIsSettingsOpen(true);
-        }}
+        onOpenSettings={() => openSettings(hasUpdateAvailable ? "sobre" : "perfil")}
         nav={<MainNav active={mainView} onSelect={setMainView} paneCount={panes.length} />}
       />
       <p className="sr-only" role="status" data-testid="connection-notice">
         {connectionNotice}
       </p>
 
+      <SystemNotices notices={systemNotices} />
       {notice && <NoticeBanner message={notice} tone={noticeTone} onDismiss={() => setNotice("")} />}
 
       {/* The three views share one cell; Conversas stays mounted (invisible and inert while another view is shown). */}
@@ -599,7 +802,8 @@ export const App: React.FC = () => {
         activePanesCount={panes.length}
         metrics={metricsFailed ? null : metrics}
         callTauri={callTauri}
-        onSettingsChanged={(snapshot) => applyInterfaceSettings(snapshot)}
+        onSettingsChanged={acceptSettings}
+        onAuthorizationChanged={handleAuthorizationChanged}
       />
     </div>
   );

@@ -228,6 +228,14 @@
   --motion-spin: 0ms;
 }
 
+/* Compact density reduces spacing only, never the 12px text floor or 24px controls. */
+:root[data-density="compact"] {
+  --sp-3: 0.5rem;
+  --sp-4: 0.75rem;
+  --gap-band: 6px;
+  --gutter: 6px;
+}
+
 /* System preference for reduced motion (applies in any mode). */
 @media (prefers-reduced-motion: reduce) {
   :root {
