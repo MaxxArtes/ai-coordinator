@@ -66,8 +66,8 @@ class TerminalSession:
     def _on_output(self, chunk: str) -> None:
         self.buffer.append(chunk)
 
-    def start(self, env: Optional[Dict[str, str]] = None, max_memory_mb: int = 256) -> ProcessIdentity:
-        """Spawn the session with bounded containment."""
+    def start(self, env: Optional[Dict[str, str]] = None, max_memory_mb: Optional[int] = 256) -> ProcessIdentity:
+        """Spawn the session in its own Job Object (tree killed on close); max_memory_mb=None means no memory cap."""
         self.identity = self.backend.spawn(
             cmd=self.command,
             cwd=self.cwd,

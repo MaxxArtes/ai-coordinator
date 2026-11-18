@@ -152,7 +152,7 @@ class BasePtyBackend(abc.ABC):
         cmd: List[str],
         cwd: Path,
         env: Optional[dict[str, str]] = None,
-        max_memory_mb: int = 256,
+        max_memory_mb: Optional[int] = 256,
     ) -> ProcessIdentity:
         """Spawn the process in the PTY with containment."""
 
@@ -201,7 +201,7 @@ class WindowsConPtyBackend(BasePtyBackend):
         cmd: List[str],
         cwd: Path,
         env: Optional[dict[str, str]] = None,
-        max_memory_mb: int = 256,
+        max_memory_mb: Optional[int] = 256,
     ) -> ProcessIdentity:
         # 1. Create communication pipes
         h_in_read = w.HANDLE()
@@ -217,7 +217,7 @@ class WindowsConPtyBackend(BasePtyBackend):
         # 2. Create Job Object with resource limits
         self._job_handle = WindowsProcessController.create_job_object(
             kill_on_close=True,
-            resource_limits=ResourceLimits(max_memory_bytes=max_memory_mb * 1024 * 1024),
+            resource_limits=ResourceLimits(max_memory_bytes=max_memory_mb * 1024 * 1024 if max_memory_mb else None),
         )
         if not self._job_handle:
             k32.CloseHandle(h_in_read)
@@ -473,7 +473,7 @@ class SubprocessPipeBackend(BasePtyBackend):
         cmd: List[str],
         cwd: Path,
         env: Optional[dict[str, str]] = None,
-        max_memory_mb: int = 256,
+        max_memory_mb: Optional[int] = 256,
     ) -> ProcessIdentity:
         working_dir = str(cwd.resolve())
         clean_env = dict(env) if env is not None else dict(os.environ)
@@ -494,7 +494,7 @@ class SubprocessPipeBackend(BasePtyBackend):
         if os.name == "nt":
             self._job_handle = WindowsProcessController.create_job_object(
                 kill_on_close=True,
-                resource_limits=ResourceLimits(max_memory_bytes=max_memory_mb * 1024 * 1024),
+                resource_limits=ResourceLimits(max_memory_bytes=max_memory_mb * 1024 * 1024 if max_memory_mb else None),
             )
             if self._job_handle:
                 WindowsProcessController.assign_to_job(self._job_handle, self.process.pid)

@@ -203,7 +203,11 @@ class TerminalManager:
                     if any(s in kl for s in ("secret", "token", "password", "key")):
                         env.pop(k, None)
 
-            session.start(env=env)
+            # The human terminal runs with the operator's own rights (no isolation): a 256 MB cap on its whole process
+            # tree only made ordinary tools die at start (Claude Code, OpenCode: allocation failures). The tree is still
+            # contained and killed on close. Governed agents keep the cap.
+            memory_cap_mb = 256 if kind == SessionKind.GOVERNED_AGENT else None
+            session.start(env=env, max_memory_mb=memory_cap_mb)
 
             # Core ProcessSupervisor integration: capture identity & bind
             if session.pid:
