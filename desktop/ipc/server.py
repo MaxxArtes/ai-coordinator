@@ -88,6 +88,7 @@ def _safe_rpc_id(value: Any) -> bool:
 VAULT_UNAVAILABLE_CODE = -32004  # RPCErrorCode.VAULT_UNAVAILABLE
 VAULT_CONFLICT_CODE = -32005
 BUSY_CODE = -32006  # another window holds the profile or vault lock; nothing was changed
+# -32007 is reserved for the host (IpcBridge, main.rs): the Core did not answer in time or closed the stream (L2).
 PROFILE_BUSY_MESSAGE = "Outra janela está usando o perfil. Tente novamente."
 VAULT_BUSY_MESSAGE = "Outra janela está usando o cofre. Tente novamente."
 VAULT_STATUS_LOCK_TIMEOUT = 2.0
@@ -126,6 +127,31 @@ def validate_secret_key(value: Any) -> str:
             reason="invalid_value",
         )
     return value
+
+
+def validate_expected_revision(value: Any) -> Optional[str]:
+    """Optional vault revision (E.1, L6): absent/null, or the 64 lowercase hex characters vault.list_keys reported."""
+    import re
+
+    if value is None:
+        return None
+    if not isinstance(value, str) or not re.fullmatch(r"[0-9a-f]{64}", value):
+        raise InvalidParamsError("A revisão do cofre é inválida.", field="expected_revision", reason="invalid_value")
+    return value
+
+
+def validate_optional_flag(params: Dict[str, Any], name: str) -> bool:
+    """Optional boolean parameter: absent or null is False; anything but true/false is refused (never coerced)."""
+    value = params.get(name)
+    if value is None:
+        return False
+    if not isinstance(value, bool):
+        raise InvalidParamsError(f"'{name}' deve ser verdadeiro ou falso.", field=name, reason="invalid_value")
+    return value
+
+
+BROAD_SCOPE_MESSAGE = ("Este diretório dá acesso amplo (raiz do disco ou pasta pessoal inteira). "
+                       "Confirme explicitamente para autorizar.")
 
 
 def validate_command_argv(value: Any) -> Optional[List[str]]:
@@ -498,17 +524,20 @@ class SecureIPCServer:
         if not isinstance(value, str) or not value.strip():
             raise InvalidParamsError("'value' deve ser um texto não vazio.", field="value", reason="invalid_value")
         value = value.strip()
-        expected_revision = params.get("expected_revision")
-        if expected_revision is not None:
-            import re
-            if not isinstance(expected_revision, str) or not re.fullmatch(r"[0-9a-f]{64}", expected_revision):
-                raise InvalidParamsError("A revisão do cofre é inválida.", field="expected_revision", reason="invalid_value")
+        expected_revision = validate_expected_revision(params.get("expected_revision"))
         self._vault_call(token, lambda vault: vault.set_secret_conditional(key, value, expected_revision))
         return {"stored": True, "key": key}
 
     def _handle_vault_delete_secret(self, params: Dict[str, Any], token: Optional[str] = None) -> Dict[str, Any]:
         key = validate_secret_key(params.get("key"))
-        deleted = self._vault_call(token, lambda vault: vault.delete_secret(key))
+        # L6: with the revision of the operator's own reading, a vault changed since then is a conflict and nothing is
+        # removed; without it, the name is removed if present (unchanged behaviour).
+        expected_revision = validate_expected_revision(params.get("expected_revision"))
+        if expected_revision is None:
+            deleted = self._vault_call(token, lambda vault: vault.delete_secret(key))
+        else:
+            deleted = self._vault_call(
+                token, lambda vault: vault.delete_secret(key, expected_revision=expected_revision))
         return {"deleted": bool(deleted), "key": key}
 
     def _handle_profile_get_active(self, _params: Dict[str, Any]) -> Dict[str, Any]:
@@ -529,13 +558,21 @@ class SecureIPCServer:
         }
 
     def _handle_profile_authorize_project(self, params: Dict[str, Any], _token: Optional[str] = None) -> Dict[str, Any]:
+        from desktop.auth.profile import is_broad_directory
+
         mgr = self._get_terminal_manager()
         prof_mgr = mgr.authorizer.profile_manager
+        self._project_text(params)
+        confirm_broad = validate_optional_flag(params, "confirm_broad")
         path_obj = self._project_param(params)
         if not path_obj.is_dir():
             # Fixed text: the requested path is never echoed back.
             raise InvalidParamsError("O diretório do projeto não existe ou não é uma pasta.",
                                      field="project_path", reason="path_missing")
+        # L5: a drive/volume or share root, or the whole home folder, needs an explicit confirmation. Judged by where
+        # the request really leads (resolved); entries already stored are kept and reported by security.status.
+        if is_broad_directory(path_obj) and not confirm_broad:
+            raise InvalidParamsError(BROAD_SCOPE_MESSAGE, field="project_path", reason="broad_scope")
         active = prof_mgr.get_active_profile()
         prof_mgr.authorize_project(active.name, str(path_obj))
         active = prof_mgr.get_active_profile()
@@ -606,12 +643,17 @@ class SecureIPCServer:
         return {"remembered": True, "last_project": str(target)}
 
     def _handle_security_status(self, _params: Dict[str, Any]) -> Dict[str, Any]:
+        from desktop.auth.profile import is_broad_directory
+
         active = self._get_terminal_manager().authorizer.profile_manager.get_active_profile()
+        # L5: authorized entries that open a whole disk or home folder (confirmed, or stored before the confirmation
+        # existed), listed with their stored text so the interface can mark them; nothing is changed here.
+        broad = [entry for entry in active.authorized_projects if is_broad_directory(entry)]
         # Only what the Desktop really enforces (BE-14): sessions open only in authorized directories (checked again
         # from disk by every window, while the active_sessions refusal of a revocation only sees this window's
         # terminals); nothing isolates the shell; TerminalManager only drops agent variables whose NAME contains
         # secret, token, password or key, so other credentials in the environment still reach an agent.
-        return {"authorized_projects": active.authorized_projects, "policy": {
+        return {"authorized_projects": active.authorized_projects, "broad_projects": broad, "policy": {
             "project_fencing": True,
             "human_terminal": "operator_permissions",
             "governed_agent": "env_sanitized_only",

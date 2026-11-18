@@ -84,6 +84,32 @@ def path_matches(entry: Union[str, Path], target: Union[str, Path], *, include_c
     return False
 
 
+def _home_forms() -> List[str]:
+    try:
+        return path_forms(Path.home())
+    except (RuntimeError, OSError, KeyError, ValueError):
+        return []  # no home folder can be determined: only roots are broad
+
+
+def is_broad_directory(path: Union[str, Path]) -> bool:
+    """True when authorizing `path` opens a whole disk or the whole home folder (L5).
+
+    Broad: the root of a drive or volume ("C:\\", "\\\\?\\C:\\", "/"), the root of a network share
+    ("\\\\server\\share"), the operator's home folder (Path.home(), literal and resolved, letter case folded where the
+    platform folds it) and any folder that contains it ("C:\\Users"). Only the text of `path` is read, never the disk,
+    so a stored entry on a disconnected network drive is classified without waiting for it; callers judging a request
+    pass the resolved path (a junction that leads to "C:\\" is broad, a drive letter mapped to a project is not).
+    """
+    try:
+        text = os.path.normpath(os.fspath(path))
+        candidate = Path(text)
+    except (TypeError, ValueError):
+        return False
+    if candidate.anchor and candidate.parent == candidate:
+        return True
+    return any(_is_within(home, text) for home in _home_forms())
+
+
 @dataclass
 class DesktopProfile:
     name: str

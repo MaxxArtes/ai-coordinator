@@ -385,8 +385,9 @@ def test_unpaired_surrogate_escape_is_refused_before_any_write(env):
 def test_security_status_never_claims_isolation_or_core_policy(env):
     repo = project(env)
     result = call(env, "security.status").result
-    assert set(result) == {"authorized_projects", "policy"}
+    assert set(result) == {"authorized_projects", "broad_projects", "policy"}
     assert result["authorized_projects"] == [str(repo.resolve())]
+    assert result["broad_projects"] == []  # L5: an ordinary project folder is not broad
     policy = result["policy"]
     assert set(policy) == {"project_fencing", "human_terminal", "governed_agent", "human_terminal_filesystem_isolation", "description"}
     assert policy["project_fencing"] is True
@@ -707,3 +708,81 @@ def test_interface_commands_exist_in_the_host_and_reach_registered_core_methods(
         body = body[: body.index("\n}\n")]
         for method in re.findall(r"""\.call(?:_structured|_locked)?\(\s*["']([a-z_.]+)["']""", body):
             assert method in registered, (command, method)
+
+
+# ---- CM-5 (Etapa 8): argument names; Tauri 2 renames each Rust parameter to camelCase ----
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import _desktop_static as static  # noqa: E402
+
+CORE_METHOD = re.compile(
+    r"""[(,]\s*"((?:system|profile|security|discovery|providers|terminal|settings|vault)\.[a-z_]+)"\s*,""")
+
+
+def test_static_reader_understands_the_argument_forms_in_use():
+    keys = static.js_object_keys('{ tabId, projectPath: path, "kind": k, // note, x: 1\n cols: f(a, { b: 1 }), '
+                                 "...(rev !== undefined ? { expectedRevision: rev } : {}), "
+                                 "...(c && { confirmBroad: true }), }")
+    assert keys.keys == {"tabId", "projectPath", "kind", "cols"}
+    assert keys.conditional == {"expectedRevision", "confirmBroad"}
+    assert keys.unresolved == []
+    odd = static.js_object_keys("{ [name]: 1, ...extra }")
+    assert odd.keys == set() and len(odd.unresolved) == 2
+    fn = static.rust_functions("#[tauri::command]\nasync fn x(project_path: String, // c, d\n "
+                               "confirm_broad: Option<bool>, bridge: State<'_, Arc<IpcBridge>>) "
+                               "-> Result<Value, Value> { Ok(json!({})) }\n")[0]
+    assert fn.is_command and fn.is_async and fn.returns == "Result<Value, Value>"
+    assert static.expected_keys(fn) == {"projectPath": ("project_path", False), "confirmBroad": ("confirm_broad", True)}
+
+
+def test_interface_arguments_match_the_host_command_parameters():
+    """A key the host does not declare is silently dropped and a missing non-Option parameter rejects the call; neither
+    shows before the native build runs. For every literal callTauri/invoke in desktop/src (tests excluded), each key
+    must be the camelCase name of a parameter of the #[tauri::command] in main.rs (State/AppHandle/Window are injected
+    and never sent), and every non-Option parameter must be sent unconditionally."""
+    analysis = static.analyze_ipc(static.MAIN_RS.read_text(encoding="utf-8"))
+    sites = static.interface_call_sites()
+    problems = []
+    for site in sites:
+        fn = analysis.commands.get(site.command)
+        if fn is None:
+            problems.append(f"{site.where()}: o comando {site.command} não existe em main.rs")
+            continue
+        expected = static.expected_keys(fn)
+        for entry in site.args.unresolved:
+            problems.append(f"{site.where()}: argumento de {site.command} ilegível estaticamente: {entry!r}")
+        for key in sorted((site.args.keys | site.args.conditional) - set(expected)):
+            problems.append(f"{site.where()}: {site.command} recebe '{key}', que não é parâmetro do comando "
+                            f"(aceitos: {sorted(expected)})")
+        for key in sorted(k for k, (_, optional) in expected.items() if not optional and k not in site.args.keys):
+            problems.append(f"{site.where()}: {site.command} não envia sempre o parâmetro obrigatório '{key}'")
+    assert not problems, "\n".join(problems)
+    with_args = {site.command for site in sites if site.has_args}
+    # The reader still sees the known calls with their arguments.
+    assert {"terminal_create_tab", "terminal_create_session", "terminal_get_output", "settings_update",
+            "vault_set_secret", "vault_delete_secret", "profile_authorize_project", "profile_revoke_project",
+            "profile_remember_project", "updater_download_and_install"} <= with_args
+
+
+def test_interface_sends_the_etapa8_optional_arguments():
+    """L7 reaches the host: the broad-scope confirmation and the revision of the vault removal are really sent."""
+    sent: dict = {}
+    for site in static.interface_call_sites():
+        sent.setdefault(site.command, set()).update(site.args.keys | site.args.conditional)
+    assert "confirmBroad" in sent.get("profile_authorize_project", set()), sent.get("profile_authorize_project")
+    assert "expectedRevision" in sent.get("vault_delete_secret", set()), sent.get("vault_delete_secret")
+
+
+def test_every_host_command_that_reaches_the_core_forwards_registered_methods():
+    """Also through helpers (count_active_sessions, a spawn_blocking wrapper): every Core method a command forwards is
+    registered in desktop/ipc/server.py."""
+    main_rs = static.MAIN_RS.read_text(encoding="utf-8")
+    registered = set(re.findall(r"""self\.register\(\s*["']([a-z_.]+)["']""",
+                                (ROOT / "desktop" / "ipc" / "server.py").read_text(encoding="utf-8")))
+    analysis = static.analyze_ipc(main_rs)
+    for name, fn in sorted(analysis.commands.items()):
+        if not analysis.uses_ipc(fn):
+            continue
+        methods = set(CORE_METHOD.findall(fn.body)) or set(CORE_METHOD.findall(analysis.expanded_body(fn)))
+        assert methods, f"{name}: nenhum método do Core encontrado"
+        assert methods <= registered, (name, sorted(methods - registered))

@@ -78,8 +78,8 @@ class BaseVault(abc.ABC):
         """Retrieve and decrypt the secret under the given key."""
 
     @abc.abstractmethod
-    def delete_secret(self, key: str) -> bool:
-        """Remove a secret from the vault."""
+    def delete_secret(self, key: str, expected_revision: Optional[str] = None) -> bool:
+        """Remove a secret from the vault; with `expected_revision`, only from that exact revision."""
 
     @abc.abstractmethod
     def list_keys(self) -> List[str]:
@@ -198,9 +198,18 @@ class _LockedVault(BaseVault):
         with self._locked():
             return self._load_dict().get(key)
 
-    def delete_secret(self, key: str) -> bool:
+    def delete_secret(self, key: str, expected_revision: Optional[str] = None) -> bool:
+        """Without a revision, remove `key` if present. With one, remove it only when the vault is still that exact
+        revision (the list the operator saw); any other revision raises VaultConflictError and nothing is removed."""
         with self._locked():
             data = self._load_dict()
+            if expected_revision is not None and not (
+                isinstance(expected_revision, str)
+                and len(expected_revision) == 64
+                and all(c in "0123456789abcdef" for c in expected_revision)
+                and hmac.compare_digest(expected_revision, self._revision())
+            ):
+                raise VaultConflictError("O cofre mudou desde a conferência. Nada foi removido.")
             if key not in data:
                 return False
             del data[key]
@@ -421,7 +430,7 @@ class UnavailableVault(BaseVault):
         self._refuse()
         return None
 
-    def delete_secret(self, key: str) -> bool:
+    def delete_secret(self, key: str, expected_revision: Optional[str] = None) -> bool:
         self._refuse()
         return False
 
