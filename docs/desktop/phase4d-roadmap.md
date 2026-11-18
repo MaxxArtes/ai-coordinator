@@ -604,6 +604,8 @@ operador.
 | Core-1 | Autorização humana fraca no Core (sondas P1 a P3 do 2º agente); DAG sem escalonador que respeite nós humanos | P1 da 4D.5 (plano de 17/11) | Antes da 4D.5; alterações do motor decididas e autorizadas à parte (operador, 17/11) |
 | Core-2 | Failover `running -> starting` no mesmo `run` | P1 da 4D.5 (plano de 17/11) | No registro até a 1.0.0 (operador, 17/11) |
 | Core-3 | AppContainer do worker sem rede (D4) | P1 da 4D.5, se houver despacho (plano de 17/11) | No registro até a 1.0.0 (operador, 17/11) |
+| Teto de 256 MB do agente governado | Mantido de propósito em `68d63c8`. Com ele, Claude Code e OpenCode caem ao iniciar como agente governado (confirmado fora da janela em 18/11, G.6): não podem ser workers governados do Desktop enquanto o teto for fixo. Não remover indiscriminadamente (operador, 18/11): limites configuráveis por agente e pelos recursos disponíveis, preservando a supervisão de processos, o isolamento e o Resource Ledger | Dependência da 4D.5 (operador, 18/11) | 4D.5, antes de qualquer despacho de CLI como worker |
+| Build final reproduzível | O build de diagnóstico 44328616887 é do `7811040` e não contém `68d63c8`; as verificações posteriores usaram a cópia portátil com 3 arquivos Python trocados (`desktop/terminal/manager.py`, `session.py`, `pty_backend.py`, hashes em `app-e8-terminal-arquivos-trocados.txt` na pasta de evidências). A entrega definitiva precisa de um build reproduzível a partir de um commit que inclua `68d63c8`, com versão própria (E2-7) e, de preferência, `Cargo.lock` versionado (R57-1) | Pendência de fechamento (operador, 18/11) | Build seguinte autorizado pelo operador; obrigatório antes da homologação da 4D.6 |
 | Core-4 | Corrida do `icacls` e 293 ACEs órfãs, `emit` com acento, `security.md` acima do uso real, teste que consulta o ai-memory real, teste instável da 4C.2.4 | P2 (plano de 17/11) | 4D.6; ACLs órfãs no registro até a 1.0.0, remoção só com autorização do operador |
 | Outros P3 das revisões | Seguem abertos, entre outros: gravar um subcampo do orçamento de missão devolve ao padrão os outros já salvos; revogar uma subpasta sob pasta-pai autorizada responde `revoked: true` com o acesso mantido pela pasta-pai; Ctrl+Shift+2 (G.2); na abertura, os terminais só são criados depois da resposta do `settings_get` (até o prazo de 30 s do IPC), apesar do prazo de 1,5 s das preferências; "O Core não está em execução" volta sem `data.reason`, e a abertura oferece um "Tentar novamente" que não ajuda | P3 (revisões das Etapas 7 e 8) | Revisão final |
 | Defeito que só aparece no app instalado | Conferência nativa da Etapa 8 interrompida; Conferências 1 a 4 adiadas. O primeiro uso do app pelo operador já revelou um (teto de 256 MB no terminal humano, G.1, corrigido em `68d63c8`) | Risco do plano de 17/11, sem classe | Decisão do operador (G.5, item 5) |
@@ -628,8 +630,11 @@ Status: **proposta, pendente de aprovação do operador.** Exceção ao §7 nos 
    pendente (Apêndice B, item 2).
 4. O Gate 4D.3 também não é declarado aprovado: os três itens têm implementação no código e testes automáticos, sem
    conferência nativa (tabela abaixo).
-5. A conferência curta no app, prevista para a Etapa 8, foi interrompida em 18/11 (só rodou o harness, G.6). Cabe ao
-   operador decidir se ela vem antes da abertura da 4D.4 ou vai para a 4D.6.
+5. A conferência curta no app, prevista para a Etapa 8, foi interrompida em 18/11 (só rodou o harness, G.6). Em 18/11
+   o operador decidiu que ela vem antes do pedido de abertura da 4D.4, com autorização própria, só no ambiente de
+   diagnóstico isolado: Claude e OpenCode na interface, teclado, configurações, permissões e cofre, integridade dos
+   arquivos protegidos depois dos testes, matriz do gate e necessidade de build final reproduzível. A 4D.4 não abre
+   automaticamente: depende do pedido formal e da aprovação do operador.
 6. Continuam valendo: branch experimental, sem merge na `main`; nenhuma tag, release, distribuição ou mudança no canal
    de atualização; Core sem alteração (Core-1 a Core-4 com decisão própria); P1 corrigidos antes da fase que bloqueiam,
    P2 acumulados para a 4D.6, P3 na revisão final.
