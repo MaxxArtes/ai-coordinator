@@ -32,7 +32,11 @@ export const AuthorizationScreen: React.FC<AuthorizationScreenProps> = ({
 }) => {
   const inputId = useId();
   const hintId = useId();
+  const noteId = useId();
   const hasProjects = authorizedProjects.length > 0 && !!onOpenProject;
+  // No notice banner comes with this screen: the reason describes the control that gets the focus, so a screen
+  // reader announces it on arrival (a live region born with the text would not be announced reliably).
+  const noteRef = note ? noteId : undefined;
 
   const handleSubmit = (event: React.FormEvent<HTMLFormElement>) => {
     event.preventDefault();
@@ -47,7 +51,11 @@ export const AuthorizationScreen: React.FC<AuthorizationScreenProps> = ({
           <Icon name="shield" />
           <span>{hasProjects ? "Escolha o projeto" : "Autorização de projeto obrigatória"}</span>
         </h2>
-        {note && <p className="card__text">{note}</p>}
+        {note && (
+          <p id={noteId} className="card__text">
+            {note}
+          </p>
+        )}
         {hasProjects ? (
           <>
             <p className="card__text">
@@ -61,6 +69,7 @@ export const AuthorizationScreen: React.FC<AuthorizationScreenProps> = ({
                     className="btn btn--sm"
                     aria-disabled={busy || undefined}
                     autoFocus={index === 0}
+                    aria-describedby={index === 0 ? noteRef : undefined}
                     data-f6-entry={index === 0 ? "" : undefined}
                     onClick={() => {
                       if (!busy) onOpenProject?.(path);
@@ -94,7 +103,7 @@ export const AuthorizationScreen: React.FC<AuthorizationScreenProps> = ({
               value={inputPath}
               onChange={(e) => onInputPathChange(e.target.value)}
               placeholder="Ex.: C:\Users\voce ou D:\meu-projeto"
-              aria-describedby={hintId}
+              aria-describedby={!hasProjects && noteRef ? `${noteRef} ${hintId}` : hintId}
               autoComplete="off"
               spellCheck={false}
               autoFocus={!hasProjects}

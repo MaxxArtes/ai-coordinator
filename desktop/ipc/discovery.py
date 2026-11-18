@@ -178,12 +178,15 @@ def routes_snapshot() -> dict:
             continue
         candidates = []
         for candidate in route.get("candidates", []) if isinstance(route.get("candidates"), list) else []:
-            if not isinstance(candidate, dict) or candidate.get("client") not in CLIENT_CONTRACTS:
+            # The type is checked before the lookup: a list or object as client is unhashable and must be skipped like
+            # any other malformed candidate, never raised to the IPC loop.
+            client = candidate.get("client") if isinstance(candidate, dict) else None
+            if not isinstance(client, str) or client not in CLIENT_CONTRACTS:
                 continue
             model = candidate.get("model")
             if not isinstance(model, str) or not SAFE_MODEL.fullmatch(model):
                 continue
-            item = {"client": candidate["client"], "model": model}
+            item = {"client": client, "model": model}
             if candidate.get("effort") in ("low", "medium", "high", "xhigh", "max", "ultra", "minimal"):
                 item["effort"] = candidate["effort"]
             candidates.append(item)

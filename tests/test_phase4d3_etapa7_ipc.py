@@ -27,7 +27,7 @@ import desktop.auth.file_lock as file_lock
 import desktop.auth.profile as profile_mod
 import desktop.auth.vault as vault_mod
 import desktop.ipc.server as server_mod
-from desktop.auth.authorizer import DesktopAuthorizer
+from desktop.auth.authorizer import DesktopAuthorizer, SecurityAuthorizationError
 from desktop.auth.profile import DesktopProfileManager
 from desktop.ipc.server import SecureIPCServer
 from desktop.terminal.manager import TerminalManager
@@ -122,6 +122,53 @@ def test_revoke_with_a_registered_session_is_refused_and_changes_nothing(env):
     assert call(env, "profile.revoke_project", {"project_path": str(repo)}).result["revoked"] is True
 
 
+def test_revoke_in_one_window_still_fences_new_terminals_in_another(env):
+    """Each window is a process with its own terminal manager: the active_sessions refusal only sees this window's
+    terminals (security.status says so), but the fence is read from disk, so no window opens a new terminal there."""
+    repo = project(env)
+    (repo / "sub").mkdir()
+    other_authorizer = DesktopAuthorizer(profile_manager=DesktopProfileManager(root_dir=env.root),
+                                         vault_backend="aes_gcm", master_password="fixture-only-password")
+    other_token = other_authorizer.issue_session("default")
+    other = TerminalManager(authorizer=other_authorizer)
+    other.create_tab(other_token, "tab", "repo", repo)
+    other.sessions["other-window-session"] = SimpleNamespace(cwd=repo / "sub")
+    assert call(env, "profile.revoke_project", {"project_path": str(repo)}).result["revoked"] is True
+    del other.sessions["other-window-session"]
+    with pytest.raises(SecurityAuthorizationError):
+        other.create_tab(other_token, "tab2", "sub", repo / "sub")
+    with pytest.raises(SecurityAuthorizationError):
+        other.create_terminal(other_token, "tab", 0, command=[sys.executable, "-c", "pass"])
+    assert other.sessions == {}
+
+
+def test_revoke_works_for_an_entry_that_can_no_longer_be_resolved(env, monkeypatch):
+    """Contracts #8: a directory on a disconnected mapped drive makes Path.resolve raise (winerror 1328). Its listed
+    text must still be revocable, and a terminal below it still blocks the revocation."""
+    entry = str(env.tmp / "fake-net" / "proj")
+    def change(profile):
+        profile.authorized_projects = [entry]
+        profile.last_project = entry
+    env.profiles._mutate("default", change)
+    real_resolve = Path.resolve
+    def resolve(self, *args, **kwargs):
+        if os.path.normcase(str(self)).startswith(os.path.normcase(entry)):
+            raise OSError(None, "synthetic disconnected network drive", None, 1328)
+        return real_resolve(self, *args, **kwargs)
+    monkeypatch.setattr(Path, "resolve", resolve)
+    with pytest.raises(OSError):
+        Path(entry).resolve()
+    env.manager.sessions["fake-session"] = SimpleNamespace(cwd=Path(entry) / "sub")
+    refused = call(env, "profile.revoke_project", {"project_path": entry})
+    assert refused.error["code"] == -32003 and refused.error["data"]["reason"] == "active_sessions"
+    del env.manager.sessions["fake-session"]
+    result = call(env, "profile.revoke_project", {"project_path": entry})
+    assert result.error is None, result.error
+    assert result.result == {"revoked": True, "authorized_projects": [], "last_project": None}
+    active = env.profiles.get_active_profile()
+    assert active.authorized_projects == [] and active.last_project is None
+
+
 @pytest.mark.parametrize("bad", ["", "   ", "a\x00b", 7, None])
 def test_revoke_rejects_invalid_paths_with_structured_errors(env, bad):
     resp = call(env, "profile.revoke_project", {"project_path": bad})
@@ -189,12 +236,22 @@ def test_authorize_missing_or_invalid_directory_is_structured_and_does_not_echo_
         assert resp.error["code"] == -32602 and resp.error["data"]["reason"] == "invalid_value"
 
 
-def test_unrecoverable_profile_error_is_structured(env):
-    env.profiles.active_file.write_text("not a valid name!", encoding="utf-8")
+def test_unrecoverable_profile_error_is_structured(env, monkeypatch):
+    # A selection whose bytes cannot be read cannot be copied, so nothing is repaired or rewritten.
+    env.profiles.active_file.write_bytes(b"default")
+    real_read = Path.read_bytes
+    def deny(self):
+        if self.name == "active_profile.txt":
+            raise OSError("synthetic read failure")
+        return real_read(self)
+    monkeypatch.setattr(Path, "read_bytes", deny)
     for method in ("profile.get_active", "settings.get", "security.status"):
         resp = call(env, method)
         assert resp.error["data"] == {"field": "profile", "reason": "profile_unreadable"}
         assert not resp.error["message"].lower().startswith("internal error")
+    monkeypatch.undo()
+    assert env.profiles.active_file.read_bytes() == b"default"
+    assert list(env.root.glob("active_profile.txt.corrupt-*")) == []
 
 
 # ---- K3: busy locks ----
@@ -255,6 +312,35 @@ def test_vault_held_by_another_window_is_busy_not_unreadable(env, monkeypatch):
     assert call(env, "vault.list_keys").result["keys"] == ["FIXTURE_KEY"]
 
 
+@pytest.mark.parametrize("backend", ["aes_gcm", "dpapi"])
+def test_unreadable_vault_is_reported_unreadable_and_never_overwritten(isolated, backend):
+    """E2-3 (P1): a vault that cannot be decrypted is not available, list/set fail with a structured error and its
+    bytes are kept. Reverting vault.status to {available: vault.available} makes this test fail."""
+    if backend == "dpapi" and sys.platform != "win32":
+        pytest.skip("DPAPI only exists on Windows")
+    root = isolated.tmp / "profiles"
+    profiles = DesktopProfileManager(root_dir=root)
+    options = {"master_password": "fixture-only-password"} if backend == "aes_gcm" else {}
+    authorizer = DesktopAuthorizer(profile_manager=profiles, vault_backend=backend, **options)
+    token = authorizer.issue_session("default")
+    server = SecureIPCServer(transport=MagicMock(), terminal_manager=TerminalManager(authorizer=authorizer), session_token=token)
+    target = SimpleNamespace(server=server, token=token)
+    vault_file = root / "default" / "vault.enc"
+    garbage = b"\x00not-a-vault" + FAKE.encode("ascii") * 3
+    vault_file.write_bytes(garbage)
+    status = call(target, "vault.status")
+    assert status.error is None, status.error
+    assert status.result["available"] is False and status.result["reason"] == "unreadable"
+    for method, params in (("vault.list_keys", {}), ("vault.set_secret", {"key": "FIXTURE_KEY", "value": f"{FAKE}-new"})):
+        resp = call(target, method, params)
+        assert resp.error is not None, resp.result
+        assert resp.error["code"] == server_mod.VAULT_UNAVAILABLE_CODE
+        assert resp.error["data"] == {"field": "vault", "reason": "unreadable"}
+        assert FAKE not in json.dumps(resp.to_dict())
+    assert FAKE not in json.dumps(status.to_dict())
+    assert vault_file.read_bytes() == garbage
+
+
 # ---- Vault: confirmation (E.1), blank values (E2-4), unpaired surrogates (E2-12) ----
 
 def test_vault_confirmation_conflicts_are_structured(env):
@@ -308,7 +394,14 @@ def test_security_status_never_claims_isolation_or_core_policy(env):
     assert policy["governed_agent"] == "env_sanitized_only"
     assert "core_policy" not in json.dumps(policy)
     assert [key for key, value in policy.items() if value is True] == ["project_fencing"]
-    assert "não há isolamento" in policy["description"] and "não há sandbox" in policy["description"]
+    description = policy["description"]
+    assert "não há isolamento" in description and "não há sandbox" in description
+    # Security #2: TerminalManager filters the agent environment by variable name only (secret, token, password,
+    # key); a PAT, a URL with a password or SSH_AUTH_SOCK still reach the agent, and the text must say so.
+    assert "sem variáveis de credenciais" not in description
+    assert "outras credenciais" in description and "SSH_AUTH_SOCK" in description
+    # Security #3: the active_sessions refusal only sees this window's terminals.
+    assert "outra janela" in description
 
 
 # ---- K6: discovery.agents and providers.routes ----
@@ -374,6 +467,18 @@ def test_discovery_reports_names_only_never_values(env):
     assert routes["routes"] == [{"category": "code", "candidates": [{"client": "claude", "model": "fixture-model", "effort": "high"}]}]
     assert routes["available"] is True and routes["source"] == "configured"
     assert sorted(p.name for p in env.core.iterdir()) == ["routes.json"]  # the Core data folder is not initialized
+
+
+@pytest.mark.parametrize("client", [["bad"], {"x": 1}, 5, None, True])
+def test_route_candidate_with_a_non_text_client_is_skipped_not_fatal(env, client):
+    """Security #5: an unhashable client made providers.routes fail as a whole (-32603)."""
+    write_routes(env, {"routes": {"code": {"candidates": [{"client": "codex", "model": "gpt-5"},
+                                                          {"client": client, "model": "m"}]}}})
+    resp = call(env, "providers.routes")
+    assert resp.error is None, resp.error
+    assert resp.result["available"] is True and resp.result["source"] == "configured"
+    assert resp.result["routes"] == [{"category": "code", "candidates": [{"client": "codex", "model": "gpt-5"}]}]
+    assert call(env, "discovery.agents").error is None
 
 
 @pytest.mark.parametrize("launchers", [[], "codex", 5, {"codex": {"cmd": "x"}}, {"codex": [1, 2]}, {"codex": [""]}])
@@ -517,6 +622,39 @@ def test_corrupt_inactive_profile_is_ignored(isolated):
     assert call(server, "settings.get").error is None
     assert other.read_bytes() == b'{"name":'
     assert sorted(p.name for p in other.parent.iterdir()) == ["profile.json"]
+
+
+@pytest.mark.parametrize("contents,repaired", [
+    (b"", True), (b"\xff\xfe\x00", True), (b"ghost", True), (b"\x00\x00", True), ("default".encode("utf-16"), True),
+    (b"\xef\xbb\xbfdefault", False), (b"default\r\n", False)],
+    ids=["empty", "invalid_utf8", "dangling", "nul", "utf16_out_file", "bom", "crlf"])
+def test_app_opens_whatever_the_active_selection_contains(isolated, contents, repaired):
+    """Security #4: an empty, unreadable or dangling active_profile.txt made every IPC method fail (the app could
+    not open). The default profile is opened, the selection is kept byte for byte and a missing profile is never
+    created."""
+    root = isolated.home / ".ai-coordinator" / "desktop" / "profiles"
+    DesktopProfileManager(root_dir=root)
+    profile_bytes = (root / "default" / "profile.json").read_bytes()
+    (root / "active_profile.txt").write_bytes(contents)
+    server = app_server(isolated)
+    for method in ("profile.get_active", "terminal.list_tabs", "settings.get", "vault.status", "security.status"):
+        resp = call(server, method)
+        assert resp.error is None, (method, resp.error)
+    active = call(server, "profile.get_active").result
+    assert active["name"] == "default"
+    assert (root / "default" / "profile.json").read_bytes() == profile_bytes
+    assert not (root / "ghost").exists()
+    copies = sorted(root.glob("active_profile.txt.corrupt-*"))
+    if repaired:
+        recovery = active["recovery"]
+        assert recovery["reason"] == "active_selection_invalid" and recovery["message"]
+        assert re.fullmatch(r"active_profile\.txt\.corrupt-\d{8}T\d{6}Z(-\d+)?", recovery["backup_file"])
+        assert [c.name for c in copies] == [recovery["backup_file"]] and copies[0].read_bytes() == contents
+        assert "ghost" not in json.dumps(recovery)
+        assert (root / "active_profile.txt").read_bytes() == b"default"
+    else:
+        assert active["recovery"] is None and copies == []
+        assert (root / "active_profile.txt").read_bytes() == contents
 
 
 # ---- CM-5: every command the interface calls exists in the host and in the Core IPC ----

@@ -6,7 +6,7 @@
  * - Revoking an authorized directory is the only mutation: explicit confirmation, focus kept inside Configurações,
  *   and the App is told, so a revoked open project is not used again (K4).
  */
-import React, { useEffect, useId, useRef, useState } from "react";
+import React, { useEffect, useId, useLayoutEffect, useRef, useState } from "react";
 import {
   errorText,
   getAgents,
@@ -128,8 +128,17 @@ export const InventoryPanel: React.FC<InventoryPanelProps> = ({ kind, active, is
     if (pending && active) cancelRef.current?.focus();
   }, [pending, active]);
 
+  // The question's buttons unmount with it: the focus must land on the target in the same commit, never wait a frame
+  // on <body>, where Escape no longer reaches Configurações (and WebView2 loses the keyboard handling).
+  const focusRequestRef = useRef<{ target: HTMLElement | null } | null>(null);
+  useLayoutEffect(() => {
+    const request = focusRequestRef.current;
+    if (!request) return;
+    focusRequestRef.current = null; // one commit only: a stale request must never steal the focus later
+    (request.target && request.target.isConnected ? request.target : headingRef.current)?.focus();
+  });
   const focusAfterClose = (target: HTMLElement | null) => {
-    requestAnimationFrame(() => (target && target.isConnected ? target : headingRef.current)?.focus());
+    focusRequestRef.current = { target };
   };
 
   const cancel = () => {
@@ -165,6 +174,7 @@ export const InventoryPanel: React.FC<InventoryPanelProps> = ({ kind, active, is
       const result = await revokeProject(callTauri, target);
       setPending(null);
       returnFocusRef.current = null;
+      focusAfterClose(headingRef.current); // the confirm button is gone: move now, not after the list reloads
       if (result?.revoked !== true) {
         await load();
         setError("A revogação não foi confirmada; a lista foi relida.");

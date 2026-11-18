@@ -207,6 +207,14 @@ export const APPLIED_ON_NEXT_START: ReadonlySet<string> = new Set(["geral.open_l
 export const invalidFieldsOf = (snapshot: SettingsSnapshot | null | undefined, category: BackedCategory): string[] =>
   Array.isArray(snapshot?.categories?.[category]?.invalid_fields) ? snapshot!.categories[category].invalid_fields! : [];
 
+/**
+ * The settings this version uses: null means its own defaults. Settings written by another version, or a malformed
+ * envelope, are protected (read_only) and the host says the defaults are in use; the values it still sends are the
+ * other version's and are never applied nor shown as in use.
+ */
+export const settingsInUse = (snapshot: SettingsSnapshot | null | undefined): SettingsSnapshot | null =>
+  snapshot && !snapshot.read_only ? snapshot : null;
+
 /** Only a loaded, validated and writable category can be said to be in effect. */
 export const categoryInEffect = (snapshot: SettingsSnapshot | null | undefined, category: BackedCategory): boolean =>
   !!snapshot && !snapshot.read_only && snapshot.categories?.[category]?.validated === true && invalidFieldsOf(snapshot, category).length === 0;
@@ -215,10 +223,12 @@ const APPEARANCE_CACHE_KEY = "ai-coordinator.appearance.v1";
 const APPEARANCE_KEYS = ["stimulation", "density", "terminalFontSize", "terminalScrollback", "terminalCursorBlink"] as const;
 
 /**
- * Applies interface-level preferences to the document (null: the defaults). The applied appearance is also kept in
- * this window's storage, only so the next start paints with it before the host answers (never a source of truth).
+ * Applies interface-level preferences to the document (null or protected settings: the defaults). The applied
+ * appearance is also kept in this window's storage, only so the next start paints with it before the host answers
+ * (never a source of truth).
  */
-export function applyInterfaceSettings(snapshot: SettingsSnapshot | null, root: HTMLElement = document.documentElement): void {
+export function applyInterfaceSettings(given: SettingsSnapshot | null, root: HTMLElement = document.documentElement): void {
+  const snapshot = settingsInUse(given);
   const stimulation = snapshot?.categories?.aparencia?.values?.stimulation;
   if (stimulation === "low") root.dataset.stimulation = "low";
   else delete root.dataset.stimulation;

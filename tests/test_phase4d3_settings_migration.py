@@ -3,6 +3,9 @@ from __future__ import annotations
 
 import json
 import multiprocessing
+import os
+import shutil
+import stat
 import subprocess
 import sys
 import time
@@ -73,6 +76,42 @@ def test_future_schema_is_read_only_and_preserves_exact_bytes(profiles):
     assert error.value.reason == "read_only_stored_schema"
     assert str(error.value) == "As configurações foram gravadas por outra versão e estão protegidas. Nada foi alterado."
     assert profile_file(profiles).read_bytes() == before
+
+
+def test_read_only_snapshot_shows_the_defaults_it_says_are_in_use(profiles):
+    """Contracts #6: "Os padrões estão em uso" must be true. Values stored by another version are neither shown nor
+    applied by this one; the fields that are stored are still listed, so no category looks unsaved."""
+    profiles.update_settings("default", {"schema_version": 2, "values": {
+        "aparencia": {"stimulation": "low", "density": "compact"},
+        "terminal": {"font_size": 21, "scrollback_lines": 100},
+        "perfil": {"display_name": "Nome da v2"},
+        "geral": {"open_last_project_on_start": False}}})
+    before = profile_file(profiles).read_bytes()
+    snapshot = SettingsStore(profiles).snapshot()
+    assert snapshot["read_only"] is True and "Os padrões estão em uso" in snapshot["stored_issue"]["message"]
+    categories = snapshot["categories"]
+    assert categories["aparencia"]["values"] == {"stimulation": "standard", "density": "comfortable"}
+    assert categories["terminal"]["values"] == {"font_size": 13, "cursor_blink": True, "scrollback_lines": 1000}
+    assert categories["perfil"]["values"] == {"display_name": None}
+    assert categories["geral"]["values"] == {"open_last_project_on_start": True}
+    assert "Nome da v2" not in json.dumps(categories, ensure_ascii=False)
+    assert categories["aparencia"]["saved_fields"] == ["density", "stimulation"]
+    assert categories["terminal"]["saved_fields"] == ["font_size", "scrollback_lines"]
+    assert categories["perfil"]["saved_fields"] == ["display_name"]
+    assert categories["geral"]["saved_fields"] == ["open_last_project_on_start"]
+    assert all(c["invalid_fields"] == [] and c["validated"] is False for c in categories.values())
+    assert profile_file(profiles).read_bytes() == before
+
+
+def test_malformed_category_makes_its_valid_neighbours_show_defaults_too(profiles):
+    profiles.update_settings("default", {"schema_version": 1, "values": {"terminal": 5, "aparencia": {"stimulation": "low"}}})
+    snapshot = SettingsStore(profiles).snapshot()
+    assert snapshot["read_only"] is True and snapshot["stored_issue"]["reason"] == "invalid_stored_value"
+    assert "Os padrões estão em uso" in snapshot["stored_issue"]["message"]
+    aparencia = snapshot["categories"]["aparencia"]
+    assert aparencia["values"] == {"stimulation": "standard", "density": "comfortable"}
+    assert aparencia["saved_fields"] == ["stimulation"] and aparencia["validated"] is False
+    assert snapshot["categories"]["terminal"]["values"]["font_size"] == 13
 
 
 @pytest.mark.parametrize("stored", [["not", "an", "object"], {"schema_version": 1, "values": []},
@@ -161,6 +200,51 @@ def test_corrupt_active_profile_is_quarantined_byte_for_byte_and_recreated_empty
     assert len(copies_after) == 2 and copies[0].read_bytes() == contents
 
 
+def test_recovery_whose_rewrite_fails_leaves_no_quarantine_copy(profiles, monkeypatch):
+    """A recovery that cannot write the new profile must not add one more copy per call (integrity #1)."""
+    import desktop.auth.profile as module
+    p = profile_file(profiles)
+    p.write_bytes(b'{"name":')
+    real_replace = module.os.replace
+    def fail(source, target):
+        if Path(target).name == "profile.json":
+            raise OSError("synthetic replace failure")
+        return real_replace(source, target)
+    monkeypatch.setattr(module.os, "replace", fail)
+    for _ in range(3):
+        with pytest.raises(ProfileError):
+            DesktopProfileManager(profiles.root_dir).get_active_profile()
+    assert quarantined(profiles) == [] and p.read_bytes() == b'{"name":'
+    assert list(p.parent.glob("profile_*.tmp")) == []
+    monkeypatch.undo()
+    manager = DesktopProfileManager(profiles.root_dir)
+    assert manager.get_active_profile().name == "default"
+    copies = quarantined(profiles)
+    assert len(copies) == 1 and copies[0].read_bytes() == b'{"name":'
+    assert manager.recovery["backup_file"] == copies[0].name
+
+
+@pytest.mark.skipif(os.name != "nt", reason="the read-only attribute makes os.replace fail only on Windows")
+def test_read_only_corrupt_profile_is_not_copied_again_on_every_call(profiles):
+    """Integrity #1 with the real cause: profile.json truncated and marked read-only on Windows."""
+    p = profile_file(profiles)
+    p.write_bytes(b'{"name":')
+    os.chmod(p, stat.S_IREAD)
+    try:
+        for _ in range(3):
+            with pytest.raises(ProfileError):
+                DesktopProfileManager(profiles.root_dir).get_active_profile()
+            assert quarantined(profiles) == []
+        assert p.read_bytes() == b'{"name":'
+    finally:
+        os.chmod(p, stat.S_IWRITE | stat.S_IREAD)
+    manager = DesktopProfileManager(profiles.root_dir)
+    assert manager.get_active_profile().name == "default"
+    copies = quarantined(profiles)
+    assert len(copies) == 1 and copies[0].read_bytes() == b'{"name":'
+    assert manager.recovery["backup_file"] == copies[0].name
+
+
 def test_corrupt_profile_recovery_does_not_echo_data(profiles):
     p = profile_file(profiles)
     p.write_bytes(b'{"name": "SYNTHETIC_SECRET", "data_dir": ["SYNTHETIC_SECRET"]}')
@@ -211,6 +295,38 @@ def test_first_migrating_write_keeps_a_pre_v1_copy_once(profiles):
     profiles.update_settings("default", {"schema_version": 0, "values": {"terminal": {"font_size": 16}}})
     SettingsStore(profiles).update(payload(cursor_blink=True))
     assert backup.read_bytes() == legacy  # never overwritten
+
+
+def test_interrupted_pre_v1_copy_is_redone_before_migrating(profiles):
+    """A 0-byte pre-v1 copy (write cut short) holds nothing: it must not count as the one-time backup."""
+    profiles.update_settings("default", {"terminal": {"font_size": 17}})
+    legacy = profile_file(profiles).read_bytes()
+    backup = profile_file(profiles).with_name("profile.json.pre-v1.bak")
+    backup.write_bytes(b"")
+    SettingsStore(profiles).update(payload(cursor_blink=False))
+    assert backup.read_bytes() == legacy
+
+
+def test_interrupted_pre_v1_copy_that_cannot_be_removed_blocks_the_migration(profiles, monkeypatch):
+    """Migrating without any copy would lose the legacy bytes: refuse and leave the profile untouched."""
+    import desktop.auth.profile as profile_module
+
+    profiles.update_settings("default", {"terminal": {"font_size": 17}})
+    legacy = profile_file(profiles).read_bytes()
+    backup = profile_file(profiles).with_name("profile.json.pre-v1.bak")
+    backup.write_bytes(b"")
+    real_unlink = os.unlink
+
+    def refuse(path, *args, **kwargs):
+        if Path(path) == backup:
+            raise PermissionError(13, "held by another program")
+        return real_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(profile_module.os, "unlink", refuse)
+    with pytest.raises(ProfileError):
+        SettingsStore(profiles).update(payload(cursor_blink=False))
+    assert profile_file(profiles).read_bytes() == legacy
+    assert backup.read_bytes() == b""
 
 
 def test_v1_profile_write_makes_no_backup(profiles):
@@ -353,12 +469,136 @@ def test_unreadable_file_is_not_quarantined_or_overwritten(profiles, monkeypatch
     assert profile_file(profiles).read_bytes() == before and quarantined(profiles) == []
 
 
-def test_missing_active_profile_does_not_silently_create_another(profiles):
-    profiles.active_file.write_text("missing", encoding="utf-8")
-    with pytest.raises(ProfileError):
-        profiles.get_active_profile()
+def selection_copies(profiles):
+    return sorted(profiles.root_dir.glob("active_profile.txt.corrupt-*"))
+
+
+@pytest.mark.parametrize("contents", [b"missing", b"", b"  \r\n", b"\xff\xfe\x00", b"\x00\x00", b"not a valid name!",
+                                      b"..", "default".encode("utf-16")],
+                         ids=["dangling", "empty", "blank", "invalid_utf8", "nul", "invalid_name", "dotdot", "utf16"])
+def test_invalid_or_dangling_selection_opens_default_and_keeps_a_copy(profiles, contents):
+    """E2-6 (security #4): the active selection is no longer a single point of failure. Its bytes are kept, the
+    default profile is opened and the missing profile named in it is never created."""
+    before = profile_file(profiles).read_bytes()
+    profiles.active_file.write_bytes(contents)
+    manager = DesktopProfileManager(profiles.root_dir)
+    active = manager.get_active_profile()
+    assert active.name == "default"
     assert not (profiles.root_dir / "missing").exists()
-    assert profiles.active_file.read_text(encoding="utf-8") == "missing"
+    assert profile_file(profiles).read_bytes() == before and quarantined(profiles) == []
+    copies = selection_copies(profiles)
+    assert len(copies) == 1 and copies[0].read_bytes() == contents
+    assert manager.recovery == {"reason": "active_selection_invalid", "backup_file": copies[0].name,
+                                "message": manager.recovery["message"]}
+    assert manager.recovery["message"] and "missing" not in manager.recovery["message"]
+    assert profiles.active_file.read_bytes() == b"default"
+    # From then on the selection is ordinary: no new copy and no recovery notice.
+    again = DesktopProfileManager(profiles.root_dir)
+    assert again.get_active_profile().name == "default" and again.recovery is None
+    assert selection_copies(profiles) == copies
+
+
+@pytest.mark.parametrize("contents", [b"\xef\xbb\xbfdefault", b"default\r\n", b"\xef\xbb\xbfdefault\r\n"])
+def test_selection_with_bom_or_line_break_is_read_as_is(profiles, contents):
+    profiles.active_file.write_bytes(contents)
+    manager = DesktopProfileManager(profiles.root_dir)
+    assert manager.get_active_profile().name == "default" and manager.recovery is None
+    assert profiles.active_file.read_bytes() == contents and selection_copies(profiles) == []
+
+
+def test_selection_in_other_letter_case_never_quarantines_a_healthy_profile(profiles, tmp_path):
+    """Review finding: "Work" in active_profile.txt must not turn the healthy "work" profile into a corrupt one.
+    Case-insensitive file systems (Windows, macOS) open "work" under its stored name; case-sensitive ones treat the
+    selection as dangling. Either way the profile keeps its bytes, its authorizations and its vault name."""
+    project = tmp_path / "proj"
+    project.mkdir()
+    profiles.create_profile("work")
+    profiles.authorize_project("work", project)
+    work_file = profiles.root_dir / "work" / "profile.json"
+    before = work_file.read_bytes()
+    profiles.active_file.write_bytes(b"Work")
+    case_insensitive = (profiles.root_dir / "WORK").exists()
+    manager = DesktopProfileManager(profiles.root_dir)
+    active = manager.get_active_profile()
+    assert work_file.read_bytes() == before
+    assert sorted((profiles.root_dir / "work").glob("profile.json.corrupt-*")) == []
+    if case_insensitive:
+        assert active.name == "work" and manager.recovery is None
+        assert Path(active.data_dir) == (profiles.root_dir / "work")
+        assert active.authorized_projects == [str(project.resolve())]
+        assert manager.set_active_profile("WORK").name == "work"
+        assert profiles.active_file.read_bytes() == b"work"  # the stored spelling is written back
+        # Writes requested in another case lock by the stored name (macOS: two lock keys for one file would wait 10 s).
+        other = tmp_path / "other"
+        other.mkdir()
+        started = time.monotonic()
+        manager.authorize_project("WORK", other)
+        assert time.monotonic() - started < 5
+        assert str(other.resolve()) in manager.get_profile("work").authorized_projects
+        project_count = 2
+    else:
+        project_count = 1
+    if not case_insensitive:
+        assert active.name == "default"
+        assert manager.recovery["reason"] == "active_selection_invalid"
+    stored = DesktopProfileManager(profiles.root_dir).get_profile("work").authorized_projects
+    assert str(project.resolve()) in stored and len(stored) == project_count
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows drops a trailing dot from a folder name")
+def test_selection_with_a_trailing_dot_opens_the_same_profile_on_windows(profiles, tmp_path):
+    project = tmp_path / "proj"
+    project.mkdir()
+    profiles.create_profile("work")
+    profiles.authorize_project("work", project)
+    before = (profiles.root_dir / "work" / "profile.json").read_bytes()
+    profiles.active_file.write_bytes(b"work.")
+    manager = DesktopProfileManager(profiles.root_dir)
+    active = manager.get_active_profile()
+    assert active.name == "work" and manager.recovery is None
+    assert active.authorized_projects == [str(project.resolve())]
+    assert (profiles.root_dir / "work" / "profile.json").read_bytes() == before
+    assert sorted((profiles.root_dir / "work").glob("profile.json.corrupt-*")) == []
+
+
+def test_dangling_selection_without_a_default_profile_creates_only_the_default(profiles):
+    profiles.create_profile("work")
+    shutil.rmtree(profiles.root_dir / "default")
+    profiles.active_file.write_bytes(b"gone")
+    manager = DesktopProfileManager(profiles.root_dir)
+    active = manager.get_active_profile()
+    assert active.name == "default" and active.authorized_projects == [] and active.settings == {}
+    assert sorted(p.name for p in profiles.root_dir.iterdir() if p.is_dir()) == ["default", "work"]
+    assert manager.recovery["reason"] == "active_selection_invalid"
+    assert selection_copies(profiles)[0].read_bytes() == b"gone"
+
+
+def test_dangling_selection_with_an_unreadable_default_reports_the_profile_recovery(profiles):
+    profile_file(profiles).write_bytes(b'{"name":')
+    profiles.active_file.write_bytes(b"gone")
+    manager = DesktopProfileManager(profiles.root_dir)
+    assert manager.get_active_profile().name == "default"
+    # Re-authorizing the projects is what the operator must do: that notice is the one reported.
+    assert manager.recovery["reason"] == "profile_unreadable"
+    assert quarantined(profiles)[0].read_bytes() == b'{"name":'
+    assert selection_copies(profiles)[0].read_bytes() == b"gone"
+    assert profiles.active_file.read_bytes() == b"default"
+
+
+def test_selection_rewrite_failure_leaves_no_copy_and_changes_nothing(profiles, monkeypatch):
+    import desktop.auth.profile as module
+    profiles.active_file.write_bytes(b"gone")
+    real_replace = module.os.replace
+    def fail(source, target):
+        if Path(target).name == "active_profile.txt":
+            raise OSError("synthetic replace failure")
+        return real_replace(source, target)
+    monkeypatch.setattr(module.os, "replace", fail)
+    for _ in range(2):
+        with pytest.raises(ProfileError):
+            DesktopProfileManager(profiles.root_dir).get_active_profile()
+    assert selection_copies(profiles) == [] and profiles.active_file.read_bytes() == b"gone"
+    assert not (profiles.root_dir / "gone").exists()
 
 
 def test_budget_extensions_survive_updates_but_are_not_returned_as_core_fields(profiles):

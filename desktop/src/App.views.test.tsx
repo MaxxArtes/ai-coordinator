@@ -345,7 +345,7 @@ describe("App views", () => {
       f6();
       trail.push(where());
     }
-    expect(trail).toEqual(["main-tab-conversas", "Salvar sessões", "Terminal 01, 1 de 2", "Terminal 02, 2 de 2", "main-tab-conversas"]);
+    expect(trail).toEqual(["main-tab-conversas", "Novo terminal", "Terminal 01, 1 de 2", "Terminal 02, 2 de 2", "main-tab-conversas"]);
     f6(true);
     expect(where()).toBe("Terminal 02, 2 de 2");
 
@@ -575,8 +575,11 @@ describe("App — inicialização que nunca trava (E2-6, K1, K2, K5)", () => {
     host({ extra: { terminal_create_tab: () => { throw new Error("Project not authorized or session invalid"); } } });
     renderApp();
     expect(await screen.findByText(/Não foi possível abrir D:\\proj: Project not authorized/)).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "Abrir D:\\proj" })).toBeInTheDocument();
+    const open = screen.getByRole("button", { name: "Abrir D:\\proj" });
     expect(xtermLog.created).toHaveLength(0);
+    // There is no notice banner on this path: the reason reaches a screen reader with the focus, as the description.
+    await waitFor(() => expect(open).toHaveFocus());
+    expect(open).toHaveAccessibleDescription(/Não foi possível abrir D:\\proj: Project not authorized/);
   });
 
   it("perfil recuperado: aviso persistente com o nome da cópia, sem caminho", async () => {
@@ -597,17 +600,45 @@ describe("App — inicialização que nunca trava (E2-6, K1, K2, K5)", () => {
     expect(within(notices()).getByText("profile.json.corrupt-20261117T120000Z").tagName).toBe("CODE");
   });
 
-  it("configurações de outra versão: aviso persistente e o terminal abre", async () => {
+  it("configurações de outra versão: aviso, xterm, documento, cabeçalho e formulário usam os padrões, como o host diz", async () => {
+    const user = userEvent.setup();
+    // The real host's message for schema_version 2 (desktop/settings/store.py). The values are the other version's,
+    // as the host sent them at a9e2462: whatever the values say, a protected snapshot means the defaults are in use.
+    const message = "As configurações foram gravadas por outra versão e estão protegidas. Os padrões estão em uso e nada será alterado.";
+    const settings = appSettings({
+      perfil: { display_name: "Outra Versao" },
+      geral: { open_last_project_on_start: false },
+      aparencia: { stimulation: "low", density: "compact" },
+      terminal: { font_size: 18, scrollback_lines: 200, cursor_blink: false },
+    });
+    for (const category of Object.values(settings.categories) as any[]) category.validated = false;
     host({
-      settings: {
-        ...appSettings(),
-        read_only: true,
-        stored_issue: { reason: "incompatible_version", message: "O esquema salvo não é compatível com esta versão. Os dados foram preservados." },
-      },
+      settings: { ...settings, stored_schema_version: 2, read_only: true, stored_issue: { reason: "incompatible_version", message } },
+      profile: { name: "trabalho" },
     });
     renderApp();
-    await connected();
+    await connected(); // the default opens the last project; the other version's "off" is not used
+    expect(xtermLog.created[0].options).toMatchObject({ fontSize: 13, scrollback: 1000, cursorBlink: true });
+    expect(document.documentElement.dataset.density).toBe("comfortable");
+    expect(document.documentElement.dataset.stimulation).toBeUndefined();
+    expect(document.querySelector(".app-header__operator")).toHaveTextContent("Perfil: trabalho");
+    expect(document.body.textContent).not.toMatch(/Outra Versao/);
     expect(notices()).toHaveTextContent("Configurações de outra versão: protegidas, somente leitura");
+    expect(notices()).toHaveTextContent(message);
+    expect(notices()).toHaveTextContent("Esta versão usa os próprios padrões e não grava sobre elas.");
+    expect(notices().textContent).not.toMatch(/próprios valores/);
+
+    await user.click(screen.getByRole("button", { name: "Configurações" }));
+    const dialog = await screen.findByRole("dialog");
+    await user.click(within(dialog).getByRole("tab", { name: /^Terminal/ }));
+    const panel = within(dialog).getByRole("tabpanel", { name: /Terminal/ });
+    expect(await within(panel).findByText(message)).toBeInTheDocument();
+    expect(within(panel).getByText(/mostram os padrões, que são os valores que esta versão está usando/)).toBeInTheDocument();
+    expect(within(panel).getByLabelText("Tamanho da fonte")).toHaveValue(13);
+    expect(within(panel).getByLabelText("Linhas de histórico")).toHaveValue(1000);
+    expect(within(panel).getByRole("checkbox", { name: "Cursor piscante" })).toBeChecked();
+    // Reloading the snapshot in Configurações does not apply the other version's values either.
+    expect(xtermLog.created[0].options).toMatchObject({ fontSize: 13, scrollback: 1000, cursorBlink: true });
   });
 
   it("campos salvos inválidos: o aviso diz onde, nunca o valor salvo", async () => {
@@ -774,6 +805,51 @@ describe("App — preferências, atalhos e revogação (Etapa 7)", () => {
     ]);
     expect(callsOf("terminal_create_session").at(-1)).toMatchObject({ tabId: "tab-2", cwd: "D:\\novo" });
     expect(document.body.textContent).not.toMatch(/Falha ao criar|already exists/);
+  });
+
+  it("Configurações aberto pelo atalho a partir da faixa: revogar o projeto aberto e fechar leva o foco à tela de projetos, nunca ao body", async () => {
+    const user = userEvent.setup();
+    host();
+    renderApp();
+    await connected();
+    await user.click(screen.getByRole("button", { name: "Fechar Terminal 01" }));
+    await waitFor(() => expect(screen.queryByRole("region", { name: "Terminal 01" })).toBeNull());
+    const opener = document.activeElement as HTMLElement;
+    expect(opener.closest(".tab-strip")).not.toBeNull(); // F10: the last pane closed, the focus is on the strip
+
+    fireEvent.keyDown(opener, { key: ",", code: "Comma", ctrlKey: true });
+    const dialog = await screen.findByRole("dialog", { name: "Configurações" });
+    await user.click(within(dialog).getByRole("tab", { name: /^Segurança/ }));
+    const panel = within(dialog).getByRole("tabpanel", { name: /Segurança/ });
+    await user.click(await within(panel).findByRole("button", { name: "Revogar D:\\proj" }));
+    await user.click(within(panel).getByRole("button", { name: "Confirmar revogação" }));
+    expect(await within(panel).findByText(/Autorização de D:\\proj revogada/)).toBeInTheDocument();
+    expect(opener.isConnected).toBe(false); // the strip went away with the terminal grid
+    await user.keyboard("{Escape}");
+    await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+
+    const input = screen.getByLabelText("Caminho do projeto no host");
+    await waitFor(() => expect(document.activeElement).toBe(input));
+    expect(input).toHaveAccessibleDescription(/A autorização de D:\\proj foi revogada/);
+  });
+
+  it("sem 'Salvar sessões': o histórico não é gravado em arquivo, e Geral não promete exportá-lo", async () => {
+    const user = userEvent.setup();
+    host();
+    renderApp();
+    await connected();
+    const strip = screen.getByRole("group", { name: "Aba do projeto" });
+    expect(within(strip).queryByRole("button", { name: /Salvar/ })).toBeNull();
+    expect(within(strip).getByRole("button", { name: "Novo terminal" })).toHaveAttribute("data-f6-entry");
+
+    await user.click(screen.getByRole("button", { name: "Configurações" }));
+    const dialog = await screen.findByRole("dialog");
+    await user.click(within(dialog).getByRole("tab", { name: /^Geral/ }));
+    const panel = within(dialog).getByRole("tabpanel", { name: /Geral/ });
+    expect(within(panel).getByText("Exportar o histórico e restaurar sessões ainda não são suportados nesta versão.")).toBeInTheDocument();
+    expect(dialog.textContent).not.toMatch(/pode ser exportado/);
+    expect(document.body.textContent).not.toMatch(/arquivados|Sessão salva/);
+    expect(count("terminal_save_sessions")).toBe(0);
   });
 
   it("com terminais abertos no projeto, a revogação é recusada e o App não muda", async () => {

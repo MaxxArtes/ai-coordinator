@@ -24,6 +24,10 @@ export interface TerminalGridProps {
   /** Live state of each pane, by session_id (unknown when missing). */
   states?: Record<string, PaneState>;
   onAddPane?: (tabId: string) => void;
+  /**
+   * Shows "Salvar sessões". The App does not pass it in this version: the host only builds the sanitized history in
+   * memory and nothing writes it to a file yet (A5), so the button would claim a save that does not happen.
+   */
   onSaveSessions?: (tabId: string) => void;
   onWrite: (sessionId: string, data: string) => void;
   onResize: (sessionId: string, cols: number, rows: number) => void;

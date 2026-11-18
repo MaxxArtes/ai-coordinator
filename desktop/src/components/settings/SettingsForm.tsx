@@ -4,7 +4,8 @@
  * "Aplicado" is shown only when it is true: the snapshot was loaded, the category is validated and writable, and the
  * interface really applies the preference. A preference used only at the next start says so.
  * Stored values that are invalid are never shown: the field shows the default and the stored value is kept until
- * this field is changed and saved. Settings saved by another version are protected: the form is read-only.
+ * this field is changed and saved. Settings saved by another version are protected: the form is read-only and shows
+ * this version's defaults, which are the values in use (the host says so); the other version's values are not shown.
  */
 import React, { useEffect, useId, useMemo, useState } from "react";
 import { Icon } from "../ui/Icon";
@@ -19,7 +20,7 @@ import {
   type SettingsSnapshot,
   type StructuredError,
 } from "./api";
-import { CATEGORY_FIELDS, fieldPath, type UiField } from "./fields";
+import { CATEGORY_DEFAULTS, CATEGORY_FIELDS, fieldPath, type UiField } from "./fields";
 import { SHORTCUT_LABELS } from "../shell/shortcuts";
 
 export interface SettingsFormProps {
@@ -83,7 +84,10 @@ export const SettingsForm: React.FC<SettingsFormProps> = ({
   const formId = useId();
   const current = snapshot?.categories?.[category];
   const fields = CATEGORY_FIELDS[category];
-  const [draft, setDraft] = useState<Draft>(() => draftFrom(category, current?.values));
+  const readOnly = !!snapshot?.read_only;
+  // Protected settings: the defaults are in use, so they are what the fields show.
+  const shownValues = readOnly ? CATEGORY_DEFAULTS[category] : current?.values;
+  const [draft, setDraft] = useState<Draft>(() => draftFrom(category, shownValues));
   // Fields the operator changed since the last load: only these replace an invalid stored value.
   const [touched, setTouched] = useState<ReadonlySet<string>>(new Set());
   const [error, setError] = useState<StructuredError | null>(null);
@@ -91,12 +95,11 @@ export const SettingsForm: React.FC<SettingsFormProps> = ({
   const [saving, setSaving] = useState(false);
 
   useEffect(() => {
-    setDraft(draftFrom(category, current?.values));
+    setDraft(draftFrom(category, shownValues));
     setTouched(new Set());
-  }, [category, current]);
+  }, [category, current, shownValues]);
 
   const loaded = isTauri && !!snapshot && !loadError;
-  const readOnly = !!snapshot?.read_only;
   const invalid = invalidFieldsOf(snapshot, category);
   const invalidField = (field: UiField) => isInvalid(invalid, category, field);
   const invalidCount = fields.filter(invalidField).length;
@@ -200,7 +203,7 @@ export const SettingsForm: React.FC<SettingsFormProps> = ({
       {category === "geral" && <>
         <h4>Atalhos de teclado</h4>
         <dl>{SHORTCUT_LABELS.map(([keys, action]) => <React.Fragment key={keys}><dt><kbd>{keys}</kbd></dt><dd>{action}</dd></React.Fragment>)}</dl>
-        <p>O histórico pode ser exportado; restaurar sessões ainda não é suportado.</p>
+        <p>Exportar o histórico e restaurar sessões ainda não são suportados nesta versão.</p>
       </>}
 
       {loadError && (
@@ -221,8 +224,9 @@ export const SettingsForm: React.FC<SettingsFormProps> = ({
           </p>
           <p className="callout__body">{snapshot?.stored_issue?.message || READ_ONLY_TEXT}</p>
           <p className="callout__body">
-            Os campos ficam somente leitura: esta versão não grava sobre configurações de outra versão. Os valores
-            mostrados são os que esta versão está usando.
+            Os campos ficam somente leitura: esta versão não grava sobre configurações de outra versão. Eles mostram os
+            padrões, que são os valores que esta versão está usando; os valores da outra versão ficam preservados e não
+            são exibidos.
           </p>
         </div>
       )}

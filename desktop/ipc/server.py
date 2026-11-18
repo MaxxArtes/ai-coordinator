@@ -522,7 +522,9 @@ class SecureIPCServer:
             "authorized_projects": active.authorized_projects,
             "data_dir": active.data_dir,
             "last_project": getattr(active, "last_project", None),
-            # E2-6: the active profile was unreadable, kept byte for byte (file name only) and recreated empty.
+            # E2-6: the active profile ("profile_unreadable": recreated empty) or the selection in active_profile.txt
+            # ("active_selection_invalid": the default profile was opened) could not be used; its bytes were kept in
+            # the file named by backup_file (name only).
             "recovery": dict(recovery) if isinstance(recovery, dict) else None,
         }
 
@@ -570,9 +572,9 @@ class SecureIPCServer:
         mgr = self._get_terminal_manager()
         profiles = mgr.authorizer.profile_manager
         # The listed text is compared as is and resolved (os.path.normcase), like the authorization itself: an entry
-        # renamed only in letter case, replaced by a junction or written another way can still be revoked (K4).
+        # renamed only in letter case, replaced by a junction or written another way can still be revoked (K4). It is
+        # never required to resolve: a folder on a disconnected mapped drive (winerror 1328) must stay revocable.
         requested = self._project_text(params)
-        self._project_param(params)
 
         def refuse_with_sessions(matching: List[str]) -> None:
             targets = [requested, *matching]
@@ -605,17 +607,23 @@ class SecureIPCServer:
 
     def _handle_security_status(self, _params: Dict[str, Any]) -> Dict[str, Any]:
         active = self._get_terminal_manager().authorizer.profile_manager.get_active_profile()
-        # Only what the Desktop really enforces (BE-14): sessions open only in authorized directories; nothing isolates
-        # the shell, and an agent opened here only gets an environment without credential variables.
+        # Only what the Desktop really enforces (BE-14): sessions open only in authorized directories (checked again
+        # from disk by every window, while the active_sessions refusal of a revocation only sees this window's
+        # terminals); nothing isolates the shell; TerminalManager only drops agent variables whose NAME contains
+        # secret, token, password or key, so other credentials in the environment still reach an agent.
         return {"authorized_projects": active.authorized_projects, "policy": {
             "project_fencing": True,
             "human_terminal": "operator_permissions",
             "governed_agent": "env_sanitized_only",
             "human_terminal_filesystem_isolation": False,
-            "description": "A autorização limita os diretórios em que terminais podem ser abertos. O terminal humano usa "
-                           "as permissões do operador do sistema; não há isolamento de filesystem do shell. Agentes "
-                           "abertos pelo Desktop recebem apenas um ambiente sem variáveis de credenciais: não há sandbox "
-                           "nem política do Core aplicada a eles.",
+            "description": "A autorização limita os diretórios em que terminais podem ser abertos. Revogar um diretório "
+                           "impede novos terminais nele em todas as janelas do Desktop, mas só confere os terminais "
+                           "desta janela: um terminal aberto nele em outra janela continua até ser fechado. O terminal "
+                           "humano usa as permissões do operador do sistema; não há isolamento de filesystem do shell. "
+                           "A interface do Desktop ainda não abre agentes governados. Um agente aberto pelo IPC herda o "
+                           "ambiente do Desktop sem o token do IPC e sem as variáveis cujo nome contém secret, token, "
+                           "password ou key; outras credenciais do ambiente (como PAT, URL com senha e SSH_AUTH_SOCK) "
+                           "passam, e não há sandbox nem política do Core aplicada a eles.",
         }}
 
     def _handle_discovery_agents(self, _params: Dict[str, Any]) -> Dict[str, Any]:

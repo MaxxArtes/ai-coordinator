@@ -224,7 +224,9 @@ class SettingsStore:
             saved = state.values.get(category, {})
             if not isinstance(saved, dict):
                 saved = {}
-            values, invalid = self._category_view(category, saved)
+            # Read-only means "the defaults are in use" (STORED_ISSUE_MESSAGES): values written by another version or
+            # in another format are listed in saved_fields but never shown or applied as if this version used them.
+            values, invalid = self._category_view(category, {} if read_only else saved)
             any_invalid = any_invalid or bool(invalid)
             categories[category] = {
                 "values": values,

@@ -97,6 +97,55 @@ def test_handler_exceptions_do_not_echo_secrets_into_response_or_diagnostics():
     assert MARKER not in json.dumps(response.to_dict()) + diag.getvalue()
     assert server.handle_raw_payload(PING).result["status"] == "pong"
 
+def _fail_once(real):
+    calls = {"n": 0}
+    def wrapper(*args, **kwargs):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise RuntimeError(MARKER)
+        return real(*args, **kwargs)
+    return wrapper
+
+
+@pytest.mark.parametrize("target", ["_json_problem", "_safe_rpc_id", "RPCRequest.from_dict"])
+def test_unexpected_failure_before_dispatch_is_one_internal_error_line(monkeypatch, target):
+    """C3 criterion 4: an unexpected exception while a line is validated (not inside a handler) is answered with
+    -32603 {request, internal_error}; it never reaches serve_forever, whose finally would end every terminal."""
+    import desktop.ipc.server as server_mod
+    if target == "RPCRequest.from_dict":
+        real_cls = server_mod.RPCRequest
+        stub = type("RPCRequestStub", (), {"from_dict": staticmethod(_fail_once(real_cls.from_dict))})
+        monkeypatch.setattr(server_mod, "RPCRequest", stub)
+    else:
+        monkeypatch.setattr(server_mod, target, _fail_once(getattr(server_mod, target)))
+    writer, diagnostics = io.StringIO(), io.StringIO()
+    manager = MagicMock()
+    line = request(params={"value": MARKER})
+    server = SecureIPCServer(StreamTransport(io.StringIO(line + "\n" + PING + "\n"), writer, diagnostics), TOKEN, manager)
+    assert server.process_one() is True
+    assert server.process_one() is True
+    first, second = [json.loads(x) for x in writer.getvalue().splitlines()]
+    assert first["error"]["code"] == -32603
+    assert first["error"]["data"] == {"field": "request", "reason": "internal_error"}
+    assert second["id"] == "next" and second["result"]["status"] == "pong"
+    manager.terminate_all.assert_not_called()
+    assert MARKER not in writer.getvalue() + diagnostics.getvalue()
+
+
+def test_serve_forever_answers_both_lines_after_an_unexpected_validation_failure(monkeypatch):
+    import desktop.ipc.server as server_mod
+    monkeypatch.setattr(server_mod, "_json_problem", _fail_once(server_mod._json_problem))
+    writer, diagnostics = io.StringIO(), io.StringIO()
+    manager = MagicMock()
+    transport = StreamTransport(io.StringIO(request(params={"value": MARKER}) + "\n" + PING + "\n"), writer, diagnostics)
+    SecureIPCServer(transport, TOKEN, manager).serve_forever()  # returns at end of input, never raises
+    first, second = [json.loads(x) for x in writer.getvalue().splitlines()]
+    assert first["error"]["data"] == {"field": "request", "reason": "internal_error"}
+    assert second["result"]["status"] == "pong"
+    manager.terminate_all.assert_called_once()  # only at the end of input, as on a normal shutdown
+    assert MARKER not in writer.getvalue() + diagnostics.getvalue()
+
+
 def test_unknown_methods_and_auth_failures_do_not_echo_arbitrary_method_text():
     diag = io.StringIO()
     server = SecureIPCServer(StreamTransport(io.StringIO(), io.StringIO(), diag), TOKEN, MagicMock())

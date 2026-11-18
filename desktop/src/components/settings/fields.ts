@@ -63,5 +63,17 @@ export const CATEGORY_FIELDS: Record<BackedCategory, UiField[]> = {
   ],
 };
 
+/**
+ * Defaults of this version, the same the host uses (desktop/settings/store.py FIELDS; the mission budget is the Core's
+ * FlightBudget()). Shown when the stored settings are protected (read-only), because these are then the values in use.
+ */
+export const CATEGORY_DEFAULTS: Record<BackedCategory, Record<string, any>> = {
+  perfil: { display_name: null },
+  geral: { open_last_project_on_start: true },
+  aparencia: { stimulation: "standard", density: "comfortable" },
+  terminal: { font_size: 13, cursor_blink: true, scrollback_lines: 1000 },
+  coordinator: { flight_budget: { max_steps: 50, max_elapsed_seconds: 3600, max_uncheckpointed_steps: 10, max_worker_calls: 15 } },
+};
+
 export const fieldPath = (category: BackedCategory, field: UiField) =>
   field.parent ? `${category}.${field.parent}.${field.key}` : `${category}.${field.key}`;

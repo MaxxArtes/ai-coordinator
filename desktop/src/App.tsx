@@ -13,6 +13,7 @@ import {
   pathWithin,
   rememberProject,
   samePath,
+  settingsInUse,
   type BackedCategory,
   type ProfileRecovery,
   type RevokeResult,
@@ -25,10 +26,10 @@ import {
   type RuntimeMetrics,
   type RuntimeStatus,
 } from "./components/shell/AppHeader";
-import { MainNav, type MainViewId } from "./components/shell/MainNav";
+import { MainNav, mainViewPanelId, type MainViewId } from "./components/shell/MainNav";
 import { MainViews } from "./components/shell/PlannedView";
 import { StatusBar } from "./components/shell/StatusBar";
-import { installGlobalShortcuts } from "./components/shell/shortcuts";
+import { findEntry, findRegions, installGlobalShortcuts } from "./components/shell/shortcuts";
 import { lowestFreeSlot, paneFromSession } from "./components/terminalIdentity";
 import { activeCountText, resolvePaneState, useTerminalStates, type PaneState } from "./components/useTerminalStates";
 import { NoticeBanner, type NoticeTone } from "./components/shell/NoticeBanner";
@@ -478,7 +479,8 @@ export const App: React.FC = () => {
           setProfileDisplayName(typeof profInfo?.display_name === "string" ? profInfo.display_name : "");
           setProfileRecovery(profInfo?.recovery && typeof profInfo.recovery === "object" ? profInfo.recovery : null);
 
-          const autoOpen = initialSettings?.categories?.geral?.values?.open_last_project_on_start !== false;
+          // Protected settings (another version): the default is in use, as the host says.
+          const autoOpen = settingsInUse(initialSettings)?.categories?.geral?.values?.open_last_project_on_start !== false;
           if (authList.length > 0 && autoOpen) {
             const activeDir = authList.find((p) => samePath(p, profInfo.last_project)) ?? authList[0];
             try {
@@ -615,24 +617,6 @@ export const App: React.FC = () => {
   }, [isTauri, connectionStatus, callTauri]);
 
 
-  // Save session layout
-  const handleSaveSessions = useCallback(
-    async (tabId: string) => {
-      if (isTauriRef.current) {
-        try {
-          const res = await callTauri("terminal_save_sessions", { tabId });
-          showNotice(`Sessão salva com sucesso: ${res?.total_sessions || panes.length} terminais arquivados.`, "success");
-        } catch (err: any) {
-          showNotice(`Falha ao salvar sessão: ${err?.message || err}`);
-        }
-      } else {
-        showNotice("Layout da sessão exportado (modo preview).", "info");
-      }
-      setTimeout(() => setNotice(""), 4000);
-    },
-    [panes.length, callTauri]
-  );
-
   // Live state of every terminal (F9): only what the host reports; unknown otherwise.
   const stateSnapshot = useTerminalStates(isTauri, callTauri, activeTab, panes.map((p) => p.sessionId));
   const paneStates = useMemo<Record<string, PaneState>>(
@@ -654,6 +638,21 @@ export const App: React.FC = () => {
       : document.querySelector<HTMLElement>(".tab-strip [data-f6-entry]");
     el?.focus();
   }, [panes]);
+
+  // Closing Configurações gives the focus back to the control that opened it (Dialog). When that control is gone (the
+  // open project was revoked there and the tab strip went with the terminal grid), the focus goes to the entry of the
+  // visible view, never to the page body (4D.3.5). The Dialog's cleanup, which lifts inert, has already run here.
+  const settingsWasOpenRef = useRef(false);
+  useEffect(() => {
+    const wasOpen = settingsWasOpenRef.current;
+    settingsWasOpenRef.current = isSettingsOpen;
+    if (isSettingsOpen || !wasOpen) return;
+    if (document.activeElement && document.activeElement !== document.body) return;
+    const view = document.getElementById(mainViewPanelId(mainView));
+    const inView = !view ? [] : view.matches("[data-f6-region]") ? [view] : findRegions(view);
+    // Else (a view without an entry, e.g. the startup screen) the first region of the window, as F6 from the body.
+    [...inView, ...findRegions()].map(findEntry).find(Boolean)?.focus();
+  }, [isSettingsOpen]);
 
   // Persistent state the operator must see; never replaced by a transient notice.
   const systemNotices = useMemo<SystemNotice[]>(() => {
@@ -685,7 +684,7 @@ export const App: React.FC = () => {
         id: "settings-read-only",
         tone: "warn",
         title: "Configurações de outra versão: protegidas, somente leitura",
-        body: `${settings.stored_issue?.message || "As configurações foram gravadas por outra versão e estão protegidas."} Esta versão segue com os próprios valores e não grava sobre elas.`,
+        body: `${settings.stored_issue?.message || "As configurações foram gravadas por outra versão e estão protegidas."} Esta versão usa os próprios padrões e não grava sobre elas.`,
         action: toSettings,
       });
     } else if (settings) {
@@ -738,13 +737,14 @@ export const App: React.FC = () => {
       }}
     />
   ) : (
+    // No "Salvar sessões": the host only builds the sanitized history in memory and nothing writes it to a file yet
+    // (A5); the button would claim a save the operator cannot get.
     <TerminalGrid
       tabId={activeTab}
       projectPath={projectPath}
       panes={panes}
       states={paneStates}
       onAddPane={handleAddPane}
-      onSaveSessions={handleSaveSessions}
       onWrite={handleWrite}
       onResize={handleResize}
       onClose={handleClosePane}
@@ -752,7 +752,7 @@ export const App: React.FC = () => {
     />
   );
 
-  const headerName = settings?.categories?.perfil?.values?.display_name || profileDisplayName || profileName || null;
+  const headerName = settingsInUse(settings)?.categories?.perfil?.values?.display_name || profileDisplayName || profileName || null;
 
   return (
     <div className="app" data-preferences-loading={preferencesLoading || undefined}>

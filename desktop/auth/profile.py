@@ -19,6 +19,10 @@ RECOVERY_MESSAGE = (
     "O perfil ativo estava ilegível. Uma cópia exata foi guardada na pasta do perfil e um perfil novo, com o mesmo "
     "nome, foi criado sem projetos autorizados e sem configurações. Autorize os projetos novamente."
 )
+SELECTION_RECOVERY_MESSAGE = (
+    "A seleção do perfil ativo estava inválida ou indicava um perfil que não existe. Uma cópia exata do arquivo de "
+    "seleção foi guardada na pasta de perfis e o perfil padrão foi aberto. Os outros perfis não foram alterados."
+)
 
 
 class ProfileError(Exception):
@@ -35,6 +39,13 @@ class ProfileNotFoundError(ProfileError):
 
 class ProfileCorruptError(ProfileError):
     """The profile bytes were read but are not a valid profile (as opposed to a file that could not be read)."""
+
+
+def _discard(path: Path) -> None:
+    try:
+        os.unlink(path)
+    except OSError:
+        pass
 
 
 def _same_path_text(a: str, b: str) -> bool:
@@ -189,11 +200,27 @@ class DesktopProfileManager:
                 data = {**data, "data_dir": str(target.parent)}
             profile = DesktopProfile.from_dict(data)
             if profile.name != cleaned:
-                raise ValueError("Profile identity mismatch")
+                # Windows and macOS ignore letter case: "Work" opens the folder of "work". That is the same healthy
+                # profile under its stored name (vault entropy uses it), never a corrupt one to quarantine.
+                if not self._same_profile_file(target, profile.name):
+                    raise ValueError("Profile identity mismatch")
+                profile = DesktopProfile.from_dict({**data, "data_dir": str(self._profile_file(profile.name).parent)})
             return profile
         except (ValueError, TypeError, KeyError, RecursionError, UnicodeError, ProfileError):
             # Do not interpolate parse errors: they can echo private values from the profile.
             raise ProfileCorruptError("O perfil salvo está inválido ou ilegível. Os dados foram preservados.") from None
+
+    def _same_profile_file(self, target: Path, stored_name: str) -> bool:
+        """True when the requested name (other letter case, or "work." on Windows) opened the very file of the stored name.
+
+        The same file is never a copy: on a case-sensitive file system "Work" is another folder and stays a mismatch.
+        """
+        if not isinstance(stored_name, str):
+            return False
+        try:
+            return os.path.samefile(target, self._profile_file(stored_name))
+        except (OSError, ValueError, ProfileValidationError):
+            return False  # a case-sensitive file system: a different folder, so a real mismatch
 
     def create_profile(self, name: str, display_name: Optional[str] = None,
                        initial_authorized_projects: Optional[List[str]] = None,
@@ -263,7 +290,17 @@ class DesktopProfileManager:
         backup = source.with_name(f"profile.json.{suffix}")
         with interprocess_lock(self._profile_lock(name)):
             if backup.exists():
-                return False
+                try:
+                    interrupted = backup.stat().st_size == 0  # a copy cut short (power loss) holds nothing
+                except OSError:
+                    interrupted = False
+                if not interrupted:
+                    return False
+                try:
+                    retry_sharing_violation(lambda: os.unlink(backup))
+                except OSError:
+                    # Migrating without the copy would lose the legacy bytes: refuse, as when the copy itself fails.
+                    raise ProfileError("Não foi possível guardar a cópia de segurança do perfil. Nada foi alterado.") from None
             try:
                 self._exclusive_copy(backup, retry_sharing_violation(source.read_bytes))
             except FileExistsError:
@@ -272,14 +309,16 @@ class DesktopProfileManager:
                 raise ProfileError("Não foi possível guardar a cópia de segurança do perfil. Nada foi alterado.") from None
             return True
 
-    def _quarantine(self, target: Path) -> Path:
-        try:
-            raw = retry_sharing_violation(target.read_bytes)
-        except OSError:
-            raise ProfileError("Não foi possível ler o perfil salvo. Os dados foram preservados.") from None
+    def _quarantine(self, target: Path, raw: Optional[bytes] = None) -> Path:
+        """Keep `raw` (by default the bytes of `target`) in a new <name>.corrupt-<stamp> file next to it."""
+        if raw is None:
+            try:
+                raw = retry_sharing_violation(target.read_bytes)
+            except OSError:
+                raise ProfileError("Não foi possível ler o perfil salvo. Os dados foram preservados.") from None
         stamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
         for attempt in range(1, 100):
-            candidate = target.with_name(f"profile.json.corrupt-{stamp}" + ("" if attempt == 1 else f"-{attempt}"))
+            candidate = target.with_name(f"{target.name}.corrupt-{stamp}" + ("" if attempt == 1 else f"-{attempt}"))
             try:
                 self._exclusive_copy(candidate, raw)
             except FileExistsError:
@@ -307,13 +346,24 @@ class DesktopProfileManager:
                     name=name, display_name=name.replace("_", " ").title(), data_dir=str(target.parent),
                     created_at=datetime.datetime.now(datetime.timezone.utc).isoformat(),
                 )
-                self._save_profile(fresh)
+                try:
+                    self._save_profile(fresh)
+                except BaseException:
+                    # The rewrite failed before os.replace, so profile.json still has the bytes just copied: drop the
+                    # copy, or every retry (each read of the profile) would leave one more identical file.
+                    _discard(backup)
+                    raise
                 self.recovery = {"reason": "profile_unreadable", "backup_file": backup.name, "message": RECOVERY_MESSAGE}
                 return fresh
 
     def _mutate(self, name: str, change: Callable[[DesktopProfile], Any]) -> tuple[DesktopProfile, Any]:
-        with interprocess_lock(self._profile_lock(name)):
-            profile = self.get_profile(name)
+        # Lock by the stored name, the one _save_profile locks: on macOS a requested "Work" and the stored "work" are
+        # different lock keys for the same file, and the second flock would wait on this process's own lock.
+        current = self.get_profile(name)
+        if current is None:
+            raise ProfileNotFoundError("Profile not found")
+        with interprocess_lock(self._profile_lock(current.name)):
+            profile = self.get_profile(current.name)
             if profile is None:
                 raise ProfileNotFoundError("Profile not found")
             result = change(profile)
@@ -346,28 +396,68 @@ class DesktopProfileManager:
             shutil.rmtree(directory)
             return True
 
-    def get_active_profile(self) -> DesktopProfile:
-        if self.active_file.exists():
-            try:
-                active_name = retry_sharing_violation(lambda: self.active_file.read_text(encoding="utf-8")).strip()
-            except (OSError, UnicodeError):
-                raise ProfileError("Não foi possível ler a seleção de perfil. Os dados foram preservados.") from None
-            missing = "O perfil ativo não foi encontrado. Nenhum perfil foi recriado."
-        else:
-            active_name = "default"
-            missing = "Nenhum perfil ativo foi definido. Selecione um perfil existente."
+    def _read_selection(self) -> bytes:
         try:
-            active_name = self._validate_name(active_name)
-        except ProfileValidationError:
-            raise ProfileError("A seleção de perfil está inválida. Os dados foram preservados.") from None
+            return retry_sharing_violation(self.active_file.read_bytes)
+        except OSError:
+            # Bytes that cannot be read cannot be kept: nothing is repaired or rewritten.
+            raise ProfileError("Não foi possível ler a seleção de perfil. Os dados foram preservados.") from None
+
+    def _selected_name(self, raw: bytes) -> Optional[str]:
+        """The profile name in active_profile.txt, or None when it is not one. A BOM (Notepad, PowerShell) and
+        surrounding blanks or line breaks are tolerated, as in profile.json."""
         try:
-            profile = self.get_profile(active_name)
+            return self._validate_name(raw.decode("utf-8-sig").strip())
+        except (UnicodeError, ProfileValidationError):
+            return None
+
+    def _open_selected(self, name: str) -> Optional[DesktopProfile]:
+        try:
+            return self.get_profile(name)
         except ProfileCorruptError:
             # E2-6: an unreadable active profile must not prevent opening the application.
-            return self._recover_active(active_name)
-        if profile is None:
-            raise ProfileNotFoundError(missing)
-        return profile
+            return self._recover_active(name)
+
+    def _recover_selection(self) -> DesktopProfile:
+        """E2-6: an empty, undecodable or dangling active_profile.txt must not prevent opening the application.
+
+        Its bytes are kept in a new active_profile.txt.corrupt-<stamp> copy, the default profile is opened (recovered
+        when unreadable, created only when absent, as in a new installation) and the selection is rewritten. A missing
+        profile named in the selection is never created.
+        """
+        with interprocess_lock(self.root_dir / "profiles.lock"):
+            raw = self._read_selection()
+            name = self._selected_name(raw)
+            if name is not None:
+                profile = self._open_selected(name)  # another window may already have repaired the selection
+                if profile is not None:
+                    return profile
+            before = self.recovery
+            profile = self._open_selected("default")
+            if profile is None:
+                profile = self.create_profile("default", display_name="Default Profile")
+            backup = self._quarantine(self.active_file, raw)
+            try:
+                self._atomic_write(self.active_file, "default")
+            except BaseException:
+                _discard(backup)  # the selection is unchanged; a retry must not add one more copy
+                raise
+            if self.recovery is before:
+                self.recovery = {"reason": "active_selection_invalid", "backup_file": backup.name,
+                                 "message": SELECTION_RECOVERY_MESSAGE}
+            # Otherwise the default profile itself was recreated empty: that notice (authorize the projects again)
+            # is the one the operator must act on, and it is kept.
+            return profile
+
+    def get_active_profile(self) -> DesktopProfile:
+        if not self.active_file.exists():
+            profile = self._open_selected("default")
+            if profile is None:
+                raise ProfileNotFoundError("Nenhum perfil ativo foi definido. Selecione um perfil existente.")
+            return profile
+        name = self._selected_name(self._read_selection())
+        profile = self._open_selected(name) if name is not None else None
+        return profile if profile is not None else self._recover_selection()
 
     def set_active_profile(self, name: str) -> DesktopProfile:
         cleaned = self._validate_name(name)
@@ -375,7 +465,7 @@ class DesktopProfileManager:
             profile = self.get_profile(cleaned)
             if profile is None:
                 raise ProfileNotFoundError("Profile not found")
-            self._atomic_write(self.active_file, cleaned)
+            self._atomic_write(self.active_file, profile.name)  # the stored spelling, not the requested case
             return profile
 
     def authorize_project(self, profile_name: str, project_path: Union[str, Path]) -> None:

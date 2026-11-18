@@ -68,6 +68,18 @@ describe("aparência da primeira pintura", () => {
     expect(() => restoreCachedAppearance()).not.toThrow();
   });
 
+  it("configurações protegidas (somente leitura): os padrões são aplicados, como a mensagem do host diz", () => {
+    applyInterfaceSettings(
+      snapshot(
+        { aparencia: { stimulation: "low", density: "compact" }, terminal: { font_size: 18, scrollback_lines: 200, cursor_blink: false } },
+        { read_only: true, stored_schema_version: 2 }
+      )
+    );
+    expect(root.dataset.stimulation).toBeUndefined();
+    expect(root.dataset.density).toBe("comfortable");
+    expect(terminalPreferences()).toEqual({ fontSize: 13, scrollback: 1000, cursorBlink: true });
+  });
+
   it("valores fora da faixa nunca chegam ao terminal", () => {
     applyInterfaceSettings(snapshot({ terminal: { font_size: 99, scrollback_lines: 5000, cursor_blink: "sim" } }));
     expect(terminalPreferences()).toEqual({ fontSize: 13, scrollback: 1000, cursorBlink: true });

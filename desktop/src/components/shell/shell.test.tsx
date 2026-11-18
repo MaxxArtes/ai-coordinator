@@ -72,6 +72,35 @@ describe("AuthorizationScreen", () => {
     expect(onSubmit).not.toHaveBeenCalled();
   });
 
+  it("o motivo (note) descreve o controle que recebe o foco, para o leitor de tela anunciá-lo", () => {
+    const note = "Não foi possível abrir D:\\proj: O diretório do projeto não existe";
+    const { rerender } = render(
+      <AuthorizationScreen
+        profileName="default"
+        authorizedProjects={["D:\\proj", "D:\\outro"]}
+        note={note}
+        inputPath=""
+        onInputPathChange={vi.fn()}
+        onSubmit={vi.fn()}
+        onOpenProject={vi.fn()}
+      />
+    );
+    const first = screen.getByRole("button", { name: "Abrir D:\\proj" });
+    expect(first).toHaveFocus();
+    expect(first).toHaveAccessibleDescription(note);
+    expect(screen.getByRole("button", { name: "Abrir D:\\outro" })).toHaveAccessibleDescription("");
+    expect(screen.getByLabelText("Caminho do projeto no host")).toHaveAccessibleDescription("O diretório precisa existir neste computador.");
+
+    // Without projects the field gets the focus, and the reason comes before its hint.
+    rerender(<AuthorizationScreen profileName="default" note={note} inputPath="" onInputPathChange={vi.fn()} onSubmit={vi.fn()} />);
+    expect(screen.getByLabelText("Caminho do projeto no host")).toHaveAccessibleDescription(
+      `${note} O diretório precisa existir neste computador.`
+    );
+    // Without a note, only the hint.
+    rerender(<AuthorizationScreen profileName="default" inputPath="" onInputPathChange={vi.fn()} onSubmit={vi.fn()} />);
+    expect(screen.getByLabelText("Caminho do projeto no host")).toHaveAccessibleDescription("O diretório precisa existir neste computador.");
+  });
+
   it("propaga a digitação para o estado do aplicativo", async () => {
     const user = userEvent.setup();
     const onChange = vi.fn();

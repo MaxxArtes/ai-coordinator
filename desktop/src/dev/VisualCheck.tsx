@@ -257,7 +257,6 @@ const ConversasView: React.FC<{ view: MainViewId }> = ({ view: initial }) => (
       panes={FOUR_PANES}
       states={FIXTURE_STATES}
       onAddPane={noop}
-      onSaveSessions={noop}
       onWrite={noop}
       onResize={noop}
       onClose={noop}
@@ -321,8 +320,8 @@ const VIEWS: Record<string, () => React.ReactElement> = {
       metrics={null}
       notices={
         <>
-          <NoticeBanner message="Falha ao salvar sessão: o Core recusou a exportação." tone="error" onDismiss={() => undefined} />
-          <NoticeBanner message="Sessão salva com sucesso: 2 terminais arquivados." tone="success" onDismiss={() => undefined} />
+          <NoticeBanner message="Erro ao fechar sessão: o host não confirmou o fechamento. O terminal continua aberto." tone="error" onDismiss={() => undefined} />
+          <NoticeBanner message="FIXTURE: confirmação de exemplo (tom de sucesso)." tone="success" onDismiss={() => undefined} />
           <NoticeBanner message="Limite máximo de 4 painéis simultâneos por aba atingido." tone="info" onDismiss={() => undefined} />
         </>
       }
@@ -379,7 +378,10 @@ const VIEWS: Record<string, () => React.ReactElement> = {
           {},
           {
             read_only: true,
-            stored_issue: { reason: "incompatible_version", message: "O esquema salvo não é compatível com esta versão. Os dados foram preservados." },
+            stored_issue: {
+              reason: "incompatible_version",
+              message: "As configurações foram gravadas por outra versão e estão protegidas. Os padrões estão em uso e nada será alterado.",
+            },
           },
         ),
       }}

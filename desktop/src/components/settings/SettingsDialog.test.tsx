@@ -1230,6 +1230,24 @@ describe("SettingsDialog — confirmação no cofre (Provedores)", () => {
     expect(within(panel).queryByText("Falha ao remover.")).not.toBeInTheDocument();
   });
 
+  it("cofre ilegível (E2-3), na forma que o host envia: avisa, não se apresenta como disponível e não oferece gravação", async () => {
+    // desktop/ipc/server.py answers vault.status with an object for an unreadable vault; it never throws there.
+    const callTauri = makeCallTauri(
+      vaultHandlers(["OPENROUTER_API_KEY"], {
+        vault_status: () => ({ available: false, backend: "unreadable", reason: "unreadable" }),
+      })
+    );
+    const { panel } = openProvedores(callTauri);
+    expect(await within(panel).findByText("Cofre ilegível: credenciais preservadas")).toBeInTheDocument();
+    expect(within(panel).getByText(/recupere o acesso ao cofre antes de continuar/)).toBeInTheDocument();
+    expect(within(panel).queryByText(/^Cofre: /)).not.toBeInTheDocument();
+    expect(within(panel).queryByText(/indisponível nesta plataforma/)).not.toBeInTheDocument();
+    expect(within(panel).queryByLabelText("Valor")).not.toBeInTheDocument();
+    expect(within(panel).queryByRole("button", { name: "Gravar no cofre" })).not.toBeInTheDocument();
+    expect(calls(callTauri, "vault_list_keys")).toHaveLength(0);
+    expect(calls(callTauri, "vault_set_secret")).toHaveLength(0);
+  });
+
   it("ao terminar uma gravação lenta não tira o foco de onde o operador o levou", async () => {
     const keys: string[] = [];
     const write = gated((args) => {
@@ -1358,15 +1376,25 @@ describe("SettingsDialog — confirmação no cofre (Provedores)", () => {
 describe("SettingsDialog — estados honestos das configurações (K1)", () => {
   beforeEach(() => vi.clearAllMocks());
 
+  // The real host's message (desktop/settings/store.py, STORED_ISSUE_MESSAGES["incompatible_version"]).
   const READ_ONLY = {
+    stored_schema_version: 2,
     read_only: true,
-    stored_issue: { reason: "incompatible_version", message: "O esquema salvo não é compatível com esta versão. Os dados foram preservados." },
+    stored_issue: {
+      reason: "incompatible_version",
+      message: "As configurações foram gravadas por outra versão e estão protegidas. Os padrões estão em uso e nada será alterado.",
+    },
   };
 
-  it("configurações de outra versão: aviso, campos somente leitura, sem 'Aplicado' e nada é enviado", async () => {
+  it("configurações de outra versão: aviso, campos somente leitura com os padrões em uso, sem 'Aplicado' e nada é enviado", async () => {
+    // The other version's values in `values`, as the host sent them at a9e2462: the form still shows the defaults.
+    const stored = snapshotWith({
+      terminal: { values: { font_size: 18, cursor_blink: false, scrollback_lines: 200 }, saved_fields: ["cursor_blink", "font_size", "scrollback_lines"], validated: false },
+      aparencia: { values: { stimulation: "low", density: "compact" }, saved_fields: ["density", "stimulation"], validated: false },
+    });
     const callTauri = makeCallTauri({
       ...updaterHandlers(UP_TO_DATE),
-      settings_get: () => ({ ...snapshotWith(), ...READ_ONLY }),
+      settings_get: () => ({ ...stored, ...READ_ONLY }),
       settings_update: () => {
         throw new Error("não deveria gravar");
       },
@@ -1375,17 +1403,26 @@ describe("SettingsDialog — estados honestos das configurações (K1)", () => {
     const panel = screen.getByRole("tabpanel", { name: /Terminal/ });
     expect(await within(panel).findByText("Configurações protegidas")).toBeInTheDocument();
     expect(within(panel).getByText(READ_ONLY.stored_issue.message)).toBeInTheDocument();
+    expect(within(panel).getByText(/mostram os padrões, que são os valores que esta versão está usando/)).toBeInTheDocument();
     expect(within(panel).getByText("Protegido: somente leitura")).toBeInTheDocument();
     expect(within(panel).queryByText("Aplicado")).not.toBeInTheDocument();
 
     const font = within(panel).getByLabelText("Tamanho da fonte");
     expect(font).toHaveAttribute("readonly");
+    expect(font).toHaveValue(13); // the default in use, not the other version's 18
+    expect(within(panel).getByLabelText("Linhas de histórico")).toHaveValue(1000);
     await user.type(font, "9");
     expect(font).toHaveValue(13);
     const blink = within(panel).getByRole("checkbox", { name: "Cursor piscante" });
     expect(blink).toHaveAttribute("aria-readonly", "true");
+    expect(blink).toBeChecked();
     await user.click(blink);
     expect(blink).toBeChecked();
+    await user.click(screen.getByRole("tab", { name: /Aparência/ }));
+    const appearance = screen.getByRole("tabpanel", { name: /Aparência/ });
+    expect(within(appearance).getByRole("radio", { name: "Confortável" })).toBeChecked();
+    expect(within(appearance).getByRole("radio", { name: "Padrão" })).toBeChecked();
+    await user.click(screen.getByRole("tab", { name: /Terminal/ }));
     expect(within(panel).getByRole("button", { name: "Salvar" })).toBeDisabled();
     expect(within(panel).getAllByText("Somente leitura: configurações de outra versão, protegidas.")).toHaveLength(3);
     expect(callTauri.mock.calls.filter(([cmd]) => cmd === "settings_update")).toHaveLength(0);
@@ -1467,6 +1504,9 @@ describe("SettingsDialog — estados honestos das configurações (K1)", () => {
       expect(within(panel).getByText(keys)).toBeInTheDocument();
     }
     expect(within(panel).getByText(/Uma aba por janela nesta versão/)).toBeInTheDocument();
+    // The host only builds the sanitized history in memory; nothing writes it to a file yet (A5).
+    expect(within(panel).getByText("Exportar o histórico e restaurar sessões ainda não são suportados nesta versão.")).toBeInTheDocument();
+    expect(panel.textContent).not.toMatch(/pode ser exportado/);
   });
 
   it("Terminal: o histórico avisa que reduzir descarta linhas dos terminais abertos", async () => {
@@ -1494,5 +1534,35 @@ describe("SettingsDialog — estados honestos das configurações (K1)", () => {
     expect(callTauri.mock.calls.filter(([cmd]) => cmd === "profile_revoke_project")).toHaveLength(0);
     await user.keyboard("{Escape}");
     expect(onClose).toHaveBeenCalledTimes(1);
+  });
+
+  it("fechar a pergunta de revogação devolve o foco no mesmo commit, sem esperar um quadro (CI de a9e2462)", async () => {
+    // Without a frame before the next key, a focus moved in requestAnimationFrame stayed on <body>, where Escape no
+    // longer reached Configurações: this is how the Linux CI failed while Windows passed.
+    const raf = vi.spyOn(window, "requestAnimationFrame").mockImplementation(() => 0);
+    try {
+      const callTauri = makeCallTauri({
+        ...updaterHandlers(UP_TO_DATE),
+        security_status: () => ({ authorized_projects: ["D:\\proj"], policy: { project_fencing: true } }),
+        profile_revoke_project: () => ({ revoked: true, authorized_projects: [], last_project: null }),
+      });
+      const { user, onClose } = renderSettings(callTauri, { initialCategory: "seguranca" });
+      const panel = screen.getByRole("tabpanel", { name: /Segurança/ });
+      const trigger = await within(panel).findByRole("button", { name: "Revogar D:\\proj" });
+      await user.click(trigger);
+      await user.keyboard("{Escape}"); // cancel: back on the button that asked
+      expect(within(panel).queryByRole("alertdialog")).not.toBeInTheDocument();
+      expect(document.activeElement).toBe(trigger);
+
+      await user.click(trigger);
+      await user.click(within(panel).getByRole("button", { name: "Confirmar revogação" }));
+      expect(await within(panel).findByText(/Autorização de D:\\proj revogada/)).toBeInTheDocument();
+      expect(document.activeElement).toBe(within(panel).getByRole("heading", { name: "Diretórios autorizados" }));
+      expect(onClose).not.toHaveBeenCalled();
+      await user.keyboard("{Escape}");
+      expect(onClose).toHaveBeenCalledTimes(1);
+    } finally {
+      raf.mockRestore();
+    }
   });
 });
