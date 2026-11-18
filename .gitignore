@@ -39,6 +39,10 @@ dist/
 
 # Desktop test and staging artifacts
 desktop/test_release_staging/
+# Tauri build output: capability schemas written by tauri-build, and cargo's default target directory.
+# Cargo.lock is versioned (reproducible build), not ignored.
+desktop/src-tauri/gen/
+desktop/src-tauri/target/
 checkpoint_*.json
 
 # Node and editor artifacts

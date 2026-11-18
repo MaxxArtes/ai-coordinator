@@ -36,6 +36,12 @@ jobs:
         with:
           workspaces: desktop/src-tauri
 
+      # The committed Cargo.lock decides every crate version. Fails here, before the long build, if it is
+      # missing or out of date with Cargo.toml (cargo would otherwise re-resolve silently).
+      - name: Verify Committed Cargo.lock (cargo fetch --locked)
+        working-directory: desktop/src-tauri
+        run: cargo fetch --locked
+
       - name: Setup Host Python for Build Tooling
         uses: actions/setup-python@v5
         with:
@@ -105,9 +111,9 @@ jobs:
           Write-Host "Resources directory populated successfully:"
           Get-ChildItem -Path "desktop/src-tauri/resources" | Select-Object Name
 
-      - name: Install Desktop Frontend Dependencies
+      - name: Install Desktop Frontend Dependencies (npm ci, package-lock.json decides)
         working-directory: desktop
-        run: npm install
+        run: npm ci
 
       - name: Verify Frontend Compilation (TypeCheck + Vite Build)
         working-directory: desktop
@@ -120,7 +126,16 @@ jobs:
         shell: powershell
         run: |
           Write-Host "=== Building Release Binaries, Portable ZIP, and NSIS Installer ==="
-          npx @tauri-apps/cli build
+          # "tauri build [ARGS]...": what follows "--" goes to cargo, so cargo builds from the committed Cargo.lock
+          # and fails instead of re-resolving. npx.cmd, not npx: Windows PowerShell resolves npx to npx.ps1, which
+          # drops the "--" and would hand "--locked" to the Tauri CLI itself.
+          npx.cmd @tauri-apps/cli build -- --locked
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          git diff --exit-code -- src-tauri/Cargo.lock package-lock.json
+          if ($LASTEXITCODE -ne 0) {
+              Write-Error "Cargo.lock ou package-lock.json mudou durante o build: o build nao saiu dos lockfiles versionados."
+              exit 1
+          }
 
       - name: Verify Windows Subsystem is GUI (Subsystem 2)
         shell: powershell
@@ -138,8 +153,115 @@ jobs:
           Copy-Item "desktop/src-tauri/target/release/ai-coordinator-desktop.exe" -Destination "$portableDir/" -Force
           Copy-Item "desktop/src-tauri/resources/*" -Destination "$portableDir/resources/" -Recurse -Force
 
-          Compress-Archive -Path "$portableDir/*" -DestinationPath "desktop/src-tauri/target/release/ai-coordinator-desktop-alpha-portable.zip" -Force
-          Write-Host "Portable package created at desktop/src-tauri/target/release/ai-coordinator-desktop-alpha-portable.zip"
+      # Identity of the portable build, written inside the folder before the zip: the commit, the pip freeze of the
+      # embedded Python and a manifest of every file (relative path, size, SHA-256). The zip is written by Python
+      # zipfile: "/" separators (Compress-Archive wrote "\"), empty files and empty folders kept, then re-read and
+      # checked against the manifest.
+      - name: Write Build Identity, Manifest and Portable ZIP
+        shell: python
+        run: |
+          import hashlib, json, os, subprocess, sys, zipfile
+          from pathlib import Path
+
+          sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+          release = Path("desktop/src-tauri/target/release")
+          portable = release / "portable"
+          zip_path = release / "ai-coordinator-desktop-alpha-portable.zip"
+          MANIFEST, FREEZE, COMMIT = "BUILD-MANIFEST.json", "BUILD-PIP-FREEZE.txt", "BUILD-COMMIT.txt"
+          commit = os.environ["GITHUB_SHA"]
+          version = json.loads(Path("desktop/src-tauri/tauri.conf.json").read_text(encoding="utf-8"))["version"]
+          run_id, run_attempt = os.environ.get("GITHUB_RUN_ID", ""), os.environ.get("GITHUB_RUN_ATTEMPT", "")
+
+          # pip freeze of the Python inside the portable folder. -I: only what is embedded (no PYTHONPATH, no user
+          # site); -B: writes no .pyc into the folder that the manifest is about to describe.
+          bundled_py = portable / "resources" / "runtime" / "python" / "python.exe"
+          freeze = subprocess.run(
+              [str(bundled_py), "-I", "-B", "-m", "pip", "freeze", "--all", "--disable-pip-version-check"],
+              check=True, capture_output=True,
+          ).stdout.decode("utf-8", errors="replace").replace("\r\n", "\n")
+          (portable / FREEZE).write_text(freeze, encoding="utf-8", newline="\n")
+          (portable / COMMIT).write_text(
+              f"commit={commit}\nversion={version}\nref={os.environ.get('GITHUB_REF', '')}\n"
+              f"run_id={run_id}\nrun_attempt={run_attempt}\n",
+              encoding="utf-8", newline="\n",
+          )
+
+          def sha256(path):
+              h = hashlib.sha256()
+              with open(path, "rb") as fh:
+                  for chunk in iter(lambda: fh.read(1 << 20), b""):
+                      h.update(chunk)
+              return h.hexdigest()
+
+          files, empty_dirs = [], []
+          for root, dirs, names in os.walk(portable):
+              dirs.sort()
+              here = Path(root)
+              if here != portable and not dirs and not names:
+                  empty_dirs.append(here.relative_to(portable).as_posix() + "/")
+              for name in sorted(names):
+                  rel = (here / name).relative_to(portable).as_posix()
+                  if rel == MANIFEST:
+                      continue
+                  files.append({"path": rel, "size": (here / name).stat().st_size, "sha256": sha256(here / name)})
+          files.sort(key=lambda e: e["path"])
+          manifest = {
+              "version": version, "commit": commit, "run_id": run_id, "run_attempt": run_attempt,
+              "file_count": len(files), "total_bytes": sum(e["size"] for e in files),
+              "not_listed": [MANIFEST], "empty_dirs": empty_dirs, "files": files,
+          }
+          (portable / MANIFEST).write_text(json.dumps(manifest, indent=1, ensure_ascii=False) + "\n", encoding="utf-8", newline="\n")
+          manifest_sha = sha256(portable / MANIFEST)
+
+          # Timestamps before 1980 do not fit in a zip entry: strict_timestamps=False clamps them instead of failing.
+          with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED, strict_timestamps=False) as zf:
+              for d in empty_dirs:
+                  zf.mkdir(d)
+              for rel in [MANIFEST] + [e["path"] for e in files]:
+                  zf.write(portable / rel, arcname=rel)
+
+          expected = {e["path"]: e["size"] for e in files}
+          expected[MANIFEST] = (portable / MANIFEST).stat().st_size
+          with zipfile.ZipFile(zip_path) as zf:
+              infos = zf.infolist()
+              got = {i.filename: i.file_size for i in infos if not i.is_dir()}
+              got_dirs = sorted(i.filename for i in infos if i.is_dir())
+              problems = [i.filename for i in infos if "\\" in i.filename]
+              problems += sorted(set(expected) ^ set(got))
+              problems += [p for p in expected if p in got and got[p] != expected[p]]
+              if got_dirs != sorted(empty_dirs):
+                  problems.append("empty folders differ")
+              bad_crc = zf.testzip()
+              if bad_crc:
+                  problems.append(f"CRC: {bad_crc}")
+          if problems:
+              print("Portable zip does not match the manifest:", *problems[:50], sep="\n  ")
+              sys.exit(1)
+          print(f"Portable zip: {len(got)} files ({len(files)} in the manifest + the manifest), {len(empty_dirs)} empty folders, '/' separators")
+          print(f"{MANIFEST} sha256={manifest_sha}")
+
+          freeze_lines = [l for l in freeze.splitlines() if l.strip()]
+          summary = [
+              "### Identidade do build portátil",
+              "",
+              f"- Commit: `{commit}`",
+              f"- Versão: `{version}`",
+              f"- Run: `{run_id}` (tentativa {run_attempt})",
+              f"- Pasta portátil: {len(files)} arquivos no manifesto, {manifest['total_bytes']:,} bytes, {len(empty_dirs)} pastas vazias",
+              f"- `{MANIFEST}` (no zip e no artefato): SHA-256 `{manifest_sha}`",
+              f"- Zip portátil conferido contra o manifesto: {len(got)} arquivos, separador `/`, CRC ok",
+              "",
+              f"<details><summary>pip freeze do Python embutido ({len(freeze_lines)} linhas)</summary>",
+              "",
+              "```",
+              *freeze_lines,
+              "```",
+              "",
+              "</details>",
+              "",
+          ]
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as fh:
+              fh.write("\n".join(summary) + "\n")
 
       - name: Compute Checksums and Export Step Summary
         shell: powershell
@@ -167,6 +289,9 @@ jobs:
           path: |
             desktop/src-tauri/target/release/ai-coordinator-desktop.exe
             desktop/src-tauri/target/release/ai-coordinator-desktop-alpha-portable.zip
+            desktop/src-tauri/target/release/portable/BUILD-MANIFEST.json
+            desktop/src-tauri/target/release/portable/BUILD-PIP-FREEZE.txt
+            desktop/src-tauri/target/release/portable/BUILD-COMMIT.txt
             desktop/src-tauri/target/release/bundle/msi/*.msi
             desktop/src-tauri/target/release/bundle/nsis/*.exe
             desktop/src-tauri/target/release/bundle/nsis/*.zip

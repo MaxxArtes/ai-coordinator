@@ -309,12 +309,17 @@ class TestDesktopUpdater(unittest.TestCase):
         tauri_conf = json.loads((_repo_root / "desktop" / "src-tauri" / "tauri.conf.json").read_text(encoding="utf-8"))
         cargo_toml = (_repo_root / "desktop" / "src-tauri" / "Cargo.toml").read_text(encoding="utf-8")
 
+        pkg_lock = json.loads((_repo_root / "desktop" / "package-lock.json").read_text(encoding="utf-8"))
+
         version_pkg = pkg_json["version"]
         version_tauri = tauri_conf["version"]
 
-        self.assertEqual(version_pkg, "0.6.1-alpha.50")
-        self.assertEqual(version_tauri, "0.6.1-alpha.50")
-        self.assertIn('version = "0.6.1-alpha.50"', cargo_toml)
+        # Diagnostic build (4D.3 Etapa 8): own version, above alpha.50 and below a future alpha.51.
+        self.assertEqual(version_pkg, "0.6.1-alpha.50.diag.1")
+        self.assertEqual(version_tauri, "0.6.1-alpha.50.diag.1")
+        self.assertIn('version = "0.6.1-alpha.50.diag.1"', cargo_toml)
+        self.assertEqual(pkg_lock["version"], version_pkg)
+        self.assertEqual(pkg_lock["packages"][""]["version"], version_pkg)
 
     def test_13_tab_info_ipc_contract_panes_and_active_counts(self) -> None:
         """Verifies TabInfo IPC contract exposes panes dict, panes_count, and active_panes_count."""

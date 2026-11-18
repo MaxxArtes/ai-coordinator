@@ -1,6 +1,8 @@
 import React, { useState, useEffect, useCallback, useRef } from "react";
 import { Icon } from "../ui/Icon";
 
+const VERSION_UNAVAILABLE = "indisponível";
+
 export interface UpdateCheckResult {
   available: boolean;
   current_version: string;
@@ -35,7 +37,8 @@ export const UpdatesSection: React.FC<UpdatesSectionProps> = ({
   isTauri,
   callTauri,
 }) => {
-  const [currentVersion, setCurrentVersion] = useState<string>("0.6.0");
+  // Installed version as reported by the host (updater_get_channel_info); never a hardcoded fallback.
+  const [currentVersion, setCurrentVersion] = useState<string>("");
   const [channel, setChannel] = useState<string>("alpha");
   const [isChecking, setIsChecking] = useState<boolean>(false);
   const [checkResult, setCheckResult] = useState<UpdateCheckResult | null>(null);
@@ -123,7 +126,7 @@ export const UpdatesSection: React.FC<UpdatesSectionProps> = ({
       callTauri("updater_get_channel_info")
         .then((info) => {
           if (info) {
-            setCurrentVersion(info.current_version || "0.6.1-alpha.50");
+            setCurrentVersion(typeof info.current_version === "string" ? info.current_version : "");
             setChannel(info.channel || "alpha");
           }
         })
@@ -186,6 +189,7 @@ export const UpdatesSection: React.FC<UpdatesSectionProps> = ({
     }
   }, [checkResult, forceAuthorized, authorizedCount, invalidateAuthorization]);
 
+  const shownVersion = currentVersion.trim() || VERSION_UNAVAILABLE;
   const sessionsKnown = checkResult !== null && checkResult.sessions_known !== false;
   const authoritativeSessionsCount = checkResult ? checkResult.active_sessions_count : 0;
 
@@ -265,7 +269,7 @@ export const UpdatesSection: React.FC<UpdatesSectionProps> = ({
       <dl className="meta-grid">
         <div>
           <dt>Versão instalada</dt>
-          <dd>{currentVersion}</dd>
+          <dd>{shownVersion}</dd>
         </div>
         <div>
           <dt>Canal de distribuição</dt>
@@ -324,7 +328,7 @@ export const UpdatesSection: React.FC<UpdatesSectionProps> = ({
           </p>
           <p className="callout__body">
             O runtime Core não está ativo (encerrado para a instalação, que não pôde ser iniciada, ou finalizado
-            inesperadamente), e os terminais não podem ser usados neste estado. A versão atual ({currentVersion})
+            inesperadamente), e os terminais não podem ser usados neste estado. A versão atual ({shownVersion})
             continua instalada. Reinicie o aplicativo para restaurar o runtime; a atualização poderá ser tentada
             novamente depois.
           </p>
@@ -442,7 +446,7 @@ export const UpdatesSection: React.FC<UpdatesSectionProps> = ({
                 <span>O AI Coordinator Desktop está atualizado.</span>
               </p>
               <p className="callout__body">
-                Versão instalada ({currentVersion}) é a mais recente no canal {channel}.
+                Versão instalada ({shownVersion}) é a mais recente no canal {channel}.
               </p>
             </div>
           )
