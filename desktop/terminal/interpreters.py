@@ -4,7 +4,7 @@ from __future__ import annotations
 import os
 import shutil
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 from typing import Callable, Dict, Iterable, List, Optional, Tuple
 
 
@@ -67,7 +67,7 @@ def discover_interpreters(
     platform: Optional[str] = None,
     environ: Optional[Dict[str, str]] = None,
     which: Callable[[str], Optional[str]] = shutil.which,
-    exists: Callable[[Path], bool] = Path.exists,
+    exists: Optional[Callable[[Path], bool]] = None,
     wsl_registered: Optional[bool] = None,
 ) -> List[Interpreter]:
     """Return only shells that are present; no package is installed or shell executed during discovery."""
@@ -87,13 +87,16 @@ def discover_interpreters(
                 shells.append(Interpreter(shell_id, label, executable, args))
         return shells
 
-    system_root = Path(env.get("SystemRoot") or r"C:\Windows")
-    program_files = Path(env.get("ProgramFiles") or r"C:\Program Files")
-    program_files_x86 = Path(env.get("ProgramFiles(x86)") or r"C:\Program Files (x86)")
+    system_root = PureWindowsPath(env.get("SystemRoot") or r"C:\Windows")
+    program_files = PureWindowsPath(env.get("ProgramFiles") or r"C:\Program Files")
+    program_files_x86 = PureWindowsPath(env.get("ProgramFiles(x86)") or r"C:\Program Files (x86)")
+    path_exists = exists or (lambda path: path.exists())
 
-    def first_path(candidates: Iterable[Path]) -> Optional[str]:
+    def first_path(candidates: Iterable[PureWindowsPath]) -> Optional[str]:
         for candidate in candidates:
-            if exists(candidate):
+            # Convert the pure Windows path using the host's concrete Path implementation. This keeps discovery
+            # correct on Windows and lets platform-mocked unit tests run on POSIX without changing path semantics.
+            if path_exists(Path(str(candidate))):
                 return str(candidate)
         return None
 
@@ -113,7 +116,7 @@ def discover_interpreters(
     git_bash = first_path((
         program_files / "Git" / "bin" / "bash.exe",
         program_files_x86 / "Git" / "bin" / "bash.exe",
-        Path(env.get("LOCALAPPDATA", "")) / "Programs" / "Git" / "bin" / "bash.exe",
+        PureWindowsPath(env.get("LOCALAPPDATA", "")) / "Programs" / "Git" / "bin" / "bash.exe",
     )) or which("bash.exe")
     if git_bash:
         found.append(Interpreter("bash_git", "Bash (Git Bash)", git_bash, ("--login", "-i")))
