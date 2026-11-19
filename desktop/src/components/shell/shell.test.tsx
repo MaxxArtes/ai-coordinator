@@ -35,7 +35,7 @@ describe("AuthorizationScreen", () => {
       <AuthorizationScreen
         profileName="default"
         authorizedProjects={["D:\\proj", "D:\\outro"]}
-        note="A abertura automática do último projeto está desligada (Configurações → Geral)."
+        note="A abertura automática está desligada (Configurações → Geral)."
         inputPath=""
         onInputPathChange={vi.fn()}
         onSubmit={onSubmit}
@@ -44,7 +44,7 @@ describe("AuthorizationScreen", () => {
     );
     expect(screen.getByRole("heading", { name: "Escolha o projeto" })).toBeInTheDocument();
     expect(screen.queryByText(/Nenhum projeto está autorizado/)).not.toBeInTheDocument();
-    expect(screen.getByText(/abertura automática do último projeto está desligada/)).toBeInTheDocument();
+    expect(screen.getByText(/abertura automática está desligada/)).toBeInTheDocument();
     const first = screen.getByRole("button", { name: "Abrir D:\\proj" });
     expect(first).toHaveFocus();
     expect(first).toHaveAttribute("data-f6-entry");

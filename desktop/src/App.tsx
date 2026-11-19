@@ -1,4 +1,5 @@
 import React, { useEffect, useMemo, useRef, useState, useCallback } from "react";
+import { invoke } from "@tauri-apps/api/core";
 import { TerminalGrid } from "./components/TerminalGrid";
 import { TerminalPaneData } from "./components/TerminalPane";
 import { Terminal } from "xterm";
@@ -45,6 +46,8 @@ import { SystemNotices, type SystemNotice } from "./components/shell/SystemNotic
  * hidden: it paints at once with the appearance cached from the previous run (main.tsx).
  */
 export const PREFERENCES_DEADLINE_MS = 1500;
+export const DEFAULT_STARTUP_DIRECTORY = "C:\\Users\\10864";
+export const DEFAULT_INTERPRETER_ID = "powershell";
 
 const BACKED: BackedCategory[] = ["perfil", "geral", "aparencia", "terminal", "coordinator"];
 
@@ -87,6 +90,9 @@ export const App: React.FC = () => {
   const startingRef = useRef<boolean>(false);
   const [inputPath, setInputPath] = useState<string>("");
   const [panes, setPanes] = useState<TerminalPaneData[]>([]);
+  const [interpreters, setInterpreters] = useState<{ id: string; label: string }[]>([]);
+  const [switchingSessionIds, setSwitchingSessionIds] = useState<Set<string>>(new Set());
+  const switchingSessionIdsRef = useRef<Set<string>>(new Set());
   const [notice, setNotice] = useState<string>("");
   const [noticeTone, setNoticeTone] = useState<NoticeTone>("error");
   const [isSettingsOpen, setIsSettingsOpen] = useState<boolean>(false);
@@ -164,7 +170,6 @@ export const App: React.FC = () => {
 
   // Direct invocation without swallowing errors
   const callTauri = useCallback(async (cmd: string, args?: Record<string, any>): Promise<any> => {
-    const { invoke } = await import("@tauri-apps/api/core");
     return await invoke(cmd, args);
   }, []);
 
@@ -191,7 +196,7 @@ export const App: React.FC = () => {
    * after the terminal exists and never blocks it (K5); a failure there is only reported.
    */
   const startProject = useCallback(
-    async (dir: string, alive: () => boolean = () => true): Promise<void> => {
+    async (dir: string, alive: () => boolean = () => true, interpreterId = DEFAULT_INTERPRETER_ID): Promise<void> => {
       let tabId = activeTabRef.current;
       const bound = tabProjectRef.current.get(tabId);
       if (bound !== undefined && !samePath(bound, dir)) tabId = `tab-${++tabSeqRef.current}`;
@@ -200,6 +205,7 @@ export const App: React.FC = () => {
         tabId,
         paneId: 0,
         kind: "human_terminal",
+        interpreterId,
         cwd: dir,
         cols: 80,
         rows: 24,
@@ -321,6 +327,54 @@ export const App: React.FC = () => {
     },
     [callTauri]
   );
+
+  const handleChangeInterpreter = useCallback(async (sessionId: string, interpreterId: string) => {
+    const current = panesRef.current.find((pane) => pane.sessionId === sessionId);
+    if (!current || current.interpreterId === interpreterId || switchingSessionIdsRef.current.has(sessionId)) return;
+    const selected = interpreters.find((item) => item.id === interpreterId);
+    if (!selected || !window.confirm(`Trocar este terminal para ${selected.label}? A sessão atual será encerrada e somente este terminal será reiniciado.`)) return;
+
+    switchingSessionIdsRef.current.add(sessionId);
+    setSwitchingSessionIds((previous) => new Set(previous).add(sessionId));
+    try {
+      if (isTauriRef.current) {
+        // Validate availability, path translation (including WSL), and authorization before closing the live session.
+        await callTauri("terminal_validate_interpreter", {
+          interpreterId,
+          cwd: current.cwd ?? projectPath,
+        });
+        const result = await callTauri("terminal_close_session", { sessionId });
+        if (result?.closed !== true) throw new Error("O host não confirmou o fechamento supervisionado");
+      }
+      endedRef.current.delete(sessionId);
+      termsRef.current.delete(sessionId);
+      lastSeqRef.current.delete(sessionId);
+      setPanes((previous) => previous.filter((pane) => pane.sessionId !== sessionId));
+
+      const next = await callTauri("terminal_create_session", {
+        tabId: current.tabId,
+        paneId: current.paneId,
+        kind: "human_terminal",
+        interpreterId,
+        cwd: current.cwd ?? projectPath,
+        cols: 80,
+        rows: 24,
+      });
+      if (!next?.session_id) throw new Error("O host não retornou a nova sessão");
+      const replacement = paneFromSession(next, takeNumber(), current.tabId, current.paneId);
+      focusAfterRef.current = { sessionId: replacement.sessionId };
+      setPanes((previous) => [...previous, replacement]);
+    } catch (err) {
+      showNotice(`Não foi possível trocar o interpretador: ${errorText(err)}`);
+    } finally {
+      switchingSessionIdsRef.current.delete(sessionId);
+      setSwitchingSessionIds((previous) => {
+        const next = new Set(previous);
+        next.delete(sessionId);
+        return next;
+      });
+    }
+  }, [callTauri, interpreters, projectPath, showNotice]);
 
   // Add new pane (Defaults strictly to human_terminal)
   const handleAddPane = useCallback(
@@ -515,6 +569,14 @@ export const App: React.FC = () => {
           isTauriRef.current = true;
           setIsTauri(true);
 
+          void callTauri("terminal_list_interpreters")
+            .then((shellResult) => {
+              if (mounted && Array.isArray(shellResult?.interpreters)) setInterpreters(shellResult.interpreters);
+            })
+            .catch(() => {
+              // Listing options is best-effort; terminal creation still validates the requested shell in the Core.
+            });
+
           const st = await callTauri("get_runtime_status");
           if (mounted && st) setStatus(st);
           if (mounted && st?.app_version) setAppVersion(st.app_version);
@@ -544,19 +606,18 @@ export const App: React.FC = () => {
 
           // Protected settings (another version): the default is in use, as the host says.
           const autoOpen = settingsInUse(initialSettings)?.categories?.geral?.values?.open_last_project_on_start !== false;
-          if (authList.length > 0 && autoOpen) {
-            const activeDir = authList.find((p) => samePath(p, profInfo.last_project)) ?? authList[0];
+          if (stillAuthorized(DEFAULT_STARTUP_DIRECTORY, authList) && autoOpen) {
             try {
-              await startProject(activeDir, alive);
+              await startProject(DEFAULT_STARTUP_DIRECTORY, alive, DEFAULT_INTERPRETER_ID);
             } catch (err) {
               if (!mounted) return;
-              // The project cannot be opened (removed, unplugged…): the chooser, not a dead end.
-              showProjectScreen(`Não foi possível abrir ${activeDir}: ${errorText(err)}`);
+              showProjectScreen(`Não foi possível abrir ${DEFAULT_STARTUP_DIRECTORY}: ${errorText(err)}`);
             }
           } else {
-            showProjectScreen(
-              authList.length > 0 ? "A abertura automática do último projeto está desligada (Configurações → Geral)." : ""
-            );
+            setInputPath(DEFAULT_STARTUP_DIRECTORY);
+            showProjectScreen(!autoOpen
+              ? "A abertura automática está desligada (Configurações → Geral)."
+              : `Autorize explicitamente ${DEFAULT_STARTUP_DIRECTORY} para iniciar o terminal PowerShell automaticamente.`);
           }
         } else {
           // Preview mode in standard browser
@@ -796,6 +857,9 @@ export const App: React.FC = () => {
       projectPath={projectPath}
       panes={panes}
       states={paneStates}
+      interpreters={interpreters}
+      switchingSessionIds={switchingSessionIds}
+      onChangeInterpreter={handleChangeInterpreter}
       onAddPane={handleAddPane}
       onWrite={handleWrite}
       onResize={handleResize}

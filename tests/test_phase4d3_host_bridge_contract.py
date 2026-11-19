@@ -31,7 +31,8 @@ _commands = _analysis.commands
 # Commands that reach the Core today (directly or through count_active_sessions / acquire_update_freeze).
 IPC_COMMANDS = {
     "get_runtime_status", "profile_get_active", "profile_authorize_project", "profile_list_authorized_projects",
-    "terminal_create_tab", "terminal_create_session", "terminal_write", "terminal_resize", "terminal_get_output",
+    "terminal_create_tab", "terminal_create_session", "terminal_list_interpreters", "terminal_validate_interpreter",
+    "terminal_write", "terminal_resize", "terminal_get_output",
     "terminal_close_session", "terminal_save_sessions", "terminal_list_tabs", "updater_check",
     "updater_download_and_install", "settings_get", "settings_update", "vault_status", "vault_list_keys",
     "vault_set_secret", "vault_delete_secret", "profile_revoke_project", "profile_remember_project",

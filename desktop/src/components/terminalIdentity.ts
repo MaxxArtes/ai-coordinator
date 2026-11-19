@@ -44,6 +44,8 @@ export function paneFromSession(
     kind,
     number,
     program: programName(session.command),
+    interpreterId: typeof session.interpreter_id === "string" ? session.interpreter_id : undefined,
+    interpreterLabel: typeof session.interpreter_label === "string" ? session.interpreter_label : undefined,
     cwd: typeof session.cwd === "string" && session.cwd ? session.cwd : undefined,
     pid: Number.isInteger(session.pid) && session.pid > 0 ? session.pid : null,
     createdAt: typeof session.created_at === "string" ? session.created_at : undefined,

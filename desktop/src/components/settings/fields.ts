@@ -20,9 +20,9 @@ export const CATEGORY_FIELDS: Record<BackedCategory, UiField[]> = {
   geral: [
     {
       key: "open_last_project_on_start",
-      label: "Abrir o último projeto autorizado ao iniciar",
+      label: "Iniciar terminal PowerShell na pasta do usuário",
       kind: "bool",
-      hint: "Desligado, a inicialização mostra os projetos autorizados para você escolher.",
+      hint: "Ao iniciar o Desktop, abre C:\\Users\\10864 somente se essa pasta já estiver autorizada. Caso contrário, solicita autorização explícita.",
     },
   ],
   aparencia: [

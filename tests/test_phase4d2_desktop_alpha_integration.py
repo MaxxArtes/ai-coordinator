@@ -654,7 +654,7 @@ class TestDesktopAlphaIntegration(unittest.TestCase):
         res1 = json.loads(transport.outbox.pop(0))
         self.assertEqual(res1["result"]["tab_id"], "tab-isolation")
 
-        # 2. Create Session with default cmd.exe
+        # 2. Create Session with CMD explicitly (the application default is PowerShell).
         transport.inbox.append(json.dumps({
             "jsonrpc": "2.0",
             "id": "2",
@@ -663,6 +663,7 @@ class TestDesktopAlphaIntegration(unittest.TestCase):
                 "tab_id": "tab-isolation",
                 "pane_id": 0,
                 "kind": "human_terminal",
+                "interpreter_id": "cmd",
                 "cwd": str(_repo_root),
                 "cols": 80,
                 "rows": 24

@@ -980,6 +980,7 @@ async fn terminal_create_session(
     kind: String,
     // argv list (program + arguments); a plain string is rejected by deserialization and by the Core IPC.
     command: Option<Vec<String>>,
+    interpreter_id: Option<String>,
     cwd: Option<String>,
     cols: Option<u16>,
     rows: Option<u16>,
@@ -994,11 +995,34 @@ async fn terminal_create_session(
                 "pane_id": pane_id,
                 "kind": kind,
                 "command": command,
+                "interpreter_id": interpreter_id,
                 "cwd": cwd,
                 "cols": cols.unwrap_or(80),
                 "rows": rows.unwrap_or(24)
             }),
         )
+    })
+    .await
+    .unwrap_or_else(|_| Err(ipc_task_failed()))
+}
+
+#[tauri::command]
+async fn terminal_list_interpreters(bridge: State<'_, Arc<IpcBridge>>) -> Result<Value, String> {
+    let bridge = bridge.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || bridge.call("terminal.list_interpreters", json!({})))
+        .await
+        .unwrap_or_else(|_| Err(ipc_task_failed()))
+}
+
+#[tauri::command]
+async fn terminal_validate_interpreter(
+    interpreter_id: String,
+    cwd: String,
+    bridge: State<'_, Arc<IpcBridge>>,
+) -> Result<Value, String> {
+    let bridge = bridge.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        bridge.call("terminal.validate_interpreter", json!({ "interpreter_id": interpreter_id, "cwd": cwd }))
     })
     .await
     .unwrap_or_else(|_| Err(ipc_task_failed()))
@@ -1678,6 +1702,8 @@ fn main() {
             profile_list_authorized_projects,
             terminal_create_tab,
             terminal_create_session,
+            terminal_list_interpreters,
+            terminal_validate_interpreter,
             terminal_write,
             terminal_resize,
             terminal_get_output,

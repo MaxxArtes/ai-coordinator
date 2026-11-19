@@ -27,7 +27,7 @@ import pytest
 from desktop.auth.authorizer import DesktopAuthorizer
 from desktop.auth.profile import DesktopProfileManager
 from desktop.ipc.protocol import RPCErrorCode
-from desktop.ipc.server import SecureIPCServer, validate_command_argv
+from desktop.ipc.server import InvalidParamsError, SecureIPCServer, validate_command_argv, validate_optional_interpreter_id
 from desktop.terminal.manager import TerminalManager
 
 
@@ -131,6 +131,10 @@ def test_invalid_command_is_rejected_with_structured_error_and_no_session(ipc_en
 def test_missing_command_keeps_default_shell_contract():
     assert validate_command_argv(None) is None
     assert validate_command_argv(["pwsh", "-NoLogo"]) == ["pwsh", "-NoLogo"]
+    assert validate_optional_interpreter_id(None) is None
+    assert validate_optional_interpreter_id("powershell") == "powershell"
+    with pytest.raises(InvalidParamsError):
+        validate_optional_interpreter_id(r"C:\Windows\System32\cmd.exe")
 
 
 def test_host_types_command_as_argv_list():

@@ -32,6 +32,9 @@ export interface TerminalGridProps {
   onWrite: (sessionId: string, data: string) => void;
   onResize: (sessionId: string, cols: number, rows: number) => void;
   onClose?: (sessionId: string) => void;
+  interpreters?: { id: string; label: string }[];
+  onChangeInterpreter?: (sessionId: string, interpreterId: string) => void;
+  switchingSessionIds?: ReadonlySet<string>;
   onMount?: (sessionId: string, term: Terminal | null) => void;
 }
 
@@ -71,6 +74,9 @@ export const TerminalGrid: React.FC<TerminalGridProps> = ({
   onWrite,
   onResize,
   onClose,
+  interpreters,
+  onChangeInterpreter,
+  switchingSessionIds,
   onMount,
 }) => {
   const folder = projectFolderName(projectPath);
@@ -126,6 +132,9 @@ export const TerminalGrid: React.FC<TerminalGridProps> = ({
               onWrite={onWrite}
               onResize={onResize}
               onClose={onClose}
+              interpreters={interpreters}
+              onChangeInterpreter={onChangeInterpreter}
+              interpreterSwitching={switchingSessionIds?.has(pane.sessionId)}
               onMount={onMount}
             />
           </div>

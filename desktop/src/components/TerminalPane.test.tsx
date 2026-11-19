@@ -452,6 +452,22 @@ describe("TerminalGrid tab strip", () => {
 });
 
 describe("TerminalPane identity, state and footer (Etapa 6)", () => {
+  it("exibe o interpretador ativo e solicita a troca pelo seletor do terminal", async () => {
+    const user = userEvent.setup();
+    const onChangeInterpreter = vi.fn();
+    render(<TerminalPane {...props({
+      interpreterId: "powershell",
+      interpreterLabel: "PowerShell 7",
+      interpreters: [{ id: "cmd", label: "CMD" }, { id: "powershell", label: "PowerShell 7" }, { id: "bash_git", label: "Bash (Git Bash)" }],
+      onChangeInterpreter,
+    })} />);
+    const selector = screen.getByRole("combobox", { name: "Interpretador de Terminal 07" });
+    expect(selector).toHaveValue("powershell");
+    expect(document.querySelector(".terminal-pane__footer-program")).toHaveTextContent("PowerShell 7");
+    await user.selectOptions(selector, "bash_git");
+    expect(onChangeInterpreter).toHaveBeenCalledWith("session-1", "bash_git");
+  });
+
   it("header: the stable number, the program and the live state; no percentage anywhere", () => {
     const { container } = render(<TerminalPane {...props({ state: { kind: "alive" } })} />);
     const header = container.querySelector(".terminal-pane__header")!;

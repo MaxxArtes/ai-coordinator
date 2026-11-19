@@ -216,12 +216,13 @@ def test_windows_conpty_cmd_interactive_stdio_isolation(auth_setup):
     proj_path = auth_setup["project_path"]
 
     mgr.create_tab(token=token, tab_id="interactive-tab", title="Interactive Shell", project_path=proj_path)
-    # Default command is ["cmd.exe"]
+    # The CMD-specific ConPTY check selects CMD explicitly; the application default is PowerShell.
     sess = mgr.create_terminal(
         token=token,
         tab_id="interactive-tab",
         pane_id=0,
         kind=SessionKind.HUMAN_TERMINAL,
+        interpreter_id="cmd",
     )
 
     assert sess.is_alive is True

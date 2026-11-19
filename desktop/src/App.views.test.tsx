@@ -34,7 +34,7 @@ function appSettings(overrides: Record<string, any> = {}): any {
 type HostSession = { pane_id: number; alive: boolean; exit_code: number | null; tab?: string; cwd?: string };
 
 /** Directories the simulated host treats as broad (L5): a disk root, a share root and a home folder. */
-const BROAD = new Set(["C:\\", "\\\\servidor\\pasta", "C:\\Users\\ana"]);
+const BROAD = new Set(["C:\\", "\\\\servidor\\pasta", "C:\\Users\\ana", "C:\\Users\\10864"]);
 const BROAD_MESSAGE = "Este diretório dá acesso amplo (raiz do disco ou pasta pessoal inteira). Confirme explicitamente para autorizar.";
 /** The transport failures of the Tauri host (L2), as call_structured sends them. */
 const TIMEOUT_30 = {
@@ -72,7 +72,7 @@ function host({ preview = false, authorized = true, metricsFail = false, setting
   const tabs = new Map<string, string>();
   const state = {
     settings: settings ?? appSettings(),
-    authorized: (profile.authorized_projects as string[] | undefined) ?? (authorized ? ["D:\\proj"] : []),
+    authorized: (profile.authorized_projects as string[] | undefined) ?? (authorized ? ["C:\\Users\\10864", "D:\\proj"] : []),
   };
   invoke.mockImplementation(async (cmd: string, args?: any) => {
     if (cmd in extra) return extra[cmd](args);
@@ -83,6 +83,15 @@ function host({ preview = false, authorized = true, metricsFail = false, setting
         return "pong";
       case "get_runtime_status":
         return { core_version: "0.6.0", app_version: "0.6.1-alpha.50", host_os: "windows", is_isolated: true, python_path: "C:\\app\\python.exe" };
+      case "terminal_list_interpreters":
+        return { interpreters: [
+          { id: "cmd", label: "CMD" },
+          { id: "powershell", label: "PowerShell 7" },
+          { id: "bash_git", label: "Bash (Git Bash)" },
+        ] };
+      case "terminal_validate_interpreter":
+        if (!state.authorized.includes(args.cwd)) throw new Error("Project not authorized or session invalid");
+        return { id: args.interpreterId, label: args.interpreterId === "cmd" ? "CMD" : "PowerShell 7" };
       case "profile_get_active":
         return { name: "default", display_name: null, last_project: null, ...profile, authorized_projects: [...state.authorized] };
       case "settings_get":
@@ -142,6 +151,8 @@ function host({ preview = false, authorized = true, metricsFail = false, setting
           session_id: id,
           pane_id: slot,
           command: ["C:\\Windows\\System32\\cmd.exe", "/k", "SEGREDO"],
+          interpreter_id: args.interpreterId ?? "powershell",
+          interpreter_label: args.interpreterId === "cmd" ? "CMD" : args.interpreterId === "bash_git" ? "Bash (Git Bash)" : "PowerShell 7",
           cwd: args.cwd,
           pid: 1000 + sessions,
           is_alive: true,
@@ -202,6 +213,54 @@ afterEach(() => {
 });
 
 describe("App views", () => {
+  it("trocar o interpretador encerra e recria somente a sessão selecionada no mesmo diretório", async () => {
+    const user = userEvent.setup();
+    host();
+    renderApp();
+    await connected();
+    await user.click(screen.getByRole("button", { name: /Novo terminal/ }));
+    await waitFor(() => expect(xtermLog.created).toHaveLength(2));
+    const confirm = vi.spyOn(window, "confirm").mockReturnValue(true);
+    const selector = await screen.findByRole("combobox", { name: "Interpretador de Terminal 01" });
+    await user.selectOptions(selector, "cmd");
+    await waitFor(() => expect(callsOf("terminal_close_session")).toContainEqual({ sessionId: "sess-1" }));
+    await waitFor(() => expect(callsOf("terminal_create_session")).toHaveLength(3));
+    expect(callsOf("terminal_create_session")[2]).toMatchObject({
+      tabId: "tab-main", paneId: 0, cwd: "C:\\Users\\10864", interpreterId: "cmd",
+    });
+    expect(invoke.mock.calls.findIndex(([cmd]) => cmd === "terminal_validate_interpreter"))
+      .toBeLessThan(invoke.mock.calls.findIndex(([cmd]) => cmd === "terminal_close_session"));
+    expect(callsOf("terminal_close_session")).toEqual([{ sessionId: "sess-1" }]);
+    expect(screen.getByRole("region", { name: "Terminal 02" })).toBeInTheDocument();
+    expect(await screen.findByRole("region", { name: "Terminal 03" })).toBeInTheDocument();
+    expect(await screen.findByRole("combobox", { name: "Interpretador de Terminal 03" })).toHaveValue("cmd");
+    await user.selectOptions(await screen.findByRole("combobox", { name: "Interpretador de Terminal 03" }), "powershell");
+    await waitFor(() => expect(callsOf("terminal_create_session")).toHaveLength(4));
+    expect(callsOf("terminal_create_session")[3]).toMatchObject({ paneId: 0, cwd: "C:\\Users\\10864", interpreterId: "powershell" });
+    expect(await screen.findByRole("combobox", { name: "Interpretador de Terminal 04" })).toHaveValue("powershell");
+    await user.selectOptions(await screen.findByRole("combobox", { name: "Interpretador de Terminal 04" }), "bash_git");
+    await waitFor(() => expect(callsOf("terminal_create_session")).toHaveLength(5));
+    expect(callsOf("terminal_create_session")[4]).toMatchObject({ paneId: 0, cwd: "C:\\Users\\10864", interpreterId: "bash_git" });
+    expect(callsOf("terminal_close_session")).toEqual([{ sessionId: "sess-1" }, { sessionId: "sess-3" }, { sessionId: "sess-4" }]);
+    expect(screen.getByRole("region", { name: "Terminal 02" })).toBeInTheDocument();
+    expect(await screen.findByRole("region", { name: "Terminal 05" })).toBeInTheDocument();
+    expect(await screen.findByRole("combobox", { name: "Interpretador de Terminal 05" })).toHaveValue("bash_git");
+    confirm.mockRestore();
+  });
+
+  it("falha na compatibilidade do novo shell mantém a sessão atual aberta", async () => {
+    const user = userEvent.setup();
+    host({ extra: { terminal_validate_interpreter: () => { throw new Error("Diretório incompatível com WSL"); } } });
+    renderApp();
+    await connected();
+    const confirm = vi.spyOn(window, "confirm").mockReturnValue(true);
+    await user.selectOptions(await screen.findByRole("combobox", { name: "Interpretador de Terminal 01" }), "cmd");
+    await waitFor(() => expect(screen.getByText(/Diretório incompatível com WSL/)).toBeInTheDocument());
+    expect(callsOf("terminal_close_session")).toHaveLength(0);
+    expect(screen.getByRole("region", { name: "Terminal 01" })).toBeInTheDocument();
+    confirm.mockRestore();
+  });
+
   it("real App headers never invent quota or context, even when the host supplies bogus metrics", async () => {
     const user = userEvent.setup();
     const registry = host();
@@ -435,7 +494,7 @@ describe("App views", () => {
     expect(names).toEqual(["Terminal 01", "Terminal 03", "Terminal 04"]);
     expect(bar()).toHaveTextContent("Terminais: 3 de 4");
     expect(document.body.textContent).not.toMatch(/Falha ao criar|SEGREDO/);
-    expect(document.body.textContent).toMatch(/cmd\.exe/);
+    expect(document.body.textContent).toMatch(/PowerShell 7/);
   }, 10000);
 
   it(
@@ -575,7 +634,7 @@ describe("App — inicialização que nunca trava (E2-6, K1, K2, K5)", () => {
     });
     renderApp();
     expect(await screen.findByRole("heading", { name: "Escolha o projeto" })).toBeInTheDocument();
-    expect(screen.getByText(/abertura automática do último projeto está desligada/)).toBeInTheDocument();
+    expect(screen.getByText(/abertura automática está desligada/)).toBeInTheDocument();
     expect(document.body.textContent).not.toMatch(/Nenhum projeto está autorizado/);
     expect(count("terminal_create_tab")).toBe(0);
     // Authorizing another directory is still offered.
@@ -588,22 +647,47 @@ describe("App — inicialização que nunca trava (E2-6, K1, K2, K5)", () => {
     expect(bar()).toHaveTextContent("outro");
   });
 
-  it("abre o último projeto quando ele está entre os autorizados (mesma comparação do host)", async () => {
-    host({ profile: { authorized_projects: ["D:\\proj", "D:\\outro"], last_project: "d:/OUTRO" } });
+  it("abre a pasta padrão do usuário com PowerShell quando ela já está autorizada", async () => {
+    host({ profile: { authorized_projects: ["D:\\proj", "C:\\Users\\10864", "D:\\outro"], last_project: "d:/OUTRO" } });
     renderApp();
     await connected();
-    expect(callsOf("terminal_create_tab")).toEqual([{ tabId: "tab-main", projectPath: "D:\\outro" }]);
+    expect(callsOf("terminal_create_tab")).toEqual([{ tabId: "tab-main", projectPath: "C:\\Users\\10864" }]);
+    expect(callsOf("terminal_create_session")[0]).toMatchObject({ cwd: "C:\\Users\\10864", interpreterId: "powershell" });
   });
 
-  it("o último projeto não abre: mostra a escolha com o motivo, não um beco sem saída", async () => {
+  it("sem autorização para a pasta padrão, pede autorização explícita e não cria terminal", async () => {
+    host({ profile: { authorized_projects: ["D:\\proj"] } });
+    renderApp();
+    expect(await screen.findByLabelText("Caminho do projeto no host")).toHaveValue("C:\\Users\\10864");
+    expect(screen.getByText(/Autorize explicitamente C:\\Users\\10864/)).toBeInTheDocument();
+    expect(count("profile_authorize_project")).toBe(0);
+    expect(count("terminal_create_tab")).toBe(0);
+  });
+
+  it("abre manualmente outro projeto autorizado em um novo terminal PowerShell", async () => {
+    const user = userEvent.setup();
+    host({
+      settings: appSettings({ geral: { open_last_project_on_start: false } }),
+      profile: { authorized_projects: ["C:\\Users\\10864", "D:\\ai-coordinator"] },
+    });
+    renderApp();
+    expect(await screen.findByRole("heading", { name: "Escolha o projeto" })).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "Abrir D:\\ai-coordinator" }));
+    await connected();
+    await waitFor(() => expect(callsOf("terminal_create_tab")).toHaveLength(1));
+    expect(callsOf("terminal_create_tab")[0]).toMatchObject({ tabId: "tab-main", projectPath: "D:\\ai-coordinator" });
+    expect(callsOf("terminal_create_session")[0]).toMatchObject({ cwd: "D:\\ai-coordinator", interpreterId: "powershell" });
+  });
+
+  it("falha ao abrir a pasta padrão: mostra a tela de autorização com o motivo", async () => {
     host({ extra: { terminal_create_tab: () => { throw new Error("Project not authorized or session invalid"); } } });
     renderApp();
-    expect(await screen.findByText(/Não foi possível abrir D:\\proj: Project not authorized/)).toBeInTheDocument();
-    const open = screen.getByRole("button", { name: "Abrir D:\\proj" });
+    expect(await screen.findByText(/Não foi possível abrir C:\\Users\\10864: Project not authorized/)).toBeInTheDocument();
+    const open = screen.getByRole("button", { name: "Abrir C:\\Users\\10864" });
     expect(xtermLog.created).toHaveLength(0);
     // There is no notice banner on this path: the reason reaches a screen reader with the focus, as the description.
     await waitFor(() => expect(open).toHaveFocus());
-    expect(open).toHaveAccessibleDescription(/Não foi possível abrir D:\\proj: Project not authorized/);
+    expect(open).toHaveAccessibleDescription(/Não foi possível abrir C:\\Users\\10864: Project not authorized/);
   });
 
   it("perfil recuperado: aviso persistente com o nome da cópia, sem caminho", async () => {
@@ -641,7 +725,7 @@ describe("App — inicialização que nunca trava (E2-6, K1, K2, K5)", () => {
       profile: { name: "trabalho" },
     });
     renderApp();
-    await connected(); // the default opens the last project; the other version's "off" is not used
+    await connected(); // the default opens the authorized user folder; the other version's preference is protected
     expect(xtermLog.created[0].options).toMatchObject({ fontSize: 13, scrollback: 1000, cursorBlink: true });
     expect(document.documentElement.dataset.density).toBe("comfortable");
     expect(document.documentElement.dataset.stimulation).toBeUndefined();
@@ -682,7 +766,7 @@ describe("App — inicialização que nunca trava (E2-6, K1, K2, K5)", () => {
       extra: {
         profile_get_active: () => {
           if (busy) throw { code: -32603, message: "Outra janela está usando o perfil/cofre. Tente novamente.", data: { reason: "busy" } };
-          return { name: "default", authorized_projects: ["D:\\proj"], last_project: null };
+          return { name: "default", authorized_projects: ["C:\\Users\\10864", "D:\\proj"], last_project: null };
         },
       },
     });
@@ -811,20 +895,22 @@ describe("App — preferências, atalhos e revogação (Etapa 7)", () => {
     const dialog = await screen.findByRole("dialog");
     await user.click(within(dialog).getByRole("tab", { name: /^Segurança/ }));
     const panel = within(dialog).getByRole("tabpanel", { name: /Segurança/ });
-    await user.click(await within(panel).findByRole("button", { name: "Revogar D:\\proj" }));
+    await user.click(await within(panel).findByRole("button", { name: "Revogar C:\\Users\\10864" }));
     await user.click(within(panel).getByRole("button", { name: "Confirmar revogação" }));
-    expect(await within(panel).findByText(/Autorização de D:\\proj revogada/)).toBeInTheDocument();
+    expect(await within(panel).findByText(/Autorização de C:\\Users\\10864 revogada/)).toBeInTheDocument();
     await user.keyboard("{Escape}");
     await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
 
-    expect(await screen.findByText(/A autorização de D:\\proj foi revogada/)).toBeInTheDocument();
-    expect(bar()).not.toHaveTextContent("proj");
-    await user.type(screen.getByLabelText("Caminho do projeto no host"), "D:\\novo");
+    expect(await screen.findByText(/A autorização de C:\\Users\\10864 foi revogada/)).toBeInTheDocument();
+    expect(bar()).not.toHaveTextContent("10864");
+    const input = screen.getByLabelText("Caminho do projeto no host");
+    await user.clear(input);
+    await user.type(input, "D:\\novo");
     await user.click(screen.getByRole("button", { name: "Autorizar diretório e iniciar terminal" }));
     await waitFor(() => expect(screen.getByRole("region", { name: /^Terminal \d+$/ })).toBeInTheDocument());
     const tabs = callsOf("terminal_create_tab");
     expect(tabs).toEqual([
-      { tabId: "tab-main", projectPath: "D:\\proj" },
+      { tabId: "tab-main", projectPath: "C:\\Users\\10864" },
       { tabId: "tab-2", projectPath: "D:\\novo" },
     ]);
     expect(callsOf("terminal_create_session").at(-1)).toMatchObject({ tabId: "tab-2", cwd: "D:\\novo" });
@@ -845,16 +931,16 @@ describe("App — preferências, atalhos e revogação (Etapa 7)", () => {
     const dialog = await screen.findByRole("dialog", { name: "Configurações" });
     await user.click(within(dialog).getByRole("tab", { name: /^Segurança/ }));
     const panel = within(dialog).getByRole("tabpanel", { name: /Segurança/ });
-    await user.click(await within(panel).findByRole("button", { name: "Revogar D:\\proj" }));
+    await user.click(await within(panel).findByRole("button", { name: "Revogar C:\\Users\\10864" }));
     await user.click(within(panel).getByRole("button", { name: "Confirmar revogação" }));
-    expect(await within(panel).findByText(/Autorização de D:\\proj revogada/)).toBeInTheDocument();
+    expect(await within(panel).findByText(/Autorização de C:\\Users\\10864 revogada/)).toBeInTheDocument();
     expect(opener.isConnected).toBe(false); // the strip went away with the terminal grid
     await user.keyboard("{Escape}");
     await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
 
-    const input = screen.getByLabelText("Caminho do projeto no host");
-    await waitFor(() => expect(document.activeElement).toBe(input));
-    expect(input).toHaveAccessibleDescription(/A autorização de D:\\proj foi revogada/);
+    const firstAuthorizedProject = screen.getByRole("button", { name: "Abrir D:\\proj" });
+    await waitFor(() => expect(document.activeElement).toBe(firstAuthorizedProject));
+    expect(firstAuthorizedProject).toHaveAccessibleDescription(/A autorização de C:\\Users\\10864 foi revogada/);
   });
 
   it("sem 'Salvar sessões': o histórico não é gravado em arquivo, e Geral não promete exportá-lo", async () => {
@@ -885,14 +971,14 @@ describe("App — preferências, atalhos e revogação (Etapa 7)", () => {
     const dialog = await screen.findByRole("dialog");
     await user.click(within(dialog).getByRole("tab", { name: /^Segurança/ }));
     const panel = within(dialog).getByRole("tabpanel", { name: /Segurança/ });
-    await user.click(await within(panel).findByRole("button", { name: "Revogar D:\\proj" }));
+    await user.click(await within(panel).findByRole("button", { name: "Revogar C:\\Users\\10864" }));
     await user.click(within(panel).getByRole("button", { name: "Confirmar revogação" }));
     expect(await within(panel).findByRole("alert")).toHaveTextContent("Feche os terminais deste diretório antes de revogar a autorização.");
     await user.keyboard("{Escape}");
     await user.keyboard("{Escape}");
     await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
     expect(screen.getByRole("region", { name: "Terminal 01" })).toBeInTheDocument();
-    expect(bar()).toHaveTextContent("proj");
+    expect(bar()).toHaveTextContent("10864");
   });
 });
 
@@ -999,6 +1085,7 @@ describe("App — diretório amplo e falhas de transporte (Etapa 8, L2/L3/L7)", 
     host({ authorized: false });
     renderApp();
     const input = await screen.findByLabelText("Caminho do projeto no host");
+    await user.clear(input);
     await user.type(input, "C:\\");
     await user.keyboard("{Enter>8/}");
     const question = await screen.findByRole("alertdialog");
@@ -1012,7 +1099,9 @@ describe("App — diretório amplo e falhas de transporte (Etapa 8, L2/L3/L7)", 
     const user = userEvent.setup();
     host({ authorized: false });
     renderApp();
-    await user.type(await screen.findByLabelText("Caminho do projeto no host"), "D:\\novo");
+    const input = await screen.findByLabelText("Caminho do projeto no host");
+    await user.clear(input);
+    await user.type(input, "D:\\novo");
     await user.click(screen.getByRole("button", { name: "Autorizar diretório e iniciar terminal" }));
     await connected();
     expect(authorizeCalls()).toEqual([{ projectPath: "D:\\novo" }]);
@@ -1032,7 +1121,9 @@ describe("App — diretório amplo e falhas de transporte (Etapa 8, L2/L3/L7)", 
       },
     });
     renderApp();
-    await user.type(await screen.findByLabelText("Caminho do projeto no host"), "D:\\sumiu");
+    const input = await screen.findByLabelText("Caminho do projeto no host");
+    await user.clear(input);
+    await user.type(input, "D:\\sumiu");
     await user.click(screen.getByRole("button", { name: "Autorizar diretório e iniciar terminal" }));
     expect(await screen.findByText("Falha na autorização do projeto: O diretório do projeto não existe ou não é uma pasta.")).toBeInTheDocument();
     expect(screen.queryByRole("alertdialog")).toBeNull();
@@ -1051,7 +1142,9 @@ describe("App — diretório amplo e falhas de transporte (Etapa 8, L2/L3/L7)", 
       },
     });
     renderApp();
-    await user.type(await screen.findByLabelText("Caminho do projeto no host"), "D:\\novo");
+    const input = await screen.findByLabelText("Caminho do projeto no host");
+    await user.clear(input);
+    await user.type(input, "D:\\novo");
     await user.click(screen.getByRole("button", { name: "Autorizar diretório e iniciar terminal" }));
     expect(
       await screen.findByText(
@@ -1071,7 +1164,7 @@ describe("App — diretório amplo e falhas de transporte (Etapa 8, L2/L3/L7)", 
       extra: {
         profile_get_active: () => {
           if (stuck) throw TIMEOUT_30;
-          return { name: "default", authorized_projects: ["D:\\proj"], last_project: null };
+          return { name: "default", authorized_projects: ["C:\\Users\\10864", "D:\\proj"], last_project: null };
         },
       },
     });

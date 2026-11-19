@@ -174,6 +174,15 @@ def validate_command_argv(value: Any) -> Optional[List[str]]:
     return list(value)
 
 
+def validate_optional_interpreter_id(value: Any) -> Optional[str]:
+    """Interpreter selection is an identifier from the Core allow-list, never an executable path or argv."""
+    if value is None:
+        return None
+    if not isinstance(value, str) or value not in {"cmd", "powershell", "bash_git", "bash_wsl"}:
+        raise InvalidParamsError("O interpretador selecionado é inválido.", field="interpreter_id", reason="invalid_value")
+    return value
+
+
 def _core_version() -> str:
     """Version of the bundled Core package (ai_coordinator.__version__), or "unknown" if it cannot be read."""
     try:
@@ -382,6 +391,8 @@ class SecureIPCServer:
         self.register("providers.routes", self._handle_providers_routes)
         self.register("terminal.create_tab", self._handle_terminal_create_tab)
         self.register("terminal.create_session", self._handle_terminal_create_session)
+        self.register("terminal.list_interpreters", self._handle_terminal_list_interpreters)
+        self.register("terminal.validate_interpreter", self._handle_terminal_validate_interpreter)
         self.register("terminal.write", self._handle_terminal_write)
         self.register("terminal.resize", self._handle_terminal_resize)
         self.register("terminal.get_output", self._handle_terminal_get_output)
@@ -430,11 +441,23 @@ class SecureIPCServer:
             pane_id=params["pane_id"],
             kind=kind,
             command=validate_command_argv(params.get("command")),
+            interpreter_id=validate_optional_interpreter_id(params.get("interpreter_id")),
             cwd=params.get("cwd"),
             cols=params.get("cols", 80),
             rows=params.get("rows", 24),
         )
         return sess.to_dict()
+
+    def _handle_terminal_list_interpreters(self, _params: Dict[str, Any], token: Optional[str] = None) -> Dict[str, Any]:
+        mgr = self._get_terminal_manager()
+        return {"interpreters": mgr.list_interpreters(token or self.session_token)}
+
+    def _handle_terminal_validate_interpreter(self, params: Dict[str, Any], token: Optional[str] = None) -> Dict[str, Any]:
+        interpreter_id = validate_optional_interpreter_id(params.get("interpreter_id"))
+        cwd = params.get("cwd")
+        if interpreter_id is None or not isinstance(cwd, str) or not cwd.strip() or "\x00" in cwd:
+            raise InvalidParamsError("Informe um interpretador e diretório válidos.", field="interpreter_id", reason="invalid_value")
+        return self._get_terminal_manager().validate_interpreter(token or self.session_token, interpreter_id, cwd)
 
     def _handle_terminal_write(self, params: Dict[str, Any]) -> Dict[str, Any]:
         mgr = self._get_terminal_manager()
@@ -866,11 +889,17 @@ class SecureIPCServer:
             from desktop.auth.authorizer import SecurityAuthorizationError
             from desktop.auth.file_lock import FileLockTimeoutError
             from desktop.auth.profile import ProfileError
-            from desktop.terminal.manager import TerminalManagerError
+            from desktop.terminal.manager import TerminalInterpreterError, TerminalManagerError, TerminalStartError
 
             if isinstance(e, FileLockTimeoutError):
                 return RPCResponse(id=req.id, error={"code": BUSY_CODE, "message": PROFILE_BUSY_MESSAGE,
                                                      "data": {"field": "profile", "reason": "busy"}})
+            if isinstance(e, TerminalInterpreterError):
+                return RPCResponse(id=req.id, error={
+                    "code": RPCErrorCode.INVALID_PARAMS.value,
+                    "message": str(e),
+                    "data": {"field": "interpreter_id", "reason": e.reason},
+                })
             if isinstance(e, ProfileError):
                 # Every ProfileError message is a fixed text from desktop/auth/profile.py, never file content.
                 self.transport.log_diagnostic(f"IPC handler failed: {type(e).__name__} (content omitted)")
@@ -881,7 +910,16 @@ class SecureIPCServer:
                 message = "Project not authorized or session invalid"
             elif isinstance(e, TerminalManagerError):
                 message = "Requested tab or terminal does not exist" if "does not exist" in str(e) else "Terminal operation failed"
-            self.transport.log_diagnostic(f"IPC handler failed: {type(e).__name__} (content omitted)")
+            if isinstance(e, TerminalStartError):
+                # Preserve actionable spawn/capture evidence without writing paths, argv, environment, or raw exception
+                # text to the Core log. The previous logger kept only the exception class, so it could not identify
+                # which terminal startup operation failed.
+                self.transport.log_diagnostic(
+                    "[TERMINAL_START_FAILURE] "
+                    f"stage={e.stage} exception_type={e.exception_type} error_code={e.error_code}"
+                )
+            else:
+                self.transport.log_diagnostic(f"IPC handler failed: {type(e).__name__} (content omitted)")
             return RPCResponse(id=req.id, error={"code": RPCErrorCode.INTERNAL_ERROR.value, "message": message})
 
     def send_notification(self, event: str, data: Dict[str, Any]) -> bool:

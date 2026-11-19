@@ -47,6 +47,8 @@ export interface TerminalPaneData {
   number: number;
   /** Executable name only (never the arguments). */
   program?: string;
+  interpreterId?: string;
+  interpreterLabel?: string;
   cwd?: string;
   pid?: number | null;
   createdAt?: string;
@@ -66,6 +68,9 @@ export interface TerminalPaneProps extends TerminalPaneData {
   onWrite: (sessionId: string, data: string) => void;
   onResize: (sessionId: string, cols: number, rows: number) => void;
   onClose?: (sessionId: string) => void;
+  interpreters?: { id: string; label: string }[];
+  onChangeInterpreter?: (sessionId: string, interpreterId: string) => void;
+  interpreterSwitching?: boolean;
   onMount?: (sessionId: string, term: Terminal | null) => void;
 }
 
@@ -86,6 +91,8 @@ export const TerminalPane: React.FC<TerminalPaneProps> = ({
   kind,
   number,
   program,
+  interpreterId,
+  interpreterLabel,
   cwd,
   pid,
   position,
@@ -95,6 +102,9 @@ export const TerminalPane: React.FC<TerminalPaneProps> = ({
   onWrite,
   onResize,
   onClose,
+  interpreters = [],
+  onChangeInterpreter,
+  interpreterSwitching = false,
   onMount,
 }) => {
   const containerRef = useRef<HTMLDivElement>(null);
@@ -258,7 +268,23 @@ export const TerminalPane: React.FC<TerminalPaneProps> = ({
           <span className="terminal-pane__title">
             {formatTerminalNumber(number)} · {label.short}
           </span>
-          {program && <span className="terminal-pane__program">{program}</span>}
+          {kind === "human_terminal" && interpreters.length > 0 && onChangeInterpreter ? (
+            <label className="terminal-pane__interpreter">
+              <span className="sr-only">Interpretador de {name}</span>
+              <select
+                aria-label={`Interpretador de ${name}`}
+                value={interpreterId ?? "powershell"}
+                disabled={interpreterSwitching || state.kind === "preview"}
+                onClick={(event) => event.stopPropagation()}
+                onKeyDown={(event) => event.stopPropagation()}
+                onChange={(event) => onChangeInterpreter(sessionId, event.currentTarget.value)}
+              >
+                {interpreters.map((item) => <option key={item.id} value={item.id}>{item.label}</option>)}
+              </select>
+            </label>
+          ) : (
+            program && <span className="terminal-pane__program">{interpreterLabel ?? program}</span>
+          )}
           <span className={`terminal-pane__state terminal-pane__state--${state.kind}`}>
             <span className="terminal-pane__state-dot" aria-hidden="true" />
             {state.kind === "alive" ? <span className="sr-only">{stateText}</span> : <span>{stateText}</span>}
@@ -275,6 +301,7 @@ export const TerminalPane: React.FC<TerminalPaneProps> = ({
             className="btn btn--ghost btn--ghost-danger btn--icon btn--sm"
             title={`Fechar ${name}`}
             aria-label={`Fechar ${name}`}
+            disabled={interpreterSwitching}
           >
             <Icon name="close" size="sm" />
           </button>
@@ -291,7 +318,7 @@ export const TerminalPane: React.FC<TerminalPaneProps> = ({
             <span>Preview: sem processo</span>
           ) : (
             <>
-              <span className="terminal-pane__footer-program">{program ?? "programa desconhecido"}</span>
+              <span className="terminal-pane__footer-program">{interpreterLabel ?? program ?? "programa desconhecido"}</span>
               <span>Local</span>
               {cwd && (
                 <span className="terminal-pane__footer-folder" title={cwd}>

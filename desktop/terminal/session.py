@@ -40,6 +40,8 @@ class TerminalSession:
         profile_name: str,
         principal: HumanPrincipal,
         backend: Optional[BasePtyBackend] = None,
+        interpreter_id: Optional[str] = None,
+        interpreter_label: Optional[str] = None,
         max_buffer_lines: int = 1000,
         max_buffer_bytes: int = 512 * 1024,
         cols: int = 80,
@@ -50,6 +52,8 @@ class TerminalSession:
         self.pane_id = pane_id
         self.kind = kind
         self.command = command
+        self.interpreter_id = interpreter_id
+        self.interpreter_label = interpreter_label
         self.cwd = cwd.resolve()
         self.profile_name = profile_name
         self.principal = principal
@@ -122,6 +126,8 @@ class TerminalSession:
             "pane_id": self.pane_id,
             "kind": self.kind.value,
             "command": self.command,
+            "interpreter_id": self.interpreter_id,
+            "interpreter_label": self.interpreter_label,
             "cwd": str(self.cwd),
             "profile_name": self.profile_name,
             "owner_id": self.principal.owner_id,

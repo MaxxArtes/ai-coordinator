@@ -312,7 +312,7 @@ def test_real_cmd_exe_processes_match_the_registered_sessions():
         every_pid: List[int] = []
 
         def open_cmd(pane_id: int):
-            sess = mgr.create_terminal(token=token, tab_id=TAB, pane_id=pane_id)
+            sess = mgr.create_terminal(token=token, tab_id=TAB, pane_id=pane_id, interpreter_id="cmd")
             assert sess.pid
             every_pid.append(sess.pid)
             return sess
