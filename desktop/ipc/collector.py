@@ -312,6 +312,8 @@ if os.name == "nt":
         return samples
 
 else:
+    import subprocess
+
     def _read_proc_btime_ns() -> int:
         try:
             with open("/proc/stat", "r", encoding="utf-8") as fh:
@@ -322,8 +324,88 @@ else:
             pass
         return 0
 
-    def inspect_os_processes(target_roots: Optional[Iterable[int]] = None) -> List[RawProcessSample]:
-        """Inspect POSIX processes via `/proc`."""
+    def _parse_ps_cpu_seconds(text: str) -> Optional[float]:
+        """Parse `ps` TIME field (`[[dd-]hh:]mm:ss(.ff)` or `mm:ss.ff`)."""
+        s = text.strip()
+        if not s:
+            return None
+        days = 0
+        if "-" in s:
+            d_part, s = s.split("-", 1)
+            days = int(d_part)
+        parts = s.split(":")
+        try:
+            if len(parts) == 2:
+                minutes, seconds = int(parts[0]), float(parts[1])
+                hours = 0
+            elif len(parts) == 3:
+                hours, minutes, seconds = int(parts[0]), int(parts[1]), float(parts[2])
+            else:
+                return None
+            return days * 86400.0 + hours * 3600.0 + minutes * 60.0 + seconds
+        except ValueError:
+            return None
+
+    def _parse_ps_lstart_ns(tokens: Sequence[str]) -> Optional[int]:
+        """Parse `ps` lstart 5-token C timestamp (`Mon Nov 23 19:41:55 2026`)."""
+        if len(tokens) != 5:
+            return None
+        try:
+            st = time.strptime(" ".join(tokens), "%a %b %d %H:%M:%S %Y")
+            return int(time.mktime(st)) * 1_000_000_000
+        except (ValueError, OverflowError):
+            return None
+
+    def _inspect_ps_processes() -> List[RawProcessSample]:
+        """Fallback POSIX process inspection via `ps` for platforms without `/proc` (e.g., macOS)."""
+        env = os.environ.copy()
+        env["LC_ALL"] = "C"
+        try:
+            res = subprocess.run(
+                ["ps", "-axo", "pid=,ppid=,rss=,time=,lstart=,comm="],
+                capture_output=True,
+                text=True,
+                env=env,
+                timeout=5,
+                check=False,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return []
+        if res.returncode != 0:
+            return []
+
+        samples: List[RawProcessSample] = []
+        for raw_line in res.stdout.splitlines():
+            line = raw_line.strip()
+            if not line:
+                continue
+            parts = line.split(None, 9)
+            if len(parts) < 10:
+                continue
+            try:
+                pid = int(parts[0])
+                ppid = int(parts[1])
+                rss_kb = int(parts[2])
+            except ValueError:
+                continue
+            cpu_sec = _parse_ps_cpu_seconds(parts[3])
+            create_ns = _parse_ps_lstart_ns(parts[4:9])
+            comm_full = parts[9].strip()
+            sep = comm_full.rfind("/")
+            name = comm_full[sep + 1 :] if sep >= 0 else comm_full
+            samples.append(
+                RawProcessSample(
+                    pid=pid,
+                    ppid=ppid,
+                    name=name,
+                    create_time_ns=create_ns,
+                    ram_bytes=max(0, rss_kb) * 1024,
+                    cpu_time_seconds=cpu_sec,
+                )
+            )
+        return samples
+
+    def _inspect_proc_processes() -> List[RawProcessSample]:
         try:
             clk_tck = os.sysconf("SC_CLK_TCK")
             page_size = os.sysconf("SC_PAGE_SIZE")
@@ -378,6 +460,11 @@ else:
                 )
             except (OSError, ValueError):
                 continue
+        return all_samples
+
+    def inspect_os_processes(target_roots: Optional[Iterable[int]] = None) -> List[RawProcessSample]:
+        """Inspect POSIX processes via `/proc` (Linux) or `ps` fallback (macOS/BSD)."""
+        all_samples = _inspect_proc_processes() if os.path.isdir("/proc") else _inspect_ps_processes()
 
         if target_roots is None:
             return all_samples

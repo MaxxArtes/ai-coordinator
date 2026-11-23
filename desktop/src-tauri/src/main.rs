@@ -89,7 +89,7 @@ pub struct RuntimeStatus {
     pub python_path: String,
 }
 
-#[derive(Serialize, Deserialize, Clone)]
+#[derive(Serialize, Clone)]
 pub struct ProcessNodeMetrics {
     pub pid: u32,
     pub ppid: Option<u32>,
@@ -102,7 +102,7 @@ pub struct ProcessNodeMetrics {
     pub cpu_provenance: &'static str,
 }
 
-#[derive(Serialize, Deserialize, Clone)]
+#[derive(Serialize, Clone)]
 pub struct CategoryResourceMetrics {
     pub role: &'static str,
     pub process_count: usize,
@@ -112,7 +112,7 @@ pub struct CategoryResourceMetrics {
     pub cpu_provenance: &'static str,
 }
 
-#[derive(Serialize, Deserialize, Clone)]
+#[derive(Serialize, Clone)]
 pub struct ProcessTreeCategories {
     pub host: CategoryResourceMetrics,
     pub core: CategoryResourceMetrics,
@@ -121,7 +121,7 @@ pub struct ProcessTreeCategories {
     pub child: CategoryResourceMetrics,
 }
 
-#[derive(Serialize, Deserialize, Clone)]
+#[derive(Serialize, Clone)]
 pub struct ProcessTreeMetrics {
     pub host_pid: u32,
     pub core_pid: Option<u32>,
