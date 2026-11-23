@@ -361,21 +361,27 @@ else:
         env = os.environ.copy()
         env["LC_ALL"] = "C"
         try:
-            res = subprocess.run(
+            proc = subprocess.Popen(
                 ["ps", "-axo", "pid=,ppid=,rss=,time=,lstart=,comm="],
-                capture_output=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
                 text=True,
                 env=env,
-                timeout=5,
-                check=False,
             )
+            ps_pid = proc.pid
+            try:
+                stdout_text, _ = proc.communicate(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.communicate()
+                return []
         except (OSError, subprocess.SubprocessError):
             return []
-        if res.returncode != 0:
+        if proc.returncode != 0:
             return []
 
         samples: List[RawProcessSample] = []
-        for raw_line in res.stdout.splitlines():
+        for raw_line in stdout_text.splitlines():
             line = raw_line.strip()
             if not line:
                 continue
@@ -388,6 +394,8 @@ else:
                 rss_kb = int(parts[2])
             except ValueError:
                 continue
+            if pid == ps_pid:
+                continue  # Exclude ephemeral helper `ps` spawned by the collector itself
             cpu_sec = _parse_ps_cpu_seconds(parts[3])
             create_ns = _parse_ps_lstart_ns(parts[4:9])
             comm_full = parts[9].strip()
