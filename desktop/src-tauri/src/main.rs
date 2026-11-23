@@ -7,14 +7,14 @@
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
-use std::sync::{Arc, Condvar, Mutex, MutexGuard};
-use std::time::{Duration, Instant};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use sysinfo::{Pid, ProcessRefreshKind, System};
 use tauri::{Emitter, State};
 
@@ -90,11 +90,51 @@ pub struct RuntimeStatus {
 }
 
 #[derive(Serialize, Deserialize, Clone)]
+pub struct ProcessNodeMetrics {
+    pub pid: u32,
+    pub ppid: Option<u32>,
+    pub start_time: u64,
+    pub role: String,
+    pub name: String,
+    pub ram_bytes: u64,
+    pub ram_provenance: &'static str,
+    pub cpu_usage_percent: Option<f32>,
+    pub cpu_provenance: &'static str,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+pub struct CategoryResourceMetrics {
+    pub role: &'static str,
+    pub process_count: usize,
+    pub ram_bytes: u64,
+    pub ram_provenance: &'static str,
+    pub cpu_usage_percent: Option<f32>,
+    pub cpu_provenance: &'static str,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+pub struct ProcessTreeCategories {
+    pub host: CategoryResourceMetrics,
+    pub core: CategoryResourceMetrics,
+    pub webview: CategoryResourceMetrics,
+    pub terminal: CategoryResourceMetrics,
+    pub child: CategoryResourceMetrics,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
 pub struct ProcessTreeMetrics {
     pub host_pid: u32,
+    pub core_pid: Option<u32>,
     pub host_ram_bytes: u64,
     pub total_tree_ram_bytes: u64,
-    pub cpu_usage_percent: f32,
+    pub ram_provenance: &'static str,
+    pub cpu_usage_percent: Option<f32>,
+    pub cpu_provenance: &'static str,
+    pub sample_interval_ms: Option<u64>,
+    pub process_count: usize,
+    pub sampled_at_unix_ms: u64,
+    pub categories: ProcessTreeCategories,
+    pub nodes: Vec<ProcessNodeMetrics>,
 }
 
 // ---- Core IPC transport (Marco 4D.3, Etapa 8: L1/L2) ----
@@ -405,6 +445,8 @@ impl IpcBridge {
 
                 match cmd.spawn() {
                     Ok(mut child) => {
+                        CORE_PYTHON_PID.store(child.id(), Ordering::SeqCst);
+                        std::thread::spawn(prime_process_collector);
                         if let Some(cin_handle) = child.stdin.take() {
                             cin = spawn_request_writer(cin_handle);
                         }
@@ -743,6 +785,7 @@ impl IpcBridge {
     }
 
     pub fn shutdown(&self) {
+        CORE_PYTHON_PID.store(0, Ordering::SeqCst);
         // Step 1: Close the request channel: the writer thread ends and drops the Core's stdin, sending EOF to
         // the Python IPC server. Never waits on a write in progress (the writer thread owns the pipe).
         let _ = lock_unpoisoned(&self.requests).take();
@@ -867,52 +910,256 @@ async fn get_process_tree_metrics() -> Result<ProcessTreeMetrics, String> {
         .map_err(|_| IPC_TASK_FAILED_MESSAGE.to_string())
 }
 
-fn measure_process_tree() -> ProcessTreeMetrics {
-    let mut sys = System::new();
-    let current_pid = Pid::from_u32(std::process::id());
+const MIN_CPU_SAMPLE_INTERVAL_MS: u64 = 200;
+static CORE_PYTHON_PID: AtomicU32 = AtomicU32::new(0);
+static PROCESS_COLLECTOR: OnceLock<Mutex<ProcessTreeCollectorState>> = OnceLock::new();
 
-    sys.refresh_processes_specifics(ProcessRefreshKind::everything());
+struct ProcessTreeCollectorState {
+    sys: System,
+    has_baseline: bool,
+    last_sample_at: Option<Instant>,
+    seen_identities: HashMap<u32, u64>,
+    last_snapshot: Option<ProcessTreeMetrics>,
+}
 
-    let mut tree_pids = HashSet::new();
-    tree_pids.insert(current_pid);
+impl ProcessTreeCollectorState {
+    fn new() -> Self {
+        Self {
+            sys: System::new(),
+            has_baseline: false,
+            last_sample_at: None,
+            seen_identities: HashMap::new(),
+            last_snapshot: None,
+        }
+    }
 
-    // Iteratively collect all descendant PIDs until fixed point
-    let mut added = true;
-    while added {
-        added = false;
-        for (pid, proc) in sys.processes() {
-            if !tree_pids.contains(pid) {
-                if let Some(parent) = proc.parent() {
-                    if tree_pids.contains(&parent) {
-                        tree_pids.insert(*pid);
-                        added = true;
+    fn aggregate_cpu<'a>(
+        values: impl IntoIterator<Item = (&'a Option<f32>, &'a &'static str)>,
+    ) -> (Option<f32>, &'static str) {
+        let mut total = 0.0_f32;
+        let mut measured_count = 0_usize;
+        let mut node_count = 0_usize;
+        let mut any_estimated = false;
+        for (cpu_opt, prov) in values {
+            node_count += 1;
+            if let Some(val) = cpu_opt {
+                if *prov == "measured" || *prov == "estimated" {
+                    total += *val;
+                    measured_count += 1;
+                    if *prov == "estimated" {
+                        any_estimated = true;
                     }
                 }
             }
         }
-    }
-
-    let mut total_ram: u64 = 0;
-    let mut host_ram: u64 = 0;
-    let mut total_cpu: f32 = 0.0;
-
-    if let Some(host_proc) = sys.process(current_pid) {
-        host_ram = host_proc.memory();
-    }
-
-    for pid in &tree_pids {
-        if let Some(proc) = sys.process(*pid) {
-            total_ram += proc.memory();
-            total_cpu += proc.cpu_usage();
+        if measured_count == 0 {
+            return (None, "unknown");
+        }
+        let clamped = (total.clamp(0.0, 100.0) * 100.0).round() / 100.0;
+        if measured_count < node_count || any_estimated {
+            (Some(clamped), "estimated")
+        } else {
+            (Some(clamped), "measured")
         }
     }
 
-    ProcessTreeMetrics {
-        host_pid: std::process::id(),
-        host_ram_bytes: host_ram,
-        total_tree_ram_bytes: total_ram,
-        cpu_usage_percent: total_cpu,
+    fn classify_role(pid: u32, ppid: Option<u32>, name: &str, host_pid: u32, core_pid: Option<u32>) -> &'static str {
+        if pid == host_pid {
+            return "host";
+        }
+        if Some(pid) == core_pid {
+            return "core";
+        }
+        let lower = name.to_ascii_lowercase();
+        if lower.contains("webview") {
+            return "webview";
+        }
+        if ppid.is_some() && ppid == core_pid {
+            return "terminal";
+        }
+        "child"
     }
+
+    fn collect(&mut self) -> ProcessTreeMetrics {
+        let now = Instant::now();
+        if self.has_baseline {
+            if let (Some(prev), Some(cached)) = (self.last_sample_at, self.last_snapshot.as_ref()) {
+                if now.duration_since(prev) < Duration::from_millis(MIN_CPU_SAMPLE_INTERVAL_MS) {
+                    return cached.clone();
+                }
+            }
+        }
+
+        let elapsed_ms = self
+            .last_sample_at
+            .map(|prev| now.duration_since(prev).as_millis() as u64);
+
+        let refresh_kind = ProcessRefreshKind::new().with_memory().with_cpu();
+        self.sys.refresh_processes_specifics(refresh_kind);
+
+        let host_pid_u32 = std::process::id();
+        let host_pid = Pid::from_u32(host_pid_u32);
+        let raw_core_pid = CORE_PYTHON_PID.load(Ordering::SeqCst);
+        let core_pid = (raw_core_pid > 0).then_some(raw_core_pid);
+
+        let mut tree_pids = HashSet::new();
+        tree_pids.insert(host_pid);
+        if let Some(cpid) = core_pid {
+            tree_pids.insert(Pid::from_u32(cpid));
+        }
+
+        // Iteratively collect all descendant PIDs until fixed point (deduplicated via HashSet)
+        let mut added = true;
+        while added {
+            added = false;
+            for (pid, proc) in self.sys.processes() {
+                if !tree_pids.contains(pid) {
+                    if let Some(parent) = proc.parent() {
+                        if tree_pids.contains(&parent) {
+                            tree_pids.insert(*pid);
+                            added = true;
+                        }
+                    }
+                }
+            }
+        }
+
+        let cpu_count = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1)
+            .max(1) as f32;
+        let can_measure_cpu = self.has_baseline
+            && elapsed_ms
+                .map(|ms| ms >= MIN_CPU_SAMPLE_INTERVAL_MS)
+                .unwrap_or(false);
+
+        let mut sorted_pids: Vec<u32> = tree_pids.iter().map(|p| p.as_u32()).collect();
+        sorted_pids.sort_unstable();
+
+        let mut nodes: Vec<ProcessNodeMetrics> = Vec::with_capacity(sorted_pids.len());
+        let mut next_identities: HashMap<u32, u64> = HashMap::with_capacity(sorted_pids.len());
+        let mut host_ram_bytes: u64 = 0;
+        let mut total_tree_ram_bytes: u64 = 0;
+
+        for pid_u32 in sorted_pids {
+            let pid = Pid::from_u32(pid_u32);
+            if let Some(proc) = self.sys.process(pid) {
+                let start_time = proc.start_time();
+                let ppid = proc.parent().map(|p| p.as_u32());
+                let ram_bytes = proc.memory();
+                let same_identity = self.seen_identities.get(&pid_u32).copied() == Some(start_time);
+
+                next_identities.insert(pid_u32, start_time);
+
+                if pid_u32 == host_pid_u32 {
+                    host_ram_bytes = ram_bytes;
+                }
+                total_tree_ram_bytes += ram_bytes;
+
+                let (cpu_usage_percent, cpu_provenance) = if can_measure_cpu && same_identity {
+                    let raw = proc.cpu_usage();
+                    if raw.is_finite() && raw >= 0.0 {
+                        let normalized = ((raw / cpu_count).clamp(0.0, 100.0) * 100.0).round() / 100.0;
+                        (Some(normalized), "measured")
+                    } else {
+                        (None, "unknown")
+                    }
+                } else {
+                    (None, "unknown")
+                };
+
+                let role = Self::classify_role(pid_u32, ppid, proc.name(), host_pid_u32, core_pid);
+                nodes.push(ProcessNodeMetrics {
+                    pid: pid_u32,
+                    ppid,
+                    start_time,
+                    role: role.to_string(),
+                    name: proc.name().to_string(),
+                    ram_bytes,
+                    ram_provenance: "measured",
+                    cpu_usage_percent,
+                    cpu_provenance,
+                });
+            }
+        }
+
+        let build_category = |role_name: &'static str| -> CategoryResourceMetrics {
+            let role_nodes: Vec<&ProcessNodeMetrics> = nodes.iter().filter(|n| n.role == role_name).collect();
+            if role_nodes.is_empty() {
+                return CategoryResourceMetrics {
+                    role: role_name,
+                    process_count: 0,
+                    ram_bytes: 0,
+                    ram_provenance: "unknown",
+                    cpu_usage_percent: None,
+                    cpu_provenance: "unknown",
+                };
+            }
+            let cat_ram: u64 = role_nodes.iter().map(|n| n.ram_bytes).sum();
+            let (cat_cpu, cat_cpu_prov) =
+                Self::aggregate_cpu(role_nodes.iter().map(|n| (&n.cpu_usage_percent, &n.cpu_provenance)));
+            CategoryResourceMetrics {
+                role: role_name,
+                process_count: role_nodes.len(),
+                ram_bytes: cat_ram,
+                ram_provenance: "measured",
+                cpu_usage_percent: cat_cpu,
+                cpu_provenance: cat_cpu_prov,
+            }
+        };
+
+        let categories = ProcessTreeCategories {
+            host: build_category("host"),
+            core: build_category("core"),
+            webview: build_category("webview"),
+            terminal: build_category("terminal"),
+            child: build_category("child"),
+        };
+
+        let (tree_cpu, tree_cpu_prov) =
+            Self::aggregate_cpu(nodes.iter().map(|n| (&n.cpu_usage_percent, &n.cpu_provenance)));
+
+        let sampled_at_unix_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+
+        let ram_provenance = if nodes.is_empty() { "unknown" } else { "measured" };
+        let snapshot = ProcessTreeMetrics {
+            host_pid: host_pid_u32,
+            core_pid,
+            host_ram_bytes,
+            total_tree_ram_bytes,
+            ram_provenance,
+            cpu_usage_percent: tree_cpu,
+            cpu_provenance: tree_cpu_prov,
+            sample_interval_ms: if can_measure_cpu { elapsed_ms } else { None },
+            process_count: nodes.len(),
+            sampled_at_unix_ms,
+            categories,
+            nodes,
+        };
+
+        self.seen_identities = next_identities;
+        self.has_baseline = true;
+        self.last_sample_at = Some(now);
+        self.last_snapshot = Some(snapshot.clone());
+        snapshot
+    }
+}
+
+fn collector_instance() -> &'static Mutex<ProcessTreeCollectorState> {
+    PROCESS_COLLECTOR.get_or_init(|| Mutex::new(ProcessTreeCollectorState::new()))
+}
+
+fn prime_process_collector() {
+    let mut guard = lock_unpoisoned(collector_instance());
+    let _ = guard.collect();
+}
+
+fn measure_process_tree() -> ProcessTreeMetrics {
+    let mut guard = lock_unpoisoned(collector_instance());
+    guard.collect()
 }
 
 // L3: structured errors ({code, message, data}) like the settings commands.

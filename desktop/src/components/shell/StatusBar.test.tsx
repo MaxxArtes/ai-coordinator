@@ -57,10 +57,67 @@ describe("StatusBar", () => {
     expect(bar().textContent).not.toMatch(/128,4|\(medida\)/);
   });
 
-  it("CPU is always 'indisponível', even when the host sends a number", () => {
+  it("CPU stays 'indisponível' when the host sends a number without provenance", () => {
     render(<StatusBar {...base} />);
     expect(bar()).toHaveTextContent("CPU: indisponível");
     expect(bar().textContent).not.toMatch(/37[,.]5/);
+  });
+
+  it("shows measured CPU percentage when provenance is measured", () => {
+    render(
+      <StatusBar
+        {...base}
+        metrics={{
+          ...base.metrics!,
+          cpu_usage_percent: 4.5,
+          cpu_provenance: "measured",
+        }}
+      />,
+    );
+    expect(bar()).toHaveTextContent("CPU: 4,5% (medida)");
+  });
+
+  it("shows estimated CPU percentage when provenance is estimated", () => {
+    render(
+      <StatusBar
+        {...base}
+        metrics={{
+          ...base.metrics!,
+          cpu_usage_percent: 12.25,
+          cpu_provenance: "estimated",
+        }}
+      />,
+    );
+    expect(bar()).toHaveTextContent("CPU: 12,3% (estimada)");
+  });
+
+  it("shows 'indisponível' when CPU provenance is unknown even if numeric value is zero or null", () => {
+    render(
+      <StatusBar
+        {...base}
+        metrics={{
+          ...base.metrics!,
+          cpu_usage_percent: 0,
+          cpu_provenance: "unknown",
+        }}
+      />,
+    );
+    expect(bar()).toHaveTextContent("CPU: indisponível");
+    expect(bar().textContent).not.toContain("0,0%");
+  });
+
+  it("shows '0,0% (medida)' only when CPU is explicitly measured as zero", () => {
+    render(
+      <StatusBar
+        {...base}
+        metrics={{
+          ...base.metrics!,
+          cpu_usage_percent: 0,
+          cpu_provenance: "measured",
+        }}
+      />,
+    );
+    expect(bar()).toHaveTextContent("CPU: 0,0% (medida)");
   });
 
   it("is not a live region (values change every 2 s)", () => {

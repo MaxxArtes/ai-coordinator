@@ -15,12 +15,52 @@ export interface RuntimeStatus {
   python_path: string;
 }
 
+export type MetricProvenance = "measured" | "estimated" | "unknown";
+export type ProcessRole = "host" | "core" | "webview" | "terminal" | "child";
+
+export interface ProcessNodeMetrics {
+  pid: number;
+  ppid: number | null;
+  start_time?: number;
+  create_time_ns?: number | null;
+  role: ProcessRole | string;
+  name: string;
+  ram_bytes: number | null;
+  ram_provenance: MetricProvenance;
+  cpu_usage_percent: number | null;
+  cpu_provenance: MetricProvenance;
+}
+
+export interface CategoryResourceMetrics {
+  role: ProcessRole | string;
+  process_count: number;
+  ram_bytes: number;
+  ram_provenance: MetricProvenance;
+  cpu_usage_percent: number | null;
+  cpu_provenance: MetricProvenance;
+}
+
+export interface ProcessTreeCategories {
+  host: CategoryResourceMetrics;
+  core: CategoryResourceMetrics;
+  webview: CategoryResourceMetrics;
+  terminal: CategoryResourceMetrics;
+  child: CategoryResourceMetrics;
+}
+
 export interface RuntimeMetrics {
   host_pid: number;
+  core_pid?: number | null;
   host_ram_bytes: number;
   total_tree_ram_bytes: number;
-  /** Sent by the host but never shown until a reliable reading exists (4D.4): the interface says "indisponível". */
-  cpu_usage_percent?: number;
+  ram_provenance?: MetricProvenance;
+  cpu_usage_percent?: number | null;
+  cpu_provenance?: MetricProvenance;
+  sample_interval_ms?: number | null;
+  process_count?: number;
+  sampled_at_unix_ms?: number;
+  categories?: ProcessTreeCategories;
+  nodes?: ProcessNodeMetrics[];
 }
 
 export interface AppHeaderProps {

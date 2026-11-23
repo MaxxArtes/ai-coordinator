@@ -65,6 +65,23 @@ export function treeRamText(
   return value ? `${value} (medida)` : "indisponível";
 }
 
+export function treeCpuText(
+  isTauri: boolean,
+  status: ConnectionStatus,
+  metrics: RuntimeMetrics | null,
+  unavailable = false
+): string {
+  if (isPreviewMode(isTauri, status)) return "indisponível (preview)";
+  if (unavailable) return "indisponível";
+  if (!metrics) return "aguardando";
+  const prov = metrics.cpu_provenance;
+  if (prov !== "measured" && prov !== "estimated") return "indisponível";
+  const value = metrics.cpu_usage_percent;
+  if (typeof value !== "number" || !Number.isFinite(value) || value < 0) return "indisponível";
+  const label = prov === "measured" ? "medida" : "estimada";
+  return `${ONE_DECIMAL.format(value)}% (${label})`;
+}
+
 /** Splits a path before its last segment, so that the ellipsis falls in the middle and the folder name stays. */
 export function splitProjectPath(path: string): { head: string; tail: string } {
   const trimmed = path.replace(/[\\/]+$/, "");
@@ -100,7 +117,7 @@ export const StatusBar: React.FC<StatusBarProps> = ({
           value={`${paneCount} de ${MAX_TERMINALS}${preview ? " (preview)" : activeText ? ` ${activeText}` : ""}`}
         />
         <Item label="RAM da árvore:" value={treeRamText(isTauri, connectionStatus, metrics, metricsUnavailable)} />
-        <Item label="CPU:" value="indisponível" />
+        <Item label="CPU:" value={treeCpuText(isTauri, connectionStatus, metrics, metricsUnavailable)} />
       </div>
       <div className="status-bar__group status-bar__group--end">
         {projectPath && (

@@ -370,10 +370,15 @@ class SecureIPCServer:
         transport: BaseTransport,
         session_token: str,
         terminal_manager: Optional[Any] = None,
+        process_collector: Optional[Any] = None,
     ) -> None:
         self.transport = transport
         self.session_token = session_token
         self.terminal_manager = terminal_manager
+        if process_collector is None:
+            from desktop.ipc.collector import ProcessTreeCollector
+            process_collector = ProcessTreeCollector(core_pid=os.getpid())
+        self.process_collector = process_collector
         self.handlers: Dict[str, Callable[..., Any]] = {}
         self.is_running = True
         self._register_default_handlers()
@@ -407,6 +412,7 @@ class SecureIPCServer:
         self.register("vault.list_keys", self._handle_vault_list_keys)
         self.register("vault.set_secret", self._handle_vault_set_secret)
         self.register("vault.delete_secret", self._handle_vault_delete_secret)
+        self.register("telemetry.process_tree_metrics", self._handle_telemetry_process_tree_metrics)
 
     def _get_terminal_manager(self) -> Any:
         if self.terminal_manager is None:
@@ -700,6 +706,67 @@ class SecureIPCServer:
     def _handle_providers_routes(self, _params: Dict[str, Any]) -> Dict[str, Any]:
         from desktop.ipc.discovery import routes_snapshot
         return routes_snapshot()
+
+    def _handle_telemetry_process_tree_metrics(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        from desktop.ipc.collector import validate_sample_interval_ms
+
+        raw_interval = params.get("min_sample_interval_ms")
+        sample_interval_ms: Optional[int] = None
+        if raw_interval is not None:
+            try:
+                sample_interval_ms = validate_sample_interval_ms(raw_interval)
+            except ValueError as exc:
+                raise InvalidParamsError(
+                    str(exc),
+                    field="min_sample_interval_ms",
+                    reason="invalid_value",
+                ) from exc
+
+        raw_host_pid = params.get("host_pid")
+        host_pid: Optional[int] = None
+        if raw_host_pid is not None:
+            if isinstance(raw_host_pid, bool) or not isinstance(raw_host_pid, int) or raw_host_pid <= 0:
+                raise InvalidParamsError(
+                    "'host_pid' deve ser um inteiro positivo.",
+                    field="host_pid",
+                    reason="invalid_value",
+                )
+            host_pid = raw_host_pid
+
+        raw_include_nodes = params.get("include_nodes")
+        if raw_include_nodes is None:
+            include_nodes = True
+        elif isinstance(raw_include_nodes, bool):
+            include_nodes = raw_include_nodes
+        else:
+            raise InvalidParamsError(
+                "'include_nodes' deve ser verdadeiro ou falso.",
+                field="include_nodes",
+                reason="invalid_value",
+            )
+
+        terminal_pids: Dict[int, Optional[int]] = {}
+        if self.terminal_manager is not None:
+            lock = getattr(self.terminal_manager, "_lock", None)
+            if lock is not None:
+                with lock:
+                    sessions = list(getattr(self.terminal_manager, "sessions", {}).values())
+            else:
+                sessions = list(getattr(self.terminal_manager, "sessions", {}).values())
+            for sess in sessions:
+                pid = getattr(sess, "pid", None)
+                if isinstance(pid, int) and pid > 0:
+                    identity = getattr(sess, "identity", None)
+                    create_ns = getattr(identity, "create_time_ns", None) if identity is not None else None
+                    terminal_pids[pid] = create_ns if isinstance(create_ns, int) else None
+
+        snapshot = self.process_collector.collect(
+            host_pid=host_pid,
+            core_pid=os.getpid(),
+            terminal_pids=terminal_pids,
+            min_sample_interval_ms=sample_interval_ms,
+        )
+        return snapshot.to_dict(include_nodes=include_nodes)
 
     def _handle_terminal_get_output(self, params: Dict[str, Any]) -> Dict[str, Any]:
         mgr = self._get_terminal_manager()

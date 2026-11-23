@@ -168,14 +168,17 @@ describe("CSS and component rules", () => {
     expect(decl(low, "animation")).toEqual(["none !important"]);
   });
 
-  it("no component reads the CPU percentage: CPU stays 'indisponível' until a reliable reading (4D.4)", () => {
+  it("only typed telemetry contracts and StatusBar read cpu_usage_percent (4D.4.1)", () => {
     const readers = PROD_TS.flatMap((file) =>
       stripComments(css(file))
         .split("\n")
         .map((line, i) => ({ file, line: i + 1, text: line.trim() }))
         .filter((l) => l.text.includes("cpu_usage_percent")),
     );
-    expect(readers.map((r) => `${r.file}: ${r.text}`)).toEqual(["components/shell/AppHeader.tsx: cpu_usage_percent?: number;"]);
+    expect(Array.from(new Set(readers.map((r) => r.file))).sort()).toEqual([
+      "components/shell/AppHeader.tsx",
+      "components/shell/StatusBar.tsx",
+    ]);
   });
 
   it("every class a component uses is defined in the CSS", () => {
