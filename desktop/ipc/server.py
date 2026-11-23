@@ -281,6 +281,8 @@ class StreamTransport(BaseTransport):
         self._log_file_handle: Optional[io.TextIOBase] = None
 
         target_log = log_file or (Path(os.environ["COORDINATOR_IPC_LOG_FILE"]) if "COORDINATOR_IPC_LOG_FILE" in os.environ else None)
+        if target_log is None and diag is None and "PYTEST_CURRENT_TEST" not in os.environ:
+            target_log = Path.home() / ".ai-coordinator" / "desktop" / "ipc-diagnostics.log"
         if target_log:
             try:
                 target_log.parent.mkdir(parents=True, exist_ok=True)
@@ -906,10 +908,29 @@ class SecureIPCServer:
                 return RPCResponse(id=req.id, error={"code": RPCErrorCode.INTERNAL_ERROR.value, "message": str(e),
                                                      "data": {"field": "profile", "reason": "profile_unreadable"}})
             message = "Internal error: operation could not be completed"
+            data: Optional[Dict[str, Any]] = None
             if isinstance(e, SecurityAuthorizationError):
                 message = "Project not authorized or session invalid"
+            elif isinstance(e, TerminalStartError):
+                message = "Terminal operation failed"
+                data = {"field": "terminal", "reason": "start_failed", **e.diagnostic()}
             elif isinstance(e, TerminalManagerError):
-                message = "Requested tab or terminal does not exist" if "does not exist" in str(e) else "Terminal operation failed"
+                err_text = str(e)
+                if "does not exist" in err_text:
+                    message = "Requested tab or terminal does not exist"
+                    data = {"field": "terminal", "reason": "not_found"}
+                elif "already exists" in err_text:
+                    message = "Terminal operation failed: tab_exists"
+                    data = {"field": "tab_id", "reason": "tab_exists"}
+                elif "Maximum limit" in err_text or "already has" in err_text:
+                    message = "Terminal operation failed: tab_full"
+                    data = {"field": "pane_id", "reason": "tab_full"}
+                elif "congelado" in err_text or "frozen" in err_text.lower():
+                    message = "Terminal operation failed: update_frozen"
+                    data = {"field": "terminal", "reason": "update_frozen"}
+                else:
+                    message = "Terminal operation failed"
+                    data = {"field": "terminal", "reason": "manager_error"}
             if isinstance(e, TerminalStartError):
                 # Preserve actionable spawn/capture evidence without writing paths, argv, environment, or raw exception
                 # text to the Core log. The previous logger kept only the exception class, so it could not identify
@@ -920,7 +941,10 @@ class SecureIPCServer:
                 )
             else:
                 self.transport.log_diagnostic(f"IPC handler failed: {type(e).__name__} (content omitted)")
-            return RPCResponse(id=req.id, error={"code": RPCErrorCode.INTERNAL_ERROR.value, "message": message})
+            err_obj: Dict[str, Any] = {"code": RPCErrorCode.INTERNAL_ERROR.value, "message": message}
+            if data is not None:
+                err_obj["data"] = data
+            return RPCResponse(id=req.id, error=err_obj)
 
     def send_notification(self, event: str, data: Dict[str, Any]) -> bool:
         notif = RPCNotification(event=event, data=data)

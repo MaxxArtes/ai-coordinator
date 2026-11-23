@@ -159,9 +159,123 @@ def test_ipc_logs_terminal_failure_stage_without_raw_exception_or_path(terminal_
                "params": {"tab_id": "tab", "pane_id": 0, "cwd": str(terminal_env.project)}}
     response = server.handle_raw_payload(json.dumps(payload))
     assert response.error["message"] == "Terminal operation failed"
+    assert response.error["data"] == {
+        "field": "terminal",
+        "reason": "start_failed",
+        "stage": "spawn",
+        "exception_type": "PermissionError",
+        "error_code": 13,
+    }
     diagnostic = transport.log_diagnostic.call_args.args[0]
     assert "stage=spawn" in diagnostic and "exception_type=PermissionError" in diagnostic and "error_code=13" in diagnostic
     assert str(terminal_env.project) not in diagnostic and "secret" not in diagnostic
+
+
+def test_open_initial_project_then_second_project_preserves_both_sessions_and_cwds(tmp_path, monkeypatch):
+    home_proj = tmp_path / "10864"
+    repo_proj = tmp_path / "ai-coordinator"
+    home_proj.mkdir()
+    repo_proj.mkdir()
+    profiles = DesktopProfileManager(root_dir=tmp_path / "profiles")
+    authorizer = DesktopAuthorizer(profile_manager=profiles)
+    token = authorizer.issue_session("default")
+    profiles.authorize_project("default", home_proj)
+    profiles.authorize_project("default", repo_proj)
+
+    monkeypatch.setenv("COORDINATOR_PTY_BACKEND", "pipe")
+    monkeypatch.setattr(manager_module.sys, "platform", "win32")
+    monkeypatch.setattr(manager_module, "discover_interpreters", lambda: [
+        Interpreter("powershell", "PythonShell", sys.executable, ("-u", "-c", "import time; time.sleep(10)"))
+    ])
+    manager = TerminalManager(authorizer)
+    server = SecureIPCServer(transport=MagicMock(), terminal_manager=manager, session_token=token)
+    try:
+        resp_tab1 = server.handle_raw_payload(json.dumps({
+            "jsonrpc": "2.0", "id": 1, "method": "terminal.create_tab", "session_token": token,
+            "params": {"tab_id": "tab-main", "project_path": str(home_proj)},
+        }))
+        assert resp_tab1.error is None
+
+        # Same tab_id + same canonical project_path is idempotent on reconnect/re-init.
+        resp_tab1_again = server.handle_raw_payload(json.dumps({
+            "jsonrpc": "2.0", "id": 2, "method": "terminal.create_tab", "session_token": token,
+            "params": {"tab_id": "tab-main", "project_path": str(home_proj)},
+        }))
+        assert resp_tab1_again.error is None
+
+        resp_sess1 = server.handle_raw_payload(json.dumps({
+            "jsonrpc": "2.0", "id": 3, "method": "terminal.create_session", "session_token": token,
+            "params": {"tab_id": "tab-main", "pane_id": 0, "kind": "human_terminal", "cwd": str(home_proj)},
+        }))
+        assert resp_sess1.error is None
+
+        # Reusing tab-main for a DIFFERENT project returns explicit structured tab_exists without clobbering tab-main.
+        resp_conflict = server.handle_raw_payload(json.dumps({
+            "jsonrpc": "2.0", "id": 4, "method": "terminal.create_tab", "session_token": token,
+            "params": {"tab_id": "tab-main", "project_path": str(repo_proj)},
+        }))
+        assert resp_conflict.error["data"] == {"field": "tab_id", "reason": "tab_exists"}
+
+        resp_tab2 = server.handle_raw_payload(json.dumps({
+            "jsonrpc": "2.0", "id": 5, "method": "terminal.create_tab", "session_token": token,
+            "params": {"tab_id": "tab-2", "project_path": str(repo_proj)},
+        }))
+        assert resp_tab2.error is None
+
+        resp_sess2 = server.handle_raw_payload(json.dumps({
+            "jsonrpc": "2.0", "id": 6, "method": "terminal.create_session", "session_token": token,
+            "params": {"tab_id": "tab-2", "pane_id": 1, "kind": "human_terminal", "cwd": str(repo_proj)},
+        }))
+        assert resp_sess2.error is None
+
+        listed = server.handle_raw_payload(json.dumps({
+            "jsonrpc": "2.0", "id": 7, "method": "terminal.list_tabs", "session_token": token, "params": {},
+        }))
+        tabs_by_id = {t["tab_id"]: t for t in listed.result["tabs"]}
+        assert tabs_by_id["tab-main"]["panes"]["0"]["cwd"] == str(home_proj.resolve())
+        assert tabs_by_id["tab-main"]["panes"]["0"]["is_alive"] is True
+        assert tabs_by_id["tab-2"]["panes"]["1"]["cwd"] == str(repo_proj.resolve())
+        assert tabs_by_id["tab-2"]["panes"]["1"]["is_alive"] is True
+    finally:
+        manager.terminate_all()
+
+
+def test_isolated_profile_preserves_path_and_keeps_logical_authorized_cwd(tmp_path, monkeypatch):
+    import os
+    isolated_home = tmp_path / "perfil-diag"
+    isolated_home.mkdir()
+    proj = tmp_path / "proj"
+    proj.mkdir()
+    launch_dir = tmp_path / "launch-cwd"
+    launch_dir.mkdir()
+    monkeypatch.setenv("USERPROFILE", str(isolated_home))
+    monkeypatch.setenv("HOME", str(isolated_home))
+    monkeypatch.setenv("PATH", f"{tmp_path / 'cli-bin'};{os.environ.get('PATH', '')}")
+
+    profiles = DesktopProfileManager(root_dir=tmp_path / "profiles")
+    authorizer = DesktopAuthorizer(profile_manager=profiles)
+    token = authorizer.issue_session("default")
+    profiles.authorize_project("default", proj)
+
+    monkeypatch.setattr(manager_module.sys, "platform", "win32")
+    monkeypatch.setattr(manager_module, "discover_interpreters", lambda: [
+        Interpreter("bash_wsl", "Bash (WSL)", "wsl.exe", cwd_kind="wsl")
+    ])
+    monkeypatch.setattr(manager_module, "resolve_interpreter", lambda *_args, **_kwargs: (
+        Interpreter("bash_wsl", "Bash (WSL)", "wsl.exe", cwd_kind="wsl"),
+        ["wsl.exe", "--cd", "/mnt/c/proj"],
+        str(launch_dir),
+        {},
+    ))
+    backend = RecordingBackend()
+    manager = TerminalManager(authorizer)
+    manager.create_tab(token, "tab", "project", proj)
+    session = manager.create_terminal(token, "tab", 0, interpreter_id="bash_wsl", cwd=proj, backend=backend)
+
+    assert backend.spawn_args[1] == launch_dir.resolve()
+    assert session.cwd == proj.resolve()
+    assert backend.spawn_args[2]["USERPROFILE"] == str(isolated_home)
+    assert str(tmp_path / "cli-bin") in backend.spawn_args[2]["PATH"]
 
 
 def test_ipc_lists_installed_interpreters_and_rejects_non_allowlisted_ids(terminal_env, monkeypatch):

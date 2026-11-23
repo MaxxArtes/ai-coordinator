@@ -24,6 +24,7 @@ export interface TerminalGridProps {
   /** Live state of each pane, by session_id (unknown when missing). */
   states?: Record<string, PaneState>;
   onAddPane?: (tabId: string) => void;
+  onOpenProjectScreen?: () => void;
   /**
    * Shows "Salvar sessões". The App does not pass it in this version: the host only builds the sanitized history in
    * memory and nothing writes it to a file yet (A5), so the button would claim a save that does not happen.
@@ -70,6 +71,7 @@ export const TerminalGrid: React.FC<TerminalGridProps> = ({
   panes,
   states,
   onAddPane,
+  onOpenProjectScreen,
   onSaveSessions,
   onWrite,
   onResize,
@@ -115,6 +117,18 @@ export const TerminalGrid: React.FC<TerminalGridProps> = ({
             >
               <Icon name="plus" size="sm" />
               Novo terminal
+            </button>
+          )}
+          {onOpenProjectScreen && (
+            <button
+              type="button"
+              onClick={onOpenProjectScreen}
+              className="btn btn--sm"
+              title="Abrir ou autorizar outro diretório de projeto"
+              data-f6-entry={!onSaveSessions && !canAdd ? "" : undefined}
+            >
+              <Icon name="shield" size="sm" />
+              Abrir projeto
             </button>
           )}
         </div>

@@ -30,17 +30,24 @@ const EMPTY: TerminalStatesSnapshot = { reported: null, askedFor: new Set(), fai
 
 type CallTauri = (cmd: string, args?: Record<string, any>) => Promise<any>;
 
-function readTab(answer: any, tabId: string): Record<string, PaneState> {
+function readTab(answer: any, tabId: string, askedFor: ReadonlySet<string>): Record<string, PaneState> {
   const tabs: any[] = Array.isArray(answer?.tabs) ? answer.tabs : [];
-  const tab = tabs.find((t) => t?.tab_id === tabId);
+  const ordered = [
+    ...tabs.filter((t) => t?.tab_id !== tabId),
+    ...tabs.filter((t) => t?.tab_id === tabId),
+  ];
   const out: Record<string, PaneState> = {};
-  const panes = tab?.panes && typeof tab.panes === "object" ? Object.values(tab.panes) : [];
-  for (const pane of panes as any[]) {
-    if (!pane || typeof pane.session_id !== "string") continue;
-    if (pane.is_alive === true) out[pane.session_id] = { kind: "alive" };
-    else if (pane.is_alive === false) {
-      out[pane.session_id] = { kind: "ended", exitCode: Number.isInteger(pane.exit_code) ? pane.exit_code : null };
-    } else out[pane.session_id] = { kind: "unknown" };
+  for (const tab of ordered) {
+    const isActiveTab = tab?.tab_id === tabId;
+    const panes = tab?.panes && typeof tab.panes === "object" ? Object.values(tab.panes) : [];
+    for (const pane of panes as any[]) {
+      if (!pane || typeof pane.session_id !== "string") continue;
+      if (!isActiveTab && !askedFor.has(pane.session_id)) continue;
+      if (pane.is_alive === true) out[pane.session_id] = { kind: "alive" };
+      else if (pane.is_alive === false) {
+        out[pane.session_id] = { kind: "ended", exitCode: Number.isInteger(pane.exit_code) ? pane.exit_code : null };
+      } else out[pane.session_id] = { kind: "unknown" };
+    }
   }
   return out;
 }
@@ -69,7 +76,7 @@ export function useTerminalStates(
       const askedFor = new Set(idsRef.current);
       try {
         const answer = await callTauri("terminal_list_tabs");
-        if (mounted) setSnapshot({ reported: readTab(answer, tabId), askedFor, failed: false });
+        if (mounted) setSnapshot({ reported: readTab(answer, tabId, askedFor), askedFor, failed: false });
       } catch {
         if (mounted) setSnapshot({ reported: null, askedFor, failed: true });
       } finally {

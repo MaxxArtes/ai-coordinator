@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useRef, useState, useCallback } from "react";
+import React, { useEffect, useLayoutEffect, useMemo, useRef, useState, useCallback } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { TerminalGrid } from "./components/TerminalGrid";
 import { TerminalPaneData } from "./components/TerminalPane";
@@ -192,18 +192,42 @@ export const App: React.FC = () => {
   );
 
   /**
-   * Opens a terminal in an authorized project. Remembering the project for the next start is a convenience that runs
-   * after the terminal exists and never blocks it (K5); a failure there is only reported.
+   * Opens a terminal in an authorized project while preserving any live sessions and their directories.
+   * Remembering the project for the next start runs after creation and never blocks it (K5).
    */
   const startProject = useCallback(
     async (dir: string, alive: () => boolean = () => true, interpreterId = DEFAULT_INTERPRETER_ID): Promise<void> => {
-      let tabId = activeTabRef.current;
+      const slot = lowestFreeSlot(panesRef.current);
+      if (slot === null) {
+        throw new Error("Limite máximo de 4 terminais simultâneos atingido. Feche um terminal antes de abrir outro projeto.");
+      }
+
+      const matchedEntry = Array.from(tabProjectRef.current.entries()).find(([, project]) => samePath(project, dir));
+      let tabId = matchedEntry?.[0] ?? activeTabRef.current;
       const bound = tabProjectRef.current.get(tabId);
-      if (bound !== undefined && !samePath(bound, dir)) tabId = `tab-${++tabSeqRef.current}`;
-      await ensureTabCreated(tabId, dir);
+      if (bound !== undefined && !samePath(bound, dir)) {
+        tabId = `tab-${++tabSeqRef.current}`;
+      }
+
+      try {
+        await ensureTabCreated(tabId, dir);
+      } catch (err) {
+        const reason = toStructuredError(err).reason;
+        if (reason === "tab_exists" || /already exists|tab_exists/i.test(errorText(err))) {
+          // Core already has this tab bound to another directory (e.g., after a webview refresh): allocate a fresh tab.
+          createdTabsRef.current.add(tabId);
+          do {
+            tabId = `tab-${++tabSeqRef.current}`;
+          } while (createdTabsRef.current.has(tabId));
+          await ensureTabCreated(tabId, dir);
+        } else {
+          throw err;
+        }
+      }
+
       const sess = await callTauri("terminal_create_session", {
         tabId,
-        paneId: 0,
+        paneId: slot,
         kind: "human_terminal",
         interpreterId,
         cwd: dir,
@@ -212,12 +236,14 @@ export const App: React.FC = () => {
       });
       if (!alive()) return;
       if (!sess || !sess.session_id) throw new Error("Sessão inicial não retornou session_id válido");
+      const createdPane = paneFromSession(sess, takeNumber(), tabId, slot);
+      focusAfterRef.current = { sessionId: createdPane.sessionId };
       activeTabRef.current = tabId;
       setActiveTab(tabId);
       setProjectPath(dir);
       setIsAuthorizing(false);
       setAuthNote("");
-      setPanes([paneFromSession(sess, takeNumber(), tabId, 0)]);
+      setPanes((prev) => [...prev, createdPane]);
       setConnectionStatus("connected");
       void rememberProject(callTauri, dir).catch((err) => {
         if (alive()) showNotice(`O terminal abriu, mas o projeto não foi lembrado para a próxima inicialização: ${errorText(err)}`, "info");
@@ -229,8 +255,32 @@ export const App: React.FC = () => {
   const showProjectScreen = useCallback((note: string) => {
     setAuthNote(note);
     setIsAuthorizing(true);
-    setConnectionStatus("authorizing");
+    setConnectionStatus(panesRef.current.length > 0 ? "connected" : "authorizing");
   }, []);
+
+  const handleOpenProjectScreen = useCallback(() => {
+    setBroadScopePath(null);
+    setAuthNote("");
+    setInputPath("");
+    setIsAuthorizing(true);
+    if (panesRef.current.length === 0) setConnectionStatus("authorizing");
+  }, [setBroadScopePath]);
+
+  const handleCancelProjectScreen = useCallback(() => {
+    if (startingRef.current) return;
+    setBroadScopePath(null);
+    setAuthNote("");
+    setIsAuthorizing(false);
+    if (panesRef.current.length > 0) {
+      setConnectionStatus("connected");
+      requestAnimationFrame(() => {
+        const target =
+          document.querySelector<HTMLElement>(".terminal-pane__focus-region") ??
+          document.querySelector<HTMLElement>(".tab-strip [data-f6-entry]");
+        target?.focus();
+      });
+    }
+  }, [setBroadScopePath]);
 
   // Terminal mount callback
   const handleMount = useCallback((sessionId: string, term: Terminal | null) => {
@@ -318,12 +368,20 @@ export const App: React.FC = () => {
       // The focus goes to the pane that takes this place, else the previous one, else the tab strip.
       const current = panesRef.current;
       const index = current.findIndex((p) => p.sessionId === sessionId);
+      const remaining = current.filter((p) => p.sessionId !== sessionId);
       const neighbour = current[index + 1] ?? current[index - 1];
       focusAfterRef.current = neighbour ? { sessionId: neighbour.sessionId } : { strip: true };
       endedRef.current.delete(sessionId);
-      setPanes((prev) => prev.filter((p) => p.sessionId !== sessionId));
+      setPanes(remaining);
       termsRef.current.delete(sessionId);
       lastSeqRef.current.delete(sessionId);
+      if (remaining.length > 0 && !remaining.some((p) => p.tabId === activeTabRef.current)) {
+        const nextPane = neighbour ?? remaining[0];
+        const nextProject = nextPane.cwd ?? tabProjectRef.current.get(nextPane.tabId) ?? "";
+        activeTabRef.current = nextPane.tabId;
+        setActiveTab(nextPane.tabId);
+        if (nextProject) setProjectPath(nextProject);
+      }
     },
     [callTauri]
   );
@@ -485,7 +543,7 @@ export const App: React.FC = () => {
           return;
         }
         setIsAuthorizing(false);
-        setConnectionStatus("connecting");
+        if (panesRef.current.length === 0) setConnectionStatus("connecting");
         try {
           await startProject(canonical);
         } catch (err) {
@@ -519,7 +577,7 @@ export const App: React.FC = () => {
       if (broadScopeRef.current !== null) return; // the open question is answered first
       if (!beginStart()) return;
       setIsAuthorizing(false);
-      setConnectionStatus("connecting");
+      if (panesRef.current.length === 0) setConnectionStatus("connecting");
       try {
         await startProject(path);
       } catch (err) {
@@ -539,9 +597,16 @@ export const App: React.FC = () => {
       const list = Array.isArray(result?.authorized_projects) ? result.authorized_projects : [];
       setAuthorizedProjects(list);
       const open = projectPathRef.current;
-      if (open && !stillAuthorized(open, list) && panesRef.current.length === 0) {
-        setProjectPath("");
-        showProjectScreen(`A autorização de ${open} foi revogada. Escolha outro projeto ou autorize um diretório.`);
+      if (open && !stillAuthorized(open, list)) {
+        const surviving = panesRef.current.find((p) => p.cwd && stillAuthorized(p.cwd, list));
+        if (surviving && surviving.cwd) {
+          activeTabRef.current = surviving.tabId;
+          setActiveTab(surviving.tabId);
+          setProjectPath(surviving.cwd);
+        } else if (panesRef.current.length === 0) {
+          setProjectPath("");
+          showProjectScreen(`A autorização de ${open} foi revogada. Escolha outro projeto ou autorize um diretório.`);
+        }
       }
     },
     [showProjectScreen]
@@ -818,54 +883,76 @@ export const App: React.FC = () => {
   }, [profileRecovery, settingsLoadError, settings, openSettings]);
 
   const isAuthorizingView = isAuthorizing || connectionStatus === "authorizing";
+  const showTerminals =
+    !isAuthorizingView && !(connectionStatus === "connecting" && panes.length === 0) && !(connectionStatus === "failed" && panes.length === 0);
+  const terminalHostRef = useRef<HTMLDivElement>(null);
+  useLayoutEffect(() => {
+    const el = terminalHostRef.current;
+    if (!el) return;
+    if (showTerminals) el.removeAttribute("inert");
+    else el.setAttribute("inert", "");
+  }, [showTerminals]);
 
-  // Conversas shows the project and startup screens too; the navigation stays available on all of them.
-  const conversasContent = isAuthorizingView ? (
-    <AuthorizationScreen
-      profileName={profileName || "perfil ativo"}
-      authorizedProjects={authorizedProjects}
-      note={authNote}
-      inputPath={inputPath}
-      onInputPathChange={setInputPath}
-      onSubmit={(path) => void handleAuthorizeAndStart(path)}
-      onOpenProject={handleOpenAuthorized}
-      busy={starting}
-      broadScopePath={broadScopePath}
-      onConfirmBroadScope={handleConfirmBroadScope}
-      onCancelBroadScope={handleCancelBroadScope}
-    />
-  ) : connectionStatus === "connecting" && panes.length === 0 ? (
-    <StartupStatus state="connecting" />
-  ) : connectionStatus === "failed" && panes.length === 0 ? (
-    <StartupStatus
-      state="failed"
-      detail={notice}
-      onRetry={
-        initRetryable
-          ? () => {
-              setNotice("");
-              setInitAttempt((n) => n + 1);
-            }
-          : undefined
-      }
-    />
-  ) : (
-    // No "Salvar sessões": the host only builds the sanitized history in memory and nothing writes it to a file yet
-    // (A5); the button would claim a save the operator cannot get.
-    <TerminalGrid
-      tabId={activeTab}
-      projectPath={projectPath}
-      panes={panes}
-      states={paneStates}
-      interpreters={interpreters}
-      switchingSessionIds={switchingSessionIds}
-      onChangeInterpreter={handleChangeInterpreter}
-      onAddPane={handleAddPane}
-      onWrite={handleWrite}
-      onResize={handleResize}
-      onClose={handleClosePane}
-      onMount={handleMount}
-    />
+  // Conversas shows the project and startup screens too; existing terminal panes stay mounted and inert when choosing another project.
+  const conversasContent = (
+    <>
+      {isAuthorizingView ? (
+        <AuthorizationScreen
+          profileName={profileName || "perfil ativo"}
+          authorizedProjects={authorizedProjects}
+          note={authNote}
+          inputPath={inputPath}
+          onInputPathChange={setInputPath}
+          onSubmit={(path) => void handleAuthorizeAndStart(path)}
+          onOpenProject={handleOpenAuthorized}
+          onCancel={panes.length > 0 ? handleCancelProjectScreen : undefined}
+          busy={starting}
+          broadScopePath={broadScopePath}
+          onConfirmBroadScope={handleConfirmBroadScope}
+          onCancelBroadScope={handleCancelBroadScope}
+        />
+      ) : connectionStatus === "connecting" && panes.length === 0 ? (
+        <StartupStatus state="connecting" />
+      ) : connectionStatus === "failed" && panes.length === 0 ? (
+        <StartupStatus
+          state="failed"
+          detail={notice}
+          onRetry={
+            initRetryable
+              ? () => {
+                  setNotice("");
+                  setInitAttempt((n) => n + 1);
+                }
+              : undefined
+          }
+        />
+      ) : null}
+      {(showTerminals || panes.length > 0) && (
+        <div
+          ref={terminalHostRef}
+          hidden={!showTerminals}
+          style={{ display: showTerminals ? "contents" : "none" }}
+        >
+          {/* No "Salvar sessões": the host only builds the sanitized history in memory and nothing writes it to a file yet
+          (A5); the button would claim a save the operator cannot get. */}
+          <TerminalGrid
+            tabId={activeTab}
+            projectPath={projectPath}
+            panes={panes}
+            states={paneStates}
+            interpreters={interpreters}
+            switchingSessionIds={switchingSessionIds}
+            onChangeInterpreter={handleChangeInterpreter}
+            onAddPane={handleAddPane}
+            onOpenProjectScreen={handleOpenProjectScreen}
+            onWrite={handleWrite}
+            onResize={handleResize}
+            onClose={handleClosePane}
+            onMount={handleMount}
+          />
+        </div>
+      )}
+    </>
   );
 
   const headerName = settingsInUse(settings)?.categories?.perfil?.values?.display_name || profileDisplayName || profileName || null;

@@ -12,6 +12,7 @@ export interface AuthorizationScreenProps {
   onInputPathChange: (value: string) => void;
   onSubmit: (path: string) => void;
   onOpenProject?: (path: string) => void;
+  onCancel?: () => void;
   /** A project is being opened or authorized: further requests are ignored until it ends. */
   busy?: boolean;
   /**
@@ -41,6 +42,7 @@ export const AuthorizationScreen: React.FC<AuthorizationScreenProps> = ({
   onInputPathChange,
   onSubmit,
   onOpenProject,
+  onCancel,
   busy = false,
   broadScopePath = null,
   onConfirmBroadScope,
@@ -190,6 +192,18 @@ export const AuthorizationScreen: React.FC<AuthorizationScreenProps> = ({
             <button ref={submitRef} type="submit" className="btn btn--primary" aria-disabled={locked || undefined}>
               Autorizar diretório e iniciar terminal
             </button>
+            {onCancel && (
+              <button
+                type="button"
+                className="btn"
+                aria-disabled={locked || undefined}
+                onClick={() => {
+                  if (!locked) onCancel();
+                }}
+              >
+                Voltar aos terminais
+              </button>
+            )}
           </div>
           {/* Below the submit button, so the risky answer does not take the place of the button just clicked. */}
           {asking && (

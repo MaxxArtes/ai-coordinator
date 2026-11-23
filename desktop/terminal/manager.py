@@ -123,11 +123,18 @@ class TerminalManager:
 
             # 1. Authorize project access
             self.authorizer.authorize_project_access(token, project_path)
+            canon_path = str(Path(project_path).resolve())
 
             if tab_id in self.tabs:
+                existing = self.tabs[tab_id]
+                try:
+                    same_dir = str(Path(existing.project_path).resolve()) == canon_path
+                except OSError:
+                    same_dir = existing.project_path == canon_path
+                if same_dir:
+                    return existing
                 raise TerminalManagerError(f"Tab with ID '{tab_id}' already exists")
 
-            canon_path = str(Path(project_path).resolve())
             tab = TabInfo(tab_id=tab_id, title=title, project_path=canon_path)
             self.tabs[tab_id] = tab
             return tab
@@ -212,6 +219,7 @@ class TerminalManager:
             # 4. Human terminals use an installed, allow-listed interpreter. Other command use remains explicit.
             interpreter = None
             shell_env: Dict[str, str] = {}
+            launch_cwd = target_cwd
             use_installed_shell = interpreter_id is not None or (
                 not command and kind == SessionKind.HUMAN_TERMINAL and sys.platform == "win32"
             )
@@ -222,12 +230,14 @@ class TerminalManager:
                     raise TerminalManagerError("O identificador do interpretador é inválido.")
                 requested = interpreter_id or DEFAULT_INTERPRETER_ID
                 try:
-                    interpreter, resolved_command, _launch_cwd, shell_env = resolve_interpreter(
+                    interpreter, resolved_command, resolved_launch_cwd, shell_env = resolve_interpreter(
                         requested, str(target_cwd), available=discover_interpreters()
                     )
                 except InterpreterError as exc:
                     raise TerminalInterpreterError(exc.reason) from None
                 command = resolved_command
+                if resolved_launch_cwd:
+                    launch_cwd = Path(resolved_launch_cwd)
             elif not command:
                 if sys.platform == "win32":
                     command = ["cmd.exe"]
@@ -235,13 +245,13 @@ class TerminalManager:
                     shell = os.environ.get("SHELL", "/bin/sh")
                     command = [shell]
 
-            # 5. Build and start session
+            # 5. Build and start session (spawn from launch_cwd while preserving logical authorized target_cwd)
             session = TerminalSession(
                 tab_id=tab_id,
                 pane_id=pane_id,
                 kind=kind,
                 command=command,
-                cwd=target_cwd,
+                cwd=launch_cwd,
                 profile_name=profile_name,
                 principal=principal,
                 backend=backend,
@@ -282,6 +292,7 @@ class TerminalManager:
                 if not isinstance(code, int):
                     code = None
                 raise TerminalStartError("spawn", type(exc).__name__, code) from exc
+            session.cwd = target_cwd.resolve()
 
             # Core ProcessSupervisor integration: capture identity & bind
             if session.pid:

@@ -1338,4 +1338,74 @@ describe("App — tráfego do terminal depois do L1/L2 (Etapa 8)", () => {
     expect(reads).toBe(1);
     expect(screen.getByRole("region", { name: "Terminal 01" })).toBeInTheDocument();
   });
+
+  it("abre C:\\Users\\10864 e depois D:\\ai-coordinator pela interface, preservando ambas as sessões e seus diretórios", async () => {
+    const user = userEvent.setup();
+    host();
+    renderApp();
+    await connected();
+
+    const pane1 = screen.getByRole("region", { name: "Terminal 01" });
+    expect(within(pane1).getByTitle("C:\\Users\\10864")).toBeInTheDocument();
+
+    // Opening the project chooser and cancelling preserves the live terminal without disposing xterm.
+    await user.click(screen.getByRole("button", { name: "Abrir projeto" }));
+    expect(screen.getByRole("heading", { name: "Escolha o projeto" })).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "Voltar aos terminais" }));
+    expect(screen.getByRole("region", { name: "Terminal 01" })).toBeInTheDocument();
+    expect(xtermLog.disposed).toBe(0);
+
+    // Authorizing and opening D:\ai-coordinator keeps Terminal 01 in C:\Users\10864 and opens Terminal 02 in D:\ai-coordinator.
+    await user.click(screen.getByRole("button", { name: "Abrir projeto" }));
+    const input = screen.getByLabelText("Caminho do projeto no host");
+    await user.clear(input);
+    await user.type(input, "D:\\ai-coordinator");
+    await user.click(screen.getByRole("button", { name: "Autorizar diretório e iniciar terminal" }));
+
+    const pane2 = await screen.findByRole("region", { name: "Terminal 02" });
+    const keptPane1 = screen.getByRole("region", { name: "Terminal 01" });
+    expect(within(keptPane1).getByTitle("C:\\Users\\10864")).toBeInTheDocument();
+    expect(within(pane2).getByTitle("D:\\ai-coordinator")).toBeInTheDocument();
+    expect(bar()).toHaveTextContent("Terminais: 2 de 4");
+    expect(callsOf("terminal_create_tab")).toEqual([
+      { tabId: "tab-main", projectPath: "C:\\Users\\10864" },
+      { tabId: "tab-2", projectPath: "D:\\ai-coordinator" },
+    ]);
+    expect(callsOf("terminal_create_session")).toMatchObject([
+      { tabId: "tab-main", paneId: 0, cwd: "C:\\Users\\10864" },
+      { tabId: "tab-2", paneId: 1, cwd: "D:\\ai-coordinator" },
+    ]);
+    expect(xtermLog.disposed).toBe(0);
+    expect(document.body.textContent).not.toMatch(/Terminal operation failed|não abriu/);
+  });
+
+  it("dessincronização com tab-main existente no Core aloca tab-2 automaticamente ao abrir D:\\ai-coordinator", async () => {
+    const user = userEvent.setup();
+    const base = appSettings();
+    const settings = {
+      ...base,
+      categories: {
+        ...base.categories,
+        geral: { ...base.categories.geral, values: { ...base.categories.geral.values, open_last_project_on_start: false } },
+      },
+    };
+    host({ settings });
+    const original = invoke.getMockImplementation()!;
+    invoke.mockImplementation(async (cmd: string, args?: any) => {
+      if (cmd === "terminal_create_tab" && args?.tabId === "tab-main") {
+        throw new Error("Terminal operation failed: tab_exists");
+      }
+      return original(cmd, args);
+    });
+    renderApp();
+    const input = await screen.findByLabelText("Caminho do projeto no host");
+    await user.clear(input);
+    await user.type(input, "D:\\ai-coordinator");
+    await user.click(screen.getByRole("button", { name: "Autorizar diretório e iniciar terminal" }));
+
+    const pane = await screen.findByRole("region", { name: "Terminal 01" });
+    expect(within(pane).getByTitle("D:\\ai-coordinator")).toBeInTheDocument();
+    expect(callsOf("terminal_create_tab")).toContainEqual({ tabId: "tab-2", projectPath: "D:\\ai-coordinator" });
+    expect(document.body.textContent).not.toMatch(/Terminal operation failed|não abriu/);
+  });
 });
