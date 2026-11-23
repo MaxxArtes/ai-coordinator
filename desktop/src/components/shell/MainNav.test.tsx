@@ -81,9 +81,9 @@ describe("MainNav", () => {
     expect(conversas.querySelector(".main-nav__count")).toHaveTextContent(String(n));
   });
 
-  it("Monitoramento and Missões are announced as planned", () => {
+  it("only Missões is announced as planned while Monitoramento is active (4D.4.2)", () => {
     render(<Harness />);
-    expect(screen.getByRole("tab", { name: /^Monitoramento\s*\(planejado\)$/ })).toBeInTheDocument();
+    expect(screen.getByRole("tab", { name: /^Monitoramento$/ })).toBeInTheDocument();
     expect(screen.getByRole("tab", { name: /^Missões\s*\(planejado\)$/ })).toBeInTheDocument();
     expect(screen.getByRole("tab", { name: /^Conversas/ }).textContent).not.toMatch(/planejado/);
   });
@@ -121,18 +121,15 @@ describe("MainViews", () => {
     }
   });
 
-  it.each([
-    ["monitoramento", "Monitoramento", "4D.4"],
-    ["missoes", "Missões", "4D.5"],
-  ] as const)("the %s screen is a clearly identified temporary screen, with no data and no control", async (id, label, milestone) => {
+  it("the missoes screen is a clearly identified temporary screen, with no data and no control", async () => {
     const user = userEvent.setup();
     render(<Harness />);
-    await user.click(screen.getByRole("tab", { name: new RegExp(`^${label}`) }));
-    const view = document.getElementById(`main-view-${id}`)!;
+    await user.click(screen.getByRole("tab", { name: /^Missões/ }));
+    const view = document.getElementById("main-view-missoes")!;
     expect(view).not.toHaveAttribute("hidden");
     const badges = Array.from(view.querySelectorAll(".badge")).map((b) => b.textContent);
-    expect(badges).toEqual(["Tela temporária", "planejado", milestone]);
-    expect(within(view).getByRole("heading", { level: 2, name: label })).toBeInTheDocument();
+    expect(badges).toEqual(["Tela temporária", "planejado", "4D.5"]);
+    expect(within(view).getByRole("heading", { level: 2, name: "Missões" })).toBeInTheDocument();
     expect(view.querySelectorAll("button, a, input, select, textarea, progress, meter, [role=progressbar], [role=meter]")).toHaveLength(0);
     expect((view.textContent ?? "").replace(/4D\.\d+/g, "")).not.toMatch(/\d/);
     expect(view).toHaveTextContent("Até lá, esta tela não mostra dados nem tem controles.");

@@ -59,9 +59,11 @@ export interface MainViewsProps {
   active: MainViewId;
   /** Content of Conversas: the terminal grid, or the authorization and startup screens. */
   conversas: React.ReactNode;
+  /** Content of Monitoramento (4D.4.2): renders in place of the temporary screen when provided. */
+  monitoramento?: React.ReactNode;
 }
 
-export const MainViews: React.FC<MainViewsProps> = ({ active, conversas }) => {
+export const MainViews: React.FC<MainViewsProps> = ({ active, conversas, monitoramento }) => {
   const conversasRef = useRef<HTMLDivElement>(null);
   const conversasActive = active === "conversas";
 
@@ -84,7 +86,7 @@ export const MainViews: React.FC<MainViewsProps> = ({ active, conversas }) => {
       >
         {conversas}
       </div>
-      <PlannedView view="monitoramento" active={active === "monitoramento"} />
+      {monitoramento ?? <PlannedView view="monitoramento" active={active === "monitoramento"} />}
       <PlannedView view="missoes" active={active === "missoes"} />
     </main>
   );

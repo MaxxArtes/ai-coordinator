@@ -11,9 +11,10 @@
  * "Aba: / Raiz:" toolbar and is the F6 region "strip"; every pane gets its position ("Terminal N de M").
  */
 
-import React from "react";
+import React, { useState } from "react";
 import { Terminal } from "xterm";
 import { TerminalPane, TerminalPaneData } from "./TerminalPane";
+import { TabContextMenu } from "./TabContextMenu";
 import { Icon } from "./ui/Icon";
 import type { PaneState } from "./useTerminalStates";
 
@@ -23,6 +24,9 @@ export interface TerminalGridProps {
   panes: TerminalPaneData[];
   /** Live state of each pane, by session_id (unknown when missing). */
   states?: Record<string, PaneState>;
+  authorizedProjects?: readonly string[];
+  onOpenAuthorizedProject?: (path: string) => void;
+  openingProject?: boolean;
   onAddPane?: (tabId: string) => void;
   onOpenProjectScreen?: () => void;
   /**
@@ -70,6 +74,9 @@ export const TerminalGrid: React.FC<TerminalGridProps> = ({
   projectPath,
   panes,
   states,
+  authorizedProjects = [],
+  onOpenAuthorizedProject,
+  openingProject = false,
   onAddPane,
   onOpenProjectScreen,
   onSaveSessions,
@@ -84,11 +91,39 @@ export const TerminalGrid: React.FC<TerminalGridProps> = ({
   const folder = projectFolderName(projectPath);
   const layout = getLayoutLabel(panes.length);
   const canAdd = !!onAddPane && panes.length < 4;
+  const [contextMenu, setContextMenu] = useState<{ x: number; y: number } | null>(null);
+
+  const openMenuAt = (x: number, y: number) => {
+    if (!onOpenAuthorizedProject && !onOpenProjectScreen) return;
+    setContextMenu({ x, y });
+  };
+
+  const handleStripContextMenu = (event: React.MouseEvent<HTMLDivElement>) => {
+    if (!onOpenAuthorizedProject && !onOpenProjectScreen) return;
+    event.preventDefault();
+    openMenuAt(event.clientX, event.clientY);
+  };
+
+  const handleStripKeyDown = (event: React.KeyboardEvent<HTMLDivElement>) => {
+    if (event.key === "ContextMenu" || (event.shiftKey && event.key === "F10")) {
+      if (!onOpenAuthorizedProject && !onOpenProjectScreen) return;
+      event.preventDefault();
+      const rect = event.currentTarget.getBoundingClientRect();
+      openMenuAt(rect.left + 12, rect.bottom + 2);
+    }
+  };
 
   return (
     <div className="terminal-grid">
-      {/* Tab strip: F6 region "strip"; its entry is the first button */}
-      <div className="tab-strip" data-f6-region="strip" role="group" aria-label="Aba do projeto">
+      {/* Tab strip: F6 region "strip"; its entry is the first button; right-click lists authorized saved folders */}
+      <div
+        className="tab-strip"
+        data-f6-region="strip"
+        role="group"
+        aria-label="Aba do projeto"
+        onContextMenu={handleStripContextMenu}
+        onKeyDown={handleStripKeyDown}
+      >
         <span className="tab-strip__label" title={projectPath || undefined}>
           <Icon name="terminal" size="sm" />
           {folder && <span className="tab-strip__name">{folder}</span>}
@@ -154,6 +189,21 @@ export const TerminalGrid: React.FC<TerminalGridProps> = ({
           </div>
         ))}
       </div>
+
+      {onOpenAuthorizedProject && (
+        <TabContextMenu
+          open={contextMenu !== null}
+          x={contextMenu?.x ?? 0}
+          y={contextMenu?.y ?? 0}
+          currentProjectPath={projectPath}
+          authorizedProjects={authorizedProjects}
+          atLimit={panes.length >= 4}
+          busy={openingProject}
+          onSelectProject={onOpenAuthorizedProject}
+          onOpenOtherProject={onOpenProjectScreen}
+          onClose={() => setContextMenu(null)}
+        />
+      )}
     </div>
   );
 };

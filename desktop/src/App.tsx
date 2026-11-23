@@ -31,6 +31,8 @@ import {
 } from "./components/shell/AppHeader";
 import { MainNav, mainViewPanelId, type MainViewId } from "./components/shell/MainNav";
 import { MainViews } from "./components/shell/PlannedView";
+import { MonitoringView } from "./components/monitoring/MonitoringView";
+import { appendHistorySample, type HistorySample } from "./components/monitoring/history";
 import { StatusBar } from "./components/shell/StatusBar";
 import { findEntry, findRegions, installGlobalShortcuts } from "./components/shell/shortcuts";
 import { lowestFreeSlot, paneFromSession } from "./components/terminalIdentity";
@@ -63,6 +65,7 @@ export const App: React.FC = () => {
   const [metrics, setMetrics] = useState<RuntimeMetrics | null>(null);
   // The last metrics reading failed: the previous value stops being shown as a measurement.
   const [metricsFailed, setMetricsFailed] = useState<boolean>(false);
+  const [metricsHistory, setMetricsHistory] = useState<HistorySample[]>([]);
   // One project tab per window (D5). A new id is used only when another project replaces a revoked one: the host
   // keeps a tab bound to the project it was created with.
   const [activeTab, setActiveTab] = useState<string>("tab-main");
@@ -575,14 +578,40 @@ export const App: React.FC = () => {
   const handleOpenAuthorized = useCallback(
     async (path: string) => {
       if (broadScopeRef.current !== null) return; // the open question is answered first
+      if (panesRef.current.length > 0 && lowestFreeSlot(panesRef.current) === null) {
+        showNotice("Limite máximo de 4 terminais simultâneos atingido. Feche um terminal antes de abrir outro projeto.", "info");
+        return;
+      }
       if (!beginStart()) return;
       setIsAuthorizing(false);
       if (panesRef.current.length === 0) setConnectionStatus("connecting");
       try {
+        if (!isTauriRef.current) {
+          const slot = lowestFreeSlot(panesRef.current);
+          if (slot === null) {
+            showNotice("Limite máximo de 4 terminais simultâneos atingido. Feche um terminal antes de abrir outro projeto.", "info");
+            return;
+          }
+          const previewPane: TerminalPaneData = {
+            sessionId: `preview-sess-${Date.now().toString(36)}-${slot}`,
+            tabId: activeTabRef.current,
+            paneId: slot,
+            kind: "human_terminal",
+            number: takeNumber(),
+            cwd: path,
+            interpreterId: DEFAULT_INTERPRETER_ID,
+            interpreterLabel: "PowerShell 7",
+          };
+          focusAfterRef.current = { sessionId: previewPane.sessionId };
+          setProjectPath(path);
+          setPanes((prev) => [...prev, previewPane]);
+          setConnectionStatus("connected");
+          return;
+        }
         await startProject(path);
       } catch (err) {
         showNotice(`Não foi possível abrir ${path}: ${errorText(err)}`);
-        showProjectScreen("");
+        if (panesRef.current.length === 0) showProjectScreen("");
       } finally {
         endStart();
       }
@@ -735,12 +764,15 @@ export const App: React.FC = () => {
         if (m) {
           setMetrics(m);
           setMetricsFailed(false);
+          setMetricsHistory((prev) => appendHistorySample(prev, m, false));
         } else {
           setMetricsFailed(true);
+          setMetricsHistory((prev) => appendHistorySample(prev, null, true));
         }
       } catch {
         // Telemetry errors are non-fatal, but the last value is no longer a measurement.
         setMetricsFailed(true);
+        setMetricsHistory((prev) => appendHistorySample(prev, null, true));
       }
     }, 2000);
     return () => clearInterval(interval);
@@ -940,6 +972,9 @@ export const App: React.FC = () => {
             projectPath={projectPath}
             panes={panes}
             states={paneStates}
+            authorizedProjects={authorizedProjects}
+            onOpenAuthorizedProject={(dir) => void handleOpenAuthorized(dir)}
+            openingProject={starting}
             interpreters={interpreters}
             switchingSessionIds={switchingSessionIds}
             onChangeInterpreter={handleChangeInterpreter}
@@ -977,7 +1012,22 @@ export const App: React.FC = () => {
       {notice && <NoticeBanner message={notice} tone={noticeTone} onDismiss={() => setNotice("")} />}
 
       {/* The three views share one cell; Conversas stays mounted (invisible and inert while another view is shown). */}
-      <MainViews active={mainView} conversas={conversasContent} />
+      <MainViews
+        active={mainView}
+        conversas={conversasContent}
+        monitoramento={
+          <MonitoringView
+            active={mainView === "monitoramento"}
+            isTauri={isTauri}
+            connectionStatus={connectionStatus}
+            metrics={metrics}
+            metricsUnavailable={metricsFailed}
+            history={metricsHistory}
+            panes={panes}
+            paneStates={paneStates}
+          />
+        }
+      />
 
       <StatusBar
         isTauri={isTauri}

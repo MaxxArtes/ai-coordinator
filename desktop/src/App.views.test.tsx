@@ -1408,4 +1408,70 @@ describe("App — tráfego do terminal depois do L1/L2 (Etapa 8)", () => {
     expect(callsOf("terminal_create_tab")).toContainEqual({ tabId: "tab-2", projectPath: "D:\\ai-coordinator" });
     expect(document.body.textContent).not.toMatch(/Terminal operation failed|não abriu/);
   });
+
+  it("menu de contexto da aba lista diretórios autorizados salvos e abre novo terminal sem reautorizar nem perder sessões", async () => {
+    const user = userEvent.setup();
+    host({ profile: { authorized_projects: ["C:\\Users\\10864", "D:\\proj"] } });
+    renderApp();
+    await connected();
+
+    const strip = screen.getByRole("group", { name: "Aba do projeto" });
+    fireEvent.contextMenu(strip, { clientX: 80, clientY: 40 });
+    const menu = await screen.findByRole("menu", { name: "Ações da aba do projeto" });
+    expect(menu).toHaveTextContent("Abrir terminal em...");
+
+    await user.click(within(menu).getByRole("menuitem", { name: /D:\\proj/ }));
+
+    const pane2 = await screen.findByRole("region", { name: "Terminal 02" });
+    expect(within(pane2).getByTitle("D:\\proj")).toBeInTheDocument();
+    expect(within(screen.getByRole("region", { name: "Terminal 01" })).getByTitle("C:\\Users\\10864")).toBeInTheDocument();
+    expect(callsOf("profile_authorize_project")).toHaveLength(0);
+    expect(count("ping")).toBe(1);
+    expect(xtermLog.disposed).toBe(0);
+    expect(bar()).toHaveTextContent("Terminais: 2 de 4");
+  });
+
+  it("aba Monitoramento exibe métricas medidas do host mantendo os terminais intactos", async () => {
+    const user = userEvent.setup();
+    host({
+      extra: {
+        get_process_tree_metrics: () => ({
+          host_pid: 4242,
+          core_pid: 5150,
+          host_ram_bytes: 61_027_123,
+          total_tree_ram_bytes: 134_637_159,
+          ram_provenance: "measured",
+          cpu_usage_percent: 12.5,
+          cpu_provenance: "measured",
+          sample_interval_ms: 2000,
+          process_count: 3,
+          categories: {
+            host: { role: "host", process_count: 1, ram_bytes: 61_027_123, ram_provenance: "measured", cpu_usage_percent: 2.0, cpu_provenance: "measured" },
+            core: { role: "core", process_count: 1, ram_bytes: 30_000_000, ram_provenance: "measured", cpu_usage_percent: 1.5, cpu_provenance: "measured" },
+            webview: { role: "webview", process_count: 0, ram_bytes: 0, ram_provenance: "unknown", cpu_usage_percent: null, cpu_provenance: "unknown" },
+            terminal: { role: "terminal", process_count: 1, ram_bytes: 43_610_036, ram_provenance: "measured", cpu_usage_percent: 9.0, cpu_provenance: "measured" },
+            child: { role: "child", process_count: 0, ram_bytes: 0, ram_provenance: "unknown", cpu_usage_percent: null, cpu_provenance: "unknown" },
+          },
+          nodes: [
+            { pid: 7001, ppid: 5150, role: "terminal", name: "pwsh.exe", ram_bytes: 43_610_036, ram_provenance: "measured", cpu_usage_percent: 9.0, cpu_provenance: "measured" },
+          ],
+        }),
+      },
+    });
+    renderApp();
+    await connected();
+
+    await waitFor(() => expect(bar()).toHaveTextContent("CPU: 12,5% (medida)"), { timeout: 3500 });
+    await user.click(screen.getByRole("tab", { name: /^Monitoramento/ }));
+
+    const mon = document.getElementById("main-view-monitoramento")!;
+    expect(mon).not.toHaveAttribute("hidden");
+    expect(mon).toHaveTextContent("12,5%");
+    expect(mon).toHaveTextContent("128,4 MB");
+    expect(mon).toHaveTextContent("pwsh.exe");
+    expect(mon).toHaveTextContent("Previsto na fase 4D.4.3 — nenhum dado simulado exibido.");
+
+    await user.click(screen.getByRole("tab", { name: /^Conversas/ }));
+    expect(xtermLog.disposed).toBe(0);
+  }, 10000);
 });

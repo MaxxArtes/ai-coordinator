@@ -168,7 +168,7 @@ describe("CSS and component rules", () => {
     expect(decl(low, "animation")).toEqual(["none !important"]);
   });
 
-  it("only typed telemetry contracts and StatusBar read cpu_usage_percent (4D.4.1)", () => {
+  it("only typed telemetry contracts, history helpers, MonitoringView, and StatusBar read cpu_usage_percent (4D.4.2)", () => {
     const readers = PROD_TS.flatMap((file) =>
       stripComments(css(file))
         .split("\n")
@@ -176,6 +176,8 @@ describe("CSS and component rules", () => {
         .filter((l) => l.text.includes("cpu_usage_percent")),
     );
     expect(Array.from(new Set(readers.map((r) => r.file))).sort()).toEqual([
+      "components/monitoring/MonitoringView.tsx",
+      "components/monitoring/history.ts",
       "components/shell/AppHeader.tsx",
       "components/shell/StatusBar.tsx",
     ]);

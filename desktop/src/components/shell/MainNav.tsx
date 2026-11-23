@@ -11,7 +11,7 @@ export type MainViewId = "conversas" | "monitoramento" | "missoes";
 
 export const MAIN_VIEWS: ReadonlyArray<{ id: MainViewId; label: string; planned: boolean }> = [
   { id: "conversas", label: "Conversas", planned: false },
-  { id: "monitoramento", label: "Monitoramento", planned: true },
+  { id: "monitoramento", label: "Monitoramento", planned: false },
   { id: "missoes", label: "Missões", planned: true },
 ];
 
