@@ -19,6 +19,8 @@ import os
 import re
 import shutil
 import string
+import subprocess
+import sys
 import threading
 import time
 from dataclasses import dataclass, field
@@ -1059,6 +1061,7 @@ else:
         def __init__(self) -> None:
             self._prev_cpu: Optional[Tuple[int, int]] = None
             self._prev_net: Optional[Tuple[int, int]] = None
+            self._cached_darwin_ram_total: Optional[int] = None
 
         def sample(self, elapsed_seconds: Optional[float], cpu_count: int) -> SystemResourcesMetrics:
             cpu_pct: Optional[float] = None
@@ -1100,6 +1103,74 @@ else:
                         ram_prov = MetricProvenance.MEASURED
                 except (OSError, ValueError):
                     pass
+            elif sys.platform == "darwin":
+                if self._cached_darwin_ram_total is None:
+                    total_mem: Optional[int] = None
+                    try:
+                        libc = ctypes.CDLL("libc.dylib")
+                        val = ctypes.c_uint64(0)
+                        sz = ctypes.c_size_t(ctypes.sizeof(val))
+                        rc = libc.sysctlbyname(
+                            b"hw.memsize", ctypes.byref(val), ctypes.byref(sz), None, 0
+                        )
+                        if rc == 0 and val.value > 0:
+                            total_mem = int(val.value)
+                    except (OSError, AttributeError, ValueError):
+                        total_mem = None
+                    if total_mem is None:
+                        try:
+                            out = subprocess.run(
+                                ["sysctl", "-n", "hw.memsize"],
+                                capture_output=True,
+                                text=True,
+                                timeout=2,
+                                check=False,
+                            )
+                            if out.returncode == 0 and out.stdout.strip().isdigit():
+                                parsed = int(out.stdout.strip())
+                                if parsed > 0:
+                                    total_mem = parsed
+                        except (OSError, subprocess.SubprocessError, ValueError):
+                            total_mem = None
+                    if total_mem is not None and total_mem > 0:
+                        self._cached_darwin_ram_total = total_mem
+                ram_total = self._cached_darwin_ram_total or 0
+                if ram_total > 0:
+                    try:
+                        vm = subprocess.run(
+                            ["vm_stat"],
+                            capture_output=True,
+                            text=True,
+                            timeout=2,
+                            check=False,
+                        )
+                        if vm.returncode == 0:
+                            page_size = 4096
+                            free_pages = inactive_pages = speculative_pages = 0
+                            m_ps = re.search(r"page size of (\d+) bytes", vm.stdout)
+                            if m_ps:
+                                page_size = max(1, int(m_ps.group(1)))
+                            for line in vm.stdout.splitlines():
+                                if ":" not in line:
+                                    continue
+                                k, v = line.split(":", 1)
+                                digits = "".join(ch for ch in v if ch.isdigit())
+                                if not digits:
+                                    continue
+                                count = int(digits)
+                                kl = k.strip().lower()
+                                if kl == "pages free":
+                                    free_pages = count
+                                elif kl == "pages inactive":
+                                    inactive_pages = count
+                                elif kl == "pages speculative":
+                                    speculative_pages = count
+                            ram_avail = min(ram_total, (free_pages + inactive_pages + speculative_pages) * page_size)
+                            ram_used = max(0, ram_total - ram_avail)
+                            ram_pct = round((ram_used / float(ram_total)) * 100.0, 2)
+                            ram_prov = MetricProvenance.MEASURED
+                    except (OSError, subprocess.SubprocessError, ValueError):
+                        pass
 
             volumes: List[StorageVolumeMetrics] = []
             try:
