@@ -7,6 +7,7 @@ import {
   buildSparklineSegments,
   CPU_CHART_SCALE_STORAGE_KEY,
   cpuChartMax,
+  formatAgentLabel,
   formatAxisPercent,
   niceCeil,
   readCpuChartScale,
@@ -151,5 +152,16 @@ describe("CPU chart scale", () => {
     expect(readCpuChartScale(blocked)).toBe("focus");
     expect(() => writeCpuChartScale(blocked, "global")).not.toThrow();
     expect(readCpuChartScale(null)).toBe("focus");
+  });
+});
+
+describe("formatAgentLabel", () => {
+  it("names every kind the host and the Core detect, including wrappers (aider, ai-coordinator)", () => {
+    expect(formatAgentLabel("claude")).toBe("Claude");
+    expect(formatAgentLabel("agy")).toBe("Antigravity");
+    expect(formatAgentLabel("aider")).toBe("Aider");
+    expect(formatAgentLabel("ai-coordinator")).toBe("AI Coordinator");
+    expect(formatAgentLabel("novo-agente")).toBe("novo-agente");
+    expect(formatAgentLabel(null)).toBeNull();
   });
 });

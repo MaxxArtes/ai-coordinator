@@ -6,7 +6,8 @@ Collects host/core/webview/terminal/agent/child and system-wide resource usage w
 - Temporal CPU sampling guarded by a configurable minimum interval (`min_sample_interval_ms`, default 200 ms).
 - Explicit provenance (`measured`, `estimated`, `unknown`) and data origin (`live_os`, `offline_cache`, `test_fixture`).
 - Stable `(pid, create_time_ns)` process identity to protect against PID reuse, exits, and restarts.
-- Safe AI agent identification via allowlisted executable names + governed session tracking.
+- Safe AI agent identification via allowlisted executable names, the command line of known wrappers (node, bun,
+  python, cmd, PowerShell; read once per `(pid, create_time_ns)`) + governed session tracking.
 - System-wide CPU, RAM, storage capacity (separate from disk I/O activity), network throughput, and GPU when supported.
 """
 
@@ -39,7 +40,10 @@ SHARED_RAM_NON_ADDITIVE_NOTE = (
     "(páginas compartilhadas como DLLs do WebView2 aparecem em múltiplos processos)."
 )
 
-# Allowlisted AI agent executable prefixes/stems (checked on lowercase basename only; no CLI args inspected).
+# AI agent detection. Same tables and rule as `detect_agent_kind` in desktop/src-tauri/src/main.rs
+# (tests/test_phase4d4_agent_detection.py compares both).
+# Executable stems: exact or followed by "-"/"_" (opencode-cli.exe, codex-code-mode-host.exe). Scripts run by a wrapper
+# must match exactly (codex.js, claude.ps1, aider.exe): gemini_web.py or claude-notes.js are not agents.
 _AGENT_EXECUTABLE_MAP: Tuple[Tuple[str, str], ...] = (
     ("claude", "claude"),
     ("codex", "codex"),
@@ -47,21 +51,213 @@ _AGENT_EXECUTABLE_MAP: Tuple[Tuple[str, str], ...] = (
     ("antigravity", "agy"),
     ("agy", "agy"),
     ("gemini", "gemini"),
+    ("aider", "aider"),
 )
+# Exact stems only: ai-coordinator-desktop.exe is the host, not an agent.
+_AGENT_EXACT_STEMS: Tuple[Tuple[str, str], ...] = (("ai-coordinator", "ai-coordinator"),)
+# npm packages: bare spec for npx/bunx (optionally @version) or a path inside node_modules.
+_AGENT_PACKAGE_MARKERS: Tuple[Tuple[str, str], ...] = (
+    ("@anthropic-ai/claude-code", "claude"),
+    ("@openai/codex", "codex"),
+    ("opencode-ai", "opencode"),
+    ("@google/gemini-cli", "gemini"),
+)
+_AGENT_PYTHON_MODULES: Tuple[Tuple[str, str], ...] = (("aider", "aider"), ("ai_coordinator", "ai-coordinator"))
+_AGENT_NAME_EXTENSIONS: Tuple[str, ...] = (".exe", ".cmd", ".bat", ".bin", ".ps1", ".js", ".mjs", ".cjs", ".py", ".pyw")
+# Wrappers whose command line is inspected; every other process is identified by its executable name alone.
+_AGENT_JS_LAUNCHERS: Tuple[str, ...] = ("node", "nodejs", "bun", "bunx")
+_AGENT_PYTHON_LAUNCHERS: Tuple[str, ...] = ("py", "pyw")
+_AGENT_CMD_LAUNCHERS: Tuple[str, ...] = ("cmd",)
+_AGENT_POWERSHELL_LAUNCHERS: Tuple[str, ...] = ("pwsh", "powershell")
+_AGENT_JS_INLINE_FLAGS: Tuple[str, ...] = ("-e", "--eval", "-p", "--print", "-")
+_AGENT_JS_VALUE_FLAGS: Tuple[str, ...] = (
+    "-r",
+    "--require",
+    "--import",
+    "--loader",
+    "--experimental-loader",
+    "--cwd",
+    "--env-file",
+)
+_AGENT_BUN_SUBCOMMANDS: Tuple[str, ...] = ("run", "x", "exec")
+_AGENT_PYTHON_VALUE_FLAGS: Tuple[str, ...] = ("-X", "-W", "--check-hash-based-pycs")
+_AGENT_CMD_SWITCHES: Tuple[str, ...] = ("/c", "/k", "/r")
+_AGENT_POWERSHELL_FILE_FLAGS: Tuple[str, ...] = ("-file", "-f")
+_AGENT_POWERSHELL_COMMAND_FLAGS: Tuple[str, ...] = ("-command", "-c")
+_ASCII_LOWER = str.maketrans(string.ascii_uppercase, string.ascii_lowercase)
 
 
-def detect_agent_kind(process_name: str) -> Optional[str]:
-    """Identify known AI agent executables safely from basename alone."""
-    lower = (process_name or "").strip().lower()
-    if not lower:
+def _normalize_agent_token(raw: str) -> str:
+    return (raw or "").strip().strip("\"'").strip().replace("\\", "/").translate(_ASCII_LOWER)
+
+
+def _strip_agent_extension(base: str) -> str:
+    for ext in _AGENT_NAME_EXTENSIONS:
+        if base.endswith(ext):
+            return base[: -len(ext)]
+    return base
+
+
+def _agent_kind_from_token(token: str, exact_only: bool) -> Optional[str]:
+    stem = _strip_agent_extension(token.rsplit("/", 1)[-1])
+    if not stem or "." in stem:
         return None
-    for ext in (".exe", ".cmd", ".bat", ".bin"):
-        if lower.endswith(ext):
-            lower = lower[: -len(ext)]
-            break
-    for prefix, kind in _AGENT_EXECUTABLE_MAP:
-        if lower == prefix or lower.startswith(f"{prefix}-") or lower.startswith(f"{prefix}_"):
+    for exact, kind in _AGENT_EXACT_STEMS:
+        if stem == exact:
             return kind
+    for prefix, kind in _AGENT_EXECUTABLE_MAP:
+        if stem == prefix:
+            return kind
+        if not exact_only and (stem.startswith(f"{prefix}-") or stem.startswith(f"{prefix}_")):
+            return kind
+    return None
+
+
+def _agent_kind_from_package(token: str) -> Optional[str]:
+    for marker, kind in _AGENT_PACKAGE_MARKERS:
+        if (
+            token == marker
+            or token.startswith(f"{marker}@")
+            or token.startswith(f"{marker}/")
+            or f"node_modules/{marker}/" in token
+        ):
+            return kind
+    return None
+
+
+def _agent_kind_from_script(raw: str) -> Optional[str]:
+    token = _normalize_agent_token(raw)
+    if not token:
+        return None
+    return _agent_kind_from_package(token) or _agent_kind_from_token(token, True)
+
+
+def _agent_kind_from_module(raw: str) -> Optional[str]:
+    root = _normalize_agent_token(raw).split(".", 1)[0]
+    for module, kind in _AGENT_PYTHON_MODULES:
+        if root == module:
+            return kind
+    return None
+
+
+def _first_command_token(text: str) -> str:
+    s = text.strip()
+    if s.startswith("&"):
+        s = s[1:].strip()
+    quoted = s[:1] in ("\"", "'")
+    s = s.lstrip("\"'")
+    for idx, ch in enumerate(s):
+        if ch in "\"'" or (not quoted and ch.isspace()):
+            return s[:idx]
+    return s
+
+
+def _agent_kind_from_js_args(args: Sequence[str], allow_subcommands: bool) -> Optional[str]:
+    i = 0
+    while i < len(args):
+        arg = args[i].strip()
+        low = arg.translate(_ASCII_LOWER)
+        if low in _AGENT_JS_INLINE_FLAGS:
+            return None
+        if low in _AGENT_JS_VALUE_FLAGS:
+            i += 2
+            continue
+        if low.startswith("-") or (allow_subcommands and low in _AGENT_BUN_SUBCOMMANDS):
+            i += 1
+            continue
+        return _agent_kind_from_script(arg)
+    return None
+
+
+def _agent_kind_from_python_args(args: Sequence[str]) -> Optional[str]:
+    i = 0
+    while i < len(args):
+        arg = args[i].strip()
+        if arg == "-m":
+            return _agent_kind_from_module(args[i + 1]) if i + 1 < len(args) else None
+        if arg.startswith("-m") and len(arg) > 2:
+            return _agent_kind_from_module(arg[2:])
+        if arg in ("-c", "-"):
+            return None
+        if arg in _AGENT_PYTHON_VALUE_FLAGS:
+            i += 2
+            continue
+        if arg.startswith("-"):
+            i += 1
+            continue
+        return _agent_kind_from_script(arg)
+    return None
+
+
+def _agent_kind_from_cmd_args(args: Sequence[str]) -> Optional[str]:
+    for i, arg in enumerate(args):
+        if arg.strip().translate(_ASCII_LOWER) in _AGENT_CMD_SWITCHES:
+            return _agent_kind_from_script(_first_command_token(" ".join(args[i + 1 :])))
+    return None
+
+
+def _agent_kind_from_powershell_args(args: Sequence[str]) -> Optional[str]:
+    for i, arg in enumerate(args):
+        low = arg.strip().translate(_ASCII_LOWER)
+        if low in _AGENT_POWERSHELL_FILE_FLAGS:
+            return _agent_kind_from_script(args[i + 1]) if i + 1 < len(args) else None
+        if low in _AGENT_POWERSHELL_COMMAND_FLAGS:
+            return _agent_kind_from_script(_first_command_token(" ".join(args[i + 1 :])))
+    return None
+
+
+def _is_python_launcher(stem: str) -> bool:
+    if stem in _AGENT_PYTHON_LAUNCHERS:
+        return True
+    if not stem.startswith("python"):
+        return False
+    rest = stem[len("python") :]
+    if rest.endswith("w"):
+        rest = rest[:-1]
+    return all(ch in "0123456789." for ch in rest)
+
+
+def _agent_launcher_stem(process_name: str) -> str:
+    return _strip_agent_extension(_normalize_agent_token(process_name).rsplit("/", 1)[-1])
+
+
+def agent_needs_cmdline(process_name: str) -> bool:
+    """True for wrappers (node, bun, python, cmd, PowerShell) whose agent only shows in the command line."""
+    if detect_agent_kind(process_name) is not None:
+        return False
+    stem = _agent_launcher_stem(process_name)
+    return (
+        stem in _AGENT_JS_LAUNCHERS
+        or _is_python_launcher(stem)
+        or stem in _AGENT_CMD_LAUNCHERS
+        or stem in _AGENT_POWERSHELL_LAUNCHERS
+    )
+
+
+def detect_agent_kind(process_name: str, cmdline: Optional[Sequence[str]] = None) -> Optional[str]:
+    """Identify AI agents by executable name, then by a known wrapper's command line (argv[0] skipped).
+
+    Only the kind is derived; arguments are never kept or returned. A wrapper whose command line could not be read
+    (no permission, process gone) stays unidentified.
+    """
+    token = _normalize_agent_token(process_name)
+    if not token:
+        return None
+    kind = _agent_kind_from_token(token, False)
+    if kind is not None:
+        return kind
+    args = list(cmdline or ())[1:]
+    if not args:
+        return None
+    stem = _agent_launcher_stem(process_name)
+    if stem in _AGENT_JS_LAUNCHERS:
+        return _agent_kind_from_js_args(args, stem.startswith("bun"))
+    if _is_python_launcher(stem):
+        return _agent_kind_from_python_args(args)
+    if stem in _AGENT_CMD_LAUNCHERS:
+        return _agent_kind_from_cmd_args(args)
+    if stem in _AGENT_POWERSHELL_LAUNCHERS:
+        return _agent_kind_from_powershell_args(args)
     return None
 
 
@@ -642,6 +838,80 @@ if os.name == "nt":
         finally:
             _kernel32.CloseHandle(handle)
 
+    _PROCESS_COMMAND_LINE_INFORMATION = 60
+    _MAX_CMDLINE_BUFFER_BYTES = 1 << 20
+
+    class _UNICODE_STRING(ctypes.Structure):
+        _fields_ = [
+            ("Length", wintypes.USHORT),
+            ("MaximumLength", wintypes.USHORT),
+            ("Buffer", ctypes.c_void_p),
+        ]
+
+    _CMDLINE_API: Dict[str, Any] = {}
+    _CMDLINE_API_LOCK = threading.Lock()
+
+    def _cmdline_api() -> Optional[Tuple[Any, Any]]:
+        """NtQueryInformationProcess + CommandLineToArgvW, bound on first use (shell32 is not loaded otherwise)."""
+        with _CMDLINE_API_LOCK:
+            if "api" not in _CMDLINE_API:
+                try:
+                    query = ctypes.WinDLL("ntdll").NtQueryInformationProcess
+                    query.argtypes = [
+                        wintypes.HANDLE,
+                        wintypes.ULONG,
+                        ctypes.c_void_p,
+                        wintypes.ULONG,
+                        ctypes.POINTER(wintypes.ULONG),
+                    ]
+                    query.restype = wintypes.LONG
+                    split = ctypes.WinDLL("shell32").CommandLineToArgvW
+                    split.argtypes = [wintypes.LPCWSTR, ctypes.POINTER(ctypes.c_int)]
+                    split.restype = ctypes.POINTER(wintypes.LPWSTR)
+                    _kernel32.LocalFree.argtypes = [ctypes.c_void_p]
+                    _kernel32.LocalFree.restype = ctypes.c_void_p
+                    _CMDLINE_API["api"] = (query, split)
+                except (OSError, AttributeError):
+                    _CMDLINE_API["api"] = None
+            return _CMDLINE_API["api"]
+
+    def read_process_cmdline(pid: int) -> Optional[List[str]]:
+        """Command line of `pid` split like the OS does (CommandLineToArgvW), or None when it cannot be read."""
+        if pid <= 0:
+            return None
+        api = _cmdline_api()
+        if api is None:
+            return None
+        query, split = api
+        handle = _kernel32.OpenProcess(_PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+        if not handle:
+            return None
+        try:
+            needed = wintypes.ULONG(0)
+            query(handle, _PROCESS_COMMAND_LINE_INFORMATION, None, 0, ctypes.byref(needed))
+            size = int(needed.value)
+            if size < ctypes.sizeof(_UNICODE_STRING) or size > _MAX_CMDLINE_BUFFER_BYTES:
+                return None
+            buf = ctypes.create_string_buffer(size)
+            if query(handle, _PROCESS_COMMAND_LINE_INFORMATION, buf, size, ctypes.byref(needed)) != 0:
+                return None
+            info = _UNICODE_STRING.from_buffer(buf)
+            if not info.Buffer or info.Length == 0:
+                return None
+            text = ctypes.wstring_at(info.Buffer, info.Length // 2)
+        except (OSError, ValueError):
+            return None
+        finally:
+            _kernel32.CloseHandle(handle)
+        argc = ctypes.c_int(0)
+        argv = split(text, ctypes.byref(argc))
+        if not argv:
+            return None
+        try:
+            return [argv[idx] or "" for idx in range(argc.value)]
+        finally:
+            _kernel32.LocalFree(argv)
+
     def _enumerate_windows_topology() -> List[Tuple[int, int]]:
         snapshot = _kernel32.CreateToolhelp32Snapshot(_TH32CS_SNAPPROCESS, 0)
         if not snapshot or snapshot == _INVALID_HANDLE_VALUE:
@@ -1029,6 +1299,39 @@ else:
                 continue
         return all_samples
 
+    _MAX_CMDLINE_READ_BYTES = 128 * 1024
+
+    def read_process_cmdline(pid: int) -> Optional[List[str]]:
+        """Command line of `pid` (`/proc/<pid>/cmdline`, or `ps` elsewhere), or None when it cannot be read."""
+        if pid <= 0:
+            return None
+        if os.path.isdir("/proc"):
+            try:
+                with open(f"/proc/{pid}/cmdline", "rb") as fh:
+                    raw = fh.read(_MAX_CMDLINE_READ_BYTES)
+            except OSError:
+                return None
+            parts = raw.split(b"\0")
+            if parts and parts[-1] == b"":
+                parts.pop()
+            return [p.decode("utf-8", errors="replace") for p in parts] or None
+        env = os.environ.copy()
+        env["LC_ALL"] = "C"
+        try:
+            result = subprocess.run(
+                ["ps", "-ww", "-o", "args=", "-p", str(pid)],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                text=True,
+                env=env,
+                timeout=2,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return None
+        if result.returncode != 0:
+            return None
+        return result.stdout.split() or None
+
     def inspect_os_processes(target_roots: Optional[Iterable[int]] = None) -> List[RawProcessSample]:
         """Inspect POSIX processes via `/proc` (Linux) or `ps` fallback (macOS/BSD)."""
         all_samples = _inspect_proc_processes() if os.path.isdir("/proc") else _inspect_ps_processes()
@@ -1281,12 +1584,16 @@ class ProcessTreeCollector:
         cpu_count_fn: Optional[Callable[[], int]] = None,
         system_sampler: Optional[Callable[[Optional[float], int], Optional[SystemResourcesMetrics]]] = None,
         data_origin: DataOrigin = DataOrigin.LIVE_OS,
+        cmdline_reader: Optional[Callable[[int], Optional[Sequence[str]]]] = None,
     ) -> None:
         if not isinstance(data_origin, DataOrigin):
             raise ValueError(f"Invalid data_origin: {data_origin!r}")
         self._core_pid = os.getpid() if core_pid is None else core_pid
         self._min_sample_interval_ms = validate_sample_interval_ms(min_sample_interval_ms)
         self._process_lister = process_lister or inspect_os_processes
+        # An injected lister describes processes that are not the live ones: never read real command lines for them.
+        self._cmdline_reader = cmdline_reader or (read_process_cmdline if process_lister is None else None)
+        self._cmdline_kind_by_identity: Dict[Tuple[int, int], Optional[str]] = {}
         self._clock_ns = clock_ns or time.monotonic_ns
         self._cpu_count_fn = cpu_count_fn or (lambda: os.cpu_count() or 1)
         self._default_system_sampler = _SystemResourceSampler() if system_sampler is None else None
@@ -1319,6 +1626,27 @@ class ProcessTreeCollector:
             agent_pids=agent_pids,
         )
 
+    def _agent_kind(
+        self,
+        sample: RawProcessSample,
+        next_cmdline_kinds: Dict[Tuple[int, int], Optional[str]],
+    ) -> Optional[str]:
+        """Name first; a wrapper's command line is read once per `(pid, create_time_ns)` and only its kind is kept."""
+        kind = detect_agent_kind(sample.name)
+        if kind is not None or sample.create_time_ns is None or not agent_needs_cmdline(sample.name):
+            return kind
+        identity = (sample.pid, sample.create_time_ns)
+        if identity in self._cmdline_kind_by_identity:
+            kind = self._cmdline_kind_by_identity[identity]
+        elif self._cmdline_reader is not None:
+            try:
+                cmdline = self._cmdline_reader(sample.pid)
+            except Exception:
+                cmdline = None
+            kind = detect_agent_kind(sample.name, cmdline) if cmdline else None
+        next_cmdline_kinds[identity] = kind
+        return kind
+
     def _classify_role(
         self,
         sample: RawProcessSample,
@@ -1327,6 +1655,7 @@ class ProcessTreeCollector:
         core_pid: Optional[int],
         terminal_pids: Dict[int, Optional[int]],
         agent_pids: Dict[int, Tuple[Optional[int], Optional[str], Optional[str]]],
+        next_cmdline_kinds: Dict[Tuple[int, int], Optional[str]],
     ) -> Tuple[str, Optional[str], Optional[str]]:
         if host_pid is not None and sample.pid == host_pid:
             return "host", None, None
@@ -1335,12 +1664,12 @@ class ProcessTreeCollector:
         if "webview" in sample.name.lower():
             return "webview", None, None
 
+        detected = self._agent_kind(sample, next_cmdline_kinds)
         if sample.pid in agent_pids:
             expected_ct, kind_hint, sess_id = agent_pids[sample.pid]
             if expected_ct is None or sample.create_time_ns is None or expected_ct == sample.create_time_ns:
-                return "agent", kind_hint or detect_agent_kind(sample.name), sess_id
+                return "agent", kind_hint or detected, sess_id
 
-        detected = detect_agent_kind(sample.name)
         if detected is not None:
             return "agent", detected, None
 
@@ -1460,6 +1789,7 @@ class ProcessTreeCollector:
 
             nodes: List[ProcessNodeMetrics] = []
             next_cpu_by_identity: Dict[Tuple[int, Optional[int]], float] = {}
+            next_cmdline_kinds: Dict[Tuple[int, int], Optional[str]] = {}
 
             for sample in subtree:
                 identity = (sample.pid, sample.create_time_ns)
@@ -1499,6 +1829,7 @@ class ProcessTreeCollector:
                     core_pid=effective_core_pid,
                     terminal_pids=term_map,
                     agent_pids=agent_map,
+                    next_cmdline_kinds=next_cmdline_kinds,
                 )
                 nodes.append(
                     ProcessNodeMetrics(
@@ -1632,6 +1963,7 @@ class ProcessTreeCollector:
             )
 
             self._previous_cpu_by_identity = next_cpu_by_identity
+            self._cmdline_kind_by_identity = next_cmdline_kinds
             self._last_sample_at_ns = now_ns
             self._last_snapshot = snapshot
             return snapshot

@@ -91,6 +91,8 @@ const AGENT_DISPLAY: Record<string, string> = {
   opencode: "OpenCode",
   agy: "Antigravity",
   gemini: "Gemini",
+  aider: "Aider",
+  "ai-coordinator": "AI Coordinator",
 };
 
 export function formatAgentLabel(kind?: string | null): string | null {

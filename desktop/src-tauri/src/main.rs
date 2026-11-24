@@ -15,7 +15,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use sysinfo::{Disks, Networks, Pid, ProcessRefreshKind, System};
+use sysinfo::{Disks, Networks, Pid, ProcessRefreshKind, System, UpdateKind};
 use tauri::{Emitter, State};
 
 #[cfg(windows)]
@@ -1367,6 +1367,263 @@ fn read_linux_disk_counters() -> Option<(u64, u64, u64)> {
     if matched { Some((read_bytes, write_bytes, io_ms)) } else { None }
 }
 
+// AI agent detection: same tables and rule as `detect_agent_kind` in desktop/ipc/collector.py
+// (tests/test_phase4d4_agent_detection.py compares both). Executable stems match exactly or followed by "-"/"_";
+// a script run by a wrapper (node, bun, python, cmd, PowerShell) must match exactly. Only the kind is kept.
+const AGENT_EXECUTABLE_MAP: [(&str, &str); 7] = [
+    ("claude", "claude"),
+    ("codex", "codex"),
+    ("opencode", "opencode"),
+    ("antigravity", "agy"),
+    ("agy", "agy"),
+    ("gemini", "gemini"),
+    ("aider", "aider"),
+];
+const AGENT_EXACT_STEMS: [(&str, &str); 1] = [("ai-coordinator", "ai-coordinator")];
+const AGENT_PACKAGE_MARKERS: [(&str, &str); 4] = [
+    ("@anthropic-ai/claude-code", "claude"),
+    ("@openai/codex", "codex"),
+    ("opencode-ai", "opencode"),
+    ("@google/gemini-cli", "gemini"),
+];
+const AGENT_PYTHON_MODULES: [(&str, &str); 2] = [("aider", "aider"), ("ai_coordinator", "ai-coordinator")];
+const AGENT_NAME_EXTENSIONS: [&str; 10] = [".exe", ".cmd", ".bat", ".bin", ".ps1", ".js", ".mjs", ".cjs", ".py", ".pyw"];
+const AGENT_JS_LAUNCHERS: [&str; 4] = ["node", "nodejs", "bun", "bunx"];
+const AGENT_PYTHON_LAUNCHERS: [&str; 2] = ["py", "pyw"];
+const AGENT_CMD_LAUNCHERS: [&str; 1] = ["cmd"];
+const AGENT_POWERSHELL_LAUNCHERS: [&str; 2] = ["pwsh", "powershell"];
+const AGENT_JS_INLINE_FLAGS: [&str; 5] = ["-e", "--eval", "-p", "--print", "-"];
+const AGENT_JS_VALUE_FLAGS: [&str; 7] = [
+    "-r",
+    "--require",
+    "--import",
+    "--loader",
+    "--experimental-loader",
+    "--cwd",
+    "--env-file",
+];
+const AGENT_BUN_SUBCOMMANDS: [&str; 3] = ["run", "x", "exec"];
+const AGENT_PYTHON_VALUE_FLAGS: [&str; 3] = ["-X", "-W", "--check-hash-based-pycs"];
+const AGENT_CMD_SWITCHES: [&str; 3] = ["/c", "/k", "/r"];
+const AGENT_POWERSHELL_FILE_FLAGS: [&str; 2] = ["-file", "-f"];
+const AGENT_POWERSHELL_COMMAND_FLAGS: [&str; 2] = ["-command", "-c"];
+
+fn normalize_agent_token(raw: &str) -> String {
+    raw.trim()
+        .trim_matches(|c: char| c == '"' || c == '\'')
+        .trim()
+        .replace('\\', "/")
+        .to_ascii_lowercase()
+}
+
+fn strip_agent_extension(base: &str) -> &str {
+    for ext in AGENT_NAME_EXTENSIONS {
+        if let Some(stem) = base.strip_suffix(ext) {
+            return stem;
+        }
+    }
+    base
+}
+
+fn agent_kind_from_token(token: &str, exact_only: bool) -> Option<&'static str> {
+    let stem = strip_agent_extension(token.rsplit('/').next().unwrap_or(""));
+    if stem.is_empty() || stem.contains('.') {
+        return None;
+    }
+    for (exact, kind) in AGENT_EXACT_STEMS {
+        if stem == exact {
+            return Some(kind);
+        }
+    }
+    for (prefix, kind) in AGENT_EXECUTABLE_MAP {
+        if stem == prefix {
+            return Some(kind);
+        }
+        if !exact_only
+            && (stem.starts_with(&format!("{prefix}-")) || stem.starts_with(&format!("{prefix}_")))
+        {
+            return Some(kind);
+        }
+    }
+    None
+}
+
+fn agent_kind_from_package(token: &str) -> Option<&'static str> {
+    for (marker, kind) in AGENT_PACKAGE_MARKERS {
+        if token == marker
+            || token.starts_with(&format!("{marker}@"))
+            || token.starts_with(&format!("{marker}/"))
+            || token.contains(&format!("node_modules/{marker}/"))
+        {
+            return Some(kind);
+        }
+    }
+    None
+}
+
+fn agent_kind_from_script(raw: &str) -> Option<&'static str> {
+    let token = normalize_agent_token(raw);
+    if token.is_empty() {
+        return None;
+    }
+    agent_kind_from_package(&token).or_else(|| agent_kind_from_token(&token, true))
+}
+
+fn agent_kind_from_module(raw: &str) -> Option<&'static str> {
+    let module = normalize_agent_token(raw);
+    let root = module.split('.').next().unwrap_or("");
+    for (name, kind) in AGENT_PYTHON_MODULES {
+        if root == name {
+            return Some(kind);
+        }
+    }
+    None
+}
+
+fn first_command_token(text: &str) -> &str {
+    let mut s = text.trim();
+    if let Some(rest) = s.strip_prefix('&') {
+        s = rest.trim();
+    }
+    let quoted = s.starts_with('"') || s.starts_with('\'');
+    let s = s.trim_start_matches(|c: char| c == '"' || c == '\'');
+    let end = s
+        .char_indices()
+        .find(|&(_, c)| c == '"' || c == '\'' || (!quoted && c.is_whitespace()))
+        .map(|(idx, _)| idx)
+        .unwrap_or(s.len());
+    &s[..end]
+}
+
+fn agent_kind_from_js_args(args: &[String], allow_subcommands: bool) -> Option<&'static str> {
+    let mut i = 0;
+    while i < args.len() {
+        let arg = args[i].trim();
+        let low = arg.to_ascii_lowercase();
+        if AGENT_JS_INLINE_FLAGS.contains(&low.as_str()) {
+            return None;
+        }
+        if AGENT_JS_VALUE_FLAGS.contains(&low.as_str()) {
+            i += 2;
+            continue;
+        }
+        if low.starts_with('-') || (allow_subcommands && AGENT_BUN_SUBCOMMANDS.contains(&low.as_str())) {
+            i += 1;
+            continue;
+        }
+        return agent_kind_from_script(arg);
+    }
+    None
+}
+
+fn agent_kind_from_python_args(args: &[String]) -> Option<&'static str> {
+    let mut i = 0;
+    while i < args.len() {
+        let arg = args[i].trim();
+        if arg == "-m" {
+            return args.get(i + 1).and_then(|module| agent_kind_from_module(module));
+        }
+        if arg.starts_with("-m") && arg.len() > 2 {
+            return agent_kind_from_module(&arg[2..]);
+        }
+        if arg == "-c" || arg == "-" {
+            return None;
+        }
+        if AGENT_PYTHON_VALUE_FLAGS.contains(&arg) {
+            i += 2;
+            continue;
+        }
+        if arg.starts_with('-') {
+            i += 1;
+            continue;
+        }
+        return agent_kind_from_script(arg);
+    }
+    None
+}
+
+fn agent_kind_from_cmd_args(args: &[String]) -> Option<&'static str> {
+    for (i, arg) in args.iter().enumerate() {
+        let low = arg.trim().to_ascii_lowercase();
+        if AGENT_CMD_SWITCHES.contains(&low.as_str()) {
+            return agent_kind_from_script(first_command_token(&args[i + 1..].join(" ")));
+        }
+    }
+    None
+}
+
+fn agent_kind_from_powershell_args(args: &[String]) -> Option<&'static str> {
+    for (i, arg) in args.iter().enumerate() {
+        let low = arg.trim().to_ascii_lowercase();
+        if AGENT_POWERSHELL_FILE_FLAGS.contains(&low.as_str()) {
+            return args.get(i + 1).and_then(|script| agent_kind_from_script(script));
+        }
+        if AGENT_POWERSHELL_COMMAND_FLAGS.contains(&low.as_str()) {
+            return agent_kind_from_script(first_command_token(&args[i + 1..].join(" ")));
+        }
+    }
+    None
+}
+
+fn is_python_launcher(stem: &str) -> bool {
+    if AGENT_PYTHON_LAUNCHERS.contains(&stem) {
+        return true;
+    }
+    match stem.strip_prefix("python") {
+        Some(rest) => {
+            let rest = rest.strip_suffix('w').unwrap_or(rest);
+            rest.chars().all(|c| c.is_ascii_digit() || c == '.')
+        }
+        None => false,
+    }
+}
+
+fn agent_launcher_stem(name: &str) -> String {
+    let token = normalize_agent_token(name);
+    strip_agent_extension(token.rsplit('/').next().unwrap_or("")).to_string()
+}
+
+fn agent_needs_cmdline(name: &str) -> bool {
+    if detect_agent_kind(name, &[]).is_some() {
+        return false;
+    }
+    let stem = agent_launcher_stem(name);
+    let stem = stem.as_str();
+    AGENT_JS_LAUNCHERS.contains(&stem)
+        || is_python_launcher(stem)
+        || AGENT_CMD_LAUNCHERS.contains(&stem)
+        || AGENT_POWERSHELL_LAUNCHERS.contains(&stem)
+}
+
+fn detect_agent_kind(name: &str, cmd: &[String]) -> Option<&'static str> {
+    let token = normalize_agent_token(name);
+    if token.is_empty() {
+        return None;
+    }
+    if let Some(kind) = agent_kind_from_token(&token, false) {
+        return Some(kind);
+    }
+    let args: &[String] = cmd.get(1..).unwrap_or(&[]);
+    if args.is_empty() {
+        return None;
+    }
+    let stem = agent_launcher_stem(name);
+    let stem = stem.as_str();
+    if AGENT_JS_LAUNCHERS.contains(&stem) {
+        return agent_kind_from_js_args(args, stem.starts_with("bun"));
+    }
+    if is_python_launcher(stem) {
+        return agent_kind_from_python_args(args);
+    }
+    if AGENT_CMD_LAUNCHERS.contains(&stem) {
+        return agent_kind_from_cmd_args(args);
+    }
+    if AGENT_POWERSHELL_LAUNCHERS.contains(&stem) {
+        return agent_kind_from_powershell_args(args);
+    }
+    None
+}
+
 struct ProcessTreeCollectorState {
     sys: System,
     disks: Disks,
@@ -1382,6 +1639,7 @@ struct ProcessTreeCollectorState {
     prev_net_rx: Option<u64>,
     prev_net_tx: Option<u64>,
     seen_identities: HashMap<u32, u64>,
+    cmdline_agent_kinds: HashMap<(u32, u64), Option<&'static str>>,
     last_snapshot: Option<ProcessTreeMetrics>,
 }
 
@@ -1402,39 +1660,9 @@ impl ProcessTreeCollectorState {
             prev_net_rx: None,
             prev_net_tx: None,
             seen_identities: HashMap::new(),
+            cmdline_agent_kinds: HashMap::new(),
             last_snapshot: None,
         }
-    }
-
-    fn detect_agent_kind(name: &str) -> Option<&'static str> {
-        let mut lower = name.trim().to_ascii_lowercase();
-        if lower.is_empty() {
-            return None;
-        }
-        for ext in [".exe", ".cmd", ".bat", ".bin"] {
-            if lower.ends_with(ext) {
-                let new_len = lower.len() - ext.len();
-                lower.truncate(new_len);
-                break;
-            }
-        }
-        let table = [
-            ("claude", "claude"),
-            ("codex", "codex"),
-            ("opencode", "opencode"),
-            ("antigravity", "agy"),
-            ("agy", "agy"),
-            ("gemini", "gemini"),
-        ];
-        for (prefix, kind) in table {
-            if lower == prefix
-                || lower.starts_with(&format!("{prefix}-"))
-                || lower.starts_with(&format!("{prefix}_"))
-            {
-                return Some(kind);
-            }
-        }
-        None
     }
 
     fn aggregate_cpu<'a>(
@@ -1492,6 +1720,7 @@ impl ProcessTreeCollectorState {
         pid: u32,
         ppid: Option<u32>,
         name: &str,
+        agent_kind: Option<&'static str>,
         host_pid: u32,
         core_pid: Option<u32>,
     ) -> (&'static str, Option<String>) {
@@ -1505,7 +1734,7 @@ impl ProcessTreeCollectorState {
         if lower.contains("webview") {
             return ("webview", None);
         }
-        if let Some(agent_kind) = Self::detect_agent_kind(name) {
+        if let Some(agent_kind) = agent_kind {
             return ("agent", Some(agent_kind.to_string()));
         }
         if ppid.is_some() && ppid == core_pid {
@@ -1619,6 +1848,30 @@ impl ProcessTreeCollectorState {
         let mut sorted_pids: Vec<u32> = tree_pids.iter().map(|p| p.as_u32()).collect();
         sorted_pids.sort_unstable();
 
+        // A wrapper's command line is read once per (pid, start_time), only for tree processes; only the kind is kept.
+        let mut cmdline_agent_kinds: HashMap<(u32, u64), Option<&'static str>> = HashMap::new();
+        let mut pending_cmdline: Vec<u32> = Vec::new();
+        for pid_u32 in &sorted_pids {
+            if let Some(proc) = self.sys.process(Pid::from_u32(*pid_u32)) {
+                let identity = (*pid_u32, proc.start_time());
+                if let Some(kind) = self.cmdline_agent_kinds.get(&identity) {
+                    cmdline_agent_kinds.insert(identity, *kind);
+                } else if agent_needs_cmdline(proc.name()) {
+                    pending_cmdline.push(*pid_u32);
+                }
+            }
+        }
+        for pid_u32 in pending_cmdline {
+            let pid = Pid::from_u32(pid_u32);
+            let _ = self
+                .sys
+                .refresh_process_specifics(pid, ProcessRefreshKind::new().with_cmd(UpdateKind::OnlyIfNotSet));
+            if let Some(proc) = self.sys.process(pid) {
+                cmdline_agent_kinds.insert((pid_u32, proc.start_time()), detect_agent_kind(proc.name(), proc.cmd()));
+            }
+        }
+        self.cmdline_agent_kinds = cmdline_agent_kinds;
+
         let mut nodes: Vec<ProcessNodeMetrics> = Vec::with_capacity(sorted_pids.len());
         let mut next_identities: HashMap<u32, u64> = HashMap::with_capacity(sorted_pids.len());
         let mut host_ram_bytes: u64 = 0;
@@ -1674,8 +1927,12 @@ impl ProcessTreeCollectorState {
                     (None, "unknown")
                 };
 
+                let agent_kind = match self.cmdline_agent_kinds.get(&(pid_u32, start_time)) {
+                    Some(kind) => *kind,
+                    None => detect_agent_kind(proc.name(), &[]),
+                };
                 let (role, agent_kind) =
-                    Self::classify_role(pid_u32, ppid, proc.name(), host_pid_u32, core_pid);
+                    Self::classify_role(pid_u32, ppid, proc.name(), agent_kind, host_pid_u32, core_pid);
                 nodes.push(ProcessNodeMetrics {
                     pid: pid_u32,
                     ppid,
