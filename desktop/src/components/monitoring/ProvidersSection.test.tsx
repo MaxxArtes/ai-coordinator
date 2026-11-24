@@ -158,16 +158,39 @@ describe("ProvidersSection — leituras locais dos provedores", () => {
     render(<ProvidersSection telemetry={SNAPSHOT} />);
     const opencode = card("OpenCode");
     expect(opencode.getByText("Janelas de 5 h e semanal")).toBeInTheDocument();
-    expect(opencode.getByText("não se aplica")).toBeInTheDocument();
-    expect(opencode.getByText(NOT_APPLICABLE)).toBeInTheDocument();
+    expect(opencode.getByText(`Não se aplica: ${NOT_APPLICABLE}`)).toBeInTheDocument();
+    expect(opencode.queryByText(/^não (se aplica|suportado)$/i)).not.toBeInTheDocument();
+    expect(screen.getByRole("article", { name: "Provedor OpenCode" }).querySelector(".provider-window__bar")).toBeNull();
     expect(opencode.queryByText("Janela de 5 h")).not.toBeInTheDocument();
     expect(opencode.queryByText("Janela semanal")).not.toBeInTheDocument();
     expect(opencode.getByText(/Gasto:/)).toHaveTextContent("US$");
 
     const openrouter = card("OpenRouter");
+    expect(openrouter.getByText("Não se aplica: este provedor não tem janela de 5 h nem semanal.")).toBeInTheDocument();
     expect(openrouter.getByLabelText("Outras cotas de OpenRouter")).toHaveTextContent("Cota diária :free");
     expect(openrouter.getByLabelText("Outras cotas de OpenRouter")).toHaveTextContent("2,0%");
     expect(openrouter.getByText(/Consulta remota: desligada \(opt-in\)/)).toBeInTheDocument();
+  });
+
+  it("uma janela isolada que não se aplica explica o motivo e não desenha barra vazia", () => {
+    const only5h: ProvidersTelemetrySnapshot = {
+      ...SNAPSHOT,
+      providers: [
+        item("parcial", "Parcial", {
+          windows: {
+            five_hour: win("5h", "Janela de 5 h", null, { supported: false }),
+            weekly: win("weekly", "Janela semanal", 30),
+          },
+        }),
+      ],
+    };
+    render(<ProvidersSection telemetry={only5h} />);
+    const article = screen.getByRole("article", { name: "Provedor Parcial" });
+    const partial = within(article);
+    expect(partial.getByText("Não se aplica: este provedor não tem esta janela.")).toBeInTheDocument();
+    expect(article.querySelectorAll(".provider-window__bar")).toHaveLength(1);
+    expect(partial.getByText("Janela semanal").closest(".provider-window")).toHaveTextContent("30,0%");
+    expect(partial.getByText("Janela de 5 h").closest(".provider-window")).not.toHaveTextContent("indisponível");
   });
 
   it("cota esgotada mostra a liberação prevista e as cotas por grupo", () => {

@@ -356,6 +356,7 @@ describe("App views", () => {
       expect(bar()).toHaveTextContent("CPU: indisponível");
       expect(bar()).toHaveTextContent("Core v0.6.0 · conectado");
       expect(bar()).toHaveTextContent("Terminais: 1 de 4");
+      expect(bar().querySelector(".status-bar__group--end .status-bar__item--hint")).toHaveTextContent("F6 alternar regiões");
       expect(document.body.textContent).not.toMatch(/37[,.]5/);
       expect(screen.getByText("v0.6.1-alpha.50")).toBeInTheDocument();
     },

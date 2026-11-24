@@ -383,7 +383,11 @@ describe("SettingsDialog — configurações integradas (Etapa 4)", () => {
     expect(within(panel).getByLabelText("Valor")).toHaveValue("");
     expect(document.body.textContent).not.toContain(secret);
     expect(screen.queryByDisplayValue(secret)).not.toBeInTheDocument();
-    expect(within(panel).getByText("Uso pelos provedores: não suportado nesta versão")).toBeInTheDocument();
+    expect(within(panel).getByText("Ainda não repassadas aos agentes")).toHaveAttribute(
+      "title",
+      expect.stringContaining("só confere se o nome da chave existe"),
+    );
+    expect(panel.textContent).not.toMatch(/Uso pelos provedores|4D\.4\.3/);
   });
 });
 

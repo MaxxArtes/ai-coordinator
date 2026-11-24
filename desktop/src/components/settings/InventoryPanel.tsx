@@ -74,7 +74,7 @@ function policyValue(item: (typeof POLICY_ITEMS)[number], value: boolean | strin
 }
 
 function windowSummary(label: string, reading: QuotaWindowReading | undefined): string {
-  if (reading?.supported === false) return `${label}: não se aplica`;
+  if (reading?.supported === false) return `${label}: não se aplica (este provedor não tem essa janela)`;
   const pct = formatPercentPtBR(reading?.used_percent);
   const reset = pct ? formatResetPtBR(reading?.resets_at_iso) : null;
   return `${label}: ${pct ?? provenanceBadgeText(reading?.provenance)}${reset ? ` (renova ${reset})` : ""}`;
@@ -287,15 +287,22 @@ export const InventoryPanel: React.FC<InventoryPanelProps> = ({ kind, active, is
                 `leitura ${formatSampleAge(p.observed_at_unix_ms, p.ttl_ms ?? undefined).text}${p.stale ? " (expirada)" : ""}`,
                 resolveOriginBadge(p.data_origin).text,
               ].filter(Boolean);
+              const noWindows = p.windows?.five_hour?.supported === false && p.windows?.weekly?.supported === false;
               return (
                 <div key={p.provider} className="providers-settings-item">
                   <strong>{p.display_name}</strong>{" "}
-                  <span className={provenanceToneClass(p.windows?.five_hour?.provenance)}>
-                    {windowSummary("5h", p.windows?.five_hour)}
-                  </span>{" "}
-                  <span className={provenanceToneClass(p.windows?.weekly?.provenance)}>
-                    {windowSummary("Semanal", p.windows?.weekly)}
-                  </span>
+                  {noWindows ? (
+                    <span className="badge badge--unknown">Não se aplica: este provedor não tem janela de 5 h nem semanal</span>
+                  ) : (
+                    <>
+                      <span className={provenanceToneClass(p.windows?.five_hour?.provenance)}>
+                        {windowSummary("5h", p.windows?.five_hour)}
+                      </span>{" "}
+                      <span className={provenanceToneClass(p.windows?.weekly?.provenance)}>
+                        {windowSummary("Semanal", p.windows?.weekly)}
+                      </span>
+                    </>
+                  )}
                   <span className="settings__note"> · {details.join(" · ")}</span>
                 </div>
               );
@@ -304,8 +311,8 @@ export const InventoryPanel: React.FC<InventoryPanelProps> = ({ kind, active, is
         </div>
       ) : (
         <p>
-          Cotas: indisponíveis até a {routes.quota_milestone || "4D.4.3"}. Credenciais armazenadas não comprovam conexão
-          ou saldo.
+          Cotas: resumo indisponível nesta leitura (a telemetria dos provedores não respondeu). Credenciais armazenadas
+          não comprovam conexão ou saldo.
         </p>
       )}
       {routes.available === false ? (
@@ -436,7 +443,7 @@ export const InventoryPanel: React.FC<InventoryPanelProps> = ({ kind, active, is
   };
 
   return (
-    <section aria-label={title}>
+    <section aria-label={title} className="inventory-panel">
       <h3 className="settings__heading">{title}</h3>
       <p className="settings__summary">
         {kind === "seguranca"

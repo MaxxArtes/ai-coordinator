@@ -1,4 +1,4 @@
-import React, { useMemo } from "react";
+import React, { useMemo, useState } from "react";
 import { Icon } from "../ui/Icon";
 import { mainViewPanelId, mainViewTabId } from "../shell/MainNav";
 import type { ConnectionStatus, RuntimeMetrics } from "../shell/AppHeader";
@@ -18,14 +18,17 @@ import {
   buildSparklineSegments,
   computeMonitoringAlerts,
   computeSeriesStats,
+  cpuChartMax,
   DEFAULT_MONITORING_THRESHOLDS,
   formatAgentLabel,
+  formatAxisPercent,
   formatPercentPtBR,
   formatRatePtBR,
   formatWindowDurationLabel,
   orderedCategories,
   provenanceBadgeText,
   provenanceToneClass,
+  readCpuChartScale,
   resolvedCpuReading,
   resolvedPrivateRamReading,
   resolvedRamReading,
@@ -34,8 +37,11 @@ import {
   ROLE_LABELS,
   sortTopProcesses,
   summarizeSessions,
+  writeCpuChartScale,
+  type CpuChartScale,
   type HistorySample,
   type MonitoringThresholds,
+  type SparklinePadding,
 } from "./history";
 
 export interface MonitoringViewProps {
@@ -57,8 +63,20 @@ export interface MonitoringViewProps {
 
 const CHART_WIDTH = 380;
 const CHART_HEIGHT = 104;
-const CHART_PAD_X = 52;
+/** Left: room for the Y-axis labels ("512,0 MB"). Top and bottom: the line and its round caps stay inside the box. */
+const CHART_PAD_X = 64;
 const CHART_PAD_Y = 12;
+const CHART_PAD_RIGHT = 4;
+const CHART_PADDING: SparklinePadding = { left: CHART_PAD_X, right: CHART_PAD_RIGHT, top: CHART_PAD_Y, bottom: CHART_PAD_Y };
+const CHART_RIGHT = CHART_WIDTH - CHART_PAD_RIGHT;
+
+const browserStorage = (): Storage | null => {
+  try {
+    return typeof window === "undefined" ? null : window.localStorage;
+  } catch {
+    return null;
+  }
+};
 
 const sessionStateBadge = (state?: PaneState): { text: string; className: string } => {
   if (!state || state.kind === "unknown") return { text: "indisponível", className: "badge badge--unknown" };
@@ -211,13 +229,21 @@ export const MonitoringView: React.FC<MonitoringViewProps> = ({
   const sysCpuStats = useMemo(() => computeSeriesStats(sysCpuSeries), [sysCpuSeries]);
   const ramStats = useMemo(() => computeSeriesStats(ramSeries), [ramSeries]);
 
+  const [cpuScale, setCpuScale] = useState<CpuChartScale>(() => readCpuChartScale(browserStorage()));
+  const chooseCpuScale = (mode: CpuChartScale) => {
+    setCpuScale(mode);
+    writeCpuChartScale(browserStorage(), mode);
+  };
+  const cpuMax = useMemo(() => cpuChartMax(cpuSeries, cpuScale), [cpuSeries, cpuScale]);
+  const focusScale = cpuScale === "focus";
+
   const cpuSegments = useMemo(
-    () => buildSparklineSegments(cpuSeries, CHART_WIDTH, CHART_HEIGHT, 100, CHART_PAD_X),
-    [cpuSeries]
+    () => buildSparklineSegments(cpuSeries, CHART_WIDTH, CHART_HEIGHT, cpuMax, CHART_PADDING),
+    [cpuSeries, cpuMax]
   );
   const sysCpuSegments = useMemo(
-    () => buildSparklineSegments(sysCpuSeries, CHART_WIDTH, CHART_HEIGHT, 100, CHART_PAD_X),
-    [sysCpuSeries]
+    () => (focusScale ? [] : buildSparklineSegments(sysCpuSeries, CHART_WIDTH, CHART_HEIGHT, 100, CHART_PADDING)),
+    [sysCpuSeries, focusScale]
   );
 
   const maxObservedRam = useMemo(() => {
@@ -227,16 +253,21 @@ export const MonitoringView: React.FC<MonitoringViewProps> = ({
   }, [ramSeries, thresholds.ramWarnBytes]);
 
   const ramSegments = useMemo(
-    () => (maxObservedRam > 0 ? buildSparklineSegments(ramSeries, CHART_WIDTH, CHART_HEIGHT, maxObservedRam, CHART_PAD_X) : []),
+    () => (maxObservedRam > 0 ? buildSparklineSegments(ramSeries, CHART_WIDTH, CHART_HEIGHT, maxObservedRam, CHART_PADDING) : []),
     [ramSeries, maxObservedRam]
   );
 
-  const hasCpuHistory = cpuSeries.some((v) => v !== null) || sysCpuSeries.some((v) => v !== null);
+  const hasAppCpuHistory = cpuSeries.some((v) => v !== null);
+  const hasCpuHistory = hasAppCpuHistory || sysCpuSeries.some((v) => v !== null);
   const hasRamHistory = ramSeries.some((v) => v !== null);
   const usableH = CHART_HEIGHT - CHART_PAD_Y * 2;
-  const warnLineY = (CHART_PAD_Y + usableH * (1 - Math.min(1, thresholds.cpuWarnPercent / 100))).toFixed(1);
+  const showWarnLine = thresholds.cpuWarnPercent > 0 && thresholds.cpuWarnPercent <= cpuMax;
+  const warnLineY = (CHART_PAD_Y + usableH * (1 - Math.min(1, thresholds.cpuWarnPercent / cpuMax))).toFixed(1);
   const midY = (CHART_PAD_Y + usableH * 0.5).toFixed(1);
   const bottomY = (CHART_HEIGHT - CHART_PAD_Y).toFixed(1);
+  const cpuScaleText = focusScale
+    ? `Escala: 0–${formatAxisPercent(cpuMax)} (pico da janela com margem)`
+    : "Escala: 0–100% (global)";
   const timeStartLabel = formatWindowDurationLabel(history);
 
   const coordBudget = settings?.categories?.coordinator?.values?.flight_budget as
@@ -453,37 +484,70 @@ export const MonitoringView: React.FC<MonitoringViewProps> = ({
               <div>
                 <h3 className="monitoring-panel__title">Histórico de CPU (%)</h3>
                 <div className="monitoring-chart__legend">
-                  <span className="monitoring-legend-item">
-                    <span className="monitoring-dot monitoring-dot--sys" aria-hidden="true" /> Computador
-                  </span>
+                  {!focusScale && (
+                    <span className="monitoring-legend-item">
+                      <span className="monitoring-dot monitoring-dot--sys" aria-hidden="true" /> Computador
+                    </span>
+                  )}
                   <span className="monitoring-legend-item">
                     <span className="monitoring-dot monitoring-dot--app" aria-hidden="true" /> AI Coordinator
                   </span>
+                  {focusScale && <span>Computador: só na escala global</span>}
                 </div>
               </div>
-              <span className="monitoring-panel__meta">{history.length}/60 amostras</span>
+              <div className="monitoring-panel__tools">
+                <div className="monitoring-scale" role="group" aria-label="Escala do gráfico de CPU">
+                  <button
+                    type="button"
+                    className="btn btn--sm monitoring-scale__option"
+                    aria-pressed={focusScale}
+                    onClick={() => chooseCpuScale("focus")}
+                  >
+                    Foco AI Coordinator
+                  </button>
+                  <button
+                    type="button"
+                    className="btn btn--sm monitoring-scale__option"
+                    aria-pressed={!focusScale}
+                    onClick={() => chooseCpuScale("global")}
+                  >
+                    Global 0–100%
+                  </button>
+                </div>
+                <span className="monitoring-panel__meta">{history.length}/60 amostras</span>
+              </div>
             </div>
-            {hasCpuHistory ? (
+            {(focusScale ? hasAppCpuHistory : hasCpuHistory) ? (
               <>
                 <svg
                   className="monitoring-chart"
                   viewBox={`0 0 ${CHART_WIDTH} ${CHART_HEIGHT}`}
                   role="img"
                   aria-label="Histórico recente de CPU"
+                  data-scale={cpuScale}
+                  data-max={cpuMax}
                 >
-                  <line x1={CHART_PAD_X} y1={CHART_PAD_Y} x2={CHART_WIDTH - 4} y2={CHART_PAD_Y} className="monitoring-chart__grid" />
-                  <line x1={CHART_PAD_X} y1={midY} x2={CHART_WIDTH - 4} y2={midY} className="monitoring-chart__grid" />
-                  <line x1={CHART_PAD_X} y1={bottomY} x2={CHART_WIDTH - 4} y2={bottomY} className="monitoring-chart__grid" />
-                  <text x="4" y={CHART_PAD_Y + 6} className="monitoring-chart__axis">100%</text>
-                  <text x="4" y={Number(midY) + 3} className="monitoring-chart__axis">50%</text>
-                  <text x="4" y={bottomY} className="monitoring-chart__axis">0%</text>
-                  <line
-                    x1={CHART_PAD_X}
-                    y1={warnLineY}
-                    x2={CHART_WIDTH - 4}
-                    y2={warnLineY}
-                    className="monitoring-chart__threshold"
-                  />
+                  <line x1={CHART_PAD_X} y1={CHART_PAD_Y} x2={CHART_RIGHT} y2={CHART_PAD_Y} className="monitoring-chart__grid" />
+                  <line x1={CHART_PAD_X} y1={midY} x2={CHART_RIGHT} y2={midY} className="monitoring-chart__grid" />
+                  <line x1={CHART_PAD_X} y1={bottomY} x2={CHART_RIGHT} y2={bottomY} className="monitoring-chart__grid" />
+                  <text x="4" y={CHART_PAD_Y + 4} className="monitoring-chart__axis">
+                    {formatAxisPercent(cpuMax)}
+                  </text>
+                  <text x="4" y={Number(midY) + 4} className="monitoring-chart__axis">
+                    {formatAxisPercent(cpuMax / 2)}
+                  </text>
+                  <text x="4" y={Number(bottomY) + 4} className="monitoring-chart__axis">
+                    0%
+                  </text>
+                  {showWarnLine && (
+                    <line
+                      x1={CHART_PAD_X}
+                      y1={warnLineY}
+                      x2={CHART_RIGHT}
+                      y2={warnLineY}
+                      className="monitoring-chart__threshold"
+                    />
+                  )}
                   {sysCpuSegments.map((d, idx) => (
                     <path key={`sys-${idx}`} d={d} className="monitoring-chart__line monitoring-chart__line--sys" />
                   ))}
@@ -500,9 +564,14 @@ export const MonitoringView: React.FC<MonitoringViewProps> = ({
                   </span>
                   <span>agora</span>
                 </div>
+                <p className="monitoring-chart__scale">{cpuScaleText}</p>
               </>
             ) : (
-              <p className="monitoring-empty">Sem medições de CPU disponíveis no histórico recente.</p>
+              <p className="monitoring-empty">
+                {hasCpuHistory
+                  ? "Sem medições de CPU do AI Coordinator no histórico recente; a CPU do computador aparece na escala global."
+                  : "Sem medições de CPU disponíveis no histórico recente."}
+              </p>
             )}
           </article>
 
@@ -523,16 +592,18 @@ export const MonitoringView: React.FC<MonitoringViewProps> = ({
                   role="img"
                   aria-label="Histórico recente de RAM"
                 >
-                  <line x1={CHART_PAD_X} y1={CHART_PAD_Y} x2={CHART_WIDTH - 4} y2={CHART_PAD_Y} className="monitoring-chart__grid" />
-                  <line x1={CHART_PAD_X} y1={midY} x2={CHART_WIDTH - 4} y2={midY} className="monitoring-chart__grid" />
-                  <line x1={CHART_PAD_X} y1={bottomY} x2={CHART_WIDTH - 4} y2={bottomY} className="monitoring-chart__grid" />
-                  <text x="4" y={CHART_PAD_Y + 6} className="monitoring-chart__axis">
+                  <line x1={CHART_PAD_X} y1={CHART_PAD_Y} x2={CHART_RIGHT} y2={CHART_PAD_Y} className="monitoring-chart__grid" />
+                  <line x1={CHART_PAD_X} y1={midY} x2={CHART_RIGHT} y2={midY} className="monitoring-chart__grid" />
+                  <line x1={CHART_PAD_X} y1={bottomY} x2={CHART_RIGHT} y2={bottomY} className="monitoring-chart__grid" />
+                  <text x="4" y={CHART_PAD_Y + 4} className="monitoring-chart__axis">
                     {formatBytesPtBR(maxObservedRam) ?? "—"}
                   </text>
-                  <text x="4" y={Number(midY) + 3} className="monitoring-chart__axis">
+                  <text x="4" y={Number(midY) + 4} className="monitoring-chart__axis">
                     {formatBytesPtBR(maxObservedRam / 2) ?? "—"}
                   </text>
-                  <text x="4" y={bottomY} className="monitoring-chart__axis">0</text>
+                  <text x="4" y={Number(bottomY) + 4} className="monitoring-chart__axis">
+                    0
+                  </text>
                   {ramSegments.map((d, idx) => (
                     <path key={idx} d={d} className="monitoring-chart__line monitoring-chart__line--ram" />
                   ))}

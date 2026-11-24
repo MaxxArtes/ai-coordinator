@@ -6,6 +6,9 @@ import { formatVersion, isPreviewMode, type ConnectionStatus, type RuntimeMetric
  * - RAM of the process tree as measured by the host, "aguardando" before the first reading, "indisponível (preview)"
  *   without a host. CPU is always "indisponível" until a reliable reading exists (4D.4): its field is never read here.
  * - No live region: the values change every 2 s and must not be announced.
+ * - Narrow windows (components.css): the F6 hint goes first, then "da árvore" and the start of the project path, then
+ *   the qualifiers of the values ("(medida)", "(3 ativos)"), then the path. They leave the screen but stay in the text,
+ *   in the accessibility tree and in each item's tooltip; nothing overlaps.
  */
 export const MAX_TERMINALS = 4;
 
@@ -101,11 +104,27 @@ export function splitProjectPath(path: string): { head: string; tail: string } {
   return i < 0 ? { head: "", tail: trimmed } : { head: trimmed.slice(0, i + 1), tail: trimmed.slice(i + 1) };
 }
 
-const Item: React.FC<{ label: string; value: string }> = ({ label, value }) => (
-  <span className="status-bar__item">
-    <span className="status-bar__label">{label}</span> <span className="status-bar__value">{value}</span>
-  </span>
-);
+/** "128,4 MB (medida · privada)" → the value and the qualifier that narrow windows hide first. */
+export function splitQualifier(text: string): { main: string; detail: string } {
+  const m = /^(.+?)( \([^()]+\))$/.exec(text);
+  return m ? { main: m[1], detail: m[2] } : { main: text, detail: "" };
+}
+
+const Item: React.FC<{ label: string; labelDetail?: string; value: string }> = ({ label, labelDetail = "", value }) => {
+  const { main, detail } = splitQualifier(value);
+  return (
+    <span className="status-bar__item" title={`${label}${labelDetail}: ${value}`}>
+      <span className="status-bar__label">
+        {label}
+        {labelDetail && <span className="status-bar__detail">{labelDetail}</span>}:
+      </span>{" "}
+      <span className="status-bar__value">
+        {main}
+        {detail && <span className="status-bar__detail status-bar__detail--value">{detail}</span>}
+      </span>
+    </span>
+  );
+};
 
 export const StatusBar: React.FC<StatusBarProps> = ({
   isTauri,
@@ -125,11 +144,11 @@ export const StatusBar: React.FC<StatusBarProps> = ({
       <div className="status-bar__group">
         <span className="status-bar__item">{coreStatusText(isTauri, connectionStatus, coreVersion)}</span>
         <Item
-          label="Terminais:"
+          label="Terminais"
           value={`${paneCount} de ${MAX_TERMINALS}${preview ? " (preview)" : activeText ? ` ${activeText}` : ""}`}
         />
-        <Item label="RAM da árvore:" value={treeRamText(isTauri, connectionStatus, metrics, metricsUnavailable)} />
-        <Item label="CPU:" value={treeCpuText(isTauri, connectionStatus, metrics, metricsUnavailable)} />
+        <Item label="RAM" labelDetail=" da árvore" value={treeRamText(isTauri, connectionStatus, metrics, metricsUnavailable)} />
+        <Item label="CPU" value={treeCpuText(isTauri, connectionStatus, metrics, metricsUnavailable)} />
       </div>
       <div className="status-bar__group status-bar__group--end">
         {projectPath && (

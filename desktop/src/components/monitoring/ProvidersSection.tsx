@@ -44,7 +44,20 @@ function boundedPercent(value: number | null | undefined): number {
   return typeof value === "number" && Number.isFinite(value) ? Math.max(0, Math.min(100, value)) : 0;
 }
 
+const NO_WINDOW_TEXT = "este provedor não tem esta janela.";
+const NO_WINDOWS_TEXT = "este provedor não tem janela de 5 h nem semanal.";
+
 const QuotaWindowRow: React.FC<{ reading: QuotaWindowReading }> = ({ reading }) => {
+  if (reading.supported === false) {
+    return (
+      <div className="provider-window">
+        <div className="provider-window__head">
+          <span className="provider-window__label">{reading.label}</span>
+        </div>
+        <p className="provider-card__muted">Não se aplica: {reading.note || NO_WINDOW_TEXT}</p>
+      </div>
+    );
+  }
   const used = formatPercentPtBR(reading.used_percent);
   const rem = formatPercentPtBR(reading.remaining_percent);
   const reset = formatResetPtBR(reading.resets_at_iso);
@@ -236,9 +249,8 @@ const ProviderCard: React.FC<{ item: ProviderTelemetryItem }> = ({ item }) => {
         <div className="provider-window">
           <div className="provider-window__head">
             <span className="provider-window__label">Janelas de 5 h e semanal</span>
-            <span className="provider-window__value">não se aplica</span>
           </div>
-          {win5h.note && <p className="provider-card__muted">{win5h.note}</p>}
+          <p className="provider-card__detail">Não se aplica: {win5h.note || NO_WINDOWS_TEXT}</p>
         </div>
       ) : (
         <div className="provider-card__windows">

@@ -91,7 +91,8 @@ export const SETTINGS_CATEGORIES: SettingsCategory[] = [
   {
     id: "provedores",
     label: "Provedores",
-    summary: "Credenciais no cofre do perfil e rotas de fallback em leitura. Cotas indisponíveis até a 4D.4.3.",
+    summary:
+      "Credenciais no cofre do perfil, rotas de fallback em leitura e resumo de cotas e tokens lidos das fontes locais dos provedores.",
     state: "available",
     backend: "vault",
     items: [],

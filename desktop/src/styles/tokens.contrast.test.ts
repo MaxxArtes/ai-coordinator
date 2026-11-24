@@ -55,6 +55,9 @@ function pairs(): Pair[] {
   for (const bg of ["--c-chrome", "--c-nav-inset", "--c-surface"]) out.push(["--c-accent-strong", bg, 3]);
   out.push(["--c-term-cursor", "--c-term-bg", 3]);
   for (const bg of ["--c-surface-raised", "--c-surface-hover"]) out.push(["--c-ring-unknown", bg, 3]);
+  // Monitoramento charts on --c-nav-inset: series lines (AI Coordinator, computer, RAM) and axis labels.
+  for (const fg of ["--c-accent", "--c-warn", "--c-ok"]) out.push([fg, "--c-nav-inset", 3]);
+  out.push(["--c-fg-subtle", "--c-nav-inset", 4.5]);
   return out;
 }
 

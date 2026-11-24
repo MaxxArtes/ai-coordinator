@@ -766,9 +766,38 @@
 
 .settings__panel-header {
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
   justify-content: space-between;
+  gap: var(--sp-2) var(--sp-3);
+}
+
+/*
+ * Agentes, Rotas de fallback and Segurança: one column, so the reload button keeps a row of its own under the summary
+ * and the status at any width. The empty live region stays mounted and cancels its own gap.
+ */
+.inventory-panel {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
   gap: var(--sp-3);
+  min-width: 0;
+}
+
+.inventory-panel > * {
+  max-width: 100%;
+  margin-top: 0;
+  margin-bottom: 0;
+}
+
+.inventory-panel > ul,
+.inventory-panel > dl,
+.inventory-panel > .settings__providers-summary {
+  align-self: stretch;
+}
+
+.inventory-panel > .settings-form__notice:empty {
+  margin-top: calc(-1 * var(--sp-3));
 }
 
 .settings__heading {
@@ -874,8 +903,12 @@
   color: var(--c-fg-subtle);
 }
 
-/* The live region stays mounted while empty; it must not add a row gap to the panel then. */
-.settings-form__notice:empty {
+/*
+ * The live region stays mounted while empty; it must not add a row gap to the panel then. Only where it sits in the
+ * panel's or the form's column: inside a block (the inventory panels) the pull would put it over what comes before.
+ */
+.settings__panel > .settings-form__notice:empty,
+.settings-form > .settings-form__notice:empty {
   margin-top: calc(-1 * var(--sp-4));
 }
 
@@ -1594,7 +1627,7 @@
   justify-content: space-between;
   gap: var(--sp-4);
   min-height: var(--h-statusbar);
-  padding: 0 var(--sp-3);
+  padding: 2px var(--sp-3);
   border-top: 1px solid var(--c-border);
   background: var(--c-chrome);
   color: var(--c-fg-muted);
@@ -1604,18 +1637,24 @@
   white-space: nowrap;
 }
 
-/* The first group (Core, terminals, RAM, CPU) never shrinks: only the project path does. */
+/*
+ * The first group (Core, terminals, RAM, CPU) keeps its width while the end group (project path, F6 hint) takes only
+ * what is left, so the two never overlap. Should the essential values alone not fit, they wrap to a second line.
+ */
 .status-bar__group {
   display: flex;
-  flex: none;
+  flex: 0 1 auto;
+  flex-wrap: wrap;
   align-items: center;
-  gap: var(--sp-4);
+  gap: 2px var(--sp-4);
 }
 
 .status-bar__group--end {
   flex: 1 1 0%;
+  flex-wrap: nowrap;
   justify-content: flex-end;
   min-width: 0;
+  overflow: hidden;
 }
 
 .status-bar__item {
@@ -1648,7 +1687,10 @@
   min-width: 0;
 }
 
-/* The ellipsis falls in the middle of the path: the head shrinks, the folder name never does. */
+/*
+ * The ellipsis falls in the middle of the path: the head shrinks, the folder name does not; it is only cut (with an
+ * ellipsis) when the whole path has less room than the name itself.
+ */
 .status-bar__path-head {
   min-width: 0;
   overflow: hidden;
@@ -1657,6 +1699,59 @@
 
 .status-bar__path-tail {
   flex: none;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/*
+ * Narrow windows: secondary parts leave the screen in order, never on top of the essential values (Core, terminals,
+ * RAM, CPU). Below the 1024 px window minimum (960 px in the homologation) only the values and the folder name stay.
+ * Visually hidden, not removed: they stay in the text, the accessibility tree and the item's tooltip.
+ */
+@media (max-width: 1240px) {
+  .status-bar__item--hint {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    margin: -1px;
+    overflow: hidden;
+    clip: rect(0, 0, 0, 0);
+  }
+}
+
+@media (max-width: 1100px) {
+  .status-bar__detail:not(.status-bar__detail--value),
+  .status-bar__path-head {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    margin: -1px;
+    overflow: hidden;
+    clip: rect(0, 0, 0, 0);
+  }
+}
+
+@media (max-width: 1023px) {
+  .status-bar__detail--value {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    margin: -1px;
+    overflow: hidden;
+    clip: rect(0, 0, 0, 0);
+  }
+}
+
+@media (max-width: 640px) {
+  .status-bar__path {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    margin: -1px;
+    overflow: hidden;
+    clip: rect(0, 0, 0, 0);
+  }
 }
 
 .kbd {
@@ -1692,6 +1787,57 @@
 
   .terminal-pane__mount ::-webkit-scrollbar-thumb {
     background: var(--c-term-fg);
+  }
+
+  /*
+   * Charts draw their series in system colors, on the system background: the AI Coordinator in Highlight, the computer
+   * in the text color and dashed, so the two never depend on a color the theme replaced. The legend dots follow.
+   */
+  .monitoring-chart,
+  .monitoring-dot,
+  .monitoring-scale__option[aria-pressed="true"] {
+    forced-color-adjust: none;
+  }
+
+  .monitoring-chart {
+    border-color: var(--c-border-control);
+    background: var(--c-term-bg);
+  }
+
+  .monitoring-chart__grid {
+    stroke: var(--c-border-control);
+  }
+
+  .monitoring-chart__axis {
+    fill: var(--c-term-fg);
+  }
+
+  .monitoring-chart__threshold {
+    stroke: var(--c-term-fg);
+  }
+
+  .monitoring-chart__line--cpu,
+  .monitoring-chart__line--ram {
+    stroke: var(--c-accent-strong);
+  }
+
+  .monitoring-chart__line--sys {
+    stroke: var(--c-term-fg);
+    stroke-dasharray: 4 2;
+  }
+
+  .monitoring-dot--app {
+    background: var(--c-accent-strong);
+  }
+
+  .monitoring-dot--sys {
+    background: var(--c-term-fg);
+  }
+
+  .monitoring-scale__option[aria-pressed="true"] {
+    border-color: var(--c-term-selection);
+    background: var(--c-term-selection);
+    color: var(--c-term-selection-fg);
   }
 }
 
@@ -2089,6 +2235,34 @@
 
 .monitoring-chart__line--ram {
   stroke: var(--c-ok);
+}
+
+.monitoring-chart__scale {
+  margin: 0;
+  font-size: var(--fs-xs);
+  color: var(--c-fg-subtle);
+}
+
+.monitoring-panel__tools {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: flex-end;
+  gap: var(--sp-2);
+}
+
+/* CPU chart scale: two buttons, the pressed one in the accent color and bold (not by color alone). */
+.monitoring-scale {
+  display: inline-flex;
+  flex-wrap: wrap;
+  gap: 2px;
+}
+
+.monitoring-scale__option[aria-pressed="true"] {
+  border-color: var(--c-accent);
+  background: var(--c-surface-hover);
+  color: var(--c-accent);
+  font-weight: var(--fw-semibold);
 }
 
 .monitoring-empty {

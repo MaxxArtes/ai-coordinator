@@ -4,7 +4,7 @@
 import React from "react";
 import { describe, expect, it } from "vitest";
 import { render, screen } from "@testing-library/react";
-import { formatBytesPtBR, splitProjectPath, StatusBar, type StatusBarProps } from "./StatusBar";
+import { formatBytesPtBR, splitProjectPath, splitQualifier, StatusBar, type StatusBarProps } from "./StatusBar";
 
 const base: StatusBarProps = {
   isTauri: true,
@@ -134,6 +134,46 @@ describe("StatusBar", () => {
     expect(path.querySelector(".status-bar__path-head")).toHaveTextContent("D:\\work\\clients\\");
     expect(path.querySelector(".status-bar__path-tail")).toHaveTextContent("ai-coordinator");
     expect(bar().querySelector(".status-bar__group:not(.status-bar__group--end)")).toHaveTextContent("CPU: indisponível");
+  });
+
+  it("narrow windows (960 px): only the qualifiers and the hint are marked to go, the values stay whole (4D.4 r2)", () => {
+    render(
+      <StatusBar
+        {...base}
+        activeText="(3 ativos)"
+        metrics={{
+          ...base.metrics!,
+          total_private_ram_bytes: 134_637_159,
+          private_ram_provenance: "measured",
+          cpu_usage_percent: 4.5,
+          cpu_provenance: "measured",
+        }}
+      >
+        <span className="status-bar__item status-bar__item--hint">F6 alternar regiões</span>
+      </StatusBar>,
+    );
+    expect(bar()).toHaveTextContent("Terminais: 2 de 4 (3 ativos)");
+    expect(bar()).toHaveTextContent("RAM da árvore: 128,4 MB (medida · privada)");
+    expect(bar()).toHaveTextContent("CPU: 4,5% (medida)");
+    const details = Array.from(bar().querySelectorAll(".status-bar__detail"));
+    expect(details.map((d) => d.textContent)).toEqual([" (3 ativos)", " da árvore", " (medida · privada)", " (medida)"]);
+    expect(bar().querySelectorAll(".status-bar__detail--value")).toHaveLength(3);
+    for (const essential of ["Core v0.6.0 · conectado", "2 de 4", "128,4 MB", "4,5%"]) {
+      expect(details.some((d) => d.textContent?.includes(essential))).toBe(false);
+    }
+    const items = Array.from(bar().querySelectorAll(".status-bar__group:not(.status-bar__group--end) .status-bar__item[title]")).map(
+      (i) => i.getAttribute("title"),
+    );
+    expect(items).toEqual(["Terminais: 2 de 4 (3 ativos)", "RAM da árvore: 128,4 MB (medida · privada)", "CPU: 4,5% (medida)"]);
+    expect(bar().querySelector(".status-bar__group--end .status-bar__item--hint")).toHaveTextContent("F6 alternar regiões");
+  });
+
+  it("splits a value from its qualifier only at a final parenthesis", () => {
+    expect(splitQualifier("128,4 MB (medida · privada)")).toEqual({ main: "128,4 MB", detail: " (medida · privada)" });
+    expect(splitQualifier("indisponível (preview)")).toEqual({ main: "indisponível", detail: " (preview)" });
+    expect(splitQualifier("indisponível")).toEqual({ main: "indisponível", detail: "" });
+    expect(splitQualifier("aguardando")).toEqual({ main: "aguardando", detail: "" });
+    expect(splitQualifier("(medida)")).toEqual({ main: "(medida)", detail: "" });
   });
 
   it("formats bytes in base 1024 and refuses what is not a measurement", () => {

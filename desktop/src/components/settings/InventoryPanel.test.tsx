@@ -74,7 +74,8 @@ describe("InventoryPanel — inventário honesto (K6)", () => {
     expect(await screen.findByRole("alert")).toHaveTextContent("Configuração de rotas ilegível; nada foi alterado.");
     expect(screen.queryByText(/Nenhuma rota/)).not.toBeInTheDocument();
     expect(screen.queryByRole("list")).not.toBeInTheDocument();
-    expect(screen.getByText(/Cotas: indisponíveis até a 4D\.4\.3/)).toBeInTheDocument();
+    expect(screen.getByText(/Cotas: resumo indisponível nesta leitura/)).toBeInTheDocument();
+    expect(document.body.textContent).not.toMatch(/4D\.4\.3/);
   });
 
   it("rotas padrão empacotadas: diz a origem; candidatos só com cliente, modelo e esforço", async () => {
@@ -194,8 +195,8 @@ describe("InventoryPanel — inventário honesto (K6)", () => {
     expect(codex).toHaveTextContent("Semanal: 3,0%");
     expect(codex).toHaveTextContent("Tokens: 1.160 · Contexto: 420 de 1.000 · leitura há 2 min · cache offline");
     const opencode = within(summary).getByText("OpenCode").closest("div") as HTMLElement;
-    expect(opencode).toHaveTextContent("5h: não se aplica");
-    expect(opencode).toHaveTextContent("Semanal: não se aplica");
+    expect(opencode).toHaveTextContent("Não se aplica: este provedor não tem janela de 5 h nem semanal");
+    expect(opencode).not.toHaveTextContent("5h:");
     expect(opencode).toHaveTextContent("Gasto: US$");
   });
 

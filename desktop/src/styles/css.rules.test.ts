@@ -183,6 +183,73 @@ describe("CSS and component rules", () => {
     ]);
   });
 
+  it("the status bar never overlaps: secondary parts leave in order, the end group takes only what is left (4D.4 r2)", () => {
+    const end = find(COMPONENT_RULES, ".status-bar__group--end");
+    expect(decl(end, "flex")).toEqual(["1 1 0%"]);
+    expect(decl(end, "min-width")).toEqual(["0"]);
+    expect(decl(end, "overflow")).toEqual(["hidden"]);
+    expect(decl(find(COMPONENT_RULES, ".status-bar__group"), "flex-wrap")).toEqual(["wrap"]);
+    // The bar spans the whole window: the tiers are window widths, like the header's.
+    const tiers = COMPONENT_RULES.filter((r) => /^@media \(max-width: \d+px\)$/.test(r.media ?? "") && r.selector.includes("status-bar"))
+      .map((r) => ({ width: Number(/max-width: (\d+)px/.exec(r.media!)![1]), selector: r.selector, body: declarations(r.body) }))
+      .sort((a, b) => b.width - a.width);
+    expect(tiers.map((t) => [t.width, t.selector])).toEqual([
+      [1240, ".status-bar__item--hint"],
+      [1100, ".status-bar__detail:not(.status-bar__detail--value), .status-bar__path-head"],
+      [1023, ".status-bar__detail--value"],
+      [640, ".status-bar__path"],
+    ]);
+    for (const tier of tiers) {
+      // Visually hidden, never removed: the text stays in the accessibility tree and in the tooltip.
+      expect(tier.body.get("position")).toBe("absolute");
+      expect(tier.body.get("clip")).toBe("rect(0, 0, 0, 0)");
+      expect(tier.body.has("display")).toBe(false);
+      expect(tier.selector).not.toMatch(/__value(?!-)|__label|^\.status-bar__item$|__group/);
+    }
+    // The 1024 px window minimum keeps the qualifiers; at 960 px only the values and the folder name are left.
+    expect(tiers.filter((t) => 1024 <= t.width).map((t) => t.width)).toEqual([1240, 1100]);
+    expect(tiers.filter((t) => 960 <= t.width).map((t) => t.width)).toEqual([1240, 1100, 1023]);
+    const tail = find(COMPONENT_RULES, ".status-bar__path-tail");
+    expect(decl(tail, "flex")).toEqual(["none"]);
+    expect(decl(tail, "max-width")).toEqual(["100%"]);
+  });
+
+  it("the empty live region pulls itself up only inside a column with a gap, never over the text before it", () => {
+    const empty = COMPONENT_RULES.filter((r) => r.selector.includes(".settings-form__notice:empty"));
+    expect(empty.map((r) => r.selector).sort()).toEqual([
+      ".inventory-panel > .settings-form__notice:empty",
+      ".settings__panel > .settings-form__notice:empty, .settings-form > .settings-form__notice:empty",
+    ]);
+    const panel = find(COMPONENT_RULES, ".inventory-panel");
+    expect(decl(panel, "display")).toEqual(["flex"]);
+    expect(decl(panel, "flex-direction")).toEqual(["column"]);
+    expect(decl(panel, "align-items")).toEqual(["flex-start"]);
+    expect(decl(find(COMPONENT_RULES, ".inventory-panel > .settings-form__notice:empty"), "margin-top")).toEqual([
+      `calc(-1 * ${decl(panel, "gap")[0]})`,
+    ]);
+    for (const parent of [".settings__panel", ".settings-form"]) {
+      const rule = find(COMPONENT_RULES, parent);
+      expect(decl(rule, "display"), parent).toEqual(["flex"]);
+      expect(decl(rule, "gap"), parent).toEqual(["var(--sp-4)"]);
+    }
+    expect(decl(find(COMPONENT_RULES, ".settings__panel-header"), "flex-wrap")).toEqual(["wrap"]);
+  });
+
+  it("charts keep their series and legend in the Windows contrast themes", () => {
+    const forced = /forced-colors: active/;
+    const adjust = find(COMPONENT_RULES, '.monitoring-chart, .monitoring-dot, .monitoring-scale__option[aria-pressed="true"]', forced);
+    expect(decl(adjust, "forced-color-adjust")).toEqual(["none"]);
+    expect(decl(find(COMPONENT_RULES, ".monitoring-chart__line--cpu, .monitoring-chart__line--ram", forced), "stroke")).toEqual([
+      "var(--c-accent-strong)",
+    ]);
+    const sys = find(COMPONENT_RULES, ".monitoring-chart__line--sys", forced);
+    expect(decl(sys, "stroke")).toEqual(["var(--c-term-fg)"]);
+    expect(decl(sys, "stroke-dasharray")).toHaveLength(1);
+    expect(decl(find(COMPONENT_RULES, ".monitoring-chart", forced), "background")).toEqual(["var(--c-term-bg)"]);
+    expect(decl(find(COMPONENT_RULES, ".monitoring-chart__line--cpu"), "stroke")).toEqual(["var(--c-accent)"]);
+    expect(decl(find(COMPONENT_RULES, '.monitoring-scale__option[aria-pressed="true"]'), "font-weight")).toEqual(["var(--fw-semibold)"]);
+  });
+
   it("every class a component uses is defined in the CSS", () => {
     const defined = new Set<string>();
     for (const rule of ALL_RULES) {

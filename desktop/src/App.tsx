@@ -1085,7 +1085,7 @@ export const App: React.FC = () => {
         metricsUnavailable={metricsFailed}
         projectPath={projectPath}
       >
-        <span className="status-bar__item">
+        <span className="status-bar__item status-bar__item--hint">
           <kbd className="kbd">F6</kbd> alternar regiões
         </span>
       </StatusBar>

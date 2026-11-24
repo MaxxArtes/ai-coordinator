@@ -481,7 +481,12 @@ export const VaultPanel: React.FC<VaultPanelProps> = ({ category, active, isTaur
         <div className="settings__badges">
           {status?.available && <span className="badge badge--ok">Cofre: {BACKEND_LABEL[status.backend] ?? status.backend}</span>}
           {unavailable && <span className="badge badge--unsupported">{status?.reason === "busy" ? "Cofre em uso" : "Armazenamento indisponível"}</span>}
-          <span className="badge badge--unsupported">Uso pelos provedores: não suportado nesta versão</span>
+          <span
+            className="badge badge--unsupported"
+            title="Nesta versão nenhum agente recebe as credenciais do cofre; a telemetria dos provedores só confere se o nome da chave existe."
+          >
+            Ainda não repassadas aos agentes
+          </span>
         </div>
       </div>
       <p className="settings__summary">{category.summary}</p>

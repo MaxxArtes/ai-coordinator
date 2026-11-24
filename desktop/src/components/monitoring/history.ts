@@ -376,40 +376,121 @@ export function computeMonitoringAlerts(
   return alerts;
 }
 
+/** Plot area inside the chart's viewBox: room for the Y-axis labels on the left, and the line never touches the edges. */
+export interface SparklinePadding {
+  left: number;
+  right: number;
+  top: number;
+  bottom: number;
+}
+
+/** A lone point (a single sample, or one between gaps) is drawn as a short dash: a bare "M" paints nothing. */
+const SPARKLINE_DASH = 6;
+
+function sparklinePadding(padding: number | Partial<SparklinePadding>): SparklinePadding {
+  if (typeof padding === "number") return { left: padding, right: padding, top: padding, bottom: padding };
+  return { left: padding.left ?? 4, right: padding.right ?? 4, top: padding.top ?? 4, bottom: padding.bottom ?? 4 };
+}
+
+/**
+ * SVG path data of a series in a width × height viewBox, with 0 on the bottom edge of the plot area and maxValue on its
+ * top edge. Values above maxValue stay on the top edge and gaps (null, negative, NaN) split the line, so every
+ * coordinate stays inside the plot area.
+ */
 export function buildSparklineSegments(
   points: ReadonlyArray<number | null>,
   width: number,
   height: number,
   maxValue: number,
-  padding: number = 4
+  padding: number | Partial<SparklinePadding> = 4
 ): string[] {
-  if (points.length === 0 || width <= padding * 2 || height <= padding * 2 || maxValue <= 0) {
+  const pad = sparklinePadding(padding);
+  const usableW = width - pad.left - pad.right;
+  const usableH = height - pad.top - pad.bottom;
+  if (points.length === 0 || !(usableW > 0) || !(usableH > 0) || !(maxValue > 0) || !Number.isFinite(maxValue)) {
     return [];
   }
-  const usableW = width - padding * 2;
-  const usableH = height - padding * 2;
+  const right = pad.left + usableW;
   const denom = Math.max(1, points.length - 1);
 
   const segments: string[] = [];
-  let current: string[] = [];
+  let current: Array<[number, number]> = [];
+  const flush = () => {
+    if (current.length === 1) {
+      const [x, y] = current[0];
+      const x0 = Math.max(pad.left, Math.min(x, right - SPARKLINE_DASH));
+      const x1 = Math.min(right, x0 + SPARKLINE_DASH);
+      segments.push(`M${x0.toFixed(1)} ${y.toFixed(1)} L${x1.toFixed(1)} ${y.toFixed(1)}`);
+    } else if (current.length > 1) {
+      segments.push(current.map(([x, y], i) => `${i === 0 ? "M" : "L"}${x.toFixed(1)} ${y.toFixed(1)}`).join(" "));
+    }
+    current = [];
+  };
 
   points.forEach((value, idx) => {
     if (typeof value !== "number" || !Number.isFinite(value) || value < 0) {
-      if (current.length > 0) {
-        segments.push(current.join(" "));
-        current = [];
-      }
+      flush();
       return;
     }
-    const x = padding + (points.length === 1 ? usableW : (idx / denom) * usableW);
+    const x = pad.left + (points.length === 1 ? usableW : (idx / denom) * usableW);
     const clamped = Math.min(1, Math.max(0, value / maxValue));
-    const y = padding + usableH * (1 - clamped);
-    const cmd = current.length === 0 ? "M" : "L";
-    current.push(`${cmd}${x.toFixed(1)} ${y.toFixed(1)}`);
+    const y = pad.top + usableH * (1 - clamped);
+    current.push([x, y]);
   });
 
-  if (current.length > 0) segments.push(current.join(" "));
+  flush();
   return segments;
+}
+
+export type CpuChartScale = "focus" | "global";
+
+export const CPU_CHART_SCALE_STORAGE_KEY = "ai-coordinator.monitoring.cpu-scale.v1";
+const FOCUS_HEADROOM = 1.25;
+const FOCUS_MIN_MAX = 1;
+
+/** Smallest 1, 2, 2,5 or 5 × 10^n that is at least value. */
+export function niceCeil(value: number): number {
+  if (!Number.isFinite(value) || value <= 0) return FOCUS_MIN_MAX;
+  const base = 10 ** Math.floor(Math.log10(value));
+  for (const step of [1, 2, 2.5, 5, 10]) {
+    const candidate = Number((step * base).toPrecision(12));
+    if (candidate >= value) return candidate;
+  }
+  return Number((10 * base).toPrecision(12));
+}
+
+/**
+ * Top of the CPU chart. Global: 0–100%. Focus: the peak of the AI Coordinator series in the window plus a margin,
+ * rounded up to a readable step (never above 100% unless the series itself goes above it).
+ */
+export function cpuChartMax(points: ReadonlyArray<number | null>, mode: CpuChartScale): number {
+  if (mode === "global") return 100;
+  const valid = points.filter((v): v is number => typeof v === "number" && Number.isFinite(v) && v >= 0);
+  const peak = valid.length > 0 ? Math.max(...valid) : 0;
+  const top = niceCeil(Math.max(peak * FOCUS_HEADROOM, FOCUS_MIN_MAX));
+  return peak <= 100 ? Math.min(top, 100) : top;
+}
+
+const AXIS_FMT = new Intl.NumberFormat("pt-BR", { maximumFractionDigits: 2 });
+
+export function formatAxisPercent(value: number): string {
+  return `${AXIS_FMT.format(value)}%`;
+}
+
+export function readCpuChartScale(storage: Pick<Storage, "getItem"> | null | undefined): CpuChartScale {
+  try {
+    return storage?.getItem(CPU_CHART_SCALE_STORAGE_KEY) === "global" ? "global" : "focus";
+  } catch {
+    return "focus";
+  }
+}
+
+export function writeCpuChartScale(storage: Pick<Storage, "setItem"> | null | undefined, mode: CpuChartScale): void {
+  try {
+    storage?.setItem(CPU_CHART_SCALE_STORAGE_KEY, mode);
+  } catch {
+    // Storage blocked or full: the choice lasts until the window closes.
+  }
 }
 
 export function formatWindowDurationLabel(history: readonly HistorySample[]): string {

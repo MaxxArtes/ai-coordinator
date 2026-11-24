@@ -1,8 +1,8 @@
 import React from "react";
-import { describe, expect, it } from "vitest";
-import { render, screen, within } from "@testing-library/react";
+import { beforeEach, describe, expect, it } from "vitest";
+import { fireEvent, render, screen, within } from "@testing-library/react";
 import { MonitoringView } from "./MonitoringView";
-import { appendHistorySample, MAX_HISTORY_POINTS, type HistorySample } from "./history";
+import { appendHistorySample, CPU_CHART_SCALE_STORAGE_KEY, MAX_HISTORY_POINTS, type HistorySample } from "./history";
 import type { RuntimeMetrics } from "../shell/AppHeader";
 import type { ProvidersTelemetrySnapshot } from "./telemetryContract";
 import type { TerminalPaneData } from "../TerminalPane";
@@ -309,7 +309,8 @@ describe("MonitoringView and history buffer (4D.4.2)", () => {
     expect(agentsSection).toHaveTextContent("82,0 MB");
 
     const chartsSection = screen.getByRole("region", { name: "Gráficos históricos recentes" });
-    expect(chartsSection).toHaveTextContent("100%");
+    expect(within(chartsSection).getByRole("button", { name: "Global 0–100%" })).toBeInTheDocument();
+    expect(chartsSection).toHaveTextContent("Escala: 0–25% (pico da janela com margem)");
     expect(chartsSection).toHaveTextContent("agora");
     expect(chartsSection).toHaveTextContent("pico");
 
@@ -424,5 +425,131 @@ describe("MonitoringView and history buffer (4D.4.2)", () => {
     expect(provSection).toHaveTextContent("Raciocínio: 150");
     expect(provSection).toHaveTextContent("expirado");
     expect(provSection).toHaveTextContent("Codex");
+  });
+});
+
+describe("CPU and RAM charts: visible lines and the adaptive scale (4D.4 r2)", () => {
+  const VIEW_W = 380;
+  const VIEW_H = 104;
+
+  beforeEach(() => {
+    window.localStorage.clear();
+  });
+
+  function historyOf(app: Array<number | null>, sys: number): HistorySample[] {
+    let hist: HistorySample[] = [];
+    app.forEach((cpu, i) => {
+      const metrics: RuntimeMetrics = {
+        ...FULL_METRICS,
+        cpu_usage_percent: cpu,
+        cpu_provenance: cpu === null ? "unknown" : "measured",
+        sampled_at_unix_ms: 1_700_000_000_000 + i * 2000,
+        system: { logical_cpu_count: 4, cpu_usage_percent: sys, cpu_provenance: "measured" },
+      };
+      hist = appendHistorySample(hist, metrics, false, 1_700_000_000_000 + i * 2000);
+    });
+    return hist;
+  }
+
+  function renderView(history: HistorySample[]) {
+    return render(
+      <MonitoringView
+        active
+        isTauri
+        connectionStatus="connected"
+        metrics={FULL_METRICS}
+        metricsUnavailable={false}
+        history={history}
+        panes={[]}
+        paneStates={{}}
+      />
+    );
+  }
+
+  function pathPoints(svg: Element, selector: string): Array<[number, number]> {
+    return Array.from(svg.querySelectorAll(selector)).flatMap((path) =>
+      [...(path.getAttribute("d") ?? "").matchAll(/[ML](-?[\d.]+) (-?[\d.]+)/g)].map((m) => [Number(m[1]), Number(m[2])] as [number, number])
+    );
+  }
+
+  function expectInsideViewBox(points: Array<[number, number]>) {
+    expect(points.length).toBeGreaterThan(0);
+    for (const [x, y] of points) {
+      expect(x).toBeGreaterThanOrEqual(0);
+      expect(x).toBeLessThanOrEqual(VIEW_W);
+      expect(y).toBeGreaterThanOrEqual(0);
+      expect(y).toBeLessThanOrEqual(VIEW_H);
+    }
+  }
+
+  it("draws the CPU and RAM lines inside the viewBox (regression: the vertical padding left no room)", () => {
+    renderView(historyOf([2.19, 3.47, 1.8], 31));
+    const cpu = screen.getByRole("img", { name: "Histórico recente de CPU" });
+    const ram = screen.getByRole("img", { name: "Histórico recente de RAM" });
+    expect(cpu.getAttribute("viewBox")).toBe(`0 0 ${VIEW_W} ${VIEW_H}`);
+    expectInsideViewBox(pathPoints(cpu, ".monitoring-chart__line--cpu"));
+    expectInsideViewBox(pathPoints(ram, ".monitoring-chart__line--ram"));
+  });
+
+  it("focus (default) scales to the AI Coordinator peak, labels the Y axis and leaves the computer to the global scale", () => {
+    renderView(historyOf([2.19, 3.47, 1.8], 31));
+    const charts = screen.getByRole("region", { name: "Gráficos históricos recentes" });
+    expect(within(charts).getByRole("button", { name: "Foco AI Coordinator" })).toHaveAttribute("aria-pressed", "true");
+    expect(within(charts).getByRole("button", { name: "Global 0–100%" })).toHaveAttribute("aria-pressed", "false");
+    const cpu = screen.getByRole("img", { name: "Histórico recente de CPU" });
+    expect(cpu).toHaveAttribute("data-scale", "focus");
+    expect(Array.from(cpu.querySelectorAll(".monitoring-chart__axis")).map((t) => t.textContent)).toEqual(["5%", "2,5%", "0%"]);
+    expect(cpu.querySelectorAll(".monitoring-chart__line--sys")).toHaveLength(0);
+    expect(cpu.querySelector(".monitoring-chart__threshold")).toBeNull();
+    expect(charts).toHaveTextContent("Escala: 0–5% (pico da janela com margem)");
+    expect(charts).toHaveTextContent("Computador: só na escala global");
+    // 3,47% of a 0–5% scale is high in the chart, not flat on the bottom as on 0–100%.
+    const ys = pathPoints(cpu, ".monitoring-chart__line--cpu").map(([, y]) => y);
+    expect(Math.min(...ys)).toBeLessThan(VIEW_H / 2);
+  });
+
+  it("global shows 0–100% with both series and the warning line, and the choice is remembered", () => {
+    const view = renderView(historyOf([2.19, 3.47, 1.8], 31));
+    fireEvent.click(screen.getByRole("button", { name: "Global 0–100%" }));
+    const cpu = screen.getByRole("img", { name: "Histórico recente de CPU" });
+    expect(cpu).toHaveAttribute("data-scale", "global");
+    expect(Array.from(cpu.querySelectorAll(".monitoring-chart__axis")).map((t) => t.textContent)).toEqual(["100%", "50%", "0%"]);
+    expectInsideViewBox(pathPoints(cpu, ".monitoring-chart__line--sys"));
+    expectInsideViewBox(pathPoints(cpu, ".monitoring-chart__line--cpu"));
+    expect(cpu.querySelector(".monitoring-chart__threshold")).not.toBeNull();
+    expect(screen.getByRole("button", { name: "Global 0–100%" })).toHaveAttribute("aria-pressed", "true");
+    expect(screen.getByText("Computador")).toBeInTheDocument();
+    expect(window.localStorage.getItem(CPU_CHART_SCALE_STORAGE_KEY)).toBe("global");
+
+    view.unmount();
+    renderView(historyOf([2.19, 3.47, 1.8], 31));
+    expect(screen.getByRole("img", { name: "Histórico recente de CPU" })).toHaveAttribute("data-scale", "global");
+    fireEvent.click(screen.getByRole("button", { name: "Foco AI Coordinator" }));
+    expect(window.localStorage.getItem(CPU_CHART_SCALE_STORAGE_KEY)).toBe("focus");
+  });
+
+  it("constant, zero, single and above-100% series all leave a visible line inside the viewBox", () => {
+    for (const series of [[4, 4, 4, 4], [0, 0, 0], [7.5], [180, 250, 120]]) {
+      for (const mode of ["Foco AI Coordinator", "Global 0–100%"]) {
+        const view = renderView(historyOf(series, 12));
+        fireEvent.click(screen.getByRole("button", { name: mode }));
+        const points = pathPoints(screen.getByRole("img", { name: "Histórico recente de CPU" }), ".monitoring-chart__line--cpu");
+        expectInsideViewBox(points);
+        expect(points.length).toBeGreaterThanOrEqual(2);
+        view.unmount();
+      }
+    }
+  });
+
+  it("without AI Coordinator CPU samples, focus says so instead of drawing the computer on a wrong scale", () => {
+    renderView(historyOf([null, null], 40));
+    expect(screen.queryByRole("img", { name: "Histórico recente de CPU" })).toBeNull();
+    expect(
+      screen.getByText("Sem medições de CPU do AI Coordinator no histórico recente; a CPU do computador aparece na escala global.")
+    ).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Global 0–100%" }));
+    const cpu = screen.getByRole("img", { name: "Histórico recente de CPU" });
+    expectInsideViewBox(pathPoints(cpu, ".monitoring-chart__line--sys"));
+    expect(cpu.querySelectorAll(".monitoring-chart__line--cpu")).toHaveLength(0);
   });
 });
