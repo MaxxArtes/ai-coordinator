@@ -57,6 +57,24 @@ describe("useTerminalStates", () => {
     expect(result.current.failed).toBe(false);
   });
 
+  it("R3 (4D.4 r2): reports the asked panes of every tab, not only the active one, and never an unasked pane of another tab", async () => {
+    const call = vi.fn(async () => answer);
+    const both = renderHook(() => useTerminalStates(true, call, "tab-main", ["a", "x"]));
+    await flush();
+    expect(both.result.current.reported).toMatchObject({ a: { kind: "alive" }, x: { kind: "alive" } });
+    expect(resolvePaneState(true, both.result.current, "x", true)).toEqual({ kind: "alive" });
+
+    // Another project is the active tab: the ended terminal of the first one keeps its exit code.
+    const fromOther = renderHook(() => useTerminalStates(true, call, "outra", ["b", "x"]));
+    await flush();
+    expect(resolvePaneState(true, fromOther.result.current, "b", true)).toEqual({ kind: "ended", exitCode: 0 });
+    expect(fromOther.result.current.reported).not.toHaveProperty("a");
+
+    const activeOnly = renderHook(() => useTerminalStates(true, call, "tab-main", ["a"]));
+    await flush();
+    expect(activeOnly.result.current.reported).not.toHaveProperty("x");
+  });
+
   it("asks every 2 s, never while a query is still running, and stops on unmount", async () => {
     let release: (v: unknown) => void = () => undefined;
     const call = vi.fn(() => new Promise((resolve) => (release = resolve)));

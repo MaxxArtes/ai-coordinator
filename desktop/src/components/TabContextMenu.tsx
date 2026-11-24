@@ -12,6 +12,11 @@ export interface TabContextMenuProps {
   onSelectProject: (path: string) => void;
   onOpenOtherProject?: () => void;
   onClose: () => void;
+  /**
+   * Where the focus goes on close when nothing focusable had it before the menu opened (a right-click on the strip
+   * label leaves it on the page body): never left on the body.
+   */
+  onRestoreFocus?: () => void;
 }
 
 const folderLabel = (path: string): string => path.split(/[\\/]+/).filter(Boolean).pop() ?? path;
@@ -29,9 +34,12 @@ export const TabContextMenu: React.FC<TabContextMenuProps> = ({
   onSelectProject,
   onOpenOtherProject,
   onClose,
+  onRestoreFocus,
 }) => {
   const menuRef = useRef<HTMLDivElement>(null);
   const previousFocusRef = useRef<HTMLElement | null>(null);
+  const restoreFocusRef = useRef(onRestoreFocus);
+  restoreFocusRef.current = onRestoreFocus;
 
   useEffect(() => {
     if (!open) return;
@@ -39,9 +47,9 @@ export const TabContextMenu: React.FC<TabContextMenuProps> = ({
     const items = menuRef.current?.querySelectorAll<HTMLButtonElement>('[role="menuitem"]:not([aria-disabled="true"])');
     items?.[0]?.focus();
     return () => {
-      if (previousFocusRef.current && document.contains(previousFocusRef.current)) {
-        previousFocusRef.current.focus();
-      }
+      const previous = previousFocusRef.current;
+      if (previous && previous !== document.body && document.contains(previous)) previous.focus();
+      else restoreFocusRef.current?.();
     };
   }, [open]);
 
@@ -97,6 +105,8 @@ export const TabContextMenu: React.FC<TabContextMenuProps> = ({
       className="tab-context-menu"
       style={{ left: `${clampedX}px`, top: `${clampedY}px` }}
       onKeyDown={onMenuKeyDown}
+      // The Menu key and Shift+F10 also send a contextmenu to the focused item: never the WebView menu over this one.
+      onContextMenu={(event) => event.preventDefault()}
     >
       <div className="tab-context-menu__heading">Abrir terminal em...</div>
       {authorizedProjects.length === 0 ? (

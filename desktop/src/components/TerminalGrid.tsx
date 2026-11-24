@@ -11,7 +11,7 @@
  * "Aba: / Raiz:" toolbar and is the F6 region "strip"; every pane gets its position ("Terminal N de M").
  */
 
-import React, { useState } from "react";
+import React, { useRef, useState } from "react";
 import { Terminal } from "xterm";
 import { TerminalPane, TerminalPaneData } from "./TerminalPane";
 import { TabContextMenu } from "./TabContextMenu";
@@ -92,6 +92,9 @@ export const TerminalGrid: React.FC<TerminalGridProps> = ({
   const layout = getLayoutLabel(panes.length);
   const canAdd = !!onAddPane && panes.length < 4;
   const [contextMenu, setContextMenu] = useState<{ x: number; y: number } | null>(null);
+  const stripRef = useRef<HTMLDivElement>(null);
+  const focusStrip = () =>
+    (stripRef.current?.querySelector<HTMLElement>("[data-f6-entry]") ?? stripRef.current?.querySelector<HTMLElement>("button"))?.focus();
 
   const openMenuAt = (x: number, y: number) => {
     if (!onOpenAuthorizedProject && !onOpenProjectScreen) return;
@@ -117,6 +120,7 @@ export const TerminalGrid: React.FC<TerminalGridProps> = ({
     <div className="terminal-grid">
       {/* Tab strip: F6 region "strip"; its entry is the first button; right-click lists authorized saved folders */}
       <div
+        ref={stripRef}
         className="tab-strip"
         data-f6-region="strip"
         role="group"
@@ -202,6 +206,7 @@ export const TerminalGrid: React.FC<TerminalGridProps> = ({
           onSelectProject={onOpenAuthorizedProject}
           onOpenOtherProject={onOpenProjectScreen}
           onClose={() => setContextMenu(null)}
+          onRestoreFocus={focusStrip}
         />
       )}
     </div>

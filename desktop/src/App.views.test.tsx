@@ -60,16 +60,18 @@ interface HostOptions {
   fail?: Record<string, unknown>;
   /** Commands answered by a custom handler (before everything else). */
   extra?: Record<string, (args?: any) => unknown>;
+  /** Tabs the Core already holds (another window, a webview refresh), by id → project directory. */
+  tabs?: Record<string, string>;
 }
 
 /**
  * Simulated host. Like the fixed manager (F10): a taken slot is never reused; the lowest free one is used instead.
- * Like the real one, a tab id cannot be created twice, and a revocation is refused while a session is registered there.
+ * Like the real one, a tab id stays bound to one directory, and a revocation is refused while a session is registered there.
  */
-function host({ preview = false, authorized = true, metricsFail = false, settings, profile = {}, fail = {}, extra = {} }: HostOptions = {}) {
+function host({ preview = false, authorized = true, metricsFail = false, settings, profile = {}, fail = {}, extra = {}, tabs: coreTabs = {} }: HostOptions = {}) {
   let sessions = 0;
   const registry = new Map<string, HostSession>();
-  const tabs = new Map<string, string>();
+  const tabs = new Map<string, string>(Object.entries(coreTabs));
   const state = {
     settings: settings ?? appSettings(),
     authorized: (profile.authorized_projects as string[] | undefined) ?? (authorized ? ["C:\\Users\\10864", "D:\\proj"] : []),
@@ -128,8 +130,13 @@ function host({ preview = false, authorized = true, metricsFail = false, setting
         return { revoked: state.authorized.length < before, authorized_projects: [...state.authorized], last_project: null };
       }
       case "terminal_create_tab":
-        if (tabs.has(args.tabId)) throw new Error(`Tab with ID '${args.tabId}' already exists`);
         if (!state.authorized.includes(args.projectPath)) throw new Error("Project not authorized or session invalid");
+        if (tabs.has(args.tabId)) {
+          // Like the Core (diag.3): the same directory again is the same tab; another directory is refused, and the
+          // host passes the Core message on as text.
+          if (tabs.get(args.tabId) === args.projectPath) return { tab_id: args.tabId };
+          throw "Terminal operation failed: tab_exists";
+        }
         tabs.set(args.tabId, args.projectPath);
         return { tab_id: args.tabId };
       case "terminal_resize":
@@ -1551,5 +1558,341 @@ describe("App — tráfego do terminal depois do L1/L2 (Etapa 8)", () => {
 
     await user.click(screen.getByRole("tab", { name: /^Conversas/ }));
     expect(xtermLog.disposed).toBe(0);
+  }, 10000);
+});
+
+/**
+ * Regressões dos terminais da Fase 4D.4 (rodada consolidada r2). A lista nominal não ficou registrada pelo agente
+ * anterior; esta é a reconstrução a partir dos checkpoints. Os testes que já cobriam uma parte ficam citados aqui e não
+ * foram repetidos:
+ *
+ * - R1. "Abrir projeto" falhava com "Terminal operation failed" porque o Core já tinha "tab-main": a interface usa a
+ *   próxima tab-N livre. Já existia: "dessincronização com tab-main existente no Core..." (um conflito só). Aqui: dois
+ *   ids já ocupados no Core (corrigido: antes só havia uma nova tentativa) e o mesmo projeto reaberto depois de
+ *   recarregar a janela. Core: tests/test_phase4d4_terminal_regressions.py.
+ * - R2. Abrir um segundo projeto não descarta a sessão anterior. Já existiam: "abre C:\Users\10864 e depois
+ *   D:\ai-coordinator..." e "menu de contexto da aba...". Aqui: três projetos em sequência.
+ * - R3. A supervisão vale para todas as abas, não só a ativa. Aqui pelo App e em useTerminalStates.test.tsx.
+ * - R4. Ids de aba iguais na interface e no Core ao fechar, reabrir e reaproveitar posições; fechar um terminal não
+ *   afeta os outros; a identidade é a sessão. Já existiam, numa aba só: os dois testes F10 de "App views".
+ * - R5. Diretório (e PATH, no Core) de cada sessão preservados ao abrir projetos em sequência e ao trocar o
+ *   interpretador. Já existia, num projeto só: "trocar o interpretador encerra e recria...". Aqui: com dois projetos.
+ * - R6. Menu de contexto da aba (clique direito, Shift+F10, tecla Menu, Esc, clique fora, foco de volta à aba):
+ *   components/TabContextMenu.test.tsx; aqui o caminho pelo teclado no App real.
+ * - R7. Projeto digitado (validação, espaços, aspas do "Copiar como caminho", caminho inexistente com mensagem clara)
+ *   e o histórico de cada terminal preservado ao alternar vistas e projetos.
+ */
+describe("App — regressões dos terminais (4D.4 r2, R1 a R7)", () => {
+  const strip = () => screen.getByRole("group", { name: "Aba do projeto" });
+  const pause = (ms: number) =>
+    act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, ms));
+    });
+
+  /** Right-click on the tab strip and pick a saved authorized directory, as the operator does. */
+  async function openFromMenu(user: ReturnType<typeof userEvent.setup>, dir: string) {
+    fireEvent.contextMenu(strip(), { clientX: 80, clientY: 40 });
+    const menu = await screen.findByRole("menu", { name: "Ações da aba do projeto" });
+    const item = within(menu).getAllByRole("menuitem").find((el) => el.getAttribute("title") === dir);
+    if (!item) throw new Error(`menu sem ${dir}`);
+    await user.click(item);
+  }
+
+  it("R1: com tab-main e tab-2 ocupadas no Core por outros diretórios, abrir D:\\ai-coordinator usa tab-3, sem 'Terminal operation failed'", async () => {
+    const user = userEvent.setup();
+    host({
+      settings: appSettings({ geral: { open_last_project_on_start: false } }),
+      profile: { authorized_projects: ["C:\\Users\\10864", "D:\\proj", "D:\\ai-coordinator"] },
+      tabs: { "tab-main": "C:\\Users\\10864", "tab-2": "D:\\proj" },
+    });
+    renderApp();
+    await user.click(await screen.findByRole("button", { name: "Abrir D:\\ai-coordinator" }));
+    await connected();
+    expect(callsOf("terminal_create_tab")).toEqual([
+      { tabId: "tab-main", projectPath: "D:\\ai-coordinator" },
+      { tabId: "tab-2", projectPath: "D:\\ai-coordinator" },
+      { tabId: "tab-3", projectPath: "D:\\ai-coordinator" },
+    ]);
+    expect(callsOf("terminal_create_session")).toMatchObject([{ tabId: "tab-3", paneId: 0, cwd: "D:\\ai-coordinator" }]);
+
+    // The next project never lands on an id the Core holds for another directory.
+    await openFromMenu(user, "D:\\proj");
+    const pane2 = await screen.findByRole("region", { name: "Terminal 02" });
+    expect(within(pane2).getByTitle("D:\\proj")).toBeInTheDocument();
+    expect(within(screen.getByRole("region", { name: "Terminal 01" })).getByTitle("D:\\ai-coordinator")).toBeInTheDocument();
+    expect(callsOf("terminal_create_session").at(-1)).toMatchObject({ tabId: "tab-4", cwd: "D:\\proj" });
+    expect(document.body.textContent).not.toMatch(/Terminal operation failed|tab_exists|Não foi possível abrir/);
+  });
+
+  it("R1: depois de recarregar a janela, o mesmo projeto reaproveita a tab-main do Core e a posição que ele informa", async () => {
+    const user = userEvent.setup();
+    const registry = host({ tabs: { "tab-main": "C:\\Users\\10864" } });
+    // The terminal of the page before the refresh is still registered in slot 0.
+    registry.set("sess-anterior", { pane_id: 0, alive: true, exit_code: null, tab: "tab-main", cwd: "C:\\Users\\10864" });
+    renderApp();
+    await connected();
+    expect(callsOf("terminal_create_tab")).toEqual([{ tabId: "tab-main", projectPath: "C:\\Users\\10864" }]);
+    expect(registry.get("sess-1")).toMatchObject({ pane_id: 1, tab: "tab-main" });
+
+    // The interface keeps the slot the Core reported (1): the lowest free one it asks for next is 0, not 1 again.
+    await user.click(screen.getByRole("button", { name: /Novo terminal/ }));
+    await screen.findByRole("region", { name: "Terminal 02" });
+    expect(callsOf("terminal_create_session").map((c) => c.paneId)).toEqual([0, 0]);
+    expect(registry.get("sess-2")).toMatchObject({ pane_id: 2, tab: "tab-main" });
+    expect(registry.get("sess-anterior")).toMatchObject({ pane_id: 0 });
+    expect(document.body.textContent).not.toMatch(/Terminal operation failed|Não foi possível abrir|Falha ao criar/);
+  });
+
+  it(
+    "R2/R3: três projetos abertos em sequência ficam vivos, e o estado de cada terminal vem do Core mesmo fora da aba ativa",
+    async () => {
+      const user = userEvent.setup();
+      const registry = host({ profile: { authorized_projects: ["C:\\Users\\10864", "D:\\proj", "D:\\ai-coordinator"] } });
+      renderApp();
+      await connected();
+      await openFromMenu(user, "D:\\proj");
+      await screen.findByRole("region", { name: "Terminal 02" });
+      await openFromMenu(user, "D:\\ai-coordinator");
+      await screen.findByRole("region", { name: "Terminal 03" });
+
+      const dirs: Record<string, string> = {
+        "Terminal 01": "C:\\Users\\10864",
+        "Terminal 02": "D:\\proj",
+        "Terminal 03": "D:\\ai-coordinator",
+      };
+      for (const [name, dir] of Object.entries(dirs)) {
+        expect(within(screen.getByRole("region", { name })).getByTitle(dir)).toBeInTheDocument();
+      }
+      expect(callsOf("terminal_create_tab").map((c) => c.tabId)).toEqual(["tab-main", "tab-2", "tab-3"]);
+      expect(count("terminal_close_session")).toBe(0);
+      expect(xtermLog.disposed).toBe(0);
+      await waitFor(() => expect(count("terminal_list_tabs")).toBeGreaterThan(1), { timeout: 3500 });
+      await waitFor(() => expect(bar()).toHaveTextContent("Terminais: 3 de 4 (3 ativos)"));
+
+      // `exit` in the first project's terminal while the third project is the active tab.
+      registry.set("sess-1", { ...registry.get("sess-1")!, alive: false, exit_code: 0 });
+      await waitFor(() => expect(screen.getByRole("region", { name: "Terminal 01" })).toHaveTextContent("encerrado, código 0"), {
+        timeout: 3500,
+      });
+      expect(bar()).toHaveTextContent("Terminais: 3 de 4 (2 ativos)");
+      expect(screen.getByRole("region", { name: "Terminal 02" })).not.toHaveTextContent(/encerrado|desconhecido/);
+    },
+    12000,
+  );
+
+  it("R4: fechar e reabrir projetos reaproveita a aba do Core de cada diretório; fechar um terminal não toca os outros", async () => {
+    const user = userEvent.setup();
+    const registry = host();
+    renderApp();
+    await connected();
+    await openFromMenu(user, "D:\\proj");
+    await screen.findByRole("region", { name: "Terminal 02" });
+    await user.click(screen.getByRole("button", { name: /Novo terminal/ })); // in the active project, D:\proj
+    await screen.findByRole("region", { name: "Terminal 03" });
+
+    await user.click(screen.getByRole("button", { name: "Fechar Terminal 01" }));
+    await waitFor(() => expect(screen.queryByRole("region", { name: "Terminal 01" })).toBeNull());
+    await openFromMenu(user, "C:\\Users\\10864");
+    await screen.findByRole("region", { name: "Terminal 04" });
+    await user.click(screen.getByRole("button", { name: "Fechar Terminal 02" }));
+    await waitFor(() => expect(screen.queryByRole("region", { name: "Terminal 02" })).toBeNull());
+
+    expect(callsOf("terminal_close_session")).toEqual([{ sessionId: "sess-1" }, { sessionId: "sess-2" }]);
+    expect(Array.from(registry.keys()).sort()).toEqual(["sess-3", "sess-4"]);
+    // Each Core tab is created once, and every session goes to the tab bound to its own directory.
+    const tabs = callsOf("terminal_create_tab");
+    expect(tabs).toEqual([
+      { tabId: "tab-main", projectPath: "C:\\Users\\10864" },
+      { tabId: "tab-2", projectPath: "D:\\proj" },
+    ]);
+    const bound = new Map(tabs.map((t) => [t.tabId, t.projectPath]));
+    for (const created of callsOf("terminal_create_session")) expect(bound.get(created.tabId)).toBe(created.cwd);
+    expect(callsOf("terminal_create_session").map((c) => [c.tabId, c.paneId])).toEqual([
+      ["tab-main", 0],
+      ["tab-2", 1],
+      ["tab-2", 2],
+      ["tab-main", 0],
+    ]);
+    expect(within(screen.getByRole("region", { name: "Terminal 03" })).getByTitle("D:\\proj")).toBeInTheDocument();
+    expect(within(screen.getByRole("region", { name: "Terminal 04" })).getByTitle("C:\\Users\\10864")).toBeInTheDocument();
+    expect(bar()).toHaveTextContent("Terminais: 2 de 4");
+    expect(document.body.textContent).not.toMatch(/Falha ao criar|Terminal operation failed|already exists/);
+  }, 10000);
+
+  it("R5: trocar o interpretador de um terminal de outro projeto mantém o diretório, a aba e a posição dele", async () => {
+    const user = userEvent.setup();
+    host();
+    renderApp();
+    await connected();
+    await openFromMenu(user, "D:\\proj");
+    await screen.findByRole("region", { name: "Terminal 02" });
+    const confirm = vi.spyOn(window, "confirm").mockReturnValue(true);
+
+    await user.selectOptions(await screen.findByRole("combobox", { name: "Interpretador de Terminal 01" }), "cmd");
+    const pane3 = await screen.findByRole("region", { name: "Terminal 03" });
+    expect(callsOf("terminal_create_session").at(-1)).toMatchObject({ tabId: "tab-main", paneId: 0, cwd: "C:\\Users\\10864", interpreterId: "cmd" });
+    expect(within(pane3).getByTitle("C:\\Users\\10864")).toBeInTheDocument();
+    expect(within(screen.getByRole("region", { name: "Terminal 02" })).getByTitle("D:\\proj")).toBeInTheDocument();
+
+    await user.selectOptions(await screen.findByRole("combobox", { name: "Interpretador de Terminal 02" }), "bash_git");
+    const pane4 = await screen.findByRole("region", { name: "Terminal 04" });
+    expect(callsOf("terminal_create_session").at(-1)).toMatchObject({ tabId: "tab-2", paneId: 1, cwd: "D:\\proj", interpreterId: "bash_git" });
+    expect(within(pane4).getByTitle("D:\\proj")).toBeInTheDocument();
+
+    await user.selectOptions(await screen.findByRole("combobox", { name: "Interpretador de Terminal 03" }), "powershell");
+    await screen.findByRole("region", { name: "Terminal 05" });
+    expect(callsOf("terminal_create_session").at(-1)).toMatchObject({ tabId: "tab-main", paneId: 0, cwd: "C:\\Users\\10864", interpreterId: "powershell" });
+
+    expect(callsOf("terminal_validate_interpreter")).toEqual([
+      { interpreterId: "cmd", cwd: "C:\\Users\\10864" },
+      { interpreterId: "bash_git", cwd: "D:\\proj" },
+      { interpreterId: "powershell", cwd: "C:\\Users\\10864" },
+    ]);
+    expect(callsOf("terminal_close_session")).toEqual([{ sessionId: "sess-1" }, { sessionId: "sess-2" }, { sessionId: "sess-3" }]);
+    expect(callsOf("terminal_create_tab")).toHaveLength(2);
+    expect(bar()).toHaveTextContent("Terminais: 2 de 4");
+    expect(bar()).toHaveTextContent("Projeto: D:\\proj");
+    confirm.mockRestore();
+  }, 10000);
+
+  it("R6: Shift+F10 e a tecla Menu na faixa do App real abrem o menu; Esc devolve o foco à aba; Enter abre o diretório sem perder o atual", async () => {
+    const user = userEvent.setup();
+    host();
+    renderApp();
+    await connected();
+    const openButton = within(strip()).getByRole("button", { name: "Abrir projeto" });
+    act(() => openButton.focus());
+    await user.keyboard("{Shift>}{F10}{/Shift}");
+    const menu = await screen.findByRole("menu", { name: "Ações da aba do projeto" });
+    expect(document.activeElement).toBe(within(menu).getAllByRole("menuitem")[0]);
+    await user.keyboard("{Escape}");
+    expect(screen.queryByRole("menu")).toBeNull();
+    expect(document.activeElement).toBe(openButton);
+    expect(count("terminal_write")).toBe(0);
+
+    fireEvent.keyDown(openButton, { key: "ContextMenu" });
+    await screen.findByRole("menu");
+    await user.keyboard("{ArrowDown}");
+    expect(document.activeElement).toHaveAttribute("title", "D:\\proj");
+    await user.keyboard("{Enter}");
+    const pane2 = await screen.findByRole("region", { name: "Terminal 02" });
+    expect(within(pane2).getByTitle("D:\\proj")).toBeInTheDocument();
+    await waitFor(() => expect(document.activeElement).toHaveAttribute("aria-label", "Terminal 02, 2 de 2"));
+    expect(screen.getByRole("region", { name: "Terminal 01" })).toBeInTheDocument();
+    expect(count("profile_authorize_project")).toBe(0);
+  });
+
+  it("R7: caminho digitado com espaços e entre aspas, como o Explorer copia, abre o terminal nesse diretório sem descartar o atual", async () => {
+    const user = userEvent.setup();
+    host();
+    renderApp();
+    await connected();
+    await user.click(screen.getByRole("button", { name: "Abrir projeto" }));
+    const input = screen.getByLabelText("Caminho do projeto no host");
+    await user.clear(input);
+    await user.type(input, '  "D:\\Meus Projetos\\app"  ');
+    await user.click(screen.getByRole("button", { name: "Autorizar diretório e iniciar terminal" }));
+
+    const pane2 = await screen.findByRole("region", { name: "Terminal 02" });
+    expect(callsOf("profile_authorize_project")).toEqual([{ projectPath: "D:\\Meus Projetos\\app" }]);
+    expect(callsOf("terminal_create_tab").at(-1)).toEqual({ tabId: "tab-2", projectPath: "D:\\Meus Projetos\\app" });
+    expect(callsOf("terminal_create_session").at(-1)).toMatchObject({ tabId: "tab-2", cwd: "D:\\Meus Projetos\\app" });
+    expect(within(pane2).getByTitle("D:\\Meus Projetos\\app")).toBeInTheDocument();
+    expect(within(screen.getByRole("region", { name: "Terminal 01" })).getByTitle("C:\\Users\\10864")).toBeInTheDocument();
+    expect(bar()).toHaveTextContent("Projeto: D:\\Meus Projetos\\app");
+  });
+
+  it("R7: caminho digitado vazio ou inexistente: mensagem clara, nada é criado e os terminais abertos ficam", async () => {
+    const user = userEvent.setup();
+    host({
+      fail: {
+        profile_authorize_project: {
+          code: -32602,
+          message: "O diretório do projeto não existe ou não é uma pasta.",
+          data: { field: "project_path", reason: "path_missing" },
+        },
+      },
+    });
+    renderApp();
+    await connected();
+    await user.click(screen.getByRole("button", { name: "Abrir projeto" }));
+    const input = screen.getByLabelText("Caminho do projeto no host");
+    const submit = screen.getByRole("button", { name: "Autorizar diretório e iniciar terminal" });
+
+    for (const typed of ["   ", '""']) {
+      await user.clear(input);
+      await user.type(input, typed);
+      await user.click(submit);
+      expect(await screen.findByText("Informe um caminho de diretório válido.")).toBeInTheDocument();
+    }
+    expect(count("profile_authorize_project")).toBe(0);
+
+    await user.clear(input);
+    await user.type(input, "D:\\Projeto que sumiu");
+    await user.click(submit);
+    expect(await screen.findByText("Falha na autorização do projeto: O diretório do projeto não existe ou não é uma pasta.")).toBeInTheDocument();
+    expect(callsOf("profile_authorize_project")).toEqual([{ projectPath: "D:\\Projeto que sumiu" }]);
+    expect(count("terminal_create_tab")).toBe(1);
+    expect(count("terminal_create_session")).toBe(1);
+
+    await user.click(screen.getByRole("button", { name: "Voltar aos terminais" }));
+    expect(within(screen.getByRole("region", { name: "Terminal 01" })).getByTitle("C:\\Users\\10864")).toBeInTheDocument();
+    expect(xtermLog.disposed).toBe(0);
+  });
+
+  it("R7: projeto autorizado que sumiu do disco: a mensagem do Core diz o motivo e o terminal atual fica", async () => {
+    const user = userEvent.setup();
+    host();
+    const original = invoke.getMockImplementation()!;
+    invoke.mockImplementation(async (cmd: string, args?: any) => {
+      // The Core text for a directory missing at spawn (desktop/ipc/server.py), passed on by the host as text.
+      if (cmd === "terminal_create_session" && args?.cwd === "D:\\proj") throw "O diretório do projeto não existe ou não é uma pasta.";
+      return original(cmd, args);
+    });
+    renderApp();
+    await connected();
+    await openFromMenu(user, "D:\\proj");
+    expect(await screen.findByText("Não foi possível abrir D:\\proj: O diretório do projeto não existe ou não é uma pasta.")).toBeInTheDocument();
+    expect(screen.getByRole("region", { name: "Terminal 01" })).toBeInTheDocument();
+    expect(screen.queryByRole("region", { name: "Terminal 02" })).toBeNull();
+    expect(bar()).toHaveTextContent("Projeto: C:\\Users\\10864");
+    expect(document.body.textContent).not.toMatch(/Terminal operation failed/);
+  });
+
+  it("R7: o histórico de cada terminal fica no seu xterm ao alternar vistas e projetos; nada é relido do início", async () => {
+    const user = userEvent.setup();
+    host();
+    const original = invoke.getMockImplementation()!;
+    invoke.mockImplementation(async (cmd: string, args?: any) => {
+      if (cmd === "terminal_get_output") {
+        return args.sinceSeq === 0 ? { raw: `historico de ${args.sessionId}\r\n`, next_seq: 1 } : { raw: "", next_seq: args.sinceSeq };
+      }
+      return original(cmd, args);
+    });
+    renderApp();
+    await connected();
+    await openFromMenu(user, "D:\\proj");
+    await screen.findByRole("region", { name: "Terminal 02" });
+    const [term1, term2] = xtermLog.created;
+    await waitFor(() => expect(term2.written).toContain("historico de sess-2\r\n"));
+
+    await user.click(screen.getByRole("tab", { name: /^Monitoramento/ }));
+    await user.click(screen.getByRole("tab", { name: /^Conversas/ }));
+    await user.click(within(strip()).getByRole("button", { name: "Abrir projeto" }));
+    await user.click(screen.getByRole("button", { name: "Voltar aos terminais" }));
+    await openFromMenu(user, "C:\\Users\\10864"); // a second terminal in the first project
+    await screen.findByRole("region", { name: "Terminal 03" });
+    await waitFor(() => expect(xtermLog.created[2].written).toContain("historico de sess-3\r\n"));
+    await pause(300);
+
+    const history = (term: (typeof xtermLog.created)[number]) => term.written.filter((chunk) => chunk.startsWith("historico de "));
+    expect(history(term1)).toEqual(["historico de sess-1\r\n"]);
+    expect(history(term2)).toEqual(["historico de sess-2\r\n"]);
+    expect(history(xtermLog.created[2])).toEqual(["historico de sess-3\r\n"]);
+    expect(xtermLog.created).toHaveLength(3);
+    expect(xtermLog.disposed).toBe(0);
+    for (const id of ["sess-1", "sess-2", "sess-3"]) {
+      expect(callsOf("terminal_get_output").filter((c) => c.sessionId === id && c.sinceSeq === 0)).toHaveLength(1);
+    }
   }, 10000);
 });

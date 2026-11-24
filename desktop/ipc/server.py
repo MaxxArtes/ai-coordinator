@@ -152,6 +152,7 @@ def validate_optional_flag(params: Dict[str, Any], name: str) -> bool:
 
 BROAD_SCOPE_MESSAGE = ("Este diretório dá acesso amplo (raiz do disco ou pasta pessoal inteira). "
                        "Confirme explicitamente para autorizar.")
+PROJECT_DIR_MISSING_MESSAGE = "O diretório do projeto não existe ou não é uma pasta."
 
 
 def validate_command_argv(value: Any) -> Optional[List[str]]:
@@ -440,21 +441,31 @@ class SecureIPCServer:
 
     def _handle_terminal_create_session(self, params: Dict[str, Any], token: Optional[str] = None) -> Dict[str, Any]:
         mgr = self._get_terminal_manager()
+        from desktop.terminal.manager import TerminalStartError
         from desktop.terminal.session import SessionKind
 
         kind_str = params.get("kind", "human_terminal")
         kind = SessionKind(kind_str)
-        sess = mgr.create_terminal(
-            token=token or self.session_token,
-            tab_id=params["tab_id"],
-            pane_id=params["pane_id"],
-            kind=kind,
-            command=validate_command_argv(params.get("command")),
-            interpreter_id=validate_optional_interpreter_id(params.get("interpreter_id")),
-            cwd=params.get("cwd"),
-            cols=params.get("cols", 80),
-            rows=params.get("rows", 24),
-        )
+        try:
+            sess = mgr.create_terminal(
+                token=token or self.session_token,
+                tab_id=params["tab_id"],
+                pane_id=params["pane_id"],
+                kind=kind,
+                command=validate_command_argv(params.get("command")),
+                interpreter_id=validate_optional_interpreter_id(params.get("interpreter_id")),
+                cwd=params.get("cwd"),
+                cols=params.get("cols", 80),
+                rows=params.get("rows", 24),
+            )
+        except TerminalStartError:
+            # An authorized project removed from the disk (or a folder replaced by a file) fails at spawn with a generic
+            # error: the operator gets the same fixed text as the authorization, never the path.
+            tab = mgr.get_tab(params["tab_id"])
+            target = params.get("cwd") or (tab.project_path if tab else None)
+            if isinstance(target, str) and target and not Path(target).is_dir():
+                raise InvalidParamsError(PROJECT_DIR_MISSING_MESSAGE, field="cwd", reason="path_missing") from None
+            raise
         return sess.to_dict()
 
     def _handle_terminal_list_interpreters(self, _params: Dict[str, Any], token: Optional[str] = None) -> Dict[str, Any]:
@@ -599,8 +610,7 @@ class SecureIPCServer:
         path_obj = self._project_param(params)
         if not path_obj.is_dir():
             # Fixed text: the requested path is never echoed back.
-            raise InvalidParamsError("O diretório do projeto não existe ou não é uma pasta.",
-                                     field="project_path", reason="path_missing")
+            raise InvalidParamsError(PROJECT_DIR_MISSING_MESSAGE, field="project_path", reason="path_missing")
         # L5: a drive/volume or share root, or the whole home folder, needs an explicit confirmation. Judged by where
         # the request really leads (resolved); entries already stored are kept and reported by security.status.
         if is_broad_directory(path_obj) and not confirm_broad:

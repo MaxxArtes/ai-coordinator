@@ -54,6 +54,13 @@ export const DEFAULT_STARTUP_DIRECTORY = "C:\\Users\\10864";
 export const DEFAULT_INTERPRETER_ID = "powershell";
 
 const BACKED: BackedCategory[] = ["perfil", "geral", "aparencia", "terminal", "coordinator"];
+const MAX_TAB_ID_ATTEMPTS = 16;
+
+/** A typed path without the surrounding spaces and the quotes "Copiar como caminho" of the Explorer adds. */
+const typedProjectPath = (text: string): string => {
+  const trimmed = text.trim();
+  return trimmed.length >= 2 && trimmed.startsWith('"') && trimmed.endsWith('"') ? trimmed.slice(1, -1).trim() : trimmed;
+};
 
 /** The open project is still usable when it, or a directory above it, is authorized (same rule as the host). */
 const stillAuthorized = (project: string, authorized: string[]): boolean => authorized.some((dir) => pathWithin(project, dir));
@@ -219,19 +226,20 @@ export const App: React.FC = () => {
         tabId = `tab-${++tabSeqRef.current}`;
       }
 
-      try {
-        await ensureTabCreated(tabId, dir);
-      } catch (err) {
-        const reason = toStructuredError(err).reason;
-        if (reason === "tab_exists" || /already exists|tab_exists/i.test(errorText(err))) {
-          // Core already has this tab bound to another directory (e.g., after a webview refresh): allocate a fresh tab.
-          createdTabsRef.current.add(tabId);
+      // The Core may already hold this id bound to another directory (another window, a webview refresh): the next free
+      // tab-N is used, as many times as needed. The taken id is never marked as created here, so it is not used later
+      // without asking the Core again.
+      for (let attempt = 1; ; attempt++) {
+        try {
+          await ensureTabCreated(tabId, dir);
+          break;
+        } catch (err) {
+          const reason = toStructuredError(err).reason;
+          const taken = reason === "tab_exists" || /already exists|tab_exists/i.test(errorText(err));
+          if (!taken || attempt >= MAX_TAB_ID_ATTEMPTS) throw err;
           do {
             tabId = `tab-${++tabSeqRef.current}`;
           } while (createdTabsRef.current.has(tabId));
-          await ensureTabCreated(tabId, dir);
-        } else {
-          throw err;
         }
       }
 
@@ -513,7 +521,7 @@ export const App: React.FC = () => {
   // broad-directory question (L7); it is never sent on a first request.
   const handleAuthorizeAndStart = useCallback(
     async (dirToAuthorize: string, confirmBroad = false) => {
-      const requested = dirToAuthorize.trim();
+      const requested = typedProjectPath(dirToAuthorize);
       if (!requested) {
         showNotice("Informe um caminho de diretório válido.");
         return;
