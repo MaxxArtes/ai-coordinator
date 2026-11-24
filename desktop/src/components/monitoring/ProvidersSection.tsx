@@ -1,10 +1,13 @@
 import React from "react";
 import type {
+  ProviderAccountReading,
+  ProviderContextReading,
+  ProviderLocalSource,
   ProviderTelemetryItem,
   ProvidersTelemetrySnapshot,
   QuotaWindowReading,
 } from "./telemetryContract";
-import { formatSampleAge, resolveOriginBadge } from "./telemetryContract";
+import { formatResetPtBR, formatSampleAge, formatUsdPtBR, resolveOriginBadge } from "./telemetryContract";
 import { formatCountPtBR, formatPercentPtBR, provenanceBadgeText, provenanceToneClass } from "./history";
 
 export interface ProvidersSectionProps {
@@ -31,38 +34,21 @@ const QUOTA_KIND_LABEL: Record<string, string> = {
   local_limit: "Limite local",
 };
 
-const USD_FMT = new Intl.NumberFormat("pt-BR", {
-  style: "currency",
-  currency: "USD",
-  minimumFractionDigits: 2,
-  maximumFractionDigits: 4,
-});
-
-function formatUsd(val: number | null | undefined): string | null {
-  if (typeof val !== "number" || !Number.isFinite(val) || val < 0) return null;
-  return USD_FMT.format(val);
+function fillClass(pct: number): string {
+  if (pct >= 85) return "provider-window__fill provider-window__fill--high";
+  if (pct >= 60) return "provider-window__fill provider-window__fill--mid";
+  return "provider-window__fill provider-window__fill--ok";
 }
 
-function formatIsoShort(iso: string | null | undefined): string | null {
-  if (!iso) return null;
-  const parsed = Date.parse(iso);
-  if (!Number.isFinite(parsed)) return iso;
-  return new Date(parsed).toLocaleString("pt-BR", {
-    day: "2-digit",
-    month: "2-digit",
-    hour: "2-digit",
-    minute: "2-digit",
-  });
+function boundedPercent(value: number | null | undefined): number {
+  return typeof value === "number" && Number.isFinite(value) ? Math.max(0, Math.min(100, value)) : 0;
 }
 
 const QuotaWindowRow: React.FC<{ reading: QuotaWindowReading }> = ({ reading }) => {
   const used = formatPercentPtBR(reading.used_percent);
   const rem = formatPercentPtBR(reading.remaining_percent);
-  const reset = formatIsoShort(reading.resets_at_iso);
-  const pctWidth =
-    typeof reading.used_percent === "number" && Number.isFinite(reading.used_percent)
-      ? Math.max(0, Math.min(100, reading.used_percent))
-      : 0;
+  const reset = formatResetPtBR(reading.resets_at_iso);
+  const age = reading.observed_at_unix_ms ? formatSampleAge(reading.observed_at_unix_ms, reading.ttl_ms ?? undefined) : null;
 
   return (
     <div className="provider-window">
@@ -74,25 +60,65 @@ const QuotaWindowRow: React.FC<{ reading: QuotaWindowReading }> = ({ reading }) 
         </span>
       </div>
       <div className="provider-window__bar" aria-hidden="true">
-        <div
-          className={`provider-window__fill ${
-            pctWidth >= 85
-              ? "provider-window__fill--high"
-              : pctWidth >= 60
-                ? "provider-window__fill--mid"
-                : "provider-window__fill--ok"
-          }`}
-          style={{ width: `${pctWidth}%` }}
-        />
+        <div className={fillClass(boundedPercent(reading.used_percent))} style={{ width: `${boundedPercent(reading.used_percent)}%` }} />
       </div>
       <div className="provider-window__meta">
         <span className={provenanceToneClass(reading.provenance)}>{provenanceBadgeText(reading.provenance)}</span>
         {reading.stale && <span className="badge badge--warn">expirado</span>}
         {reset && <span>Renova: {reset}</span>}
+        {reading.profile && <span>Perfil: {reading.profile}</span>}
+        {age && <span>Leitura {age.text}</span>}
+      </div>
+      {reading.note && <p className="provider-card__muted">{reading.note}</p>}
+    </div>
+  );
+};
+
+const ContextRow: React.FC<{ context: ProviderContextReading }> = ({ context }) => {
+  const used = formatCountPtBR(context.used_tokens);
+  const limit = formatCountPtBR(context.limit_tokens);
+  const pct = formatPercentPtBR(context.used_percent);
+  return (
+    <div className="provider-window" aria-label="Contexto do último turno">
+      <div className="provider-window__head">
+        <span className="provider-window__label">Contexto (último turno)</span>
+        <span className="provider-window__value">
+          {used ? `${used}${limit ? ` de ${limit}` : ""} tokens` : "indisponível"}
+          {pct ? ` · ${pct}` : ""}
+        </span>
+      </div>
+      {limit && (
+        <div className="provider-window__bar" aria-hidden="true">
+          <div className={fillClass(boundedPercent(context.used_percent))} style={{ width: `${boundedPercent(context.used_percent)}%` }} />
+        </div>
+      )}
+      <div className="provider-window__meta">
+        <span className={provenanceToneClass(context.provenance)}>{provenanceBadgeText(context.provenance)}</span>
+        {!limit && <span>Limite da janela indisponível na fonte local</span>}
+        {context.model && <span>Modelo: {context.model}</span>}
       </div>
     </div>
   );
 };
+
+function accountText(account: ProviderAccountReading): string {
+  const fiveHour = formatPercentPtBR(account.windows?.five_hour?.used_percent) ?? "indisponível";
+  const weekly = formatPercentPtBR(account.windows?.weekly?.used_percent) ?? "indisponível";
+  const age = formatSampleAge(account.observed_at_unix_ms).text;
+  const parts = [`5 h: ${fiveHour}`, `semanal: ${weekly}`, `leitura ${age}`];
+  if (account.stale) parts.push("expirada");
+  if (account.exhausted) {
+    const until = formatResetPtBR(account.exhausted_until_iso);
+    const scope = account.exhausted_model ? ` no modelo ${account.exhausted_model}` : "";
+    parts.push(`cota esgotada${scope}${until ? ` até ${until}` : ""}`);
+  }
+  return parts.join(" · ");
+}
+
+function sourceText(source: ProviderLocalSource): string {
+  const state = source.available ? "lida" : "indisponível";
+  return `${source.label}: ${state}${source.reason ? ` (${source.reason})` : ""}`;
+}
 
 const EMPTY_TOKENS: ProviderTelemetryItem["tokens"] = {
   input_tokens: null,
@@ -126,10 +152,18 @@ const ProviderCard: React.FC<{ item: ProviderTelemetryItem }> = ({ item }) => {
   const avail = AVAILABILITY_LABEL[item.availability_status] ?? AVAILABILITY_LABEL.unknown;
   const kindLabel = QUOTA_KIND_LABEL[item.quota_kind] ?? item.quota_kind;
   const age = formatSampleAge(item.observed_at_unix_ms, item.ttl_ms ?? undefined);
+  const origin = resolveOriginBadge(item.data_origin);
   const tokens = item.tokens ?? EMPTY_TOKENS;
   const win5h = item.windows?.five_hour ?? EMPTY_WINDOW_5H;
   const winWeekly = item.windows?.weekly ?? EMPTY_WINDOW_WEEKLY;
+  const windowsNotApplicable = item.windows_supported === false && win5h.supported === false && winWeekly.supported === false;
+  const extraWindows = Array.isArray(item.extra_windows) ? item.extra_windows.slice(0, 6) : [];
+  const accounts = Array.isArray(item.accounts) ? item.accounts : [];
+  const sources = Array.isArray(item.local_sources) ? item.local_sources : [];
   const models = Array.isArray(item.models) ? item.models : [];
+  const scope = item.usage_scope;
+  const retry = formatResetPtBR(item.availability_retry_at_iso);
+  const modelUntil = formatResetPtBR(item.exhausted_until_iso);
 
   const tokenParts = [
     tokens.input_tokens !== null ? `Entrada: ${formatCountPtBR(tokens.input_tokens)}` : null,
@@ -140,13 +174,23 @@ const ProviderCard: React.FC<{ item: ProviderTelemetryItem }> = ({ item }) => {
     tokens.total_tokens !== null ? `Total: ${formatCountPtBR(tokens.total_tokens)}` : null,
   ].filter(Boolean) as string[];
 
+  const scopeParts = scope
+    ? ([
+        scope.label,
+        typeof scope.sessions === "number"
+          ? `${formatCountPtBR(scope.sessions)} ${scope.sessions === 1 ? "sessão" : "sessões"}`
+          : null,
+        scope.truncated ? "amostra parcial (cauda limitada dos registros)" : null,
+      ].filter(Boolean) as string[])
+    : [];
+
   const cc = item.cost_credits;
   const costParts = cc
     ? [
-        formatUsd(cc.balance_usd) ? `Saldo: ${formatUsd(cc.balance_usd)}` : null,
-        formatUsd(cc.credits_remaining_usd) ? `Créditos: ${formatUsd(cc.credits_remaining_usd)}` : null,
-        formatUsd(cc.spent_usd) ? `Gasto: ${formatUsd(cc.spent_usd)}` : null,
-        formatUsd(cc.estimated_cost_usd) ? `Estimado: ${formatUsd(cc.estimated_cost_usd)}` : null,
+        formatUsdPtBR(cc.balance_usd) ? `Saldo: ${formatUsdPtBR(cc.balance_usd)}` : null,
+        formatUsdPtBR(cc.credits_remaining_usd) ? `Créditos: ${formatUsdPtBR(cc.credits_remaining_usd)}` : null,
+        formatUsdPtBR(cc.spent_usd) ? `Gasto: ${formatUsdPtBR(cc.spent_usd)}` : null,
+        formatUsdPtBR(cc.estimated_cost_usd) ? `Estimado: ${formatUsdPtBR(cc.estimated_cost_usd)}` : null,
       ].filter(Boolean) as string[]
     : [];
 
@@ -160,6 +204,17 @@ const ProviderCard: React.FC<{ item: ProviderTelemetryItem }> = ({ item }) => {
           ? `Tokens API: ${formatCountPtBR(al.tokens_remaining)}/${formatCountPtBR(al.tokens_limit)}`
           : null,
       ].filter(Boolean) as string[]
+    : [];
+
+  const plan = item.plan;
+  const planParts = plan
+    ? ([
+        plan.plan_type ? `Plano: ${plan.plan_type}` : null,
+        plan.unlimited === true ? "créditos ilimitados" : null,
+        plan.unlimited !== true && typeof plan.credits_balance === "number"
+          ? `Créditos: ${formatCountPtBR(plan.credits_balance)}`
+          : null,
+      ].filter(Boolean) as string[])
     : [];
 
   return (
@@ -177,10 +232,30 @@ const ProviderCard: React.FC<{ item: ProviderTelemetryItem }> = ({ item }) => {
         </div>
       </div>
 
-      <div className="provider-card__windows">
-        <QuotaWindowRow reading={win5h} />
-        <QuotaWindowRow reading={winWeekly} />
-      </div>
+      {windowsNotApplicable ? (
+        <div className="provider-window">
+          <div className="provider-window__head">
+            <span className="provider-window__label">Janelas de 5 h e semanal</span>
+            <span className="provider-window__value">não se aplica</span>
+          </div>
+          {win5h.note && <p className="provider-card__muted">{win5h.note}</p>}
+        </div>
+      ) : (
+        <div className="provider-card__windows">
+          <QuotaWindowRow reading={win5h} />
+          <QuotaWindowRow reading={winWeekly} />
+        </div>
+      )}
+
+      {extraWindows.length > 0 && (
+        <div className="provider-card__windows" aria-label={`Outras cotas de ${item.display_name}`}>
+          {extraWindows.map((reading) => (
+            <QuotaWindowRow key={`${reading.profile ?? ""}-${reading.window}-${reading.label}`} reading={reading} />
+          ))}
+        </div>
+      )}
+
+      {item.context && <ContextRow context={item.context} />}
 
       <div className="provider-card__section">
         <div className="provider-card__rowhead">
@@ -190,14 +265,20 @@ const ProviderCard: React.FC<{ item: ProviderTelemetryItem }> = ({ item }) => {
         <p className="provider-card__detail">
           {tokenParts.length > 0 ? tokenParts.join(" · ") : "Sem tokens reportados nas fontes locais."}
         </p>
+        {scopeParts.length > 0 && <p className="provider-card__muted">Escopo: {scopeParts.join(" · ")}</p>}
       </div>
 
-      {(costParts.length > 0 || apiParts.length > 0 || item.local_limit) && (
+      {(costParts.length > 0 || apiParts.length > 0 || planParts.length > 0 || item.local_limit) && (
         <div className="provider-card__section">
           {costParts.length > 0 && (
             <p className="provider-card__detail">
               <strong>Custos/Créditos:</strong> {costParts.join(" · ")} (
               {provenanceBadgeText(cc?.provenance)})
+            </p>
+          )}
+          {planParts.length > 0 && (
+            <p className="provider-card__detail">
+              <strong>Assinatura:</strong> {planParts.join(" · ")} ({provenanceBadgeText(plan?.provenance)})
             </p>
           )}
           {apiParts.length > 0 && (
@@ -215,6 +296,21 @@ const ProviderCard: React.FC<{ item: ProviderTelemetryItem }> = ({ item }) => {
         </div>
       )}
 
+      {accounts.length > 1 && (
+        <div className="provider-card__section">
+          <div className="provider-card__rowhead">
+            <span>Perfis locais (sem soma entre perfis)</span>
+          </div>
+          <ul className="provider-card__accounts">
+            {accounts.map((account) => (
+              <li key={account.profile} className="provider-card__detail">
+                <strong>{account.profile}</strong>: {accountText(account)}
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
+
       {models.length > 0 && (
         <div className="provider-card__models">
           {models.slice(0, 4).map((m) => (
@@ -226,14 +322,31 @@ const ProviderCard: React.FC<{ item: ProviderTelemetryItem }> = ({ item }) => {
         </div>
       )}
 
+      {sources.length > 0 && (
+        <p className="provider-card__muted">Fontes locais (somente leitura): {sources.map(sourceText).join(" · ")}</p>
+      )}
+      {item.remote_lookup && !item.remote_lookup.enabled && (
+        <p className="provider-card__muted">Consulta remota: desligada (opt-in). {item.remote_lookup.note ?? ""}</p>
+      )}
+
       <div className="provider-card__foot">
         <span>{item.has_vault_key ? "Chave no cofre: sim" : "Chave no cofre: não"}</span>
         {item.launcher_available !== null && (
           <span>{item.launcher_available ? "Launcher: encontrado" : "Launcher: ausente"}</span>
         )}
+        <span>Origem: {origin.text}</span>
         <span>Leitura: {age.text}</span>
       </div>
       {item.availability_detail && <p className="provider-card__note">{item.availability_detail}</p>}
+      {item.availability_status === "quota_exhausted" && retry && (
+        <p className="provider-card__note">Cota esgotada; liberação prevista: {retry}.</p>
+      )}
+      {item.exhausted_model && (
+        <p className="provider-card__note">
+          Cota esgotada no modelo {item.exhausted_model}
+          {modelUntil ? ` até ${modelUntil}` : ""}; outros grupos de modelos podem ter cota.
+        </p>
+      )}
     </article>
   );
 };

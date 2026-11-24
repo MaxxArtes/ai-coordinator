@@ -783,6 +783,7 @@ class SecureIPCServer:
     def _handle_telemetry_providers_snapshot(self, _params: Dict[str, Any], token: Optional[str] = None) -> Dict[str, Any]:
         from desktop.auth.file_lock import FileLockTimeoutError
         from desktop.auth.vault import VaultBusyError, VaultError
+        from desktop.ipc.provider_adapters import read_local_provider_telemetry
         from desktop.ipc.providers_telemetry import collect_providers_telemetry
 
         mgr = self._get_terminal_manager()
@@ -810,10 +811,17 @@ class SecureIPCServer:
         except Exception:
             coord_budget = None
 
+        local_readings: Optional[Dict[str, Any]] = None
+        try:
+            local_readings = read_local_provider_telemetry()
+        except Exception:
+            local_readings = None
+
         return collect_providers_telemetry(
             profile_name=active.name,
             vault_keys=vault_keys,
             coordinator_budget=coord_budget,
+            local_readings=local_readings,
         )
 
     def _handle_terminal_get_output(self, params: Dict[str, Any]) -> Dict[str, Any]:

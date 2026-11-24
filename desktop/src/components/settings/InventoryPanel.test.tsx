@@ -125,6 +125,80 @@ describe("InventoryPanel — inventário honesto (K6)", () => {
     expect(screen.getByLabelText("Resumo de cotas e tokens dos provedores")).toHaveTextContent("Tokens: 150");
   });
 
+  it("provedores com leitura local: renovação, contexto, custo, idade e origem; janelas que não se aplicam", async () => {
+    const now = Date.now();
+    const unknownWindow = { used_percent: null, remaining_percent: null, resets_at_iso: null, provenance: "unknown" as const };
+    const noTokens = { input_tokens: null, output_tokens: null, cache_read_tokens: null, cache_creation_tokens: null, reasoning_tokens: null, total_tokens: null, provenance: "unknown" as const };
+    renderPanel(
+      "provedores",
+      host({
+        providers_routes: () => ROUTES,
+        providers_telemetry: () => ({
+          schema_version: 1,
+          profile_name: "default",
+          sampled_at_unix_ms: now,
+          ttl_ms: 300_000,
+          stale: false,
+          data_origin: "offline_cache",
+          provenance: "measured",
+          sources: { sqlite_available: false, quota_snapshot_available: false, vault_keys_checked: true, local_sources_checked: true },
+          providers: [
+            {
+              provider: "codex",
+              display_name: "Codex",
+              profile_name: "default",
+              launcher_available: true,
+              has_vault_key: false,
+              availability_status: "unknown",
+              quota_kind: "subscription_quota",
+              windows: {
+                five_hour: { window: "5h", label: "Janela de 5 h", used_percent: 22, remaining_percent: 78, resets_at_iso: new Date(now + 3_600_000).toISOString(), provenance: "measured" },
+                weekly: { window: "weekly", label: "Janela semanal", used_percent: 3, remaining_percent: 97, resets_at_iso: null, provenance: "measured" },
+              },
+              tokens: { ...noTokens, total_tokens: 1160, provenance: "measured" },
+              context: { used_tokens: 420, limit_tokens: 1000, used_percent: 42, provenance: "measured" },
+              models: [],
+              data_origin: "offline_cache",
+              observed_at_unix_ms: now - 120_000,
+              ttl_ms: 900_000,
+              stale: false,
+            },
+            {
+              provider: "opencode",
+              display_name: "OpenCode",
+              profile_name: "default",
+              launcher_available: true,
+              has_vault_key: false,
+              availability_status: "unknown",
+              quota_kind: "api_rate_limit",
+              windows_supported: false,
+              windows: {
+                five_hour: { window: "5h", label: "Janela de 5 h", ...unknownWindow, supported: false },
+                weekly: { window: "weekly", label: "Janela semanal", ...unknownWindow, supported: false },
+              },
+              tokens: noTokens,
+              cost_credits: { kind: "api_rate_limit", currency: "USD", balance_usd: null, credits_remaining_usd: null, spent_usd: 0.5, estimated_cost_usd: null, provenance: "measured" },
+              models: [],
+              data_origin: "offline_cache",
+              observed_at_unix_ms: now,
+              ttl_ms: 900_000,
+              stale: false,
+            },
+          ],
+        }),
+      })
+    );
+    const summary = await screen.findByLabelText("Resumo de cotas e tokens dos provedores");
+    const codex = within(summary).getByText("Codex").closest("div") as HTMLElement;
+    expect(codex).toHaveTextContent("5h: 22,0% (renova");
+    expect(codex).toHaveTextContent("Semanal: 3,0%");
+    expect(codex).toHaveTextContent("Tokens: 1.160 · Contexto: 420 de 1.000 · leitura há 2 min · cache offline");
+    const opencode = within(summary).getByText("OpenCode").closest("div") as HTMLElement;
+    expect(opencode).toHaveTextContent("5h: não se aplica");
+    expect(opencode).toHaveTextContent("Semanal: não se aplica");
+    expect(opencode).toHaveTextContent("Gasto: US$");
+  });
+
   it("sem rotas configuradas: diz isso, sem alerta", async () => {
     renderPanel("provedores", host({ providers_routes: () => ({ ...ROUTES, routes: [] }) }));
     expect(await screen.findByText("Nenhuma rota de fallback configurada.")).toBeInTheDocument();

@@ -142,6 +142,57 @@ export interface QuotaWindowReading {
   observed_at_unix_ms?: number | null;
   ttl_ms?: number | null;
   stale?: boolean;
+  /** false: the provider has no such window (OpenCode, OpenRouter); shown as "não se aplica", never as an empty bar. */
+  supported?: boolean;
+  note?: string | null;
+  group?: string | null;
+  profile?: string | null;
+  disabled?: boolean;
+}
+
+/** Context of the last turn read from local session logs. `limit_tokens` stays null when the source does not say it. */
+export interface ProviderContextReading {
+  used_tokens: number | null;
+  limit_tokens: number | null;
+  used_percent: number | null;
+  model?: string | null;
+  provenance: MetricProvenance;
+  observed_at_unix_ms?: number | null;
+}
+
+export interface ProviderPlanReading {
+  plan_type: string | null;
+  has_credits: boolean | null;
+  unlimited: boolean | null;
+  credits_balance: number | null;
+  provenance: MetricProvenance;
+}
+
+/** One local profile/account of the same CLI (carvalima, max, padrao); nothing is summed between profiles. */
+export interface ProviderAccountReading {
+  profile: string;
+  windows: { five_hour: QuotaWindowReading; weekly: QuotaWindowReading };
+  observed_at_unix_ms: number | null;
+  stale: boolean;
+  exhausted?: boolean;
+  exhausted_until_iso?: string | null;
+  exhausted_model?: string | null;
+}
+
+/** A local, read-only source and whether it could be read; never a path or a value from the file. */
+export interface ProviderLocalSource {
+  kind: string;
+  label: string;
+  available: boolean;
+  reason?: string | null;
+  observed_at_unix_ms?: number | null;
+}
+
+export interface ProviderUsageScope {
+  label: string;
+  lookback_hours?: number | null;
+  sessions?: number | null;
+  truncated?: boolean;
 }
 
 export interface TokenUsageSummary {
@@ -201,6 +252,20 @@ export interface ProviderTelemetryItem {
   cost_credits?: ProviderCostCreditSnapshot | null;
   local_limit?: Record<string, unknown> | null;
   tokens: TokenUsageSummary;
+  coordinator_tokens?: TokenUsageSummary | null;
+  usage_scope?: ProviderUsageScope | null;
+  context?: ProviderContextReading | null;
+  plan?: ProviderPlanReading | null;
+  windows_supported?: boolean;
+  extra_windows?: QuotaWindowReading[];
+  accounts?: ProviderAccountReading[];
+  local_sources?: ProviderLocalSource[];
+  local_available?: boolean;
+  remote_lookup?: { enabled: boolean; note?: string | null } | null;
+  /** A quota mark scoped to one model (AGY 429): other model groups may still have quota. */
+  exhausted_model?: string | null;
+  exhausted_until_iso?: string | null;
+  last_activity_unix_ms?: number | null;
   models: ProviderModelTelemetry[];
   data_origin: DataOrigin | string;
   observed_at_unix_ms: number | null;
@@ -220,6 +285,9 @@ export interface ProvidersTelemetrySnapshot {
     sqlite_available: boolean;
     quota_snapshot_available: boolean;
     vault_keys_checked: boolean;
+    local_sources_checked?: boolean;
+    local_providers?: Record<string, boolean>;
+    local_read_at_unix_ms?: number | null;
   };
   providers: ProviderTelemetryItem[];
   notice?: string | null;
@@ -238,6 +306,30 @@ export function resolveOriginBadge(origin?: string): { text: string; className: 
     default:
       return { text: "origem não informada", className: "badge badge--unknown", isFixture: false };
   }
+}
+
+const USD_FMT = new Intl.NumberFormat("pt-BR", {
+  style: "currency",
+  currency: "USD",
+  minimumFractionDigits: 2,
+  maximumFractionDigits: 4,
+});
+
+export function formatUsdPtBR(val: number | null | undefined): string | null {
+  if (typeof val !== "number" || !Number.isFinite(val) || val < 0) return null;
+  return USD_FMT.format(val);
+}
+
+export function formatResetPtBR(iso: string | null | undefined): string | null {
+  if (!iso) return null;
+  const parsed = Date.parse(iso);
+  if (!Number.isFinite(parsed)) return null;
+  return new Date(parsed).toLocaleString("pt-BR", {
+    day: "2-digit",
+    month: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+  });
 }
 
 export function formatSampleAge(

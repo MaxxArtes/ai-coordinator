@@ -23,7 +23,14 @@ import {
   type RoutesSnapshot,
   type SecurityStatus,
 } from "./api";
-import { resolveOriginBadge, type ProvidersTelemetrySnapshot } from "../monitoring/telemetryContract";
+import {
+  formatResetPtBR,
+  formatSampleAge,
+  formatUsdPtBR,
+  resolveOriginBadge,
+  type ProvidersTelemetrySnapshot,
+  type QuotaWindowReading,
+} from "../monitoring/telemetryContract";
 import { formatCountPtBR, formatPercentPtBR, provenanceBadgeText, provenanceToneClass } from "../monitoring/history";
 
 type InventoryKind = "agentes" | "provedores" | "seguranca";
@@ -64,6 +71,13 @@ const POLICY_TEXT_KEYS = new Set(["description"]);
 function policyValue(item: (typeof POLICY_ITEMS)[number], value: boolean | string): string {
   if (typeof value === "boolean") return value ? "Sim" : "Não";
   return item.values?.[value] ?? "Valor não reconhecido por esta versão da interface";
+}
+
+function windowSummary(label: string, reading: QuotaWindowReading | undefined): string {
+  if (reading?.supported === false) return `${label}: não se aplica`;
+  const pct = formatPercentPtBR(reading?.used_percent);
+  const reset = pct ? formatResetPtBR(reading?.resets_at_iso) : null;
+  return `${label}: ${pct ?? provenanceBadgeText(reading?.provenance)}${reset ? ` (renova ${reset})` : ""}`;
 }
 
 const SOURCE_TEXT: Record<string, string> = {
@@ -261,20 +275,31 @@ export const InventoryPanel: React.FC<InventoryPanelProps> = ({ kind, active, is
             comprovam conexão ou saldo.
           </p>
           <div className="providers-settings-grid">
-            {provTelemetry.providers.map((p) => (
-              <div key={p.provider} className="providers-settings-item">
-                <strong>{p.display_name}</strong>{" "}
-                <span className={provenanceToneClass(p.windows.five_hour.provenance)}>
-                  5h: {formatPercentPtBR(p.windows.five_hour.used_percent) ?? provenanceBadgeText(p.windows.five_hour.provenance)}
-                </span>{" "}
-                <span className={provenanceToneClass(p.windows.weekly.provenance)}>
-                  Semanal: {formatPercentPtBR(p.windows.weekly.used_percent) ?? provenanceBadgeText(p.windows.weekly.provenance)}
-                </span>
-                {p.tokens.total_tokens !== null && (
-                  <span className="settings__note"> · Tokens: {formatCountPtBR(p.tokens.total_tokens)}</span>
-                )}
-              </div>
-            ))}
+            {provTelemetry.providers.map((p) => {
+              const details = [
+                p.tokens?.total_tokens != null ? `Tokens: ${formatCountPtBR(p.tokens.total_tokens)}` : null,
+                p.context?.used_tokens != null
+                  ? `Contexto: ${formatCountPtBR(p.context.used_tokens)}${
+                      p.context.limit_tokens ? ` de ${formatCountPtBR(p.context.limit_tokens)}` : ""
+                    }`
+                  : null,
+                formatUsdPtBR(p.cost_credits?.spent_usd) ? `Gasto: ${formatUsdPtBR(p.cost_credits?.spent_usd)}` : null,
+                `leitura ${formatSampleAge(p.observed_at_unix_ms, p.ttl_ms ?? undefined).text}${p.stale ? " (expirada)" : ""}`,
+                resolveOriginBadge(p.data_origin).text,
+              ].filter(Boolean);
+              return (
+                <div key={p.provider} className="providers-settings-item">
+                  <strong>{p.display_name}</strong>{" "}
+                  <span className={provenanceToneClass(p.windows?.five_hour?.provenance)}>
+                    {windowSummary("5h", p.windows?.five_hour)}
+                  </span>{" "}
+                  <span className={provenanceToneClass(p.windows?.weekly?.provenance)}>
+                    {windowSummary("Semanal", p.windows?.weekly)}
+                  </span>
+                  <span className="settings__note"> · {details.join(" · ")}</span>
+                </div>
+              );
+            })}
           </div>
         </div>
       ) : (

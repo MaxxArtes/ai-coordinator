@@ -8,6 +8,8 @@ or exposing credentials:
 4. Coordinator SQLite (`coordination.sqlite` read-only): `route_health`, `runs`, `cognitive_telemetry`
 5. Optional validated local quota snapshot (`provider_quotas.json`), strictly honoring provenance,
    `data_origin` (`live_network` | `offline_cache` | `test_fixture`), TTL, and expiration (`stale`).
+6. Optional local provider readings (`desktop.ipc.provider_adapters`): CLI session logs, aviso-cota readings,
+   quota caches and the OpenCode database, read only, already reduced to numbers.
 
 Missing metrics always remain `None` with `provenance="unknown"` — never invented.
 """
@@ -412,6 +414,29 @@ def _read_sqlite_telemetry(
                 pass
 
 
+def _prefer_local_window(current: Dict[str, Any], local: Any) -> Dict[str, Any]:
+    """Local reading replaces an unknown window, or a known one it is at least as fresh as."""
+    if not isinstance(local, dict):
+        return current
+    if current.get("provenance") == MetricProvenance.UNKNOWN.value:
+        return local
+    if local.get("provenance") == MetricProvenance.UNKNOWN.value:
+        return current
+    local_obs = _finite_nonneg_int(local.get("observed_at_unix_ms")) or 0
+    current_obs = _finite_nonneg_int(current.get("observed_at_unix_ms")) or 0
+    return local if local_obs >= current_obs else current
+
+
+def _local_list(local: Optional[Dict[str, Any]], key: str, limit: int) -> List[Any]:
+    value = local.get(key) if local else None
+    return [entry for entry in value if isinstance(entry, dict)][:limit] if isinstance(value, list) else []
+
+
+def _local_dict(local: Optional[Dict[str, Any]], key: str) -> Optional[Dict[str, Any]]:
+    value = local.get(key) if local else None
+    return value if isinstance(value, dict) else None
+
+
 def _read_quota_snapshot_file(path: Path) -> Tuple[bool, Dict[str, Any], Optional[str]]:
     if not path.is_file():
         return False, {}, None
@@ -436,8 +461,13 @@ def collect_providers_telemetry(
     agents_data: Optional[Dict[str, Any]] = None,
     routes_data: Optional[Dict[str, Any]] = None,
     now_ms: Optional[int] = None,
+    local_readings: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
-    """Build sanitized, provenance-tagged provider telemetry snapshot for 4D.4.3 / 4D.4.4."""
+    """Build sanitized, provenance-tagged provider telemetry snapshot for 4D.4.3 / 4D.4.4.
+
+    ``local_readings`` is the result of ``provider_adapters.read_local_provider_telemetry()``; without it only the
+    Coordinator's own sources are used.
+    """
     from ai_coordinator.data import default_data_dir
     from desktop.ipc.discovery import agents_snapshot, routes_snapshot
 
@@ -479,6 +509,14 @@ def collect_providers_telemetry(
     doc_observed_ms = _finite_nonneg_int(quota_doc.get("observed_at_unix_ms")) if quota_ok else None
     doc_ttl_ms = _finite_nonneg_int(quota_doc.get("ttl_ms")) or DEFAULT_PROVIDER_TTL_MS
     doc_providers = quota_doc.get("providers") if (quota_ok and isinstance(quota_doc.get("providers"), dict)) else {}
+
+    local_by_provider: Dict[str, Dict[str, Any]] = {}
+    if isinstance(local_readings, dict) and isinstance(local_readings.get("providers"), dict):
+        local_by_provider = {
+            pid: reading
+            for pid, reading in local_readings["providers"].items()
+            if isinstance(pid, str) and SAFE_PROVIDER_ID.fullmatch(pid) and isinstance(reading, dict)
+        }
 
     provider_ids: List[str] = [p["provider"] for p in CANONICAL_PROVIDERS]
     for extra_pid in sorted(set(health_by_prov) | set(prov_buckets) | set(doc_providers)):
@@ -528,6 +566,10 @@ def collect_providers_telemetry(
             entry_ttl_ms,
             current_ms,
         )
+        local = local_by_provider.get(pid)
+        local_windows = _local_dict(local, "windows") or {}
+        win_5h = _prefer_local_window(win_5h, local_windows.get("five_hour"))
+        win_weekly = _prefer_local_window(win_weekly, local_windows.get("weekly"))
 
         # API rate limits (requests / tokens remaining)
         api_limits = None
@@ -552,7 +594,15 @@ def collect_providers_telemetry(
 
         # Cost / balance / credits
         p_bucket = prov_buckets.get(pid, _empty_token_bucket())
-        tokens_summary = _finalize_tokens(p_bucket)
+        coordinator_tokens = _finalize_tokens(p_bucket)
+        tokens_summary = coordinator_tokens
+        usage_scope: Optional[Dict[str, Any]] = None
+        local_tokens = _local_dict(local, "tokens")
+        if local_tokens and local_tokens.get("provenance") in (MetricProvenance.MEASURED.value, MetricProvenance.ESTIMATED.value):
+            tokens_summary = local_tokens
+            usage_scope = _local_dict(local, "usage_scope")
+        elif coordinator_tokens["provenance"] != MetricProvenance.UNKNOWN.value:
+            usage_scope = {"label": "execuções registradas pelo Coordinator", "sessions": coordinator_tokens["runs_count"]}
 
         cost_credits = None
         raw_cc = q_entry.get("cost_credits") if isinstance(q_entry.get("cost_credits"), dict) else {}
@@ -560,6 +610,9 @@ def collect_providers_telemetry(
         cred_rem = _finite_nonneg_float(raw_cc.get("credits_remaining_usd"))
         spent_usd = _finite_nonneg_float(raw_cc.get("spent_usd"))
         est_usd = _finite_nonneg_float(raw_cc.get("estimated_cost_usd"))
+        local_cost = _local_dict(local, "cost")
+        if spent_usd is None and local_cost:
+            spent_usd = _finite_nonneg_float(local_cost.get("spent_usd"))
         if spent_usd is None and p_bucket["has_cost"]:
             spent_usd = p_bucket["cost_usd"]
         if any(x is not None for x in (bal_usd, cred_rem, spent_usd, est_usd)):
@@ -583,12 +636,20 @@ def collect_providers_telemetry(
         avail_status = q_entry.get("availability_status") if isinstance(q_entry.get("availability_status"), str) else (h["status"] if h else "unknown")
         avail_detail = scrub_sensitive_text(str(q_entry.get("availability_detail")))[:180] if isinstance(q_entry.get("availability_detail"), str) else (h["detail"] if h else None)
         retry_iso = h["retry_at_iso"] if h else None
+        if avail_status == "unknown" and local and local.get("exhausted") is True:
+            avail_status = "quota_exhausted"
+            if retry_iso is None and isinstance(local.get("exhausted_until_iso"), str):
+                retry_iso = local["exhausted_until_iso"]
 
-        # Combine per-model breakdown (runs/cognitive telemetry + configured route models)
+        # Combine per-model breakdown (local session logs + runs/cognitive telemetry + configured route models)
         models_list: List[Dict[str, Any]] = []
         seen_models: set[str] = set()
+        for local_model in _local_list(local, "models", 12):
+            if isinstance(local_model.get("model"), str) and local_model["model"] not in seen_models:
+                seen_models.add(local_model["model"])
+                models_list.append(local_model)
         for (mp, model_name), mb in sorted(model_buckets.items(), key=lambda kv: (kv[1]["total_tokens"] or 0), reverse=True):
-            if mp != pid:
+            if mp != pid or model_name in seen_models:
                 continue
             seen_models.add(model_name)
             models_list.append(
@@ -612,6 +673,10 @@ def collect_providers_telemetry(
                 )
 
         # Freshness for provider item
+        local_obs_ms = _finite_nonneg_int(local.get("observed_at_unix_ms")) if local else None
+        if not q_entry and local_obs_ms is not None:
+            entry_obs_ms = local_obs_ms
+            entry_ttl_ms = _finite_nonneg_int(local.get("ttl_ms")) or entry_ttl_ms
         if entry_obs_ms is None and h and h.get("observed_ms"):
             entry_obs_ms = h["observed_ms"]
         item_stale = bool(
@@ -656,6 +721,19 @@ def collect_providers_telemetry(
                 "cost_credits": cost_credits,
                 "local_limit": coordinator_budget if coordinator_budget else None,
                 "tokens": tokens_summary,
+                "coordinator_tokens": coordinator_tokens,
+                "usage_scope": usage_scope,
+                "context": _local_dict(local, "context"),
+                "plan": _local_dict(local, "plan"),
+                "windows_supported": local.get("windows_supported") is not False if local else True,
+                "extra_windows": _local_list(local, "extra_windows", 8),
+                "accounts": _local_list(local, "accounts", 6),
+                "local_sources": _local_list(local, "sources", 6),
+                "local_available": bool(local and local.get("available") is True),
+                "remote_lookup": _local_dict(local, "remote_lookup"),
+                "exhausted_model": local.get("exhausted_model") if local and isinstance(local.get("exhausted_model"), str) else None,
+                "exhausted_until_iso": local.get("exhausted_until_iso") if local and isinstance(local.get("exhausted_until_iso"), str) else None,
+                "last_activity_unix_ms": _finite_nonneg_int(local.get("last_activity_unix_ms")) if local else None,
                 "models": models_list[:12],
                 "data_origin": entry_origin,
                 "observed_at_unix_ms": entry_obs_ms,
@@ -690,6 +768,9 @@ def collect_providers_telemetry(
             "sqlite_available": sqlite_ok,
             "quota_snapshot_available": quota_ok,
             "vault_keys_checked": vault_keys is not None,
+            "local_sources_checked": local_readings is not None,
+            "local_providers": {pid: reading.get("available") is True for pid, reading in local_by_provider.items()},
+            "local_read_at_unix_ms": _finite_nonneg_int(local_readings.get("read_at_unix_ms")) if isinstance(local_readings, dict) else None,
         },
         "providers": items,
         "notice": quota_notice,
