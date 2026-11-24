@@ -985,6 +985,7 @@ const PDH_FMT_LARGE: u32 = 0x00000400;
 const PDH_MORE_DATA: i32 = 0x800007D2_u32 as i32;
 
 #[cfg(windows)]
+#[allow(dead_code)]
 #[repr(C)]
 #[derive(Copy, Clone)]
 union PdhFmtCounterValueUnion {

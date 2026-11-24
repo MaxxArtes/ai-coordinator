@@ -716,7 +716,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import _desktop_static as static  # noqa: E402
 
 CORE_METHOD = re.compile(
-    r"""[(,]\s*"((?:system|profile|security|discovery|providers|terminal|settings|vault)\.[a-z_]+)"\s*,""")
+    r"""[(,]\s*"((?:system|profile|security|discovery|providers|terminal|settings|vault|telemetry)\.[a-z_]+)"\s*,""")
 
 
 def test_static_reader_understands_the_argument_forms_in_use():

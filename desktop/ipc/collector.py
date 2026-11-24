@@ -1209,7 +1209,10 @@ class ProcessTreeCollector:
         clock_ns: Optional[Callable[[], int]] = None,
         cpu_count_fn: Optional[Callable[[], int]] = None,
         system_sampler: Optional[Callable[[Optional[float], int], Optional[SystemResourcesMetrics]]] = None,
+        data_origin: DataOrigin = DataOrigin.LIVE_OS,
     ) -> None:
+        if not isinstance(data_origin, DataOrigin):
+            raise ValueError(f"Invalid data_origin: {data_origin!r}")
         self._core_pid = os.getpid() if core_pid is None else core_pid
         self._min_sample_interval_ms = validate_sample_interval_ms(min_sample_interval_ms)
         self._process_lister = process_lister or inspect_os_processes
@@ -1217,6 +1220,7 @@ class ProcessTreeCollector:
         self._cpu_count_fn = cpu_count_fn or (lambda: os.cpu_count() or 1)
         self._default_system_sampler = _SystemResourceSampler() if system_sampler is None else None
         self._system_sampler = system_sampler or self._default_system_sampler.sample
+        self._data_origin = data_origin
 
         self._lock = threading.Lock()
         self._last_sample_at_ns: Optional[int] = None
@@ -1552,6 +1556,7 @@ class ProcessTreeCollector:
                 sampled_at_unix_ms=int(time.time() * 1000),
                 categories=categories,
                 nodes=nodes,
+                data_origin=self._data_origin,
                 system=sys_metrics,
             )
 
