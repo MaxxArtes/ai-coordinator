@@ -178,7 +178,7 @@ describe("CSS and component rules", () => {
     expect(Array.from(new Set(readers.map((r) => r.file))).sort()).toEqual([
       "components/monitoring/MonitoringView.tsx",
       "components/monitoring/history.ts",
-      "components/shell/AppHeader.tsx",
+      "components/monitoring/telemetryContract.ts",
       "components/shell/StatusBar.tsx",
     ]);
   });

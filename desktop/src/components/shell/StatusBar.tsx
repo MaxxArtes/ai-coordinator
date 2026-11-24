@@ -61,6 +61,18 @@ export function treeRamText(
   if (isPreviewMode(isTauri, status)) return "indisponível (preview)";
   if (unavailable) return "indisponível";
   if (!metrics) return "aguardando";
+  const privProv = metrics.private_ram_provenance;
+  if (
+    (privProv === "measured" || privProv === "estimated") &&
+    typeof metrics.total_private_ram_bytes === "number" &&
+    metrics.total_private_ram_bytes > 0
+  ) {
+    const privVal = formatBytesPtBR(metrics.total_private_ram_bytes);
+    if (privVal) {
+      const label = privProv === "measured" ? "medida · privada" : "estimada · privada";
+      return `${privVal} (${label})`;
+    }
+  }
   const value = formatBytesPtBR(metrics.total_tree_ram_bytes);
   return value ? `${value} (medida)` : "indisponível";
 }

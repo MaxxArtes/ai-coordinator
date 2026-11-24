@@ -1890,6 +1890,44 @@
   gap: var(--sp-3);
 }
 
+.monitoring-cards--compact {
+  grid-template-columns: repeat(auto-fit, minmax(170px, 1fr));
+}
+
+.monitoring-section {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-2);
+}
+
+.monitoring-section__head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: var(--sp-2);
+}
+
+.monitoring-section__title {
+  margin: 0;
+  font-size: var(--fs-md);
+  font-weight: var(--fw-semibold);
+  color: var(--c-fg);
+}
+
+.monitoring-limits-note {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: space-between;
+  gap: var(--sp-2);
+  padding: var(--sp-2) var(--sp-3);
+  border: 1px solid var(--c-border);
+  border-radius: var(--radius);
+  background: var(--c-surface);
+  font-size: var(--fs-xs);
+  color: var(--c-fg-muted);
+}
+
 .monitoring-card {
   display: flex;
   flex-direction: column;
@@ -1970,10 +2008,61 @@
 .monitoring-chart {
   display: block;
   width: 100%;
-  height: 72px;
+  height: 112px;
   border: 1px solid var(--c-border);
   border-radius: var(--radius);
   background: var(--c-nav-inset);
+}
+
+.monitoring-chart__grid {
+  stroke: var(--c-border);
+  stroke-width: 0.75;
+  stroke-dasharray: 2 3;
+}
+
+.monitoring-chart__axis {
+  fill: var(--c-fg-subtle);
+  font-family: var(--font-mono);
+  font-size: var(--fs-xs);
+}
+
+.monitoring-chart__legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--sp-3);
+  margin-top: 2px;
+  font-size: var(--fs-xs);
+  color: var(--c-fg-muted);
+}
+
+.monitoring-legend-item {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+}
+
+.monitoring-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+}
+
+.monitoring-dot--sys {
+  background: var(--c-warn);
+}
+
+.monitoring-dot--app {
+  background: var(--c-accent);
+}
+
+.monitoring-chart__footer {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: space-between;
+  gap: var(--sp-2);
+  font-family: var(--font-mono);
+  font-size: var(--fs-xs);
+  color: var(--c-fg-muted);
 }
 
 .monitoring-chart__threshold {
@@ -1987,6 +2076,11 @@
   stroke-width: 2;
   stroke-linecap: round;
   stroke-linejoin: round;
+}
+
+.monitoring-chart__line--sys {
+  stroke: var(--c-warn);
+  stroke-width: 1.5;
 }
 
 .monitoring-chart__line--cpu {

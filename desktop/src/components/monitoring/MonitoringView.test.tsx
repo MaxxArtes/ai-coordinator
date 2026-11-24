@@ -89,7 +89,8 @@ describe("MonitoringView and history buffer (4D.4.2)", () => {
     expect(catSection).toHaveTextContent("Core Python");
     expect(catSection).toHaveTextContent("WebView2");
     expect(catSection).toHaveTextContent("Terminais");
-    expect(catSection).toHaveTextContent("Filhos e agentes");
+    expect(catSection).toHaveTextContent("Agentes de IA");
+    expect(catSection).toHaveTextContent("Filhos genéricos");
 
     const procSection = screen.getByRole("region", { name: "Processos com maior consumo" });
     const rows = within(procSection).getAllByRole("row").slice(1);
@@ -192,5 +193,126 @@ describe("MonitoringView and history buffer (4D.4.2)", () => {
       />
     );
     expect(screen.getByText("Coletor nativo indisponível (modo preview)")).toBeInTheDocument();
+  });
+
+  it("separates system resources, exclusive private RAM, AI agents, scaled charts, and session PID metrics", () => {
+    const detailed: RuntimeMetrics = {
+      ...FULL_METRICS,
+      data_origin: "live_os",
+      ttl_ms: 10_000,
+      host_private_ram_bytes: 34_000_000,
+      total_private_ram_bytes: 148 * 1024 * 1024,
+      private_ram_provenance: "measured",
+      total_working_set_ram_bytes: 547 * 1024 * 1024,
+      total_shared_ram_bytes: 399 * 1024 * 1024,
+      total_tree_ram_bytes: 547 * 1024 * 1024,
+      logical_cpu_count: 8,
+      categories: {
+        ...FULL_METRICS.categories!,
+        agent: {
+          role: "agent",
+          process_count: 1,
+          ram_bytes: 110 * 1024 * 1024,
+          ram_provenance: "measured",
+          private_ram_bytes: 82 * 1024 * 1024,
+          private_ram_provenance: "measured",
+          working_set_ram_bytes: 110 * 1024 * 1024,
+          shared_ram_bytes: 28 * 1024 * 1024,
+          cpu_usage_percent: 6.2,
+          cpu_provenance: "measured",
+        },
+      },
+      nodes: [
+        ...(FULL_METRICS.nodes ?? []),
+        {
+          pid: 8801,
+          ppid: 7002,
+          role: "agent",
+          name: "claude.exe",
+          ram_bytes: 110 * 1024 * 1024,
+          ram_provenance: "measured",
+          private_ram_bytes: 82 * 1024 * 1024,
+          private_ram_provenance: "measured",
+          working_set_ram_bytes: 110 * 1024 * 1024,
+          shared_ram_bytes: 28 * 1024 * 1024,
+          cpu_usage_percent: 6.2,
+          cpu_provenance: "measured",
+          agent_kind: "claude",
+        },
+      ],
+      system: {
+        logical_cpu_count: 8,
+        cpu_usage_percent: 48.0,
+        cpu_provenance: "measured",
+        ram_total_bytes: 32 * 1024**3,
+        ram_used_bytes: 22 * 1024**3,
+        ram_available_bytes: 10 * 1024**3,
+        ram_usage_percent: 68.8,
+        ram_provenance: "measured",
+        storage_total_bytes: 1000 * 1024**3,
+        storage_used_bytes: 620 * 1024**3,
+        storage_available_bytes: 380 * 1024**3,
+        storage_usage_percent: 62.0,
+        storage_provenance: "measured",
+        storage_volumes: [{ name: "C:", mount_point: "C:\\", total_bytes: 1000 * 1024**3, used_bytes: 620 * 1024**3, available_bytes: 380 * 1024**3, usage_percent: 62.0 }],
+        disk_activity_percent: 12.0,
+        disk_activity_provenance: "measured",
+        disk_read_bytes_per_sec: 1_500_000,
+        disk_write_bytes_per_sec: 500_000,
+        disk_io_provenance: "measured",
+        network_rx_bytes_per_sec: 8_000_000,
+        network_tx_bytes_per_sec: 400_000,
+        network_total_bytes_per_sec: 8_400_000,
+        network_provenance: "measured",
+        gpu_usage_percent: 3.0,
+        gpu_provenance: "measured",
+      },
+    };
+    let hist: HistorySample[] = [];
+    hist = appendHistorySample(hist, detailed, false, 1_700_000_000_000);
+    hist = appendHistorySample(hist, detailed, false, 1_700_000_002_000);
+
+    const panesWithPid: TerminalPaneData[] = [
+      ...PANES,
+      { sessionId: "s-3", tabId: "tab-main", paneId: 2, kind: "governed_agent", number: 3, pid: 8801, cwd: "D:\\ai-coordinator" },
+    ];
+
+    render(
+      <MonitoringView
+        active
+        isTauri
+        connectionStatus="connected"
+        metrics={detailed}
+        metricsUnavailable={false}
+        history={hist}
+        panes={panesWithPid}
+        paneStates={{ ...STATES, "s-3": { kind: "alive" } }}
+      />
+    );
+
+    const sysSection = screen.getByRole("region", { name: "Recursos do computador" });
+    expect(sysSection).toHaveTextContent("48,0%");
+    expect(sysSection).toHaveTextContent("68,8%");
+    expect(sysSection).toHaveTextContent("62,0%");
+    expect(sysSection).toHaveTextContent("12,0%");
+    expect(sysSection).toHaveTextContent("8,0 MB/s");
+    expect(sysSection).toHaveTextContent("3,0%");
+
+    const summary = screen.getByRole("region", { name: "Resumo do consumo atual" });
+    expect(summary).toHaveTextContent("148,0 MB");
+    expect(summary).toHaveTextContent("Working Set total (inclui compartilhada): 547,0 MB");
+
+    const agentsSection = screen.getByRole("region", { name: "Agentes de IA em execução" });
+    expect(agentsSection).toHaveTextContent("Claude");
+    expect(agentsSection).toHaveTextContent("8801");
+    expect(agentsSection).toHaveTextContent("82,0 MB");
+
+    const chartsSection = screen.getByRole("region", { name: "Gráficos históricos recentes" });
+    expect(chartsSection).toHaveTextContent("100%");
+    expect(chartsSection).toHaveTextContent("agora");
+    expect(chartsSection).toHaveTextContent("pico");
+
+    const sessSection = screen.getByRole("region", { name: "Sessões supervisionadas" });
+    expect(sessSection).toHaveTextContent("CPU 6,2% · RAM priv. 82,0 MB");
   });
 });

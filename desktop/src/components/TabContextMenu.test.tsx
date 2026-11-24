@@ -93,4 +93,36 @@ describe("TabContextMenu and TerminalGrid right-click navigation (4D.4.2)", () =
     expect(screen.getByText("Nenhum diretório autorizado salvo")).toBeInTheDocument();
     expect(screen.getByRole("menuitem", { name: /Outro diretório/ })).toBeInTheDocument();
   });
+
+  it("opens context menu via Shift+F10 keyboard shortcut and preserves existing sessions on selection", async () => {
+    const user = userEvent.setup();
+    const onOpenAuthorizedProject = vi.fn();
+
+    render(
+      <TerminalGrid
+        tabId="tab-main"
+        projectPath={"C:\\Users\\10864"}
+        panes={[
+          { sessionId: "sess-1", tabId: "tab-main", paneId: 0, kind: "human_terminal", number: 1 },
+          { sessionId: "sess-2", tabId: "tab-main", paneId: 1, kind: "human_terminal", number: 2 },
+        ]}
+        authorizedProjects={["C:\\Users\\10864", "D:\\ai-coordinator"]}
+        onOpenAuthorizedProject={onOpenAuthorizedProject}
+        onAddPane={vi.fn()}
+        onWrite={vi.fn()}
+        onResize={vi.fn()}
+      />
+    );
+
+    const strip = screen.getByRole("group", { name: "Aba do projeto" });
+    fireEvent.keyDown(strip, { key: "F10", shiftKey: true });
+
+    const menu = screen.getByRole("menu", { name: "Ações da aba do projeto" });
+    const items = screen.getAllByRole("menuitem");
+    await user.click(items[1]);
+    expect(onOpenAuthorizedProject).toHaveBeenCalledWith("D:\\ai-coordinator");
+    expect(menu).not.toBeInTheDocument();
+    // Both existing terminal panes remain rendered
+    expect(document.querySelectorAll("[data-session-id]")).toHaveLength(2);
+  });
 });

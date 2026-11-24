@@ -1025,6 +1025,7 @@ export const App: React.FC = () => {
             history={metricsHistory}
             panes={panes}
             paneStates={paneStates}
+            settings={settings}
           />
         }
       />
