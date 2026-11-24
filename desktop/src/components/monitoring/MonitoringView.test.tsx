@@ -553,3 +553,56 @@ describe("CPU and RAM charts: visible lines and the adaptive scale (4D.4 r2)", (
     expect(cpu.querySelectorAll(".monitoring-chart__line--cpu")).toHaveLength(0);
   });
 });
+
+describe("Readings asked by the status bar alone (4D.4 r2, Bloco 5)", () => {
+  beforeEach(() => {
+    window.localStorage.clear();
+  });
+
+  const view = (metrics: RuntimeMetrics, history: HistorySample[] = []) =>
+    render(
+      <MonitoringView
+        active
+        isTauri
+        connectionStatus="connected"
+        metrics={metrics}
+        metricsUnavailable={false}
+        history={history}
+        panes={[]}
+        paneStates={{}}
+      />
+    );
+
+  it("without the process list it waits for the detailed reading instead of claiming there is none", () => {
+    const { unmount } = view({ ...FULL_METRICS, nodes: undefined, system: null });
+    expect(screen.getAllByText("Aguardando a leitura detalhada dos processos.")).toHaveLength(2);
+    expect(screen.queryByText("Nenhum agente de IA identificado em execução no momento.")).toBeNull();
+    unmount();
+
+    view({ ...FULL_METRICS, nodes: [] });
+    expect(screen.getByText("Nenhum agente de IA identificado em execução no momento.")).toBeInTheDocument();
+    expect(screen.getByText("Nenhum processo detalhado disponível na árvore atual.")).toBeInTheDocument();
+  });
+
+  it("the computer line explains its gap: the status bar readings do not include the system", () => {
+    const system = { logical_cpu_count: 4, cpu_usage_percent: 35, cpu_provenance: "measured" as const };
+    let hist: HistorySample[] = [];
+    [false, false, true, true].forEach((withSystem, i) => {
+      const metrics: RuntimeMetrics = {
+        ...FULL_METRICS,
+        sampled_at_unix_ms: 1_700_000_000_000 + i * 2000,
+        system: withSystem ? system : null,
+      };
+      hist = appendHistorySample(hist, metrics, false, 1_700_000_000_000 + i * 2000);
+    });
+    expect(hist.map((s) => s.systemSkipped)).toEqual([true, true, false, false]);
+    expect(hist.map((s) => s.systemCpuPercent)).toEqual([null, null, 35, 35]);
+    expect(appendHistorySample([], null, true)[0].systemSkipped).toBe(false);
+
+    view(FULL_METRICS, hist);
+    const note = "Computador: sem amostras enquanto o Monitoramento esteve fechado (a barra de status lê só o AI Coordinator).";
+    expect(screen.queryByText(note)).toBeNull(); // focus scale: the computer is not drawn
+    fireEvent.click(screen.getByRole("button", { name: "Global 0–100%" }));
+    expect(screen.getByText(note)).toBeInTheDocument();
+  });
+});

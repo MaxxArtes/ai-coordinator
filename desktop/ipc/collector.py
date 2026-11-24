@@ -1602,6 +1602,7 @@ class ProcessTreeCollector:
 
         self._lock = threading.Lock()
         self._last_sample_at_ns: Optional[int] = None
+        self._last_system_sample_at_ns: Optional[int] = None
         self._previous_cpu_by_identity: Dict[Tuple[int, Optional[int]], float] = {}
         self._last_snapshot: Optional[ProcessTreeMetricsSnapshot] = None
 
@@ -1936,7 +1937,15 @@ class ProcessTreeCollector:
                 [n.cpu_provenance for n in nodes],
             )
 
-            sys_metrics = self._system_sampler(elapsed_seconds, cpu_count) if include_system else None
+            sys_metrics: Optional[SystemResourcesMetrics] = None
+            if include_system:
+                # Rates (network) are measured since the last reading that sampled the system, not since the last one.
+                sys_elapsed_seconds = (
+                    (now_ns - self._last_system_sample_at_ns) / 1_000_000_000.0
+                    if can_compute_delta and self._last_system_sample_at_ns is not None
+                    else None
+                )
+                sys_metrics = self._system_sampler(sys_elapsed_seconds, cpu_count)
             sample_interval = int(round(elapsed_ns / 1_000_000)) if can_compute_delta and elapsed_ns is not None else None
             snapshot = ProcessTreeMetricsSnapshot(
                 root_pid=host_pid if host_pid is not None else effective_core_pid,
@@ -1965,6 +1974,8 @@ class ProcessTreeCollector:
             self._previous_cpu_by_identity = next_cpu_by_identity
             self._cmdline_kind_by_identity = next_cmdline_kinds
             self._last_sample_at_ns = now_ns
+            if include_system:
+                self._last_system_sample_at_ns = now_ns
             self._last_snapshot = snapshot
             return snapshot
 

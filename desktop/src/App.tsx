@@ -34,6 +34,15 @@ import { MainNav, mainViewPanelId, type MainViewId } from "./components/shell/Ma
 import { MainViews } from "./components/shell/PlannedView";
 import { MonitoringView } from "./components/monitoring/MonitoringView";
 import { appendHistorySample, type HistorySample } from "./components/monitoring/history";
+import {
+  DEFAULT_PROVIDERS_TTL_MS,
+  METRICS_DETAIL_INTERVAL_MS,
+  METRICS_MAX_BACKOFF_MS,
+  METRICS_SUMMARY_INTERVAL_MS,
+  PROVIDERS_FALLBACK_INTERVAL_MS,
+  providersRefreshDelayMs,
+  usePolling,
+} from "./components/monitoring/polling";
 import type { ProvidersTelemetrySnapshot } from "./components/monitoring/telemetryContract";
 import { StatusBar } from "./components/shell/StatusBar";
 import { findEntry, findRegions, installGlobalShortcuts } from "./components/shell/shortcuts";
@@ -75,11 +84,9 @@ export const App: React.FC = () => {
   // The last metrics reading failed: the previous value stops being shown as a measurement.
   const [metricsFailed, setMetricsFailed] = useState<boolean>(false);
   const [metricsHistory, setMetricsHistory] = useState<HistorySample[]>([]);
-  const metricsInFlightRef = useRef<boolean>(false);
   const [providersTelemetry, setProvidersTelemetry] = useState<ProvidersTelemetrySnapshot | null>(null);
   const [providersLoading, setProvidersLoading] = useState<boolean>(false);
   const [providersError, setProvidersError] = useState<string | null>(null);
-  const providersInFlightRef = useRef<boolean>(false);
   // One project tab per window (D5). A new id is used only when another project replaces a revoked one: the host
   // keeps a tab bound to the project it was created with.
   const [activeTab, setActiveTab] = useState<string>("tab-main");
@@ -770,62 +777,68 @@ export const App: React.FC = () => {
     };
   }, [callTauri, initAttempt]);
 
-  // Periodic metrics refresh (guarded against overlapping polls)
-  useEffect(() => {
-    if (!isTauri) return;
-    const interval = setInterval(async () => {
-      if (metricsInFlightRef.current) return;
-      metricsInFlightRef.current = true;
-      try {
-        const m = await callTauri("get_process_tree_metrics");
-        if (m) {
-          setMetrics(m);
-          setMetricsFailed(false);
-          setMetricsHistory((prev) => appendHistorySample(prev, m, false));
-        } else {
-          setMetricsFailed(true);
-          setMetricsHistory((prev) => appendHistorySample(prev, null, true));
-        }
-      } catch {
-        // Telemetry errors are non-fatal, but the last value is no longer a measurement.
-        setMetricsFailed(true);
-        setMetricsHistory((prev) => appendHistorySample(prev, null, true));
-      } finally {
-        metricsInFlightRef.current = false;
+  // Metrics (Bloco 5): every 2 s with the system counters and the process list while Monitoramento is visible; every
+  // 5 s, tree CPU and RAM only, when just the status bar shows them. One reading at a time, none while the window is
+  // hidden, a longer wait after failures (usePolling). The first reading keeps the 2 s CPU window after connecting.
+  const metricsDetail = mainView === "monitoramento";
+  const metricsDetailRef = useRef(metricsDetail);
+  metricsDetailRef.current = metricsDetail;
+  const readMetrics = useCallback(async (): Promise<boolean> => {
+    const detail = metricsDetailRef.current;
+    try {
+      const m = await callTauri("get_process_tree_metrics", { includeSystem: detail, includeNodes: detail });
+      if (m) {
+        setMetrics(m);
+        setMetricsFailed(false);
+        setMetricsHistory((prev) => appendHistorySample(prev, m, false));
+        return true;
       }
-    }, 2000);
-    return () => clearInterval(interval);
-  }, [isTauri, callTauri]);
+    } catch {
+      // Telemetry errors are non-fatal, but the last value is no longer a measurement.
+    }
+    setMetricsFailed(true);
+    setMetricsHistory((prev) => appendHistorySample(prev, null, true));
+    return false;
+  }, [callTauri]);
+  const metricsPolling = usePolling({
+    enabled: isTauri,
+    intervalMs: metricsDetail ? METRICS_DETAIL_INTERVAL_MS : METRICS_SUMMARY_INTERVAL_MS,
+    initialDelayMs: METRICS_DETAIL_INTERVAL_MS,
+    maxBackoffMs: METRICS_MAX_BACKOFF_MS,
+    read: readMetrics,
+  });
+  // Opening Monitoramento reads the full set at once instead of showing the status bar's reading until the next tick.
+  useEffect(() => {
+    if (metricsDetail) metricsPolling.runNow();
+  }, [metricsDetail, metricsPolling]);
 
-  const refreshProvidersTelemetry = useCallback(async () => {
-    if (!isTauriRef.current || providersInFlightRef.current) return;
-    providersInFlightRef.current = true;
+  // Provider telemetry: only while Monitoramento is visible and connected, at the pace of its source (the local
+  // reader's cache, else the snapshot TTL), never on the metrics tick.
+  const readProvidersTelemetry = useCallback(async (): Promise<number | false> => {
+    if (!isTauriRef.current) return false;
     setProvidersLoading(true);
     try {
       const snap = await getProvidersTelemetry(callTauri);
       if (snap && Array.isArray(snap.providers)) {
         setProvidersTelemetry(snap);
         setProvidersError(null);
-      } else {
-        setProvidersError("Resposta de provedores indisponível.");
+        return providersRefreshDelayMs(snap, Date.now());
       }
+      setProvidersError("Resposta de provedores indisponível.");
+      return false;
     } catch (err) {
       setProvidersError(errorText(err));
+      return false;
     } finally {
-      providersInFlightRef.current = false;
       setProvidersLoading(false);
     }
   }, [callTauri]);
-
-  // Poll provider telemetry only when Monitoramento is active and connected (15 s cadence)
-  useEffect(() => {
-    if (!isTauri || connectionStatus !== "connected" || mainView !== "monitoramento") return;
-    void refreshProvidersTelemetry();
-    const timer = setInterval(() => {
-      void refreshProvidersTelemetry();
-    }, 15_000);
-    return () => clearInterval(timer);
-  }, [isTauri, connectionStatus, mainView, refreshProvidersTelemetry]);
+  const providersPolling = usePolling({
+    enabled: isTauri && connectionStatus === "connected" && mainView === "monitoramento",
+    intervalMs: PROVIDERS_FALLBACK_INTERVAL_MS,
+    maxBackoffMs: DEFAULT_PROVIDERS_TTL_MS,
+    read: readProvidersTelemetry,
+  });
 
   // Output polling: never two readings at once, each answer written only for the position it was asked from (no
   // repeated output), a pause after a timeout, and a stop when the Core closed the communication.
@@ -1078,7 +1091,7 @@ export const App: React.FC = () => {
             providersTelemetry={providersTelemetry}
             providersLoading={providersLoading}
             providersError={providersError}
-            onRefreshProviders={() => void refreshProvidersTelemetry()}
+            onRefreshProviders={providersPolling.runNow}
           />
         }
       />

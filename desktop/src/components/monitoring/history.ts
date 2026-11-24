@@ -44,6 +44,8 @@ export interface HistorySample {
   networkBytesPerSec: number | null;
   diskActivityPercent: number | null;
   processCount: number | null;
+  /** The reading was asked without the system counters: only the status bar was visible. */
+  systemSkipped?: boolean;
 }
 
 export interface MonitoringAlert {
@@ -247,6 +249,7 @@ export function appendHistorySample(
     networkBytesPerSec: netBps,
     diskActivityPercent: diskAct,
     processCount: procCount,
+    systemSkipped: !failed && metrics !== null && !metrics.system,
   };
 
   const next = [...history, sample];

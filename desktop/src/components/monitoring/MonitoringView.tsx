@@ -212,6 +212,10 @@ export const MonitoringView: React.FC<MonitoringViewProps> = ({
     [metrics, metricsUnavailable]
   );
 
+  // A reading asked by the status bar alone carries no process list: wait for the next one, never claim "none".
+  const nodesPending = !metricsUnavailable && metrics !== null && !Array.isArray(metrics.nodes);
+  const systemGap = useMemo(() => history.some((s) => s.systemSkipped === true), [history]);
+
   const sessionSummary = useMemo(() => summarizeSessions(panes, paneStates), [panes, paneStates]);
 
   const cpuSeries = useMemo(() => history.map((s) => s.cpuPercent), [history]);
@@ -565,6 +569,12 @@ export const MonitoringView: React.FC<MonitoringViewProps> = ({
                   <span>agora</span>
                 </div>
                 <p className="monitoring-chart__scale">{cpuScaleText}</p>
+                {!focusScale && systemGap && (
+                  <p className="monitoring-chart__scale">
+                    Computador: sem amostras enquanto o Monitoramento esteve fechado (a barra de status lê só o AI
+                    Coordinator).
+                  </p>
+                )}
               </>
             ) : (
               <p className="monitoring-empty">
@@ -734,7 +744,11 @@ export const MonitoringView: React.FC<MonitoringViewProps> = ({
               </table>
             </div>
           ) : (
-            <p className="monitoring-empty">Nenhum agente de IA identificado em execução no momento.</p>
+            <p className="monitoring-empty">
+              {nodesPending
+                ? "Aguardando a leitura detalhada dos processos."
+                : "Nenhum agente de IA identificado em execução no momento."}
+            </p>
           )}
         </section>
 
@@ -793,7 +807,11 @@ export const MonitoringView: React.FC<MonitoringViewProps> = ({
               </table>
             </div>
           ) : (
-            <p className="monitoring-empty">Nenhum processo detalhado disponível na árvore atual.</p>
+            <p className="monitoring-empty">
+              {nodesPending
+                ? "Aguardando a leitura detalhada dos processos."
+                : "Nenhum processo detalhado disponível na árvore atual."}
+            </p>
           )}
         </section>
 

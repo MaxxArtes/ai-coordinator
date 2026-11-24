@@ -744,17 +744,21 @@ class SecureIPCServer:
                 )
             host_pid = raw_host_pid
 
-        raw_include_nodes = params.get("include_nodes")
-        if raw_include_nodes is None:
-            include_nodes = True
-        elif isinstance(raw_include_nodes, bool):
-            include_nodes = raw_include_nodes
-        else:
-            raise InvalidParamsError(
-                "'include_nodes' deve ser verdadeiro ou falso.",
-                field="include_nodes",
-                reason="invalid_value",
-            )
+        flags: Dict[str, bool] = {}
+        for flag in ("include_nodes", "include_system"):
+            raw_flag = params.get(flag)
+            if raw_flag is None:
+                flags[flag] = True
+            elif isinstance(raw_flag, bool):
+                flags[flag] = raw_flag
+            else:
+                raise InvalidParamsError(
+                    f"'{flag}' deve ser verdadeiro ou falso.",
+                    field=flag,
+                    reason="invalid_value",
+                )
+        include_nodes = flags["include_nodes"]
+        include_system = flags["include_system"]
 
         terminal_pids: Dict[int, Optional[int]] = {}
         agent_pids: Dict[int, tuple] = {}
@@ -787,8 +791,13 @@ class SecureIPCServer:
             terminal_pids=terminal_pids,
             agent_pids=agent_pids or None,
             min_sample_interval_ms=sample_interval_ms,
+            include_system=include_system,
         )
-        return snapshot.to_dict(include_nodes=include_nodes)
+        payload = snapshot.to_dict(include_nodes=include_nodes)
+        # A reading reused within the minimum interval may carry the system counters of an earlier full reading.
+        if not include_system:
+            payload["system"] = None
+        return payload
 
     def _handle_telemetry_providers_snapshot(self, _params: Dict[str, Any], token: Optional[str] = None) -> Dict[str, Any]:
         from desktop.auth.file_lock import FileLockTimeoutError

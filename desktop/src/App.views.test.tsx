@@ -1559,6 +1559,21 @@ describe("App — tráfego do terminal depois do L1/L2 (Etapa 8)", () => {
     await user.click(screen.getByRole("tab", { name: /^Conversas/ }));
     expect(xtermLog.disposed).toBe(0);
   }, 10000);
+
+  it("métricas (Bloco 5): a barra de status pede só CPU e RAM da árvore; abrir o Monitoramento pede tudo na hora", async () => {
+    const user = userEvent.setup();
+    host();
+    renderApp();
+    await connected();
+    await waitFor(() => expect(count("get_process_tree_metrics")).toBe(1), { timeout: 3500 });
+    expect(callsOf("get_process_tree_metrics")[0]).toEqual({ includeSystem: false, includeNodes: false });
+
+    await user.click(screen.getByRole("tab", { name: /^Monitoramento/ }));
+    await waitFor(() => expect(count("get_process_tree_metrics")).toBe(2));
+    expect(callsOf("get_process_tree_metrics")[1]).toEqual({ includeSystem: true, includeNodes: true });
+    // The provider telemetry is read once on opening; a failure waits (backoff) instead of retrying on every tick.
+    await waitFor(() => expect(count("providers_telemetry")).toBe(1));
+  }, 10000);
 });
 
 /**

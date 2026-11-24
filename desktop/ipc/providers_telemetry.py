@@ -771,6 +771,9 @@ def collect_providers_telemetry(
             "local_sources_checked": local_readings is not None,
             "local_providers": {pid: reading.get("available") is True for pid, reading in local_by_provider.items()},
             "local_read_at_unix_ms": _finite_nonneg_int(local_readings.get("read_at_unix_ms")) if isinstance(local_readings, dict) else None,
+            # The local reader answers from its cache until this long after local_read_at_unix_ms: the interface
+            # refreshes at that pace, never on every metrics tick.
+            "local_cache_ttl_ms": _finite_nonneg_int(local_readings.get("cache_ttl_ms")) if isinstance(local_readings, dict) else None,
         },
         "providers": items,
         "notice": quota_notice,

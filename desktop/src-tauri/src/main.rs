@@ -194,8 +194,11 @@ pub struct ProcessTreeMetrics {
     pub process_count: usize,
     pub sampled_at_unix_ms: u64,
     pub categories: ProcessTreeCategories,
-    pub system: SystemResourcesMetrics,
-    pub nodes: Vec<ProcessNodeMetrics>,
+    // null when the reading was asked without the system-wide counters (include_system: false).
+    pub system: Option<SystemResourcesMetrics>,
+    // Left out when the reading was asked without the process list (include_nodes: false), as the Core does.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub nodes: Option<Vec<ProcessNodeMetrics>>,
 }
 
 // ---- Core IPC transport (Marco 4D.3, Etapa 8: L1/L2) ----
@@ -964,9 +967,15 @@ async fn get_runtime_status(bridge: State<'_, Arc<IpcBridge>>) -> Result<Runtime
 
 // Issue D: Recursively measure all process tree descendants (children, grandchildren, WebView2 renderers)
 #[tauri::command]
-async fn get_process_tree_metrics() -> Result<ProcessTreeMetrics, String> {
+async fn get_process_tree_metrics(
+    include_system: Option<bool>,
+    include_nodes: Option<bool>,
+) -> Result<ProcessTreeMetrics, String> {
     // Walking every process takes 50-235 ms: off the main thread, or the window stutters every 2 s (Etapa 8, L1).
-    tauri::async_runtime::spawn_blocking(measure_process_tree)
+    // The status bar alone asks without the system-wide counters and the process list; both default to true.
+    let include_system = include_system.unwrap_or(true);
+    let include_nodes = include_nodes.unwrap_or(true);
+    tauri::async_runtime::spawn_blocking(move || measure_process_tree_scoped(include_system, include_nodes))
         .await
         .map_err(|_| IPC_TASK_FAILED_MESSAGE.to_string())
 }
@@ -1067,13 +1076,17 @@ struct WindowsPdhSample {
 
 #[cfg(windows)]
 struct WindowsPdhCollector {
+    // Process counters (private RAM of the tree), collected on every reading.
     query: isize,
+    // System-wide counters (disk, GPU), collected only by readings that include the system.
+    system_query: isize,
     c_pid: isize,
     c_priv: isize,
     c_disk_pct: isize,
     c_disk_read: isize,
     c_disk_write: isize,
     c_gpu: isize,
+    // Collections of system_query: its rates need two.
     collect_count: u64,
 }
 
@@ -1085,6 +1098,12 @@ impl Drop for WindowsPdhCollector {
                 let _ = PdhCloseQuery(self.query);
             }
             self.query = 0;
+        }
+        if self.system_query != 0 {
+            unsafe {
+                let _ = PdhCloseQuery(self.system_query);
+            }
+            self.system_query = 0;
         }
     }
 }
@@ -1101,33 +1120,28 @@ impl WindowsPdhCollector {
         if st == 0 { handle } else { 0 }
     }
 
-    fn new() -> Self {
+    fn open_query() -> isize {
         let mut query: isize = 0;
         let ok = unsafe { PdhOpenQueryW(std::ptr::null(), 0, &mut query) } == 0;
-        if !ok || query == 0 {
-            return Self {
-                query: 0,
-                c_pid: 0,
-                c_priv: 0,
-                c_disk_pct: 0,
-                c_disk_read: 0,
-                c_disk_write: 0,
-                c_gpu: 0,
-                collect_count: 0,
-            };
-        }
+        if ok { query } else { 0 }
+    }
+
+    fn new() -> Self {
+        let query = Self::open_query();
+        let system_query = Self::open_query();
         let c_pid = Self::add_counter(query, r"\Process(*)\ID Process");
         let c_priv = Self::add_counter(query, r"\Process(*)\Working Set - Private");
-        let c_disk_pct = Self::add_counter(query, r"\PhysicalDisk(_Total)\% Disk Time");
-        let c_disk_read = Self::add_counter(query, r"\PhysicalDisk(_Total)\Disk Read Bytes/sec");
-        let c_disk_write = Self::add_counter(query, r"\PhysicalDisk(_Total)\Disk Write Bytes/sec");
-        let c_gpu = Self::add_counter(query, r"\GPU Engine(*)\Utilization Percentage");
+        let c_disk_pct = Self::add_counter(system_query, r"\PhysicalDisk(_Total)\% Disk Time");
+        let c_disk_read = Self::add_counter(system_query, r"\PhysicalDisk(_Total)\Disk Read Bytes/sec");
+        let c_disk_write = Self::add_counter(system_query, r"\PhysicalDisk(_Total)\Disk Write Bytes/sec");
+        let c_gpu = Self::add_counter(system_query, r"\GPU Engine(*)\Utilization Percentage");
         let mut collect_count = 0;
-        if unsafe { PdhCollectQueryData(query) } == 0 {
+        if system_query != 0 && unsafe { PdhCollectQueryData(system_query) } == 0 {
             collect_count = 1;
         }
         Self {
             query,
+            system_query,
             c_pid,
             c_priv,
             c_disk_pct,
@@ -1218,7 +1232,7 @@ impl WindowsPdhCollector {
         instance
     }
 
-    fn sample(&mut self) -> WindowsPdhSample {
+    fn sample(&mut self, include_system: bool) -> WindowsPdhSample {
         let mut out = WindowsPdhSample {
             private_by_pid: HashMap::new(),
             disk_activity_percent: None,
@@ -1226,15 +1240,8 @@ impl WindowsPdhCollector {
             disk_write_bytes_per_sec: None,
             gpu_usage_percent: None,
         };
-        if self.query == 0 {
-            return out;
-        }
-        if unsafe { PdhCollectQueryData(self.query) } != 0 {
-            return out;
-        }
-        self.collect_count += 1;
-
-        if self.c_pid != 0 && self.c_priv != 0 {
+        let has_process_counters = self.query != 0 && self.c_pid != 0 && self.c_priv != 0;
+        if has_process_counters && unsafe { PdhCollectQueryData(self.query) } == 0 {
             let pids = Self::read_array(self.c_pid, PDH_FMT_LARGE);
             let privs = Self::read_array(self.c_priv, PDH_FMT_LARGE);
             for ((p_name, p_val, _), (m_name, m_val, _)) in pids.iter().zip(privs.iter()) {
@@ -1243,6 +1250,13 @@ impl WindowsPdhCollector {
                 }
             }
         }
+
+        // The GPU engines and the disk are the expensive part: skipped by the status bar's readings. A rate read
+        // after a skip covers the whole time since the previous reading that included them.
+        if !include_system || self.system_query == 0 || unsafe { PdhCollectQueryData(self.system_query) } != 0 {
+            return out;
+        }
+        self.collect_count += 1;
 
         if self.collect_count >= 2 {
             out.disk_activity_percent = Self::read_scalar(self.c_disk_pct)
@@ -1634,6 +1648,8 @@ struct ProcessTreeCollectorState {
     prev_disk_counters: Option<(u64, u64, u64)>,
     has_baseline: bool,
     last_sample_at: Option<Instant>,
+    // Last reading that included the system-wide counters: the network and disk rates are measured from it.
+    last_system_sample_at: Option<Instant>,
     last_storage_at: Option<Instant>,
     cached_storage: Vec<StorageVolumeMetrics>,
     prev_net_rx: Option<u64>,
@@ -1655,6 +1671,7 @@ impl ProcessTreeCollectorState {
             prev_disk_counters: None,
             has_baseline: false,
             last_sample_at: None,
+            last_system_sample_at: None,
             last_storage_at: None,
             cached_storage: Vec::new(),
             prev_net_rx: None,
@@ -1783,6 +1800,13 @@ impl ProcessTreeCollectorState {
     }
 
     fn collect(&mut self) -> ProcessTreeMetrics {
+        self.collect_scoped(true)
+    }
+
+    /// One reading of the tree. Without `include_system`, the network, the disks, the GPU and the storage volumes
+    /// are not read and `system` is None; the CPU and memory refreshes stay (cheap, and the CPU baseline of every
+    /// reading keeps its window).
+    fn collect_scoped(&mut self, include_system: bool) -> ProcessTreeMetrics {
         let now = Instant::now();
         if self.has_baseline {
             if let (Some(prev), Some(cached)) = (self.last_sample_at, self.last_snapshot.as_ref()) {
@@ -1800,10 +1824,12 @@ impl ProcessTreeCollectorState {
         self.sys.refresh_processes_specifics(refresh_kind);
         self.sys.refresh_cpu();
         self.sys.refresh_memory();
-        self.networks.refresh();
+        if include_system {
+            self.networks.refresh();
+        }
 
         #[cfg(windows)]
-        let pdh_sample = self.pdh.sample();
+        let pdh_sample = self.pdh.sample(include_system);
 
         let host_pid_u32 = std::process::id();
         let host_pid = Pid::from_u32(host_pid_u32);
@@ -1841,7 +1867,10 @@ impl ProcessTreeCollectorState {
             && elapsed_ms
                 .map(|ms| ms >= MIN_CPU_SAMPLE_INTERVAL_MS)
                 .unwrap_or(false);
-        let elapsed_secs = elapsed_ms
+        // Network and disk rates are measured since the last reading that included them (status bar readings skip them).
+        let elapsed_secs = self
+            .last_system_sample_at
+            .map(|prev| now.duration_since(prev).as_millis() as u64)
             .filter(|ms| *ms >= MIN_CPU_SAMPLE_INTERVAL_MS)
             .map(|ms| (ms as f64) / 1000.0);
 
@@ -2034,7 +2063,7 @@ impl ProcessTreeCollectorState {
             (None, "unknown")
         };
 
-        let storage_volumes = self.refresh_storage_if_needed(now);
+        let storage_volumes = if include_system { self.refresh_storage_if_needed(now) } else { Vec::new() };
         let storage_total_bytes: u64 = storage_volumes.iter().map(|v| v.total_bytes).sum();
         let storage_used_bytes: u64 = storage_volumes.iter().map(|v| v.used_bytes).sum();
         let storage_available_bytes: u64 = storage_volumes.iter().map(|v| v.available_bytes).sum();
@@ -2076,7 +2105,7 @@ impl ProcessTreeCollectorState {
         );
         #[cfg(target_os = "linux")]
         let (disk_activity_percent, disk_read_bytes_per_sec, disk_write_bytes_per_sec, gpu_usage_percent) = {
-            let cur = read_linux_disk_counters();
+            let cur = if include_system { read_linux_disk_counters() } else { self.prev_disk_counters };
             let (d_pct, d_r, d_w) = match (elapsed_secs, self.prev_disk_counters, cur) {
                 (Some(secs), Some((pr, pw, pio)), Some((cr, cw, cio)))
                     if secs > 0.0 && cr >= pr && cw >= pw && cio >= pio =>
@@ -2089,7 +2118,7 @@ impl ProcessTreeCollectorState {
                 _ => (None, None, None),
             };
             self.prev_disk_counters = cur;
-            (d_pct, d_r, d_w, read_linux_gpu_percent())
+            (d_pct, d_r, d_w, if include_system { read_linux_gpu_percent() } else { None })
         };
         #[cfg(not(any(windows, target_os = "linux")))]
         let (disk_activity_percent, disk_read_bytes_per_sec, disk_write_bytes_per_sec, gpu_usage_percent): (
@@ -2164,13 +2193,16 @@ impl ProcessTreeCollectorState {
             process_count: nodes.len(),
             sampled_at_unix_ms,
             categories,
-            system,
-            nodes,
+            system: include_system.then_some(system),
+            nodes: Some(nodes),
         };
 
         self.seen_identities = next_identities;
         self.has_baseline = true;
         self.last_sample_at = Some(now);
+        if include_system {
+            self.last_system_sample_at = Some(now);
+        }
         self.last_snapshot = Some(snapshot.clone());
         snapshot
     }
@@ -2181,13 +2213,29 @@ fn collector_instance() -> &'static Mutex<ProcessTreeCollectorState> {
 }
 
 fn prime_process_collector() {
-    let mut guard = lock_unpoisoned(collector_instance());
-    let _ = guard.collect();
+    let _ = measure_process_tree();
 }
 
 fn measure_process_tree() -> ProcessTreeMetrics {
     let mut guard = lock_unpoisoned(collector_instance());
     guard.collect()
+}
+
+/// A reading for the interface. A reading taken less than MIN_CPU_SAMPLE_INTERVAL_MS earlier is returned again
+/// (the CPU cannot be measured over a shorter window), so what was not asked for is removed here: `system` only
+/// with include_system, the process list only with include_nodes.
+fn measure_process_tree_scoped(include_system: bool, include_nodes: bool) -> ProcessTreeMetrics {
+    let mut snapshot = {
+        let mut guard = lock_unpoisoned(collector_instance());
+        guard.collect_scoped(include_system)
+    };
+    if !include_system {
+        snapshot.system = None;
+    }
+    if !include_nodes {
+        snapshot.nodes = None;
+    }
+    snapshot
 }
 
 // L3: structured errors ({code, message, data}) like the settings commands.

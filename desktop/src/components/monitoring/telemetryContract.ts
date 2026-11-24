@@ -288,6 +288,8 @@ export interface ProvidersTelemetrySnapshot {
     local_sources_checked?: boolean;
     local_providers?: Record<string, boolean>;
     local_read_at_unix_ms?: number | null;
+    /** The local reader answers from its cache until this long after local_read_at_unix_ms. */
+    local_cache_ttl_ms?: number | null;
   };
   providers: ProviderTelemetryItem[];
   notice?: string | null;
