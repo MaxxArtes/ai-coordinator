@@ -671,3 +671,21 @@ SHA-256 do artefato do build 44328616887:
 - `ai-coordinator-desktop-alpha-portable.zip`: `559d50c162cd328b613f6c9eac568a52937b35e37f615da69a14f040b443db04`
 - `AI Coordinator Desktop_0.6.1-alpha.50_x64-setup.exe` (não executado):
   `2ca454ab061949f19cb90f53fcaf63a7c700207d7789829b0e41eb5e8a401543`
+
+---
+
+## Apêndice H — Requisito futuro para o backlog do Mission Control (Fase 4D.5): Human-in-the-Loop assíncrono por tarefa (24/11/2026)
+
+Status: **backlog futuro (não implementado na Fase 4D.4)**. Avaliação técnica prevista exclusivamente quando iniciarmos a **Fase 4D.5 — Mission Control**, reaproveitando os mecanismos existentes do Core (`dag.py`, checkpoints duráveis, invariantes e controle de recursos / *Resource Ledger*) e dependendo de decisão e aprovação próprias antes de qualquer alteração no Core.
+
+### Capacidades previstas para avaliação na Fase 4D.5
+
+1. **Solicitação de intervenção humana:** permitir que uma tarefa ou nó do fluxo solicite formalmente uma ação ou decisão do operador humano sem derrubar a missão.
+2. **Suspensão seletiva do agente ou tarefa dependente:** suspender apenas a tarefa que aguarda o operador e as tarefas que dependem diretamente dela no grafo.
+3. **Continuidade das tarefas independentes:** manter os demais agentes e ramificações independentes da DAG em execução normal.
+4. **Checkpoint persistente:** gravar estado durável da tarefa suspensa e do contexto necessário antes de aguardar o operador.
+5. **Notificação ao operador:** sinalizar de forma clara no Desktop/Mission Control qual tarefa aguarda intervenção e o motivo objetivo da parada.
+6. **Retomada mediante confirmação explícita e revalidação dos invariantes:** somente retomar a tarefa após confirmação explícita do operador e nova verificação dos invariantes aplicáveis.
+7. **Preservação do histórico e prevenção de operações duplicadas:** manter trilha íntegra do histórico de execução e impedir reexecução duplicada de etapas ou efeitos já concluídos.
+8. **Possibilidade de cancelamento seguro:** permitir abortar a espera/tarefa de forma limpa e determinística, preservando a consistência da missão.
+
