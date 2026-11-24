@@ -4,6 +4,7 @@ import { render, screen, within } from "@testing-library/react";
 import { MonitoringView } from "./MonitoringView";
 import { appendHistorySample, MAX_HISTORY_POINTS, type HistorySample } from "./history";
 import type { RuntimeMetrics } from "../shell/AppHeader";
+import type { ProvidersTelemetrySnapshot } from "./telemetryContract";
 import type { TerminalPaneData } from "../TerminalPane";
 import type { PaneState } from "../useTerminalStates";
 
@@ -82,7 +83,7 @@ describe("MonitoringView and history buffer (4D.4.2)", () => {
     expect(summary).toHaveTextContent("Host (PID 4242): 58,0 MB");
     expect(summary).toHaveTextContent("4 processos");
     expect(summary).toHaveTextContent("1 ativas · 1 encerradas · 0 indisponíveis");
-    expect(summary).toHaveTextContent("Previsto na fase 4D.4.3 — nenhum dado simulado exibido.");
+    expect(summary).toHaveTextContent("Aguardando leitura de provedores — nenhum dado simulado exibido.");
 
     const catSection = screen.getByRole("region", { name: "Detalhamento por categoria" });
     expect(catSection).toHaveTextContent("Aplicativo (Host)");
@@ -314,5 +315,114 @@ describe("MonitoringView and history buffer (4D.4.2)", () => {
 
     const sessSection = screen.getByRole("region", { name: "Sessões supervisionadas" });
     expect(sessSection).toHaveTextContent("CPU 6,2% · RAM priv. 82,0 MB");
+  });
+
+  it("renders 4D.4.3 provider cards, 5h/weekly quotas, tokens, costs, and test_fixture segregation", () => {
+    const provSnap: ProvidersTelemetrySnapshot = {
+      schema_version: 1,
+      profile_name: "operador",
+      sampled_at_unix_ms: Date.now() - 1000,
+      ttl_ms: 300_000,
+      stale: true,
+      data_origin: "test_fixture",
+      provenance: "measured",
+      sources: { sqlite_available: true, quota_snapshot_available: true, vault_keys_checked: true },
+      providers: [
+        {
+          provider: "claude",
+          display_name: "Claude",
+          profile_name: "operador",
+          launcher_available: true,
+          has_vault_key: true,
+          availability_status: "available",
+          quota_kind: "subscription_quota",
+          windows: {
+            five_hour: {
+              window: "5h",
+              label: "5 horas",
+              used_percent: 38.0,
+              remaining_percent: 62.0,
+              resets_at_iso: "2026-11-24T19:00:00Z",
+              provenance: "measured",
+              stale: false,
+            },
+            weekly: {
+              window: "weekly",
+              label: "Semanal",
+              used_percent: 64.0,
+              remaining_percent: 36.0,
+              resets_at_iso: "2026-11-30T00:00:00Z",
+              provenance: "measured",
+              stale: true,
+            },
+          },
+          tokens: {
+            input_tokens: 1200,
+            output_tokens: 350,
+            cache_read_tokens: 4000,
+            cache_creation_tokens: 500,
+            reasoning_tokens: 150,
+            total_tokens: 6200,
+            provenance: "measured",
+          },
+          cost_credits: {
+            kind: "subscription_quota",
+            currency: "USD",
+            balance_usd: null,
+            credits_remaining_usd: null,
+            spent_usd: 0.0125,
+            estimated_cost_usd: null,
+            provenance: "measured",
+          },
+          models: [{ model: "sonnet", tokens: { input_tokens: 1200, output_tokens: 350, cache_read_tokens: null, cache_creation_tokens: null, reasoning_tokens: null, total_tokens: 1550, provenance: "measured" }, cost_usd: 0.0125, cost_provenance: "measured" }],
+          data_origin: "test_fixture",
+          observed_at_unix_ms: Date.now() - 1000,
+          ttl_ms: 300_000,
+          stale: true,
+        },
+        {
+          provider: "codex",
+          display_name: "Codex",
+          profile_name: "operador",
+          launcher_available: true,
+          has_vault_key: false,
+          availability_status: "unknown",
+          quota_kind: "subscription_quota",
+          windows: {
+            five_hour: { window: "5h", label: "5 horas", used_percent: null, remaining_percent: null, resets_at_iso: null, provenance: "unknown" },
+            weekly: { window: "weekly", label: "Semanal", used_percent: null, remaining_percent: null, resets_at_iso: null, provenance: "unknown" },
+          },
+          tokens: { input_tokens: null, output_tokens: null, cache_read_tokens: null, cache_creation_tokens: null, reasoning_tokens: null, total_tokens: null, provenance: "unknown" },
+          models: [],
+          data_origin: "offline_cache",
+          observed_at_unix_ms: null,
+          ttl_ms: 300_000,
+          stale: false,
+        },
+      ],
+    };
+
+    render(
+      <MonitoringView
+        active
+        isTauri
+        connectionStatus="connected"
+        metrics={FULL_METRICS}
+        metricsUnavailable={false}
+        history={[]}
+        panes={PANES}
+        paneStates={STATES}
+        providersTelemetry={provSnap}
+      />
+    );
+
+    const provSection = screen.getByRole("region", { name: "Provedores de Inteligência Artificial" });
+    expect(provSection).toHaveTextContent("Provedores em modo Fixture de teste");
+    expect(provSection).toHaveTextContent("38,0%");
+    expect(provSection).toHaveTextContent("64,0%");
+    expect(provSection).toHaveTextContent("Entrada: 1.200");
+    expect(provSection).toHaveTextContent("Raciocínio: 150");
+    expect(provSection).toHaveTextContent("expirado");
+    expect(provSection).toHaveTextContent("Codex");
   });
 });

@@ -36,7 +36,7 @@ IPC_COMMANDS = {
     "terminal_close_session", "terminal_save_sessions", "terminal_list_tabs", "updater_check",
     "updater_download_and_install", "settings_get", "settings_update", "vault_status", "vault_list_keys",
     "vault_set_secret", "vault_delete_secret", "profile_revoke_project", "profile_remember_project",
-    "security_status", "discovery_agents", "providers_routes",
+    "security_status", "discovery_agents", "providers_routes", "providers_telemetry",
 }
 NOT_IPC_COMMANDS = {"ping", "get_process_tree_metrics", "updater_get_channel_info", "updater_restart_app"}
 LONG_METHODS = ("terminal.create_tab", "terminal.create_session", "terminal.restore_sessions")

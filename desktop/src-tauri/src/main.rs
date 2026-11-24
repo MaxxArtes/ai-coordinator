@@ -2691,6 +2691,14 @@ async fn providers_routes(bridge: State<'_, Arc<IpcBridge>>) -> Result<Value, Va
         .unwrap_or_else(|_| Err(ipc_task_failed_structured()))
 }
 
+#[tauri::command]
+async fn providers_telemetry(bridge: State<'_, Arc<IpcBridge>>) -> Result<Value, Value> {
+    let bridge = bridge.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || bridge.call_structured("telemetry.providers_snapshot", json!({})))
+        .await
+        .unwrap_or_else(|_| Err(ipc_task_failed_structured()))
+}
+
 fn main() {
     let bridge = Arc::new(IpcBridge::new());
     let bridge_window = bridge.clone();
@@ -2741,7 +2749,8 @@ fn main() {
             profile_remember_project,
             security_status,
             discovery_agents,
-            providers_routes
+            providers_routes,
+            providers_telemetry
         ])
         .run(tauri::generate_context!())
         .expect("error while running AI Coordinator Desktop");

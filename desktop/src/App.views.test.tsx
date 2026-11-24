@@ -1456,6 +1456,82 @@ describe("App — tráfego do terminal depois do L1/L2 (Etapa 8)", () => {
             { pid: 7001, ppid: 5150, role: "terminal", name: "pwsh.exe", ram_bytes: 43_610_036, ram_provenance: "measured", cpu_usage_percent: 9.0, cpu_provenance: "measured" },
           ],
         }),
+        providers_telemetry: () => ({
+          schema_version: 1,
+          profile_name: "default",
+          sampled_at_unix_ms: Date.now(),
+          ttl_ms: 300_000,
+          stale: false,
+          data_origin: "offline_cache",
+          provenance: "measured",
+          sources: {
+            sqlite_available: true,
+            quota_snapshot_available: true,
+            vault_keys_checked: true,
+          },
+          providers: [
+            {
+              provider: "claude",
+              display_name: "Claude",
+              profile_name: "default",
+              launcher_available: true,
+              has_vault_key: true,
+              availability_status: "available",
+              quota_kind: "subscription_quota",
+              windows: {
+                five_hour: {
+                  window: "5h",
+                  label: "Janela de 5 h",
+                  used_percent: 25,
+                  remaining_percent: 75,
+                  resets_at_iso: "2026-11-24T21:00:00Z",
+                  provenance: "measured",
+                  data_origin: "offline_cache",
+                  stale: false,
+                },
+                weekly: {
+                  window: "weekly",
+                  label: "Janela semanal",
+                  used_percent: null,
+                  remaining_percent: null,
+                  resets_at_iso: null,
+                  provenance: "unknown",
+                  data_origin: "offline_cache",
+                  stale: false,
+                },
+              },
+              tokens: {
+                input_tokens: 1200,
+                output_tokens: 300,
+                cache_read_tokens: 0,
+                cache_creation_tokens: 0,
+                reasoning_tokens: null,
+                total_tokens: 1500,
+                provenance: "measured",
+              },
+              models: [
+                {
+                  model: "claude-sonnet-4-6",
+                  tokens: {
+                    input_tokens: 1200,
+                    output_tokens: 300,
+                    cache_read_tokens: 0,
+                    cache_creation_tokens: 0,
+                    reasoning_tokens: null,
+                    total_tokens: 1500,
+                    provenance: "measured",
+                  },
+                  cost_usd: null,
+                  cost_provenance: "unknown",
+                },
+              ],
+              data_origin: "offline_cache",
+              observed_at_unix_ms: Date.now(),
+              ttl_ms: 300_000,
+              stale: false,
+            },
+          ],
+        }),
       },
     });
     renderApp();
@@ -1469,7 +1545,8 @@ describe("App — tráfego do terminal depois do L1/L2 (Etapa 8)", () => {
     expect(mon).toHaveTextContent("12,5%");
     expect(mon).toHaveTextContent("128,4 MB");
     expect(mon).toHaveTextContent("pwsh.exe");
-    expect(mon).toHaveTextContent("Previsto na fase 4D.4.3 — nenhum dado simulado exibido.");
+    await waitFor(() => expect(mon).toHaveTextContent("Provedores de Inteligência Artificial"), { timeout: 3500 });
+    await waitFor(() => expect(mon).toHaveTextContent("claude-sonnet-4-6"), { timeout: 3500 });
 
     await user.click(screen.getByRole("tab", { name: /^Conversas/ }));
     expect(xtermLog.disposed).toBe(0);

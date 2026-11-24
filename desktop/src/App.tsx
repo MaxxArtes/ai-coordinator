@@ -10,6 +10,7 @@ import {
   authorizeProject,
   errorText,
   getActiveProfile,
+  getProvidersTelemetry,
   getSettings,
   invalidFieldsOf,
   pathWithin,
@@ -33,6 +34,7 @@ import { MainNav, mainViewPanelId, type MainViewId } from "./components/shell/Ma
 import { MainViews } from "./components/shell/PlannedView";
 import { MonitoringView } from "./components/monitoring/MonitoringView";
 import { appendHistorySample, type HistorySample } from "./components/monitoring/history";
+import type { ProvidersTelemetrySnapshot } from "./components/monitoring/telemetryContract";
 import { StatusBar } from "./components/shell/StatusBar";
 import { findEntry, findRegions, installGlobalShortcuts } from "./components/shell/shortcuts";
 import { lowestFreeSlot, paneFromSession } from "./components/terminalIdentity";
@@ -66,6 +68,11 @@ export const App: React.FC = () => {
   // The last metrics reading failed: the previous value stops being shown as a measurement.
   const [metricsFailed, setMetricsFailed] = useState<boolean>(false);
   const [metricsHistory, setMetricsHistory] = useState<HistorySample[]>([]);
+  const metricsInFlightRef = useRef<boolean>(false);
+  const [providersTelemetry, setProvidersTelemetry] = useState<ProvidersTelemetrySnapshot | null>(null);
+  const [providersLoading, setProvidersLoading] = useState<boolean>(false);
+  const [providersError, setProvidersError] = useState<string | null>(null);
+  const providersInFlightRef = useRef<boolean>(false);
   // One project tab per window (D5). A new id is used only when another project replaces a revoked one: the host
   // keeps a tab bound to the project it was created with.
   const [activeTab, setActiveTab] = useState<string>("tab-main");
@@ -755,10 +762,12 @@ export const App: React.FC = () => {
     };
   }, [callTauri, initAttempt]);
 
-  // Periodic metrics refresh
+  // Periodic metrics refresh (guarded against overlapping polls)
   useEffect(() => {
     if (!isTauri) return;
     const interval = setInterval(async () => {
+      if (metricsInFlightRef.current) return;
+      metricsInFlightRef.current = true;
       try {
         const m = await callTauri("get_process_tree_metrics");
         if (m) {
@@ -773,10 +782,42 @@ export const App: React.FC = () => {
         // Telemetry errors are non-fatal, but the last value is no longer a measurement.
         setMetricsFailed(true);
         setMetricsHistory((prev) => appendHistorySample(prev, null, true));
+      } finally {
+        metricsInFlightRef.current = false;
       }
     }, 2000);
     return () => clearInterval(interval);
   }, [isTauri, callTauri]);
+
+  const refreshProvidersTelemetry = useCallback(async () => {
+    if (!isTauriRef.current || providersInFlightRef.current) return;
+    providersInFlightRef.current = true;
+    setProvidersLoading(true);
+    try {
+      const snap = await getProvidersTelemetry(callTauri);
+      if (snap && Array.isArray(snap.providers)) {
+        setProvidersTelemetry(snap);
+        setProvidersError(null);
+      } else {
+        setProvidersError("Resposta de provedores indisponível.");
+      }
+    } catch (err) {
+      setProvidersError(errorText(err));
+    } finally {
+      providersInFlightRef.current = false;
+      setProvidersLoading(false);
+    }
+  }, [callTauri]);
+
+  // Poll provider telemetry only when Monitoramento is active and connected (15 s cadence)
+  useEffect(() => {
+    if (!isTauri || connectionStatus !== "connected" || mainView !== "monitoramento") return;
+    void refreshProvidersTelemetry();
+    const timer = setInterval(() => {
+      void refreshProvidersTelemetry();
+    }, 15_000);
+    return () => clearInterval(timer);
+  }, [isTauri, connectionStatus, mainView, refreshProvidersTelemetry]);
 
   // Output polling: never two readings at once, each answer written only for the position it was asked from (no
   // repeated output), a pause after a timeout, and a stop when the Core closed the communication.
@@ -1026,6 +1067,10 @@ export const App: React.FC = () => {
             panes={panes}
             paneStates={paneStates}
             settings={settings}
+            providersTelemetry={providersTelemetry}
+            providersLoading={providersLoading}
+            providersError={providersError}
+            onRefreshProviders={() => void refreshProvidersTelemetry()}
           />
         }
       />

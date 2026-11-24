@@ -413,6 +413,7 @@ class SecureIPCServer:
         self.register("vault.set_secret", self._handle_vault_set_secret)
         self.register("vault.delete_secret", self._handle_vault_delete_secret)
         self.register("telemetry.process_tree_metrics", self._handle_telemetry_process_tree_metrics)
+        self.register("telemetry.providers_snapshot", self._handle_telemetry_providers_snapshot)
 
     def _get_terminal_manager(self) -> Any:
         if self.terminal_manager is None:
@@ -778,6 +779,42 @@ class SecureIPCServer:
             min_sample_interval_ms=sample_interval_ms,
         )
         return snapshot.to_dict(include_nodes=include_nodes)
+
+    def _handle_telemetry_providers_snapshot(self, _params: Dict[str, Any], token: Optional[str] = None) -> Dict[str, Any]:
+        from desktop.auth.file_lock import FileLockTimeoutError
+        from desktop.auth.vault import VaultBusyError, VaultError
+        from desktop.ipc.providers_telemetry import collect_providers_telemetry
+
+        mgr = self._get_terminal_manager()
+        prof_mgr = mgr.authorizer.profile_manager
+        active = prof_mgr.get_active_profile()
+
+        vault_keys: Optional[List[str]] = None
+        try:
+            vault = self._vault_for(token)
+            if getattr(vault, "available", False):
+                snap = vault.get_keys_snapshot(lock_timeout=VAULT_STATUS_LOCK_TIMEOUT)
+                keys = snap.get("keys") if isinstance(snap, dict) else None
+                if isinstance(keys, list):
+                    vault_keys = [str(k) for k in keys if isinstance(k, str)]
+        except (VaultBusyError, FileLockTimeoutError, VaultError, OSError, ValueError):
+            vault_keys = None
+
+        coord_budget: Optional[Dict[str, Any]] = None
+        try:
+            settings_snap = self._settings_store().snapshot()
+            coord_cat = settings_snap.get("categories", {}).get("coordinator", {})
+            vals = coord_cat.get("values") if isinstance(coord_cat, dict) else None
+            if isinstance(vals, dict) and isinstance(vals.get("flight_budget"), dict):
+                coord_budget = vals["flight_budget"]
+        except Exception:
+            coord_budget = None
+
+        return collect_providers_telemetry(
+            profile_name=active.name,
+            vault_keys=vault_keys,
+            coordinator_budget=coord_budget,
+        )
 
     def _handle_terminal_get_output(self, params: Dict[str, Any]) -> Dict[str, Any]:
         mgr = self._get_terminal_manager()

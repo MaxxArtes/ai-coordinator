@@ -13,6 +13,7 @@ import {
   type MetricProvenance,
   type ProvidersTelemetrySnapshot,
 } from "./telemetryContract";
+import { ProvidersSection } from "./ProvidersSection";
 import {
   buildSparklineSegments,
   computeMonitoringAlerts,
@@ -85,6 +86,10 @@ export const MonitoringView: React.FC<MonitoringViewProps> = ({
   paneStates,
   thresholds = DEFAULT_MONITORING_THRESHOLDS,
   settings = null,
+  providersTelemetry = null,
+  providersLoading = false,
+  providersError = null,
+  onRefreshProviders,
 }) => {
   const cpuReading = resolvedCpuReading(metrics, metricsUnavailable);
   const privRamReading = resolvedPrivateRamReading(metrics, metricsUnavailable);
@@ -410,11 +415,21 @@ export const MonitoringView: React.FC<MonitoringViewProps> = ({
 
             <article className="monitoring-card">
               <div className="monitoring-card__head">
-                <span className="monitoring-card__label">Cotas e custos</span>
-                <span className="badge badge--unknown">indisponível</span>
+                <span className="monitoring-card__label">Cotas e provedores</span>
+                <span className={provenanceToneClass(providersTelemetry?.provenance)}>
+                  {provenanceBadgeText(providersTelemetry?.provenance)}
+                </span>
               </div>
-              <p className="monitoring-card__value monitoring-card__value--muted">Não coletado</p>
-              <p className="monitoring-card__meta">Previsto na fase 4D.4.3 — nenhum dado simulado exibido.</p>
+              <p className="monitoring-card__value">
+                {providersTelemetry
+                  ? `${providersTelemetry.providers.length} provedores`
+                  : "Não coletado"}
+              </p>
+              <p className="monitoring-card__meta">
+                {providersTelemetry
+                  ? `${providersTelemetry.providers.filter((p) => p.availability_status === "available").length} disponíveis · origem ${resolveOriginBadge(providersTelemetry.data_origin).text}`
+                  : "Aguardando leitura de provedores — nenhum dado simulado exibido."}
+              </p>
             </article>
           </div>
 
@@ -750,6 +765,13 @@ export const MonitoringView: React.FC<MonitoringViewProps> = ({
             <p className="monitoring-empty">Nenhuma sessão aberta no momento.</p>
           )}
         </section>
+
+        <ProvidersSection
+          telemetry={providersTelemetry}
+          loading={providersLoading}
+          error={providersError}
+          onRefresh={onRefreshProviders}
+        />
       </div>
     </div>
   );

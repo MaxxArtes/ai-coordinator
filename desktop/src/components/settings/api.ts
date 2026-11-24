@@ -4,6 +4,7 @@
  * Vault calls never return secret values, and nothing here logs request payloads.
  */
 
+import type { ProvidersTelemetrySnapshot } from "../monitoring/telemetryContract";
 import { TERMINAL_SETTINGS_EVENT, validInt } from "./terminalPreferences";
 
 export type CallTauri = (cmd: string, args?: Record<string, any>) => Promise<any>;
@@ -220,6 +221,7 @@ export const authorizeProject = (callTauri: CallTauri, projectPath: string, conf
   call<AuthorizeResult>(callTauri, "profile_authorize_project", { projectPath, ...(confirmBroad ? { confirmBroad: true } : {}) });
 export const getAgents = (callTauri: CallTauri) => call<AgentsSnapshot>(callTauri, "discovery_agents");
 export const getRoutes = (callTauri: CallTauri) => call<RoutesSnapshot>(callTauri, "providers_routes");
+export const getProvidersTelemetry = (callTauri: CallTauri) => call<ProvidersTelemetrySnapshot>(callTauri, "providers_telemetry");
 export const getSecurityStatus = (callTauri: CallTauri) => call<SecurityStatus>(callTauri, "security_status");
 export const revokeProject = (callTauri: CallTauri, projectPath: string) =>
   call<RevokeResult>(callTauri, "profile_revoke_project", { projectPath });

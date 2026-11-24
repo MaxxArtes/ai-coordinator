@@ -12,6 +12,7 @@ import React, { useEffect, useId, useLayoutEffect, useRef, useState } from "reac
 import {
   errorText,
   getAgents,
+  getProvidersTelemetry,
   getRoutes,
   getSecurityStatus,
   revokeProject,
@@ -22,6 +23,8 @@ import {
   type RoutesSnapshot,
   type SecurityStatus,
 } from "./api";
+import { resolveOriginBadge, type ProvidersTelemetrySnapshot } from "../monitoring/telemetryContract";
+import { formatCountPtBR, formatPercentPtBR, provenanceBadgeText, provenanceToneClass } from "../monitoring/history";
 
 type InventoryKind = "agentes" | "provedores" | "seguranca";
 type InventoryData = AgentsSnapshot | RoutesSnapshot | SecurityStatus;
@@ -80,6 +83,7 @@ export interface InventoryPanelProps {
 export const InventoryPanel: React.FC<InventoryPanelProps> = ({ kind, active, isTauri, callTauri, onAuthorizationChanged }) => {
   const idBase = useId();
   const [data, setData] = useState<InventoryData | null>(null);
+  const [provTelemetry, setProvTelemetry] = useState<ProvidersTelemetrySnapshot | null>(null);
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(false);
   const [pending, setPending] = useState<string | null>(null);
@@ -102,12 +106,19 @@ export const InventoryPanel: React.FC<InventoryPanelProps> = ({ kind, active, is
     setLoading(true);
     setError("");
     try {
-      const next = await LOADERS[kind](callTauri);
+      const [next, pt] = await Promise.all([
+        LOADERS[kind](callTauri),
+        kind === "provedores" ? getProvidersTelemetry(callTauri).catch(() => null) : Promise.resolve(null),
+      ]);
       if (!next || typeof next !== "object") throw new Error("Resposta de leitura indisponível.");
-      if (current === generation.current) setData(next);
+      if (current === generation.current) {
+        setData(next);
+        setProvTelemetry(pt);
+      }
     } catch (err) {
       if (current === generation.current) {
         setData(null);
+        setProvTelemetry(null);
         setError(errorText(err));
       }
     } finally {
@@ -243,10 +254,35 @@ export const InventoryPanel: React.FC<InventoryPanelProps> = ({ kind, active, is
 
   const renderRoutes = (routes: RoutesSnapshot) => (
     <>
-      <p>
-        Cotas: indisponíveis até a {routes.quota_milestone || "4D.4.3"}. Credenciais armazenadas não comprovam conexão
-        ou saldo.
-      </p>
+      {provTelemetry ? (
+        <div className="settings__providers-summary" aria-label="Resumo de cotas e tokens dos provedores">
+          <p className="settings__note">
+            Telemetria de provedores ({resolveOriginBadge(provTelemetry.data_origin).text}). Credenciais armazenadas não
+            comprovam conexão ou saldo.
+          </p>
+          <div className="providers-settings-grid">
+            {provTelemetry.providers.map((p) => (
+              <div key={p.provider} className="providers-settings-item">
+                <strong>{p.display_name}</strong>{" "}
+                <span className={provenanceToneClass(p.windows.five_hour.provenance)}>
+                  5h: {formatPercentPtBR(p.windows.five_hour.used_percent) ?? provenanceBadgeText(p.windows.five_hour.provenance)}
+                </span>{" "}
+                <span className={provenanceToneClass(p.windows.weekly.provenance)}>
+                  Semanal: {formatPercentPtBR(p.windows.weekly.used_percent) ?? provenanceBadgeText(p.windows.weekly.provenance)}
+                </span>
+                {p.tokens.total_tokens !== null && (
+                  <span className="settings__note"> · Tokens: {formatCountPtBR(p.tokens.total_tokens)}</span>
+                )}
+              </div>
+            ))}
+          </div>
+        </div>
+      ) : (
+        <p>
+          Cotas: indisponíveis até a {routes.quota_milestone || "4D.4.3"}. Credenciais armazenadas não comprovam conexão
+          ou saldo.
+        </p>
+      )}
       {routes.available === false ? (
         <p role="alert">{routes.reason || "Configuração de rotas ilegível; nada foi alterado."}</p>
       ) : (

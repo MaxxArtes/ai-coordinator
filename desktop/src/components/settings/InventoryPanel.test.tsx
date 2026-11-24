@@ -83,6 +83,48 @@ describe("InventoryPanel — inventário honesto (K6)", () => {
     expect(screen.getByRole("listitem")).toHaveTextContent("codigo: codex / modelo-a / high → agy / modelo-b");
   });
 
+  it("provedores com telemetria 4D.4.3 integra resumo honesto sem prometer saldo por credencial", async () => {
+    renderPanel(
+      "provedores",
+      host({
+        providers_routes: () => ROUTES,
+        providers_telemetry: () => ({
+          schema_version: 1,
+          profile_name: "default",
+          sampled_at_unix_ms: Date.now(),
+          ttl_ms: 300_000,
+          stale: false,
+          data_origin: "offline_cache",
+          provenance: "measured",
+          sources: { sqlite_available: true, quota_snapshot_available: false, vault_keys_checked: true },
+          providers: [
+            {
+              provider: "claude",
+              display_name: "Claude",
+              profile_name: "default",
+              launcher_available: true,
+              has_vault_key: true,
+              availability_status: "available",
+              quota_kind: "subscription_quota",
+              windows: {
+                five_hour: { window: "5h", label: "5 horas", used_percent: 25.0, remaining_percent: 75.0, resets_at_iso: null, provenance: "measured" },
+                weekly: { window: "weekly", label: "Semanal", used_percent: null, remaining_percent: null, resets_at_iso: null, provenance: "unknown" },
+              },
+              tokens: { input_tokens: 100, output_tokens: 50, cache_read_tokens: null, cache_creation_tokens: null, reasoning_tokens: null, total_tokens: 150, provenance: "measured" },
+              models: [],
+              data_origin: "offline_cache",
+              observed_at_unix_ms: Date.now(),
+              ttl_ms: 300_000,
+              stale: false,
+            },
+          ],
+        }),
+      })
+    );
+    expect(await screen.findByLabelText("Resumo de cotas e tokens dos provedores")).toHaveTextContent("5h: 25,0%");
+    expect(screen.getByLabelText("Resumo de cotas e tokens dos provedores")).toHaveTextContent("Tokens: 150");
+  });
+
   it("sem rotas configuradas: diz isso, sem alerta", async () => {
     renderPanel("provedores", host({ providers_routes: () => ({ ...ROUTES, routes: [] }) }));
     expect(await screen.findByText("Nenhuma rota de fallback configurada.")).toBeInTheDocument();
