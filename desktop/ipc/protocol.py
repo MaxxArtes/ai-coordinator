@@ -15,6 +15,7 @@ from enum import Enum
 from typing import Any, Dict, List, Optional, Union
 
 PROTOCOL_VERSION = "1.0.0"
+TELEMETRY_SCHEMA_VERSION = 1
 MAX_PAYLOAD_BYTES = 1024 * 1024  # 1 MB boundary cap
 
 
@@ -38,6 +39,7 @@ class MetricProvenance(str, Enum):
 
 
 class DataOrigin(str, Enum):
+    LIVE_OS = "live_os"
     LIVE_NETWORK = "live_network"
     TEST_FIXTURE = "test_fixture"
     OFFLINE_CACHE = "offline_cache"

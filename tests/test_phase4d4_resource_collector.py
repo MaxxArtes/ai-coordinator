@@ -329,3 +329,188 @@ def test_07_rust_host_collector_contract_and_safety() -> None:
 
     # Ensure previous IPC & updater structural ordering guarantees remain intact
     assert main_rs.index("fn get_runtime_status(") < main_rs.index("fn get_process_tree_metrics(")
+
+    bloco1_symbols = [
+        "struct SystemResourcesMetrics",
+        "struct StorageVolumeMetrics",
+        "private_ram_bytes",
+        "private_ram_provenance",
+        "working_set_ram_bytes",
+        "shared_ram_bytes",
+        "agent_kind",
+        "PdhAddEnglishCounterW",
+        "Working Set - Private",
+        "Disks::new_with_refreshed_list",
+        "Networks::new_with_refreshed_list",
+        "global_cpu_info",
+    ]
+    for symbol in bloco1_symbols:
+        assert symbol in main_rs, f"Missing Rust 4D.4.1 refined collector symbol: {symbol}"
+
+
+def test_08_private_working_set_vs_working_set_and_shared_ram() -> None:
+    from desktop.ipc.collector import SystemResourcesMetrics
+
+    clock = [1_000_000_000]
+    samples_all_private = [
+        RawProcessSample(100, 1, "ai-coordinator-desktop.exe", 11, 50_000_000, 1.0, private_ram_bytes=35_000_000),
+        RawProcessSample(200, 100, "msedgewebview2.exe", 22, 180_000_000, 2.0, private_ram_bytes=55_000_000),
+        RawProcessSample(300, 100, "msedgewebview2.exe", 33, 180_000_000, 1.5, private_ram_bytes=50_000_000),
+    ]
+    samples_missing_private = [
+        RawProcessSample(100, 1, "host.exe", 11, 50_000_000, 1.0, private_ram_bytes=None),
+        RawProcessSample(200, 100, "webview.exe", 22, 180_000_000, 2.0, private_ram_bytes=None),
+    ]
+    mode = ["all"]
+
+    col = ProcessTreeCollector(
+        core_pid=999,
+        process_lister=lambda _r: samples_all_private if mode[0] == "all" else samples_missing_private,
+        clock_ns=lambda: clock[0],
+        cpu_count_fn=lambda: 2,
+        system_sampler=lambda _e, cpus: SystemResourcesMetrics(logical_cpu_count=cpus),
+    )
+    snap = col.collect(host_pid=100, core_pid=999)
+    assert snap.total_working_set_ram_bytes == 410_000_000
+    assert snap.total_private_ram_bytes == 140_000_000
+    assert snap.private_ram_provenance == MetricProvenance.MEASURED
+    assert snap.host_private_ram_bytes == 35_000_000
+    # Shared RAM per process: 15M + 125M + 130M = 270M (explicitly annotated as non-additive)
+    assert snap.total_shared_ram_bytes == 270_000_000
+    assert "não é aditiva" in snap.shared_ram_note
+
+    # Fail-closed: if OS cannot report Private Working Set, never pretend Working Set is private RAM
+    mode[0] = "none"
+    clock[0] += 1_000_000_000
+    snap_unknown = col.collect(host_pid=100, core_pid=999)
+    assert snap_unknown.total_working_set_ram_bytes == 230_000_000
+    assert snap_unknown.total_private_ram_bytes is None
+    assert snap_unknown.private_ram_provenance == MetricProvenance.UNKNOWN
+
+
+def test_09_ai_agent_detection_vs_generic_child_processes() -> None:
+    from desktop.ipc.collector import detect_agent_kind
+
+    assert detect_agent_kind("claude.exe") == "claude"
+    assert detect_agent_kind("codex") == "codex"
+    assert detect_agent_kind("opencode-cli.exe") == "opencode"
+    assert detect_agent_kind("antigravity.exe") == "agy"
+    assert detect_agent_kind("git.exe") is None
+    assert detect_agent_kind("pwsh.exe") is None
+
+    clock = [1_000_000_000]
+    samples = [
+        RawProcessSample(100, 1, "ai-coordinator-desktop.exe", 10, 40_000_000, 1.0, private_ram_bytes=30_000_000),
+        RawProcessSample(200, 100, "python.exe", 20, 30_000_000, 0.5, private_ram_bytes=20_000_000),
+        RawProcessSample(300, 200, "pwsh.exe", 30, 25_000_000, 0.3, private_ram_bytes=18_000_000),
+        RawProcessSample(400, 300, "claude.exe", 40, 120_000_000, 2.0, private_ram_bytes=95_000_000),
+        RawProcessSample(500, 300, "git.exe", 50, 10_000_000, 0.1, private_ram_bytes=7_000_000),
+    ]
+    col = ProcessTreeCollector(
+        core_pid=200,
+        process_lister=lambda _r: samples,
+        clock_ns=lambda: clock[0],
+        cpu_count_fn=lambda: 2,
+    )
+    snap = col.collect(
+        host_pid=100,
+        core_pid=200,
+        terminal_pids={300: 30},
+        agent_pids={400: (40, "claude", "sess-agent-1")},
+    )
+    by_pid = {n.pid: n for n in snap.nodes}
+    assert by_pid[300].role == "terminal"
+    assert by_pid[400].role == "agent" and by_pid[400].agent_kind == "claude" and by_pid[400].session_id == "sess-agent-1"
+    assert by_pid[500].role == "child" and by_pid[500].agent_kind is None
+    assert snap.categories["agent"].process_count == 1
+    assert snap.categories["agent"].private_ram_bytes == 95_000_000
+    assert snap.categories["child"].process_count == 1
+    assert sum(c.ram_bytes for c in snap.categories.values()) == snap.total_tree_ram_bytes
+    assert sum(c.private_ram_bytes or 0 for c in snap.categories.values()) == snap.total_private_ram_bytes
+
+
+def test_10_system_resources_separation_and_gpu_engine_aggregation() -> None:
+    from desktop.ipc.collector import StorageVolumeMetrics, SystemResourcesMetrics, aggregate_gpu_engine_values
+
+    gpu = aggregate_gpu_engine_values(
+        [
+            ("pid_100_luid_0x00000000_0x00010000_phys_0_eng_0_engtype_3D", 14.5),
+            ("pid_200_luid_0x00000000_0x00010000_phys_0_eng_0_engtype_3D", 9.0),
+            ("pid_100_luid_0x00000000_0x00010000_phys_0_eng_1_engtype_Copy", 4.0),
+        ]
+    )
+    assert gpu == pytest.approx(23.5, abs=0.01)
+    assert aggregate_gpu_engine_values([]) is None
+
+    sys_metrics = SystemResourcesMetrics(
+        logical_cpu_count=8,
+        cpu_usage_percent=42.5,
+        cpu_provenance=MetricProvenance.MEASURED,
+        ram_total_bytes=32 * 1024**3,
+        ram_used_bytes=20 * 1024**3,
+        ram_available_bytes=12 * 1024**3,
+        ram_usage_percent=62.5,
+        ram_provenance=MetricProvenance.MEASURED,
+        storage_total_bytes=1000 * 1024**3,
+        storage_used_bytes=600 * 1024**3,
+        storage_available_bytes=400 * 1024**3,
+        storage_usage_percent=60.0,
+        storage_provenance=MetricProvenance.MEASURED,
+        storage_volumes=[StorageVolumeMetrics("C:", "C:\\", 1000 * 1024**3, 600 * 1024**3, 400 * 1024**3, 60.0)],
+        disk_activity_percent=7.2,
+        disk_activity_provenance=MetricProvenance.MEASURED,
+        disk_read_bytes_per_sec=1_200_000,
+        disk_write_bytes_per_sec=400_000,
+        disk_io_provenance=MetricProvenance.MEASURED,
+        network_rx_bytes_per_sec=500_000,
+        network_tx_bytes_per_sec=100_000,
+        network_total_bytes_per_sec=600_000,
+        network_provenance=MetricProvenance.MEASURED,
+        gpu_usage_percent=gpu,
+        gpu_provenance=MetricProvenance.MEASURED,
+    )
+    col = ProcessTreeCollector(
+        core_pid=200,
+        process_lister=lambda _r: [RawProcessSample(200, 1, "python.exe", 20, 30_000_000, 1.0, 20_000_000)],
+        clock_ns=lambda: 2_000_000_000,
+        cpu_count_fn=lambda: 8,
+        system_sampler=lambda _e, _c: sys_metrics,
+    )
+    snap_dict = col.collect(core_pid=200).to_dict()
+    assert snap_dict["system"]["storage_usage_percent"] == 60.0
+    assert snap_dict["system"]["disk_activity_percent"] == 7.2
+    assert snap_dict["system"]["network_total_bytes_per_sec"] == 600_000
+    assert snap_dict["system"]["gpu_usage_percent"] == 23.5
+    assert snap_dict["data_origin"] == "live_os"
+
+
+def test_11_live_os_private_vs_working_set_consistency() -> None:
+    # Real OS test validating private RAM <= Working Set and system telemetry on current host
+    proc = subprocess.Popen(
+        [sys.executable, "-c", "import time; buf = bytearray(12 * 1024 * 1024); time.sleep(2.5)"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    try:
+        time.sleep(0.35)
+        col = ProcessTreeCollector(core_pid=os.getpid(), min_sample_interval_ms=200)
+        col.prime()
+        time.sleep(0.25)
+        snap = col.collect()
+        by_pid = {n.pid: n for n in snap.nodes}
+        assert proc.pid in by_pid
+        child = by_pid[proc.pid]
+        assert child.working_set_ram_bytes is not None and child.working_set_ram_bytes >= 12 * 1024 * 1024
+        if sys.platform == "win32" or sys.platform.startswith("linux"):
+            assert child.private_ram_bytes is not None and child.private_ram_bytes >= 10 * 1024 * 1024
+            assert child.private_ram_bytes <= child.working_set_ram_bytes
+            assert child.private_ram_provenance == MetricProvenance.MEASURED
+        assert snap.system is not None
+        assert snap.system.ram_total_bytes > 0
+        assert snap.system.storage_total_bytes > 0
+    finally:
+        proc.terminate()
+        try:
+            proc.wait(timeout=3)
+        except subprocess.TimeoutExpired:
+            proc.kill()

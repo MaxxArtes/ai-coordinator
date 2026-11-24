@@ -746,6 +746,7 @@ class SecureIPCServer:
             )
 
         terminal_pids: Dict[int, Optional[int]] = {}
+        agent_pids: Dict[int, tuple] = {}
         if self.terminal_manager is not None:
             lock = getattr(self.terminal_manager, "_lock", None)
             if lock is not None:
@@ -758,12 +759,22 @@ class SecureIPCServer:
                 if isinstance(pid, int) and pid > 0:
                     identity = getattr(sess, "identity", None)
                     create_ns = getattr(identity, "create_time_ns", None) if identity is not None else None
-                    terminal_pids[pid] = create_ns if isinstance(create_ns, int) else None
+                    c_ns = create_ns if isinstance(create_ns, int) else None
+                    terminal_pids[pid] = c_ns
+                    kind_obj = getattr(sess, "kind", None)
+                    kind_val = getattr(kind_obj, "value", kind_obj)
+                    if kind_val == "governed_agent":
+                        agent_pids[pid] = (
+                            c_ns,
+                            getattr(sess, "agent_kind", None),
+                            getattr(sess, "session_id", None),
+                        )
 
         snapshot = self.process_collector.collect(
             host_pid=host_pid,
             core_pid=os.getpid(),
             terminal_pids=terminal_pids,
+            agent_pids=agent_pids or None,
             min_sample_interval_ms=sample_interval_ms,
         )
         return snapshot.to_dict(include_nodes=include_nodes)

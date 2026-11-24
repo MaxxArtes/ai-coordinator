@@ -15,7 +15,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use sysinfo::{Pid, ProcessRefreshKind, System};
+use sysinfo::{Disks, Networks, Pid, ProcessRefreshKind, System};
 use tauri::{Emitter, State};
 
 #[cfg(windows)]
@@ -90,6 +90,45 @@ pub struct RuntimeStatus {
 }
 
 #[derive(Serialize, Clone)]
+pub struct StorageVolumeMetrics {
+    pub name: String,
+    pub mount_point: String,
+    pub total_bytes: u64,
+    pub used_bytes: u64,
+    pub available_bytes: u64,
+    pub usage_percent: Option<f32>,
+}
+
+#[derive(Serialize, Clone)]
+pub struct SystemResourcesMetrics {
+    pub logical_cpu_count: u32,
+    pub cpu_usage_percent: Option<f32>,
+    pub cpu_provenance: &'static str,
+    pub ram_total_bytes: u64,
+    pub ram_used_bytes: u64,
+    pub ram_available_bytes: u64,
+    pub ram_usage_percent: Option<f32>,
+    pub ram_provenance: &'static str,
+    pub storage_total_bytes: u64,
+    pub storage_used_bytes: u64,
+    pub storage_available_bytes: u64,
+    pub storage_usage_percent: Option<f32>,
+    pub storage_provenance: &'static str,
+    pub storage_volumes: Vec<StorageVolumeMetrics>,
+    pub disk_activity_percent: Option<f32>,
+    pub disk_activity_provenance: &'static str,
+    pub disk_read_bytes_per_sec: Option<u64>,
+    pub disk_write_bytes_per_sec: Option<u64>,
+    pub disk_io_provenance: &'static str,
+    pub network_rx_bytes_per_sec: Option<u64>,
+    pub network_tx_bytes_per_sec: Option<u64>,
+    pub network_total_bytes_per_sec: Option<u64>,
+    pub network_provenance: &'static str,
+    pub gpu_usage_percent: Option<f32>,
+    pub gpu_provenance: &'static str,
+}
+
+#[derive(Serialize, Clone)]
 pub struct ProcessNodeMetrics {
     pub pid: u32,
     pub ppid: Option<u32>,
@@ -98,8 +137,13 @@ pub struct ProcessNodeMetrics {
     pub name: String,
     pub ram_bytes: u64,
     pub ram_provenance: &'static str,
+    pub private_ram_bytes: Option<u64>,
+    pub private_ram_provenance: &'static str,
+    pub working_set_ram_bytes: Option<u64>,
+    pub shared_ram_bytes: Option<u64>,
     pub cpu_usage_percent: Option<f32>,
     pub cpu_provenance: &'static str,
+    pub agent_kind: Option<String>,
 }
 
 #[derive(Serialize, Clone)]
@@ -108,6 +152,10 @@ pub struct CategoryResourceMetrics {
     pub process_count: usize,
     pub ram_bytes: u64,
     pub ram_provenance: &'static str,
+    pub private_ram_bytes: Option<u64>,
+    pub private_ram_provenance: &'static str,
+    pub working_set_ram_bytes: u64,
+    pub shared_ram_bytes: Option<u64>,
     pub cpu_usage_percent: Option<f32>,
     pub cpu_provenance: &'static str,
 }
@@ -118,22 +166,35 @@ pub struct ProcessTreeCategories {
     pub core: CategoryResourceMetrics,
     pub webview: CategoryResourceMetrics,
     pub terminal: CategoryResourceMetrics,
+    pub agent: CategoryResourceMetrics,
     pub child: CategoryResourceMetrics,
 }
 
 #[derive(Serialize, Clone)]
 pub struct ProcessTreeMetrics {
+    pub schema_version: u32,
+    pub data_origin: &'static str,
+    pub ttl_ms: u64,
+    pub stale: bool,
     pub host_pid: u32,
     pub core_pid: Option<u32>,
     pub host_ram_bytes: u64,
+    pub host_private_ram_bytes: Option<u64>,
     pub total_tree_ram_bytes: u64,
     pub ram_provenance: &'static str,
+    pub total_private_ram_bytes: Option<u64>,
+    pub private_ram_provenance: &'static str,
+    pub total_working_set_ram_bytes: u64,
+    pub total_shared_ram_bytes: Option<u64>,
+    pub shared_ram_note: &'static str,
     pub cpu_usage_percent: Option<f32>,
     pub cpu_provenance: &'static str,
+    pub logical_cpu_count: u32,
     pub sample_interval_ms: Option<u64>,
     pub process_count: usize,
     pub sampled_at_unix_ms: u64,
     pub categories: ProcessTreeCategories,
+    pub system: SystemResourcesMetrics,
     pub nodes: Vec<ProcessNodeMetrics>,
 }
 
@@ -911,13 +972,414 @@ async fn get_process_tree_metrics() -> Result<ProcessTreeMetrics, String> {
 }
 
 const MIN_CPU_SAMPLE_INTERVAL_MS: u64 = 200;
+const STORAGE_REFRESH_INTERVAL_SECS: u64 = 10;
+const SHARED_RAM_NON_ADDITIVE_NOTE: &str = "Memória compartilhada somada por processo não é aditiva entre processos (páginas compartilhadas como DLLs do WebView2 aparecem em múltiplos processos).";
 static CORE_PYTHON_PID: AtomicU32 = AtomicU32::new(0);
 static PROCESS_COLLECTOR: OnceLock<Mutex<ProcessTreeCollectorState>> = OnceLock::new();
 
+#[cfg(windows)]
+const PDH_FMT_DOUBLE: u32 = 0x00000200;
+#[cfg(windows)]
+const PDH_FMT_LARGE: u32 = 0x00000400;
+#[cfg(windows)]
+const PDH_MORE_DATA: i32 = 0x800007D2_u32 as i32;
+
+#[cfg(windows)]
+#[repr(C)]
+#[derive(Copy, Clone)]
+union PdhFmtCounterValueUnion {
+    long_value: i32,
+    double_value: f64,
+    large_value: i64,
+    ansi_ptr: usize,
+    wide_ptr: usize,
+}
+
+#[cfg(windows)]
+#[repr(C)]
+#[derive(Copy, Clone)]
+struct PdhFmtCounterValue {
+    c_status: u32,
+    value: PdhFmtCounterValueUnion,
+}
+
+#[cfg(windows)]
+#[repr(C)]
+struct PdhFmtCounterValueItemW {
+    sz_name: *const u16,
+    fmt_value: PdhFmtCounterValue,
+}
+
+#[cfg(windows)]
+#[allow(non_snake_case)]
+#[link(name = "pdh")]
+extern "system" {
+    fn PdhOpenQueryW(sz_data_source: *const u16, dw_user_data: usize, ph_query: *mut isize) -> i32;
+    fn PdhAddEnglishCounterW(
+        h_query: isize,
+        sz_full_counter_path: *const u16,
+        dw_user_data: usize,
+        ph_counter: *mut isize,
+    ) -> i32;
+    fn PdhCollectQueryData(h_query: isize) -> i32;
+    fn PdhGetFormattedCounterArrayW(
+        h_counter: isize,
+        dw_format: u32,
+        lpdw_buffer_size: *mut u32,
+        lpdw_item_count: *mut u32,
+        item_buffer: *mut std::ffi::c_void,
+    ) -> i32;
+    fn PdhGetFormattedCounterValue(
+        h_counter: isize,
+        dw_format: u32,
+        lpdw_type: *mut u32,
+        p_value: *mut PdhFmtCounterValue,
+    ) -> i32;
+    fn PdhCloseQuery(h_query: isize) -> i32;
+}
+
+#[cfg(windows)]
+fn to_wide_z(s: &str) -> Vec<u16> {
+    s.encode_utf16().chain(std::iter::once(0)).collect()
+}
+
+#[cfg(windows)]
+unsafe fn wide_ptr_to_string(ptr: *const u16) -> String {
+    if ptr.is_null() {
+        return String::new();
+    }
+    let mut len = 0usize;
+    while len < 512 && *ptr.add(len) != 0 {
+        len += 1;
+    }
+    String::from_utf16_lossy(std::slice::from_raw_parts(ptr, len))
+}
+
+#[cfg(windows)]
+struct WindowsPdhSample {
+    private_by_pid: HashMap<u32, u64>,
+    disk_activity_percent: Option<f32>,
+    disk_read_bytes_per_sec: Option<u64>,
+    disk_write_bytes_per_sec: Option<u64>,
+    gpu_usage_percent: Option<f32>,
+}
+
+#[cfg(windows)]
+struct WindowsPdhCollector {
+    query: isize,
+    c_pid: isize,
+    c_priv: isize,
+    c_disk_pct: isize,
+    c_disk_read: isize,
+    c_disk_write: isize,
+    c_gpu: isize,
+    collect_count: u64,
+}
+
+#[cfg(windows)]
+impl Drop for WindowsPdhCollector {
+    fn drop(&mut self) {
+        if self.query != 0 {
+            unsafe {
+                let _ = PdhCloseQuery(self.query);
+            }
+            self.query = 0;
+        }
+    }
+}
+
+#[cfg(windows)]
+impl WindowsPdhCollector {
+    fn add_counter(query: isize, path: &str) -> isize {
+        if query == 0 {
+            return 0;
+        }
+        let w = to_wide_z(path);
+        let mut handle: isize = 0;
+        let st = unsafe { PdhAddEnglishCounterW(query, w.as_ptr(), 0, &mut handle) };
+        if st == 0 { handle } else { 0 }
+    }
+
+    fn new() -> Self {
+        let mut query: isize = 0;
+        let ok = unsafe { PdhOpenQueryW(std::ptr::null(), 0, &mut query) } == 0;
+        if !ok || query == 0 {
+            return Self {
+                query: 0,
+                c_pid: 0,
+                c_priv: 0,
+                c_disk_pct: 0,
+                c_disk_read: 0,
+                c_disk_write: 0,
+                c_gpu: 0,
+                collect_count: 0,
+            };
+        }
+        let c_pid = Self::add_counter(query, r"\Process(*)\ID Process");
+        let c_priv = Self::add_counter(query, r"\Process(*)\Working Set - Private");
+        let c_disk_pct = Self::add_counter(query, r"\PhysicalDisk(_Total)\% Disk Time");
+        let c_disk_read = Self::add_counter(query, r"\PhysicalDisk(_Total)\Disk Read Bytes/sec");
+        let c_disk_write = Self::add_counter(query, r"\PhysicalDisk(_Total)\Disk Write Bytes/sec");
+        let c_gpu = Self::add_counter(query, r"\GPU Engine(*)\Utilization Percentage");
+        let mut collect_count = 0;
+        if unsafe { PdhCollectQueryData(query) } == 0 {
+            collect_count = 1;
+        }
+        Self {
+            query,
+            c_pid,
+            c_priv,
+            c_disk_pct,
+            c_disk_read,
+            c_disk_write,
+            c_gpu,
+            collect_count,
+        }
+    }
+
+    fn read_array(counter: isize, fmt: u32) -> Vec<(String, i64, f64)> {
+        if counter == 0 {
+            return Vec::new();
+        }
+        let mut sz: u32 = 0;
+        let mut cnt: u32 = 0;
+        let st = unsafe {
+            PdhGetFormattedCounterArrayW(counter, fmt, &mut sz, &mut cnt, std::ptr::null_mut())
+        };
+        if st != PDH_MORE_DATA || sz == 0 {
+            return Vec::new();
+        }
+        let words = ((sz as usize) + 7) / 8;
+        let mut buf: Vec<u64> = vec![0; words];
+        let st2 = unsafe {
+            PdhGetFormattedCounterArrayW(
+                counter,
+                fmt,
+                &mut sz,
+                &mut cnt,
+                buf.as_mut_ptr() as *mut std::ffi::c_void,
+            )
+        };
+        if st2 != 0 || cnt == 0 {
+            return Vec::new();
+        }
+        let item_size = std::mem::size_of::<PdhFmtCounterValueItemW>();
+        if (cnt as usize) * item_size > buf.len() * 8 {
+            return Vec::new();
+        }
+        let items = unsafe {
+            std::slice::from_raw_parts(buf.as_ptr() as *const PdhFmtCounterValueItemW, cnt as usize)
+        };
+        let mut out = Vec::with_capacity(items.len());
+        for item in items {
+            if item.fmt_value.c_status != 0 {
+                continue;
+            }
+            let name = unsafe { wide_ptr_to_string(item.sz_name) };
+            let (large_v, double_v) = unsafe {
+                if fmt == PDH_FMT_LARGE {
+                    (item.fmt_value.value.large_value, item.fmt_value.value.large_value as f64)
+                } else {
+                    (item.fmt_value.value.double_value as i64, item.fmt_value.value.double_value)
+                }
+            };
+            out.push((name, large_v, double_v));
+        }
+        out
+    }
+
+    fn read_scalar(counter: isize) -> Option<f64> {
+        if counter == 0 {
+            return None;
+        }
+        let mut val = PdhFmtCounterValue {
+            c_status: 1,
+            value: PdhFmtCounterValueUnion { double_value: 0.0 },
+        };
+        let st = unsafe {
+            PdhGetFormattedCounterValue(counter, PDH_FMT_DOUBLE, std::ptr::null_mut(), &mut val)
+        };
+        if st != 0 || val.c_status != 0 {
+            return None;
+        }
+        let num = unsafe { val.value.double_value };
+        if num.is_finite() && num >= 0.0 { Some(num) } else { None }
+    }
+
+    fn gpu_engine_key(instance: &str) -> &str {
+        if let Some(pos) = instance.find("luid_") {
+            let tail = &instance[pos..];
+            if let Some(end) = tail.find("_engtype_") {
+                return &tail[..end];
+            }
+            return tail;
+        }
+        instance
+    }
+
+    fn sample(&mut self) -> WindowsPdhSample {
+        let mut out = WindowsPdhSample {
+            private_by_pid: HashMap::new(),
+            disk_activity_percent: None,
+            disk_read_bytes_per_sec: None,
+            disk_write_bytes_per_sec: None,
+            gpu_usage_percent: None,
+        };
+        if self.query == 0 {
+            return out;
+        }
+        if unsafe { PdhCollectQueryData(self.query) } != 0 {
+            return out;
+        }
+        self.collect_count += 1;
+
+        if self.c_pid != 0 && self.c_priv != 0 {
+            let pids = Self::read_array(self.c_pid, PDH_FMT_LARGE);
+            let privs = Self::read_array(self.c_priv, PDH_FMT_LARGE);
+            for ((p_name, p_val, _), (m_name, m_val, _)) in pids.iter().zip(privs.iter()) {
+                if p_name == m_name && *p_val > 0 && *m_val >= 0 {
+                    out.private_by_pid.insert(*p_val as u32, *m_val as u64);
+                }
+            }
+        }
+
+        if self.collect_count >= 2 {
+            out.disk_activity_percent = Self::read_scalar(self.c_disk_pct)
+                .map(|v| ((v as f32).clamp(0.0, 100.0) * 100.0).round() / 100.0);
+            out.disk_read_bytes_per_sec = Self::read_scalar(self.c_disk_read)
+                .map(|v| v.max(0.0).round() as u64);
+            out.disk_write_bytes_per_sec = Self::read_scalar(self.c_disk_write)
+                .map(|v| v.max(0.0).round() as u64);
+
+            let gpu_items = Self::read_array(self.c_gpu, PDH_FMT_DOUBLE);
+            let mut per_engine: HashMap<String, f64> = HashMap::new();
+            for (name, _, val) in gpu_items {
+                if val.is_finite() && val >= 0.0 {
+                    let key = Self::gpu_engine_key(&name).to_string();
+                    *per_engine.entry(key).or_insert(0.0) += val;
+                }
+            }
+            if let Some(peak) = per_engine.values().copied().reduce(f64::max) {
+                out.gpu_usage_percent = Some(((peak as f32).clamp(0.0, 100.0) * 100.0).round() / 100.0);
+            }
+        }
+
+        out
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn read_linux_private_shared(pid: u32) -> (Option<u64>, Option<u64>) {
+    if let Ok(text) = std::fs::read_to_string(format!("/proc/{pid}/smaps_rollup")) {
+        let mut priv_kb: u64 = 0;
+        let mut shared_kb: u64 = 0;
+        let mut found_priv = false;
+        let mut found_shared = false;
+        for line in text.lines() {
+            if line.starts_with("Private_Clean:") || line.starts_with("Private_Dirty:") {
+                if let Some(val) = line.split_whitespace().nth(1).and_then(|v| v.parse::<u64>().ok()) {
+                    priv_kb += val;
+                    found_priv = true;
+                }
+            } else if line.starts_with("Shared_Clean:") || line.starts_with("Shared_Dirty:") {
+                if let Some(val) = line.split_whitespace().nth(1).and_then(|v| v.parse::<u64>().ok()) {
+                    shared_kb += val;
+                    found_shared = true;
+                }
+            }
+        }
+        if found_priv || found_shared {
+            return (
+                if found_priv { Some(priv_kb * 1024) } else { None },
+                if found_shared { Some(shared_kb * 1024) } else { None },
+            );
+        }
+    }
+    if let Ok(statm) = std::fs::read_to_string(format!("/proc/{pid}/statm")) {
+        let parts: Vec<u64> = statm.split_whitespace().filter_map(|p| p.parse::<u64>().ok()).collect();
+        if parts.len() >= 3 {
+            let page_size: u64 = 4096;
+            let res = parts[1].saturating_mul(page_size);
+            let shared = parts[2].saturating_mul(page_size).min(res);
+            return (Some(res.saturating_sub(shared)), Some(shared));
+        }
+    }
+    (None, None)
+}
+
+#[cfg(target_os = "linux")]
+fn read_linux_gpu_percent() -> Option<f32> {
+    let entries = std::fs::read_dir("/sys/class/drm").ok()?;
+    let mut best: Option<f32> = None;
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name_str = name.to_string_lossy();
+        if !name_str.starts_with("card") || name_str.contains('-') {
+            continue;
+        }
+        let path = entry.path().join("device").join("gpu_busy_percent");
+        if let Ok(raw) = std::fs::read_to_string(path) {
+            if let Ok(val) = raw.trim().parse::<f32>() {
+                if val.is_finite() && (0.0..=100.0).contains(&val) {
+                    best = Some(best.map(|b| b.max(val)).unwrap_or(val));
+                }
+            }
+        }
+    }
+    best.map(|v| (v * 100.0).round() / 100.0)
+}
+
+#[cfg(target_os = "linux")]
+fn read_linux_disk_counters() -> Option<(u64, u64, u64)> {
+    let mut block_devs: HashSet<String> = HashSet::new();
+    if let Ok(entries) = std::fs::read_dir("/sys/block") {
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if !name.starts_with("loop") && !name.starts_with("ram") && !name.starts_with("dm-") {
+                block_devs.insert(name);
+            }
+        }
+    }
+    if block_devs.is_empty() {
+        return None;
+    }
+    let text = std::fs::read_to_string("/proc/diskstats").ok()?;
+    let mut read_bytes: u64 = 0;
+    let mut write_bytes: u64 = 0;
+    let mut io_ms: u64 = 0;
+    let mut matched = false;
+    for line in text.lines() {
+        let cols: Vec<&str> = line.split_whitespace().collect();
+        if cols.len() >= 13 && block_devs.contains(cols[2]) {
+            if let (Ok(r_sec), Ok(w_sec), Ok(ticks)) = (
+                cols[5].parse::<u64>(),
+                cols[9].parse::<u64>(),
+                cols[12].parse::<u64>(),
+            ) {
+                read_bytes = read_bytes.saturating_add(r_sec.saturating_mul(512));
+                write_bytes = write_bytes.saturating_add(w_sec.saturating_mul(512));
+                io_ms = io_ms.saturating_add(ticks);
+                matched = true;
+            }
+        }
+    }
+    if matched { Some((read_bytes, write_bytes, io_ms)) } else { None }
+}
+
 struct ProcessTreeCollectorState {
     sys: System,
+    disks: Disks,
+    networks: Networks,
+    #[cfg(windows)]
+    pdh: WindowsPdhCollector,
+    #[cfg(target_os = "linux")]
+    prev_disk_counters: Option<(u64, u64, u64)>,
     has_baseline: bool,
     last_sample_at: Option<Instant>,
+    last_storage_at: Option<Instant>,
+    cached_storage: Vec<StorageVolumeMetrics>,
+    prev_net_rx: Option<u64>,
+    prev_net_tx: Option<u64>,
     seen_identities: HashMap<u32, u64>,
     last_snapshot: Option<ProcessTreeMetrics>,
 }
@@ -926,11 +1388,52 @@ impl ProcessTreeCollectorState {
     fn new() -> Self {
         Self {
             sys: System::new(),
+            disks: Disks::new_with_refreshed_list(),
+            networks: Networks::new_with_refreshed_list(),
+            #[cfg(windows)]
+            pdh: WindowsPdhCollector::new(),
+            #[cfg(target_os = "linux")]
+            prev_disk_counters: None,
             has_baseline: false,
             last_sample_at: None,
+            last_storage_at: None,
+            cached_storage: Vec::new(),
+            prev_net_rx: None,
+            prev_net_tx: None,
             seen_identities: HashMap::new(),
             last_snapshot: None,
         }
+    }
+
+    fn detect_agent_kind(name: &str) -> Option<&'static str> {
+        let mut lower = name.trim().to_ascii_lowercase();
+        if lower.is_empty() {
+            return None;
+        }
+        for ext in [".exe", ".cmd", ".bat", ".bin"] {
+            if lower.ends_with(ext) {
+                let new_len = lower.len() - ext.len();
+                lower.truncate(new_len);
+                break;
+            }
+        }
+        let table = [
+            ("claude", "claude"),
+            ("codex", "codex"),
+            ("opencode", "opencode"),
+            ("antigravity", "agy"),
+            ("agy", "agy"),
+            ("gemini", "gemini"),
+        ];
+        for (prefix, kind) in table {
+            if lower == prefix
+                || lower.starts_with(&format!("{prefix}-"))
+                || lower.starts_with(&format!("{prefix}_"))
+            {
+                return Some(kind);
+            }
+        }
+        None
     }
 
     fn aggregate_cpu<'a>(
@@ -963,21 +1466,90 @@ impl ProcessTreeCollectorState {
         }
     }
 
-    fn classify_role(pid: u32, ppid: Option<u32>, name: &str, host_pid: u32, core_pid: Option<u32>) -> &'static str {
+    fn aggregate_optional_ram(values: &[Option<u64>], node_count: usize) -> (Option<u64>, &'static str) {
+        if node_count == 0 {
+            return (None, "unknown");
+        }
+        let mut total: u64 = 0;
+        let mut measured_count = 0_usize;
+        for v in values {
+            if let Some(bytes) = v {
+                total = total.saturating_add(*bytes);
+                measured_count += 1;
+            }
+        }
+        if measured_count == 0 {
+            (None, "unknown")
+        } else if measured_count == node_count {
+            (Some(total), "measured")
+        } else {
+            (Some(total), "estimated")
+        }
+    }
+
+    fn classify_role(
+        pid: u32,
+        ppid: Option<u32>,
+        name: &str,
+        host_pid: u32,
+        core_pid: Option<u32>,
+    ) -> (&'static str, Option<String>) {
         if pid == host_pid {
-            return "host";
+            return ("host", None);
         }
         if Some(pid) == core_pid {
-            return "core";
+            return ("core", None);
         }
         let lower = name.to_ascii_lowercase();
         if lower.contains("webview") {
-            return "webview";
+            return ("webview", None);
+        }
+        if let Some(agent_kind) = Self::detect_agent_kind(name) {
+            return ("agent", Some(agent_kind.to_string()));
         }
         if ppid.is_some() && ppid == core_pid {
-            return "terminal";
+            return ("terminal", None);
         }
-        "child"
+        ("child", None)
+    }
+
+    fn refresh_storage_if_needed(&mut self, now: Instant) -> Vec<StorageVolumeMetrics> {
+        let should_refresh = self
+            .last_storage_at
+            .map(|prev| now.duration_since(prev) >= Duration::from_secs(STORAGE_REFRESH_INTERVAL_SECS))
+            .unwrap_or(true);
+        if should_refresh {
+            self.disks.refresh_list();
+            self.disks.refresh();
+            let mut seen_mounts: HashSet<String> = HashSet::new();
+            let mut vols: Vec<StorageVolumeMetrics> = Vec::new();
+            for disk in self.disks.list() {
+                let total = disk.total_space();
+                if total == 0 {
+                    continue;
+                }
+                let mount = disk.mount_point().to_string_lossy().to_string();
+                if !seen_mounts.insert(mount.clone()) {
+                    continue;
+                }
+                let avail = disk.available_space().min(total);
+                let used = total.saturating_sub(avail);
+                let pct = (((used as f64 / total as f64) * 100.0) * 100.0).round() as f32 / 100.0;
+                let d_name = disk.name().to_string_lossy().trim().to_string();
+                vols.push(StorageVolumeMetrics {
+                    name: if d_name.is_empty() { mount.clone() } else { d_name },
+                    mount_point: mount,
+                    total_bytes: total,
+                    used_bytes: used,
+                    available_bytes: avail,
+                    usage_percent: Some(pct.clamp(0.0, 100.0)),
+                });
+            }
+            vols.sort_by(|a, b| a.mount_point.cmp(&b.mount_point));
+            self.cached_storage = vols;
+            self.last_storage_at = Some(now);
+        }
+        self.cached_storage.clone()
     }
 
     fn collect(&mut self) -> ProcessTreeMetrics {
@@ -996,6 +1568,12 @@ impl ProcessTreeCollectorState {
 
         let refresh_kind = ProcessRefreshKind::new().with_memory().with_cpu();
         self.sys.refresh_processes_specifics(refresh_kind);
+        self.sys.refresh_cpu();
+        self.sys.refresh_memory();
+        self.networks.refresh();
+
+        #[cfg(windows)]
+        let pdh_sample = self.pdh.sample();
 
         let host_pid_u32 = std::process::id();
         let host_pid = Pid::from_u32(host_pid_u32);
@@ -1024,14 +1602,18 @@ impl ProcessTreeCollectorState {
             }
         }
 
-        let cpu_count = std::thread::available_parallelism()
-            .map(|n| n.get())
+        let logical_cpu_count = std::thread::available_parallelism()
+            .map(|n| n.get() as u32)
             .unwrap_or(1)
-            .max(1) as f32;
+            .max(1);
+        let cpu_count = logical_cpu_count as f32;
         let can_measure_cpu = self.has_baseline
             && elapsed_ms
                 .map(|ms| ms >= MIN_CPU_SAMPLE_INTERVAL_MS)
                 .unwrap_or(false);
+        let elapsed_secs = elapsed_ms
+            .filter(|ms| *ms >= MIN_CPU_SAMPLE_INTERVAL_MS)
+            .map(|ms| (ms as f64) / 1000.0);
 
         let mut sorted_pids: Vec<u32> = tree_pids.iter().map(|p| p.as_u32()).collect();
         sorted_pids.sort_unstable();
@@ -1039,6 +1621,7 @@ impl ProcessTreeCollectorState {
         let mut nodes: Vec<ProcessNodeMetrics> = Vec::with_capacity(sorted_pids.len());
         let mut next_identities: HashMap<u32, u64> = HashMap::with_capacity(sorted_pids.len());
         let mut host_ram_bytes: u64 = 0;
+        let mut host_private_ram_bytes: Option<u64> = None;
         let mut total_tree_ram_bytes: u64 = 0;
 
         for pid_u32 in sorted_pids {
@@ -1046,15 +1629,37 @@ impl ProcessTreeCollectorState {
             if let Some(proc) = self.sys.process(pid) {
                 let start_time = proc.start_time();
                 let ppid = proc.parent().map(|p| p.as_u32());
-                let ram_bytes = proc.memory();
+                let ws_bytes = proc.memory();
                 let same_identity = self.seen_identities.get(&pid_u32).copied() == Some(start_time);
 
                 next_identities.insert(pid_u32, start_time);
 
+                #[cfg(windows)]
+                let (private_ram_bytes, shared_ram_bytes) = {
+                    if let Some(&priv_raw) = pdh_sample.private_by_pid.get(&pid_u32) {
+                        let priv_capped = priv_raw.min(ws_bytes);
+                        (Some(priv_capped), Some(ws_bytes.saturating_sub(priv_capped)))
+                    } else {
+                        (None, None)
+                    }
+                };
+                #[cfg(target_os = "linux")]
+                let (private_ram_bytes, shared_ram_bytes) = {
+                    let (p_opt, s_opt) = read_linux_private_shared(pid_u32);
+                    let p_capped = p_opt.map(|p| p.min(ws_bytes));
+                    let s_final = s_opt.or_else(|| p_capped.map(|p| ws_bytes.saturating_sub(p)));
+                    (p_capped, s_final)
+                };
+                #[cfg(not(any(windows, target_os = "linux")))]
+                let (private_ram_bytes, shared_ram_bytes): (Option<u64>, Option<u64>) = (None, None);
+
+                let private_ram_provenance = if private_ram_bytes.is_some() { "measured" } else { "unknown" };
+
                 if pid_u32 == host_pid_u32 {
-                    host_ram_bytes = ram_bytes;
+                    host_ram_bytes = ws_bytes;
+                    host_private_ram_bytes = private_ram_bytes;
                 }
-                total_tree_ram_bytes += ram_bytes;
+                total_tree_ram_bytes = total_tree_ram_bytes.saturating_add(ws_bytes);
 
                 let (cpu_usage_percent, cpu_provenance) = if can_measure_cpu && same_identity {
                     let raw = proc.cpu_usage();
@@ -1068,17 +1673,23 @@ impl ProcessTreeCollectorState {
                     (None, "unknown")
                 };
 
-                let role = Self::classify_role(pid_u32, ppid, proc.name(), host_pid_u32, core_pid);
+                let (role, agent_kind) =
+                    Self::classify_role(pid_u32, ppid, proc.name(), host_pid_u32, core_pid);
                 nodes.push(ProcessNodeMetrics {
                     pid: pid_u32,
                     ppid,
                     start_time,
                     role: role.to_string(),
                     name: proc.name().to_string(),
-                    ram_bytes,
+                    ram_bytes: ws_bytes,
                     ram_provenance: "measured",
+                    private_ram_bytes,
+                    private_ram_provenance,
+                    working_set_ram_bytes: Some(ws_bytes),
+                    shared_ram_bytes,
                     cpu_usage_percent,
                     cpu_provenance,
+                    agent_kind,
                 });
             }
         }
@@ -1091,11 +1702,19 @@ impl ProcessTreeCollectorState {
                     process_count: 0,
                     ram_bytes: 0,
                     ram_provenance: "unknown",
+                    private_ram_bytes: None,
+                    private_ram_provenance: "unknown",
+                    working_set_ram_bytes: 0,
+                    shared_ram_bytes: None,
                     cpu_usage_percent: None,
                     cpu_provenance: "unknown",
                 };
             }
             let cat_ram: u64 = role_nodes.iter().map(|n| n.ram_bytes).sum();
+            let priv_vals: Vec<Option<u64>> = role_nodes.iter().map(|n| n.private_ram_bytes).collect();
+            let shared_vals: Vec<Option<u64>> = role_nodes.iter().map(|n| n.shared_ram_bytes).collect();
+            let (cat_priv, cat_priv_prov) = Self::aggregate_optional_ram(&priv_vals, role_nodes.len());
+            let (cat_shared, _) = Self::aggregate_optional_ram(&shared_vals, role_nodes.len());
             let (cat_cpu, cat_cpu_prov) =
                 Self::aggregate_cpu(role_nodes.iter().map(|n| (&n.cpu_usage_percent, &n.cpu_provenance)));
             CategoryResourceMetrics {
@@ -1103,6 +1722,10 @@ impl ProcessTreeCollectorState {
                 process_count: role_nodes.len(),
                 ram_bytes: cat_ram,
                 ram_provenance: "measured",
+                private_ram_bytes: cat_priv,
+                private_ram_provenance: cat_priv_prov,
+                working_set_ram_bytes: cat_ram,
+                shared_ram_bytes: cat_shared,
                 cpu_usage_percent: cat_cpu,
                 cpu_provenance: cat_cpu_prov,
             }
@@ -1113,11 +1736,146 @@ impl ProcessTreeCollectorState {
             core: build_category("core"),
             webview: build_category("webview"),
             terminal: build_category("terminal"),
+            agent: build_category("agent"),
             child: build_category("child"),
         };
 
         let (tree_cpu, tree_cpu_prov) =
             Self::aggregate_cpu(nodes.iter().map(|n| (&n.cpu_usage_percent, &n.cpu_provenance)));
+
+        let all_priv: Vec<Option<u64>> = nodes.iter().map(|n| n.private_ram_bytes).collect();
+        let all_shared: Vec<Option<u64>> = nodes.iter().map(|n| n.shared_ram_bytes).collect();
+        let (total_private_ram_bytes, private_ram_provenance) =
+            Self::aggregate_optional_ram(&all_priv, nodes.len());
+        let (total_shared_ram_bytes, _) =
+            Self::aggregate_optional_ram(&all_shared, nodes.len());
+
+        // Host computer system-wide telemetry (separate from AI Coordinator tree)
+        let (sys_cpu_pct, sys_cpu_prov) = if can_measure_cpu {
+            let raw = self.sys.global_cpu_info().cpu_usage();
+            if raw.is_finite() && raw >= 0.0 {
+                (Some((raw.clamp(0.0, 100.0) * 100.0).round() / 100.0), "measured")
+            } else {
+                (None, "unknown")
+            }
+        } else {
+            (None, "unknown")
+        };
+
+        let sys_ram_total = self.sys.total_memory();
+        let sys_ram_avail = self.sys.available_memory().min(sys_ram_total);
+        let sys_ram_used = if sys_ram_avail > 0 && sys_ram_avail <= sys_ram_total {
+            sys_ram_total.saturating_sub(sys_ram_avail)
+        } else {
+            self.sys.used_memory().min(sys_ram_total)
+        };
+        let (sys_ram_pct, sys_ram_prov) = if sys_ram_total > 0 {
+            let pct = (((sys_ram_used as f64 / sys_ram_total as f64) * 100.0) * 100.0).round() as f32 / 100.0;
+            (Some(pct.clamp(0.0, 100.0)), "measured")
+        } else {
+            (None, "unknown")
+        };
+
+        let storage_volumes = self.refresh_storage_if_needed(now);
+        let storage_total_bytes: u64 = storage_volumes.iter().map(|v| v.total_bytes).sum();
+        let storage_used_bytes: u64 = storage_volumes.iter().map(|v| v.used_bytes).sum();
+        let storage_available_bytes: u64 = storage_volumes.iter().map(|v| v.available_bytes).sum();
+        let (storage_usage_percent, storage_provenance) = if storage_total_bytes > 0 {
+            let pct = (((storage_used_bytes as f64 / storage_total_bytes as f64) * 100.0) * 100.0).round() as f32 / 100.0;
+            (Some(pct.clamp(0.0, 100.0)), "measured")
+        } else {
+            (None, "unknown")
+        };
+
+        let mut cur_net_rx: u64 = 0;
+        let mut cur_net_tx: u64 = 0;
+        for (iface_name, net) in &self.networks {
+            let lower = iface_name.to_ascii_lowercase();
+            if lower == "lo" || lower.contains("loopback") {
+                continue;
+            }
+            cur_net_rx = cur_net_rx.saturating_add(net.total_received());
+            cur_net_tx = cur_net_tx.saturating_add(net.total_transmitted());
+        }
+        let (network_rx_bytes_per_sec, network_tx_bytes_per_sec, network_total_bytes_per_sec, network_provenance) =
+            match (elapsed_secs, self.prev_net_rx, self.prev_net_tx) {
+                (Some(secs), Some(prx), Some(ptx)) if secs > 0.0 && cur_net_rx >= prx && cur_net_tx >= ptx => {
+                    let rx = ((cur_net_rx - prx) as f64 / secs).round() as u64;
+                    let tx = ((cur_net_tx - ptx) as f64 / secs).round() as u64;
+                    (Some(rx), Some(tx), Some(rx.saturating_add(tx)), "measured")
+                }
+                _ => (None, None, None, "unknown"),
+            };
+        self.prev_net_rx = Some(cur_net_rx);
+        self.prev_net_tx = Some(cur_net_tx);
+
+        #[cfg(windows)]
+        let (disk_activity_percent, disk_read_bytes_per_sec, disk_write_bytes_per_sec, gpu_usage_percent) = (
+            pdh_sample.disk_activity_percent,
+            pdh_sample.disk_read_bytes_per_sec,
+            pdh_sample.disk_write_bytes_per_sec,
+            pdh_sample.gpu_usage_percent,
+        );
+        #[cfg(target_os = "linux")]
+        let (disk_activity_percent, disk_read_bytes_per_sec, disk_write_bytes_per_sec, gpu_usage_percent) = {
+            let cur = read_linux_disk_counters();
+            let (d_pct, d_r, d_w) = match (elapsed_secs, self.prev_disk_counters, cur) {
+                (Some(secs), Some((pr, pw, pio)), Some((cr, cw, cio)))
+                    if secs > 0.0 && cr >= pr && cw >= pw && cio >= pio =>
+                {
+                    let pct = ((((cio - pio) as f64) / (secs * 1000.0)) * 100.0).clamp(0.0, 100.0);
+                    let r_bps = ((cr - pr) as f64 / secs).round() as u64;
+                    let w_bps = ((cw - pw) as f64 / secs).round() as u64;
+                    (Some(((pct as f32) * 100.0).round() / 100.0), Some(r_bps), Some(w_bps))
+                }
+                _ => (None, None, None),
+            };
+            self.prev_disk_counters = cur;
+            (d_pct, d_r, d_w, read_linux_gpu_percent())
+        };
+        #[cfg(not(any(windows, target_os = "linux")))]
+        let (disk_activity_percent, disk_read_bytes_per_sec, disk_write_bytes_per_sec, gpu_usage_percent): (
+            Option<f32>,
+            Option<u64>,
+            Option<u64>,
+            Option<f32>,
+        ) = (None, None, None, None);
+
+        let disk_activity_provenance = if disk_activity_percent.is_some() { "measured" } else { "unknown" };
+        let disk_io_provenance = if disk_read_bytes_per_sec.is_some() && disk_write_bytes_per_sec.is_some() {
+            "measured"
+        } else {
+            "unknown"
+        };
+        let gpu_provenance = if gpu_usage_percent.is_some() { "measured" } else { "unknown" };
+
+        let system = SystemResourcesMetrics {
+            logical_cpu_count,
+            cpu_usage_percent: sys_cpu_pct,
+            cpu_provenance: sys_cpu_prov,
+            ram_total_bytes: sys_ram_total,
+            ram_used_bytes: sys_ram_used,
+            ram_available_bytes: sys_ram_avail,
+            ram_usage_percent: sys_ram_pct,
+            ram_provenance: sys_ram_prov,
+            storage_total_bytes,
+            storage_used_bytes,
+            storage_available_bytes,
+            storage_usage_percent,
+            storage_provenance,
+            storage_volumes,
+            disk_activity_percent,
+            disk_activity_provenance,
+            disk_read_bytes_per_sec,
+            disk_write_bytes_per_sec,
+            disk_io_provenance,
+            network_rx_bytes_per_sec,
+            network_tx_bytes_per_sec,
+            network_total_bytes_per_sec,
+            network_provenance,
+            gpu_usage_percent,
+            gpu_provenance,
+        };
 
         let sampled_at_unix_ms = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -1126,17 +1884,29 @@ impl ProcessTreeCollectorState {
 
         let ram_provenance = if nodes.is_empty() { "unknown" } else { "measured" };
         let snapshot = ProcessTreeMetrics {
+            schema_version: 1,
+            data_origin: "live_os",
+            ttl_ms: 10_000,
+            stale: false,
             host_pid: host_pid_u32,
             core_pid,
             host_ram_bytes,
+            host_private_ram_bytes,
             total_tree_ram_bytes,
             ram_provenance,
+            total_private_ram_bytes,
+            private_ram_provenance,
+            total_working_set_ram_bytes: total_tree_ram_bytes,
+            total_shared_ram_bytes,
+            shared_ram_note: SHARED_RAM_NON_ADDITIVE_NOTE,
             cpu_usage_percent: tree_cpu,
             cpu_provenance: tree_cpu_prov,
+            logical_cpu_count,
             sample_interval_ms: if can_measure_cpu { elapsed_ms } else { None },
             process_count: nodes.len(),
             sampled_at_unix_ms,
             categories,
+            system,
             nodes,
         };
 
