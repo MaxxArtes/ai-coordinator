@@ -315,9 +315,9 @@ class TestDesktopUpdater(unittest.TestCase):
         version_tauri = tauri_conf["version"]
 
         # Diagnostic build (4D.3 Etapa 8): own version, above alpha.50 and below a future alpha.51.
-        self.assertEqual(version_pkg, "0.6.1-alpha.50.diag.3")
-        self.assertEqual(version_tauri, "0.6.1-alpha.50.diag.3")
-        self.assertIn('version = "0.6.1-alpha.50.diag.3"', cargo_toml)
+        self.assertEqual(version_pkg, "0.6.1-alpha.50.diag.4")
+        self.assertEqual(version_tauri, "0.6.1-alpha.50.diag.4")
+        self.assertIn('version = "0.6.1-alpha.50.diag.4"', cargo_toml)
         self.assertEqual(pkg_lock["version"], version_pkg)
         self.assertEqual(pkg_lock["packages"][""]["version"], version_pkg)
 
