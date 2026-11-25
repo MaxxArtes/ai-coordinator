@@ -677,10 +677,21 @@ def bootstrap(store, project):
 
 
 def launch(store, config, client, project, task_id=None, model=None):
-    project = project_path(project)
+    directory = Path(project).expanduser().resolve()
+    key = project_path(directory)
+    # Scope resolution still uses the legacy normalized key. On a
+    # case-sensitive Windows directory, that spelling may name a different
+    # checkout. Refuse the ambiguity before reading or creating a marker.
+    if not directory.samefile(key):
+        raise ValueError("Normalizacao do projeto aponta para outro diretorio")
+    project = str(directory)
     if task_id:
         task = store.task(task_id)
-        if task["project"] != project:
+        try:
+            same_project = directory.samefile(task["project"])
+        except OSError:
+            same_project = False
+        if not same_project:
             raise ValueError("Tarefa pertence a outro projeto")
         snapshot = {k: task[k] for k in ("id", "goal", "revision", "snapshot", "ai_memory_workstream_id")}
     else:
