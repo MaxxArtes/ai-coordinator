@@ -689,3 +689,101 @@ Status: **backlog futuro (não implementado na Fase 4D.4)**. Avaliação técnic
 7. **Preservação do histórico e prevenção de operações duplicadas:** manter trilha íntegra do histórico de execução e impedir reexecução duplicada de etapas ou efeitos já concluídos.
 8. **Possibilidade de cancelamento seguro:** permitir abortar a espera/tarefa de forma limpa e determinística, preservando a consistência da missão.
 
+---
+
+## Apêndice I — Lições operacionais (24–25/11/2026), dependências da Fase 4D.5 / 4D.6 e pré-fechamento da Fase 4D.4
+
+Registro de governança e backlog técnico decorrente da execução completa da **Fase 4D.4 — Segunda rodada (`5c94318`)**, antes da autorização de atualização para `0.6.1-alpha.52`.
+
+### I.1 — Backlog técnico para o Marco 4D.5 (Mission Control)
+
+1. **Handoff preventivo por cota entre agentes/modelos heterogêneos:** validar transferência limpa antes de 90% de uso da janela de 5 h sem perda de requisitos nem retrabalho de código.
+2. **Recuperação após desligamento inesperado (`power loss`) e integridade atômica em disco:** desligamento abrupto em 24/11 deixou arquivo de leitura local preenchido com bytes nulos (`leitura-claude-max.json`, `2.662` bytes zero) e temporário truncado (`0` bytes no `hook-spool`). Leitores do Coordinator devem tratar arquivos zerados/truncados isoladamente por perfil (já verificado em `provider_adapters.py`), e escritores gerenciados no Mission Control devem usar gravação temporária + `fsync` + troca atômica.
+3. **Resiliência ante indisponibilidade ou atraso do `ai-memory`:** em reinicializações após falha no Windows, o servidor local `ai-memory` demorou ~24 min (`19m27s` antes do primeiro log + `5m20s` até abrir a porta). A integração no Core/Mission Control deve operar com *timeouts* curtos, degradação controlada e checkpoints autossuficientes no Coordinator, de modo que indisponibilidade do `ai-memory` nunca bloqueie a retomada mínima de uma tarefa.
+4. **Identidade explícita de sessão, projeto, tarefa, agente e perfil:** nunca depender apenas do diretório inicial (`cwd`) do terminal para escopo. Propagar explicitamente `(session_id, project, task_id, agent, launcher_profile)` no despacho e vincular decisões automáticas de cota na 4D.5 diretamente ao perfil correspondente em `ProviderTelemetryItem.accounts` (`profile == target_launcher_profile`), jamais a `windows` agregadas ou ao nome do perfil de autorização do Desktop (`Default Profile`).
+5. **Regras de confiabilidade para seleção automática de provedores na 4D.5:** dados com `stale=True` (`> 15 min`), `provenance != "measured"` (`estimated` / `unknown`), janelas renovadas (`used_percent=None`) ou histórico de execução anterior em `coordination.sqlite` (`route_health` expirado / `runs`) jamais podem ser interpretados como disponibilidade atual garantida. Manter busca remota do OpenRouter desativada por padrão (*opt-in* explícito).
+6. **Preservação integral de instruções críticas e invariantes nos checkpoints:** checkpoints e handoffs devem carregar integralmente invariantes, critérios de aceite, pendências numeradas e achados de revisão (evitando perdas como a observada no Bloco 4 entre checkpoints anteriores).
+
+### I.2 — Dependência explícita do Marco 4D.6 (Distribuição Multiplataforma)
+
+- **Compilação e verificação nativa Rust/Tauri em Linux e macOS:** incluir obrigatoriamente na 4D.6 a compilação nativa dos binários Rust/Tauri para Linux (Ubuntu) e macOS, englobando o **Apontamento 1 (P3)** da revisão da 4D.4 r2 (`cargo check` em ambiente Ubuntu e `cargo test --locked` em `desktop/src-tauri` no fluxo de CI), além da verificação em janela real no app instalado.
+
+### I.3 — Pendências manuais nativas para fechamento da Fase 4D.4 antes da `0.6.1-alpha.52`
+
+Uso exclusivo pelo atalho isolado **`AI Coordinator (validacao 4D.4 r2, perfil isolado)`** (`D:\ai-coordinator-diag\app-4d4-r2`, commit `5c94318`, versão `0.6.1-alpha.50.diag.4`):
+
+1. Menu de contexto da aba com clique direito e `Shift+F10` em diretórios autorizados.
+2. Digitar texto no terminal, alternar entre abas e confirmar preservação do conteúdo na tela/buffer.
+3. Executar agente de IA autorizado ao vivo dentro do terminal e confirmar sua identificação na aba **Monitoramento** (no benchmark automatizado em instância única, `agent_spawned_in_pty=False`, mantendo este item dependente de verificação manual ao vivo).
+
+
+---
+
+## Apêndice J — Fechamento funcional da 4D.4 e decisões para 4D.5, 4E e 4F
+
+Este registro consolida o checkpoint 115 e o aceite posterior do operador. O Apêndice I preserva o roteiro original. Os resultados abaixo atualizam a situação do item I.3. A atualização controlada da `0.6.1-alpha.52` foi autorizada sob condição de aprovação dos gates técnicos. A evidência do instalador e dos testes pós-instalação será registrada na tarefa `1210ff494600475c`.
+
+### J.1 — Evidência do checkpoint 115
+
+O executável `0.6.1-alpha.50.diag.4` do commit `5c94318` foi conferido contra o manifesto do artefato. O ensaio usou Core `v0.6.0`, ConPTY, perfil sintético e dois diretórios autorizados de teste. O harness enviou cliques e teclas diretamente ao WebView2 por CDP restrito ao loopback, em um desktop Windows separado. O atalho oficial passou na verificação preliminar. A entrega de cliques e teclas pelo Windows via atalho ficou sem ensaio.
+
+| Verificação | Resultado observado | Evidência registrada no checkpoint 115 |
+| --- | --- | --- |
+| Menu de contexto | Clique direito e `Shift+F10` abriram o menu das abas. `Esc` o fechou nas duas tentativas. | `CDP-03-menu-clique-direito.png`, `CDP-04-menu-shift-f10.png`, `menu.json` |
+| Continuidade do terminal | A saída `R2_PTY_76294` e o PID `12184` permaneceram após alternar entre Monitoramento e Conversas. A abertura de outro projeto preservou a saída do primeiro terminal e o segundo manteve o próprio marcador. | `terminal-telas.json`, `terminal-projetos.json`, `CDP-09-terminais-projetos.png` |
+| Identificação de agente | O Monitoramento exibiu `OpenCode`, `opencode.exe` e PID `21276`, filho do PowerShell `12184` no PTY. O processo abriu um listener local. O ensaio verificou a identificação do processo, sem inferência. | `agente.json`, `CDP-11-linha-opencode.png` |
+
+Os três resultados funcionais foram aprovados pelo operador. A árvore de teste foi encerrada com zero processos restantes. As capturas e os registros ficam no diretório de conferência referenciado pelo checkpoint 115, no relatório `resultado-4d4-r2.md`.
+
+O ensaio de entrada nativa do Windows é complementar após a instalação, quando houver sessão disponível. O benchmark anterior de Monitoramento continua representando um terminal aberto e será complementado se houver medição isolada com inferência ativa. O Apontamento 1 (P3) de Linux e macOS permanece na 4D.6 conforme I.2. A origem de `CreateProcessAsUserW failed: 5` continua em aberto. A correção de identidade do launcher do checkpoint 114 segue em laboratório, com integração sujeita a revisão patch explícita do Core, validação isolada e manifesto do artefato que a incluir.
+
+### J.2 — Execução paralela e adaptativa
+
+- O Coordinator manteve a tarefa, os checkpoints e os critérios de aceite. O harness Codex iniciou `native_review` em modo somente leitura para revisar critérios e opções enquanto o agente principal verificava o artefato e a disponibilidade do desktop. O harness selecionou o desktop separado e executou o ensaio.
+- Abertura do perfil, autorização dos diretórios, alternância de vistas, entrada no PTY, verificação do PID e encerramento foram sequenciais porque compartilharam a mesma janela ou dependeram do estado anterior. As asserções de menu, buffer, PID, descendência e listener foram determinísticas.
+- A rodada teve **14 min 11 s**, conforme o registro encaminhado pelo operador. O desktop compartilhado ocupado motivou a troca do método de entrada e limitou a cobertura. O aceite funcional e a autorização condicional da atualização foram decisões humanas. O ensaio funcional ficou sem benchmark concorrente e sem coleta comparativa de consumo, cotas, tempo ou retrabalho. O consumo e o ganho de paralelismo desta rodada não foram quantificados.
+- O caso passa a orientar avaliação futura de recursos exclusivos, prontidão de tarefas, retomada após bloqueios e qualidade de evidência. Uma avaliação do escalonador deve registrar intervalo e consumo por tarefa, espera por recurso, troca de método, intervenções humanas e retrabalho. Comparações de ganho exigem uma referência sequencial equivalente.
+
+### J.3 — Contratos e componentes confirmados no Core
+
+| Capacidade atual | Reaproveitamento e lacuna para a fase futura |
+| --- | --- |
+| O MCP opcional `ai-coordinator-mcp` oferece bootstrap de projeto, tarefas, checkpoints, resolução de rotas e delegação de workers pela fachada `Coordinator`, também acessível pelo CLI. [MCP](../../src/ai_coordinator/mcp_server.py) · [API](../../src/ai_coordinator/api.py) · [CLI](../../src/ai_coordinator/cli.py) | Inventariar ferramentas existentes, definir seu escopo e adaptar os contratos ao Gateway. A exposição programática precisa de identidade vinculada a perfil, projeto e missão, além de autorização e auditoria por operação. |
+| O Tool Broker já possui registro de ferramentas, políticas de permissão e aprovação, tokens de capacidade vinculados à tarefa e ao worker, expiração, revogação, limites e auditoria. [Tool Broker](../../src/ai_coordinator/tool_broker.py) | Reusar as políticas e avaliar como a identidade de um cliente local ingressa no contrato. Os tokens atuais do broker têm vínculo com o processo supervisionado. O Gateway precisa definir o vínculo dos clientes com as operações de Desktop e de missão. |
+| O IPC JSON-RPC do Desktop coordena operações internas do host, Core e terminais. O CLI já reserva e supervisiona workers por rota. [IPC](../../desktop/ipc/protocol.py) · [Servidor IPC](../../desktop/ipc/server.py) · [CLI](../../src/ai_coordinator/cli.py) | Definir operações públicas de consulta e solicitação sobre contratos do Core. Terminais e mutações sensíveis passam por autorização explícita, limites e auditoria. A janela segue independente do serviço de coordenação autorizado. |
+| `MissionControl`, DAG, reconstrução de trajetória, Invariant Oracle e Resource Ledger já cobrem planejamento, dependências, revisões, evidência e controle de efeitos. [Missão](../../src/ai_coordinator/mission.py) · [DAG](../../src/ai_coordinator/dag.py) · [Reconstrução](../../src/ai_coordinator/reconstruction.py) · [Oracle](../../src/ai_coordinator/invariants.py) · [Ledger](../../src/ai_coordinator/resource_ledger.py) | Conectar prontidão, reservas, decisões de despacho e consolidação sob limites comuns. Projetar concorrência entre ramos independentes com exclusão de recursos em conflito e idempotência após reenvio. |
+| Checkpoints revisionados, Human Workspace e modelos de dependências humanas já fornecem base para continuidade durável. [Persistência](../../src/ai_coordinator/storage.py) · [Human Workspace](../../src/ai_coordinator/human_workspace.py) · [DAG](../../src/ai_coordinator/dag.py) | Integrar handoff, memória autorizada e intervenção seletiva à missão. As tarefas independentes continuam enquanto o ramo dependente aguarda decisão autorizada. |
+| Insight Engine, Experience Store e telemetria de trajetória oferecem insumos para aprendizado supervisionado. [Insight Engine](../../src/ai_coordinator/insights.py) · [Experiências](../../src/ai_coordinator/experience.py) · [Trajetória](../../src/ai_coordinator/trajectory.py) | Evoluir o mecanismo existente para avaliação de estratégias e políticas com evidências, supervisão, teste e reversão na 4E. |
+
+### J.4 — Visão aprovada para as fases futuras
+
+Os princípios permanentes são **processo, qualidade e melhoria contínua**. Os cinco pilares de inspiração são **processadores, cérebro, aviação, fábrica e indústria, e gestão da qualidade**. As decisões abaixo complementam as subetapas e os gates já numerados no corpo deste roadmap.
+
+**4D.5 — Mission Control**
+
+- Planejar processamento heterogêneo com unidades lógicas `P-Core`, `E-Core`, `D-Core`, `S-Core`, `H-Core` e `V-Core`. Vincular as funções e capacidades de cada unidade a critérios de qualidade, custo, cota, latência e evidência na fase de desenho. A unidade pode ser um algoritmo determinístico, agente, pessoa ou verificador, conforme a operação.
+- Definir o pipeline de entrada, análise de dependências, despacho, execução, verificação e consolidação. Permitir paralelismo e conclusão fora da ordem apresentada quando a DAG e os recursos permitirem. Reavaliar dinamicamente a alocação conforme bloqueios, disponibilidade, custo e progresso, com reserva de recursos e revisão dos resultados.
+- Definir a coerência de contexto entre tarefas e a hierarquia lógica `L0`–`L4`. Especificar, por nível, escopo, autoridade, retenção, recuperação, promoção e invalidação. Incluir armazenamento local, isolamento por identidade e compartilhamento seletivo autorizado. Preservar handoff e checkpoints autossuficientes para recuperação com degradação controlada durante a indisponibilidade do AI Memory.
+- Planejar o **AI Coordinator Gateway** independente da interface gráfica, com **MCP Server local** para solicitações de agentes e **MCP Client** para ferramentas e serviços autorizados. Prever consulta inicial de estado, recursos, tarefas e capacidades, seguida por solicitações de despacho, resultados, handoff e intervenção humana. A interface programática usa os mesmos contratos do Core para execução e persistência.
+- Aplicar segurança e autorização desde a primeira operação exposta. Confinar a superfície ao uso local nesta fase, autenticar o acesso e vincular credenciais individuais a identidade, perfil, projeto, missão e prazo. Definir limites de chamadas, concorrência, delegação, recursos e orçamento, revogação, prevenção de duplicação e auditoria. Operações sensíveis passam por aprovação humana e verificação de invariantes. Execução arbitrária de comandos fica desabilitada por padrão.
+- A conferência 4D.4 do checkpoint 115 é um caso para avaliar planejamento de dependências e exclusividade de recursos. A instrumentação precisa indicar quando o trabalho foi planejado pelo Coordinator, executado pelo harness ou decidido pelo operador.
+
+**4E — Meta-Coordinator e Insight Engine**
+
+- Evoluir o Insight Engine existente com aprendizado experiencial, seleção adaptativa de estratégias, metacognição operacional e reconhecimento das próprias capacidades, limitações e incertezas.
+- Organizar experimentação e melhoria contínua supervisionadas com critérios verificáveis, comparação de resultados, trilha de evidências e decisões humanas. Versionar políticas, testar mudanças e permitir sua reversão. Manter a execução sujeita aos limites e invariantes da missão.
+
+**4F — Ecossistema e conectividade**
+
+- Planejar APIs, SDKs e integrações externas sobre os contratos já validados no Core e no Gateway. Avaliar acesso remoto seguro e opcional e processamento distribuído quando tecnicamente justificado.
+- Preservar o uso inteiramente local como opção independente, inclusive com modelos locais. Acesso remoto permanece desabilitado nesta etapa.
+
+Este registro é documental. A 4D.5 e o Meta-Coordinator aguardam sua fase de implementação. A frente do AI Memory continua independente na tarefa `52e09fb9b0f24a91`, checkpoint 8. O fechamento da 4D.4 preserva o escopo da frente SSW.
+
+### J.5 — Encerramento da 4D.4 e instalação local
+
+Em 25/11/2026, a **0.6.1-alpha.52** foi instalada localmente após aprovação dos gates. O build do commit 1b5d681 e os workflows 45693420438 e 45693420453 passaram. Foram confirmados a assinatura Minisign do NSIS com a chave fixada, o SHA-256 informado pelo CI, a versão PE e a integridade de 4.359 arquivos portáteis. O executável instalado foi conferido com a marca NSIS documentada do Tauri. O backup da alpha.51 e dos dados do usuário foi validado por SHA-256 e preservado com o instalador de recuperação assinado.
+
+O teste do executável instalado confirmou Core conectado, terminal em projeto já autorizado, saída preservada na troca de vistas, provedores locais no Monitoramento e encerramento sem processos órfãos. O ensaio usou uma cópia do perfil em desktop Windows separado. A entrada nativa pelo Windows no desktop compartilhado continua como verificação complementar. A homologação funcional, a instalação local e o smoke encerram a entrega 4D.4 no Windows. O caso completo e as evidências estão na tarefa 1210ff494600475c, checkpoint 117, relatório resultado-alpha52.md.
+
+A revisão de identidade do launcher segue separada como futura revisão patch do Core. As fases posteriores permanecem planejadas, com uso local e Gateway sujeito aos gates do Apêndice J. O Core v0.6.0, o runtime central, o AI Memory e a frente SSW permaneceram fora da atualização.
