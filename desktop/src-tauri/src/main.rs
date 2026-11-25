@@ -1956,9 +1956,13 @@ impl ProcessTreeCollectorState {
                     (None, "unknown")
                 };
 
-                let agent_kind = match self.cmdline_agent_kinds.get(&(pid_u32, start_time)) {
-                    Some(kind) => *kind,
-                    None => detect_agent_kind(proc.name(), &[]),
+                // Name first, as in the Core: a pid that exec'd into an agent (Linux) is not hidden by a cached wrapper kind.
+                let agent_kind = match detect_agent_kind(proc.name(), &[]) {
+                    Some(kind) => Some(kind),
+                    None if agent_needs_cmdline(proc.name()) => {
+                        self.cmdline_agent_kinds.get(&(pid_u32, start_time)).copied().flatten()
+                    }
+                    None => None,
                 };
                 let (role, agent_kind) =
                     Self::classify_role(pid_u32, ppid, proc.name(), agent_kind, host_pid_u32, core_pid);

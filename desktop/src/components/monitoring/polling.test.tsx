@@ -193,6 +193,30 @@ describe("Poller", () => {
     await advance(0);
     expect(read).toHaveBeenCalledTimes(3);
   });
+
+  it("enabled again after a failure, retries at once instead of waiting out the backoff", async () => {
+    let fail = true;
+    const read = vi.fn(async () => {
+      if (fail) throw new Error("Core ocupado");
+      return true;
+    });
+    const poller = new Poller(read);
+    poller.attach();
+    poller.configure(settings({ intervalMs: 30_000, maxBackoffMs: 300_000 }));
+    await advance(0);
+    expect(read).toHaveBeenCalledTimes(1); // failed: the next one would wait 60 s
+    poller.configure(settings({ intervalMs: 30_000, maxBackoffMs: 300_000, enabled: false }));
+    await advance(20_000);
+    fail = false;
+    poller.configure(settings({ intervalMs: 30_000, maxBackoffMs: 300_000 }));
+    await advance(0);
+    expect(read).toHaveBeenCalledTimes(2);
+    await advance(29_999);
+    expect(read).toHaveBeenCalledTimes(2); // success: back to the normal interval
+    await advance(1);
+    expect(read).toHaveBeenCalledTimes(3);
+    poller.detach();
+  });
 });
 
 describe("usePolling", () => {

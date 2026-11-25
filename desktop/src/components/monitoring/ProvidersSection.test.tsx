@@ -193,6 +193,53 @@ describe("ProvidersSection — leituras locais dos provedores", () => {
     expect(partial.getByText("Janela de 5 h").closest(".provider-window")).not.toHaveTextContent("indisponível");
   });
 
+  it("tokens somados entre perfis mostram a parte de cada perfil, o teto de arquivos e o perfil do contexto", () => {
+    const summed: ProvidersTelemetrySnapshot = {
+      ...SNAPSHOT,
+      providers: [
+        item("claude", "Claude", {
+          tokens: { ...NO_TOKENS, input_tokens: 1500, total_tokens: 1500, provenance: "estimated" },
+          usage_scope: {
+            label: "sessões locais mais recentes das últimas 48 h",
+            sessions: 6,
+            truncated: true,
+            tail_truncated: false,
+            files_read: 8,
+            files_found: 19,
+            profiles: [
+              { profile: "carvalima", sessions: 4, total_tokens: 1200 },
+              { profile: "max", sessions: 2, total_tokens: 300 },
+            ],
+            note: "transcrições de subagentes não incluídas",
+          },
+          context: { used_tokens: 900, limit_tokens: null, used_percent: null, model: "claude-test-opus", provenance: "measured", profile: "max" },
+        }),
+        item("codex", "Codex", {
+          tokens: { ...NO_TOKENS, total_tokens: 110, provenance: "measured" },
+          usage_scope: {
+            label: "sessões locais atualizadas nas últimas 48 h",
+            sessions: 1,
+            truncated: false,
+            tail_truncated: false,
+            files_read: 1,
+            files_found: 1,
+            profiles: [{ profile: "padrao", sessions: 1, total_tokens: 110 }],
+          },
+        }),
+      ],
+    };
+    render(<ProvidersSection telemetry={summed} />);
+    const claude = card("Claude");
+    expect(claude.getByText(/Escopo:/)).toHaveTextContent(
+      "Escopo: sessões locais mais recentes das últimas 48 h · 6 sessões · soma dos perfis (carvalima: 1.200; max: 300) · " +
+        "amostra parcial (8 arquivos mais recentes de 19) · transcrições de subagentes não incluídas"
+    );
+    expect(claude.getByLabelText("Contexto do último turno")).toHaveTextContent("Perfil: max");
+    const codex = card("Codex");
+    expect(codex.getByText(/Escopo:/)).toHaveTextContent("Escopo: sessões locais atualizadas nas últimas 48 h · 1 sessão · perfil padrao");
+    expect(codex.getByText(/Escopo:/)).not.toHaveTextContent("amostra parcial");
+  });
+
   it("cota esgotada mostra a liberação prevista e as cotas por grupo", () => {
     render(<ProvidersSection telemetry={SNAPSHOT} />);
     const agy = card("Antigravity (AGY)");

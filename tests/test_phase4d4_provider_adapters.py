@@ -348,11 +348,18 @@ def test_claude_statusline_profiles_and_session_usage(tmp_path: Path) -> None:
     assert tokens["total_tokens"] == 3367
     assert tokens["provenance"] == "measured"
     assert claude["usage_scope"]["sessions"] == 2 and claude["usage_scope"]["truncated"] is False
+    # The totals add up both profiles; the scope says so, with each profile's share.
+    assert claude["usage_scope"]["profiles"] == [
+        {"profile": "carvalima", "sessions": 1, "total_tokens": 3365},
+        {"profile": "max", "sessions": 1, "total_tokens": 2},
+    ]
+    assert claude["usage_scope"]["note"] == provider_adapters.CLAUDE_SUBAGENTS_NOTE
 
     context = claude["context"]
     assert context["used_tokens"] == 2005  # last turn: input + cache_read + cache_creation
     assert context["limit_tokens"] is None and context["used_percent"] is None
     assert context["model"] == "claude-test-opus"
+    assert context["profile"] == "carvalima"
     assert {m["model"] for m in claude["models"]} == {"claude-test-opus", "claude-test-sonnet"}
     assert "<synthetic>" not in json.dumps(claude)
     _assert_no_leak(result, tmp_path)
@@ -377,7 +384,11 @@ def test_codex_token_count_rate_limits_context_and_plan(tmp_path: Path) -> None:
         "model": "gpt-test-codex",
         "provenance": "measured",
         "observed_at_unix_ms": NOW_MS - 60_000,
+        "profile": "padrao",
     }
+    assert codex["usage_scope"]["truncated"] is False
+    assert codex["usage_scope"]["files_read"] == codex["usage_scope"]["files_found"] == 2
+    assert codex["usage_scope"]["profiles"] == [{"profile": "padrao", "sessions": 2, "total_tokens": 1160}]
     assert codex["plan"]["plan_type"] == "team"
     assert codex["plan"]["credits_balance"] == 0.0 and codex["plan"]["has_credits"] is False
     assert {m["model"] for m in codex["models"]} == {"gpt-test-codex", "gpt-test-mini"}
@@ -456,6 +467,7 @@ def test_opencode_and_openrouter_from_sqlite_strictly_read_only(tmp_path: Path, 
     assert opencode["tokens"]["total_tokens"] == 1345  # s1 + s2; s4 outside the window, s1 not counted twice
     assert opencode["cost"] == {"spent_usd": 0.5, "provenance": "measured"}
     assert {m["model"] for m in opencode["models"]} == {"opencode/big-pickle", "xai/grok-test"}
+    assert opencode["usage_scope"]["profiles"] == [{"profile": "padrao", "sessions": 2, "total_tokens": 1345}]
 
     openrouter = result["providers"]["openrouter"]
     assert openrouter["tokens"]["total_tokens"] == 55
@@ -550,8 +562,103 @@ def test_read_limits_tail_file_count_and_lookback(tmp_path: Path) -> None:
     assert claude["usage_scope"]["truncated"] is True
     assert claude["tokens"]["provenance"] == "estimated"  # lower bound: only the tail of the big file was read
     assert 0 < claude["tokens"]["input_tokens"] < 2000
+    assert claude["usage_scope"]["tail_truncated"] is True
+    assert (claude["usage_scope"]["files_read"], claude["usage_scope"]["files_found"]) == (3, 6)
     assert reader.stats["files_read"] == 3
     assert reader.stats["bytes_read"] <= 64 * 1024 * 3
+
+
+def _codex_session(folder: Path, name: str, total: int, age_s: float) -> None:
+    _write_lines(
+        folder / name,
+        [
+            {
+                "timestamp": _iso(NOW_MS - age_s * 1000),
+                "type": "event_msg",
+                "payload": {"type": "token_count", "info": {"total_token_usage": {"input_tokens": total, "total_tokens": total}}},
+            }
+        ],
+        age_s=age_s,
+    )
+
+
+def test_file_cap_turns_the_totals_into_a_partial_estimate(tmp_path: Path) -> None:
+    day = dt.datetime.fromtimestamp(NOW_S, tz=dt.timezone.utc).date()
+    folder = tmp_path / "codex" / "sessions" / f"{day.year:04d}" / f"{day.month:02d}" / f"{day.day:02d}"
+    for index in range(4):
+        _codex_session(folder, f"rollout-{index}.jsonl", 100, 60 + index)
+    projects = tmp_path / "claude" / "projects" / "p"
+    for index in range(4):
+        _write_lines(
+            projects / f"sessao-{index}.jsonl",
+            [_claude_line(f"m{index}", "claude-test-opus", {"input_tokens": 10, "output_tokens": 0}, NOW_MS - 60_000)],
+            age_s=60 + index,
+        )
+    paths = LocalSourcePaths(claude_dirs=(("padrao", tmp_path / "claude"),), codex_homes=(("padrao", tmp_path / "codex"),))
+
+    full = LocalProviderReader(paths).read(now_ms=NOW_MS)["providers"]
+    for pid in ("codex", "claude"):
+        assert full[pid]["tokens"]["provenance"] == "measured"
+        assert full[pid]["usage_scope"]["truncated"] is False
+        assert full[pid]["usage_scope"]["label"] == "sessões locais atualizadas nas últimas 48 h"
+
+    capped = LocalProviderReader(paths, max_files=2).read(now_ms=NOW_MS)["providers"]
+    codex, claude = capped["codex"], capped["claude"]
+    assert codex["tokens"]["total_tokens"] == 200
+    assert codex["tokens"]["provenance"] == "estimated"  # only the 2 newest of 4 sessions were read
+    assert {m["tokens"]["provenance"] for m in codex["models"]} == {"estimated"}
+    for reading in (codex, claude):
+        scope = reading["usage_scope"]
+        assert scope["truncated"] is True and scope["tail_truncated"] is False
+        assert (scope["files_read"], scope["files_found"]) == (2, 4)
+        assert scope["label"] == "sessões locais mais recentes das últimas 48 h"
+    assert claude["tokens"]["provenance"] == "estimated" and claude["tokens"]["input_tokens"] == 20
+
+
+def test_project_folder_cap_keeps_the_most_recently_changed_folders(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    projects = tmp_path / "claude" / "projects"
+    for name, age_s, tokens in (("a-antiga", 7200, 1), ("z-recente", 60, 50)):
+        _write_lines(
+            projects / name / "sessao.jsonl",
+            [_claude_line(f"m-{name}", "claude-test-opus", {"input_tokens": tokens, "output_tokens": 0}, NOW_MS - age_s * 1000)],
+            age_s=age_s,
+        )
+        _touch(projects / name, age_s)
+    monkeypatch.setattr(provider_adapters, "MAX_PROJECT_DIRS", 1)
+    claude = LocalProviderReader(LocalSourcePaths(claude_dirs=(("padrao", tmp_path / "claude"),))).read(now_ms=NOW_MS)["providers"]["claude"]
+    assert claude["tokens"]["input_tokens"] == 50  # the recent folder, not the first one in alphabetical order
+    assert claude["tokens"]["provenance"] == "estimated"
+    assert claude["usage_scope"]["truncated"] is True
+
+
+def test_discovery_never_follows_network_share_paths(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    base = tmp_path / "home"
+    (base / ".claude" / "projects").mkdir(parents=True)
+    quota = base / ".local" / "share" / "ai-coordinator-runtime" / "state" / "cota"
+    _write_json(quota / "leitura-claude-extra.json", {"perfil": "extra", "userprofile": "\\\\servidor\\compartilhado\\pessoa"})
+    _write_json(quota / "leitura-claude-device.json", {"perfil": "device", "userprofile": "//servidor/compartilhado/pessoa"})
+    checked: List[str] = []
+    for name in ("_has_projects", "_has_sessions"):
+        real = getattr(provider_adapters, name)
+
+        def spy(path: Path, real: Any = real) -> bool:
+            checked.append(str(path))
+            return real(path)
+
+        monkeypatch.setattr(provider_adapters, name, spy)
+    found = discover_local_source_paths(
+        env={
+            "CLAUDE_CONFIG_DIR": "\\\\servidor\\claude",
+            "CODEX_HOME": "//servidor/codex",
+            "XDG_DATA_HOME": "\\\\?\\UNC\\servidor\\dados",
+            "AVISO_COTA_DIR": "\\\\servidor\\cota",
+        },
+        home=base,
+    )
+    assert found.quota_dir == quota
+    assert [p for p, _ in found.claude_dirs] == ["padrao"]
+    assert found.opencode_dbs == ()
+    assert checked and not any(c.startswith(("\\\\", "//")) for c in checked)
 
 
 def test_ttl_cache_and_per_file_cache(tmp_path: Path) -> None:
@@ -768,3 +875,11 @@ def test_ipc_handler_feeds_local_readings_and_fails_closed(tmp_path: Path, monke
     assert degraded is not None and degraded.error is None
     assert degraded.result["sources"]["local_sources_checked"] is False
     assert len(degraded.result["providers"]) >= 5
+
+
+def test_suite_never_reads_the_sources_of_the_machine_running_it() -> None:
+    # tests/conftest.py swaps the IPC handler's shared reader for one without sources (no discovery from the home).
+    reader = provider_adapters._DEFAULT_READER
+    assert reader is not None and reader._paths == LocalSourcePaths()
+    snapshot = provider_adapters.read_local_provider_telemetry(now_ms=NOW_MS)
+    assert not any(reading["available"] for reading in snapshot["providers"].values())

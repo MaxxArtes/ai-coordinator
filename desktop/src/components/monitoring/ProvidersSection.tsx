@@ -5,6 +5,7 @@ import type {
   ProviderLocalSource,
   ProviderTelemetryItem,
   ProvidersTelemetrySnapshot,
+  ProviderUsageScope,
   QuotaWindowReading,
 } from "./telemetryContract";
 import { formatResetPtBR, formatSampleAge, formatUsdPtBR, resolveOriginBadge } from "./telemetryContract";
@@ -109,10 +110,36 @@ const ContextRow: React.FC<{ context: ProviderContextReading }> = ({ context }) 
         <span className={provenanceToneClass(context.provenance)}>{provenanceBadgeText(context.provenance)}</span>
         {!limit && <span>Limite da janela indisponível na fonte local</span>}
         {context.model && <span>Modelo: {context.model}</span>}
+        {context.profile && <span>Perfil: {context.profile}</span>}
       </div>
     </div>
   );
 };
+
+function scopeProfilesText(scope: ProviderUsageScope): string | null {
+  const shares = Array.isArray(scope.profiles) ? scope.profiles.filter((p) => p && typeof p.profile === "string") : [];
+  if (shares.length === 0) return null;
+  if (shares.length === 1) return `perfil ${shares[0].profile}`;
+  const parts = shares.map((p) => {
+    const total = formatCountPtBR(p.total_tokens);
+    return total ? `${p.profile}: ${total}` : p.profile;
+  });
+  return `soma dos perfis (${parts.join("; ")})`;
+}
+
+function scopePartialText(scope: ProviderUsageScope): string | null {
+  const parts: string[] = [];
+  const read = formatCountPtBR(scope.files_read);
+  const found = formatCountPtBR(scope.files_found);
+  if (read && found && (scope.files_found ?? 0) > (scope.files_read ?? 0)) {
+    parts.push(`${read} arquivos mais recentes de ${found}`);
+  }
+  if (scope.tail_truncated ?? (scope.truncated === true && parts.length === 0)) {
+    parts.push("cauda limitada dos registros");
+  }
+  if (parts.length > 0) return `amostra parcial (${parts.join("; ")})`;
+  return scope.truncated ? "amostra parcial" : null;
+}
 
 function accountText(account: ProviderAccountReading): string {
   const fiveHour = formatPercentPtBR(account.windows?.five_hour?.used_percent) ?? "indisponível";
@@ -193,7 +220,9 @@ const ProviderCard: React.FC<{ item: ProviderTelemetryItem }> = ({ item }) => {
         typeof scope.sessions === "number"
           ? `${formatCountPtBR(scope.sessions)} ${scope.sessions === 1 ? "sessão" : "sessões"}`
           : null,
-        scope.truncated ? "amostra parcial (cauda limitada dos registros)" : null,
+        scopeProfilesText(scope),
+        scopePartialText(scope),
+        scope.note || null,
       ].filter(Boolean) as string[])
     : [];
 

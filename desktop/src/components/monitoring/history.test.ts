@@ -4,11 +4,13 @@
  */
 import { describe, expect, it } from "vitest";
 import {
+  appendHistorySample,
   buildSparklineSegments,
   CPU_CHART_SCALE_STORAGE_KEY,
   cpuChartMax,
   formatAgentLabel,
   formatAxisPercent,
+  isRepeatedReading,
   niceCeil,
   readCpuChartScale,
   writeCpuChartScale,
@@ -163,5 +165,18 @@ describe("formatAgentLabel", () => {
     expect(formatAgentLabel("ai-coordinator")).toBe("AI Coordinator");
     expect(formatAgentLabel("novo-agente")).toBe("novo-agente");
     expect(formatAgentLabel(null)).toBeNull();
+  });
+});
+
+describe("isRepeatedReading", () => {
+  it("the same host reading answered twice (within 200 ms) is one point of the history, not two", () => {
+    const reading = { sampled_at_unix_ms: 1_700_000_000_000, system: null } as unknown as Parameters<typeof appendHistorySample>[1];
+    const history = appendHistorySample([], reading, false, 1_700_000_000_000);
+    expect(isRepeatedReading(history, reading)).toBe(true);
+    expect(isRepeatedReading(history, { ...reading!, sampled_at_unix_ms: 1_700_000_002_000 })).toBe(false);
+    expect(isRepeatedReading([], reading)).toBe(false);
+    expect(isRepeatedReading(history, null)).toBe(false);
+    const afterFailure = appendHistorySample(history, null, true, 1_700_000_001_000);
+    expect(isRepeatedReading(afterFailure, reading)).toBe(false);
   });
 });

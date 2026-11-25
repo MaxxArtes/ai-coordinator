@@ -158,6 +158,8 @@ export interface ProviderContextReading {
   model?: string | null;
   provenance: MetricProvenance;
   observed_at_unix_ms?: number | null;
+  /** Local profile whose session gave the last turn. */
+  profile?: string | null;
 }
 
 export interface ProviderPlanReading {
@@ -188,11 +190,24 @@ export interface ProviderLocalSource {
   observed_at_unix_ms?: number | null;
 }
 
+/** One profile's share of the token totals (the totals add up every listed profile). */
+export interface ProviderUsageProfileShare {
+  profile: string;
+  sessions: number;
+  total_tokens: number | null;
+}
+
 export interface ProviderUsageScope {
   label: string;
   lookback_hours?: number | null;
   sessions?: number | null;
+  /** Partial sample: a cut tail, or more session files than the reader takes per cycle. */
   truncated?: boolean;
+  tail_truncated?: boolean;
+  files_read?: number | null;
+  files_found?: number | null;
+  profiles?: ProviderUsageProfileShare[];
+  note?: string | null;
 }
 
 export interface TokenUsageSummary {

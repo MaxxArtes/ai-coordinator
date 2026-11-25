@@ -206,6 +206,15 @@ export function resolvedSystemRamReading(
   return { percent: pct, usedBytes: used, totalBytes: tot, provenance: prov };
 }
 
+/**
+ * The host answers a request made within 200 ms of its last reading with that same reading (same `sampled_at_unix_ms`),
+ * e.g. when Monitoramento opens right after a status bar reading: it is already the newest point of the history.
+ */
+export function isRepeatedReading(history: readonly HistorySample[], metrics: RuntimeMetrics | null): boolean {
+  const sampledAt = metrics?.sampled_at_unix_ms;
+  return typeof sampledAt === "number" && sampledAt > 0 && history.length > 0 && history[history.length - 1].timestampMs === sampledAt;
+}
+
 export function appendHistorySample(
   history: readonly HistorySample[],
   metrics: RuntimeMetrics | null,

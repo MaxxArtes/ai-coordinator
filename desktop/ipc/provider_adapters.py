@@ -69,6 +69,7 @@ _OPENCODE_SESSION_COLUMNS = (
     "tokens_cache_write",
 )
 _EXTRA_WINDOW_LABELS = {"openrouter-free-dia": "Cota diária :free"}
+CLAUDE_SUBAGENTS_NOTE = "transcrições de subagentes não incluídas"
 
 OPENROUTER_REMOTE_LOOKUP = {
     "enabled": False,
@@ -426,7 +427,9 @@ def _source(kind: str, label: str, available: bool, reason: Optional[str] = None
     }
 
 
-def _context(used: Any, limit: Any, model: Optional[str], observed_ms: Optional[int]) -> Optional[Dict[str, Any]]:
+def _context(
+    used: Any, limit: Any, model: Optional[str], observed_ms: Optional[int], profile: Optional[str] = None
+) -> Optional[Dict[str, Any]]:
     used_i = _int(used)
     if used_i is None:
         return None
@@ -438,16 +441,54 @@ def _context(used: Any, limit: Any, model: Optional[str], observed_ms: Optional[
         "model": model,
         "provenance": _MEASURED,
         "observed_at_unix_ms": observed_ms,
+        "profile": profile,
     }
 
 
-def _scope(lookback_hours: float, sessions: int, truncated: bool, label: str) -> Dict[str, Any]:
-    return {
+def _add_profile_share(shares: Dict[str, Dict[str, Any]], profile: str, tokens: Optional[Dict[str, Optional[int]]], sessions: int = 0) -> None:
+    share = shares.setdefault(profile, {"sessions": 0, "tokens": {}})
+    share["sessions"] += sessions
+    _add_tokens(share["tokens"], tokens)
+
+
+def _scope(
+    lookback_hours: float,
+    sessions: int,
+    truncated: bool,
+    label: str,
+    *,
+    tail_truncated: Optional[bool] = None,
+    files_read: Optional[int] = None,
+    files_found: Optional[int] = None,
+    profiles: Optional[Dict[str, Dict[str, Any]]] = None,
+    note: Optional[str] = None,
+) -> Dict[str, Any]:
+    """What the token totals cover: the totals add up every listed profile, and ``truncated`` marks a partial sample."""
+    scope: Dict[str, Any] = {
         "label": label,
         "lookback_hours": lookback_hours,
         "sessions": sessions,
         "truncated": truncated,
     }
+    if tail_truncated is not None:
+        scope["tail_truncated"] = tail_truncated
+    if files_found is not None:
+        scope["files_read"] = files_read
+        scope["files_found"] = files_found
+    if profiles is not None:
+        scope["profiles"] = [
+            {"profile": name, "sessions": share["sessions"], "total_tokens": share["tokens"].get("total_tokens")}
+            for name, share in sorted(profiles.items())
+        ]
+    if note:
+        scope["note"] = note
+    return scope
+
+
+def _session_scope_label(lookback_hours: float, capped: bool) -> str:
+    if capped:
+        return f"sessões locais mais recentes das últimas {lookback_hours:g} h"
+    return f"sessões locais atualizadas nas últimas {lookback_hours:g} h"
 
 
 def _reading(
@@ -718,20 +759,31 @@ def _small_json(path: Path) -> Optional[Dict[str, Any]]:
     return data if isinstance(data, dict) else None
 
 
+def _configured_root(raw: Any, require_absolute: bool = False) -> Optional[Path]:
+    """A folder named by the environment or by an aviso-cota reading; None for a network share (UNC) or device path."""
+    if not isinstance(raw, str) or not raw or raw.startswith(("\\\\", "//")):
+        return None
+    path = Path(raw)
+    if path.drive.startswith(("\\\\", "//")) or (require_absolute and not path.is_absolute()):
+        return None
+    return path
+
+
 def discover_local_source_paths(env: Optional[Mapping[str, str]] = None, home: Optional[Path] = None) -> LocalSourcePaths:
     """Find the sources by the same conventions the CLIs and aviso-cota use (environment first, then home)."""
     env = os.environ if env is None else env
     bases = _base_homes(Path(home) if home is not None else Path.home())
 
-    quota_candidates = [Path(env["AVISO_COTA_DIR"])] if env.get("AVISO_COTA_DIR") else []
+    configured_quota = _configured_root(env.get("AVISO_COTA_DIR"))
+    quota_candidates = [configured_quota] if configured_quota is not None else []
     quota_candidates += [b / ".local" / "share" / "ai-coordinator-runtime" / "state" / "cota" for b in bases]
     quota_dir = next((c for c in quota_candidates if c.is_dir()), None)
 
     homes = _profile_homes(bases)
 
     claude = _Unique()
-    if env.get("CLAUDE_CONFIG_DIR"):
-        configured = Path(env["CLAUDE_CONFIG_DIR"])
+    configured = _configured_root(env.get("CLAUDE_CONFIG_DIR"))
+    if configured is not None:
         claude.add(_profile_of_home(configured.parent), configured, _has_projects)
     if quota_dir is not None:
         try:
@@ -740,22 +792,23 @@ def discover_local_source_paths(env: Optional[Mapping[str, str]] = None, home: O
             names = []
         for name in names[:MAX_QUOTA_FILES]:
             doc = _small_json(quota_dir / name)
-            userprofile = doc.get("userprofile") if doc else None
-            if isinstance(userprofile, str) and Path(userprofile).is_absolute():
-                claude.add(_safe_id(doc.get("perfil"), "padrao"), Path(userprofile) / ".claude", _has_projects)
+            userprofile = _configured_root(doc.get("userprofile") if doc else None, require_absolute=True)
+            if doc and userprofile is not None:
+                claude.add(_safe_id(doc.get("perfil"), "padrao"), userprofile / ".claude", _has_projects)
     for profile, home_dir in homes:
         claude.add(profile, home_dir / ".claude", _has_projects)
 
     codex = _Unique()
-    if env.get("CODEX_HOME"):
-        configured = Path(env["CODEX_HOME"])
+    configured = _configured_root(env.get("CODEX_HOME"))
+    if configured is not None:
         codex.add(_profile_of_home(configured.parent), configured, _has_sessions)
     for profile, home_dir in homes:
         codex.add(profile, home_dir / ".codex", _has_sessions)
 
     opencode = _Unique()
-    if env.get("XDG_DATA_HOME"):
-        opencode.add(_profile_of_home(bases[0]), Path(env["XDG_DATA_HOME"]) / "opencode" / "opencode.db", Path.is_file)
+    configured = _configured_root(env.get("XDG_DATA_HOME"))
+    if configured is not None:
+        opencode.add(_profile_of_home(bases[0]), configured / "opencode" / "opencode.db", Path.is_file)
     for profile, home_dir in homes:
         opencode.add(profile, home_dir / ".local" / "share" / "opencode" / "opencode.db", Path.is_file)
 
@@ -894,34 +947,40 @@ class LocalProviderReader:
         sources = [statusline]
 
         candidates: List[Tuple[int, int, Path, str]] = []
+        dirs_capped = False
         for profile, config_dir in paths.claude_dirs:
             projects = config_dir / "projects"
-            dirs = [projects] + self._subdirs(projects, MAX_PROJECT_DIRS)
-            candidates += [(m, s, p, profile) for m, s, p in self._recent_files(dirs, now_ms)]
+            subdirs, total_dirs = self._subdirs(projects, MAX_PROJECT_DIRS)
+            dirs_capped = dirs_capped or total_dirs > len(subdirs)
+            candidates += [(m, s, p, profile) for m, s, p in self._recent_files([projects] + subdirs, now_ms)]
         candidates.sort(key=lambda c: c[0], reverse=True)
         picked = candidates[: self.max_files]
+        capped = dirs_capped or len(candidates) > len(picked)
 
         per_model: Dict[str, Dict[str, Any]] = {}
         totals: Dict[str, Optional[int]] = {}
-        truncated = False
+        by_profile: Dict[str, Dict[str, Any]] = {}
+        tail_truncated = False
         sessions = 0
         last: Optional[Dict[str, Any]] = None
         last_activity: Optional[int] = None
-        for mtime_ns, size, path, _profile in picked:
+        for mtime_ns, size, path, profile in picked:
             parsed = self._session_file("claude", path, mtime_ns, size, parse_claude_session_tail)
             if not parsed or not parsed["messages"]:
                 continue
             sessions += 1
-            truncated = truncated or parsed["truncated"]
+            tail_truncated = tail_truncated or parsed["truncated"]
             last_activity = max(last_activity or 0, mtime_ns // 1_000_000)
+            _add_profile_share(by_profile, profile, None, 1)
             for model, entry in parsed["per_model"].items():
                 target = per_model.setdefault(model, {"tokens": {}, "runs": 0, "cost": None})
                 _add_tokens(target["tokens"], entry["tokens"])
                 _add_tokens(totals, entry["tokens"])
+                _add_profile_share(by_profile, profile, entry["tokens"])
                 target["runs"] += entry["runs"]
             candidate = parsed["last"]
             if candidate and (last is None or (candidate.get("at_ms") or 0) > (last.get("at_ms") or 0)):
-                last = candidate
+                last = dict(candidate, profile=profile)
         if not paths.claude_dirs:
             sources.append(_source("session_logs", "Sessões locais do Claude Code (.jsonl)", False, "pasta de perfis não encontrada"))
         else:
@@ -936,7 +995,23 @@ class LocalProviderReader:
             )
 
         main = _freshest(readings)
-        provenance = _ESTIMATED if truncated else _MEASURED
+        partial = tail_truncated or capped
+        provenance = _ESTIMATED if partial else _MEASURED
+        scope = (
+            _scope(
+                self.lookback_hours,
+                sessions,
+                partial,
+                _session_scope_label(self.lookback_hours, capped),
+                tail_truncated=tail_truncated,
+                files_read=len(picked),
+                files_found=len(candidates),
+                profiles=by_profile,
+                note=CLAUDE_SUBAGENTS_NOTE,
+            )
+            if sessions
+            else None
+        )
         return _reading(
             "claude",
             now_ms,
@@ -945,8 +1020,8 @@ class LocalProviderReader:
             extra_windows=main["extra_windows"] if main else [],
             accounts=[_account(r, now_ms) for r in sorted(readings, key=lambda r: r["profile"])],
             tokens=_token_summary(totals, provenance, sessions) if sessions else None,
-            usage_scope=_scope(self.lookback_hours, sessions, truncated, f"sessões locais atualizadas nas últimas {self.lookback_hours:g} h") if sessions else None,
-            context=_context(last["context_used"], None, last["model"], last.get("at_ms")) if last else None,
+            usage_scope=scope,
+            context=_context(last["context_used"], None, last["model"], last.get("at_ms"), last["profile"]) if last else None,
             models=_models_list(per_model, provenance),
             exhausted=bool(main and main["exhausted"]),
             exhausted_until_iso=main["exhausted_until_iso"] if main else None,
@@ -963,14 +1038,17 @@ class LocalProviderReader:
             candidates += [(m, s, p, profile) for m, s, p in self._recent_files(home_dirs, now_ms)]
         candidates.sort(key=lambda c: c[0], reverse=True)
         picked = candidates[: self.max_files]
+        capped = len(candidates) > len(picked)
 
         per_model: Dict[str, Dict[str, Any]] = {}
         totals: Dict[str, Optional[int]] = {}
+        by_profile: Dict[str, Dict[str, Any]] = {}
         sessions = 0
         latest_info: Optional[Dict[str, Any]] = None
         latest_limits: Optional[Dict[str, Any]] = None
         last_activity: Optional[int] = None
         limits_profile = "padrao"
+        info_profile = "padrao"
         for mtime_ns, size, path, profile in picked:
             parsed = self._session_file("codex", path, mtime_ns, size, parse_codex_session_tail)
             if not parsed:
@@ -979,11 +1057,12 @@ class LocalProviderReader:
                 sessions += 1
                 last_activity = max(last_activity or 0, mtime_ns // 1_000_000)
                 _add_tokens(totals, parsed["totals"])
+                _add_profile_share(by_profile, profile, parsed["totals"], 1)
                 entry = per_model.setdefault(parsed["model"] or "desconhecido", {"tokens": {}, "runs": 0, "cost": None})
                 _add_tokens(entry["tokens"], parsed["totals"])
                 entry["runs"] += 1
                 if latest_info is None or (parsed["info_at_ms"] or 0) > (latest_info["info_at_ms"] or 0):
-                    latest_info = parsed
+                    latest_info, info_profile = parsed, profile
             if parsed["limits"] and (latest_limits is None or (parsed["limits_at_ms"] or 0) > (latest_limits["limits_at_ms"] or 0)):
                 latest_limits, limits_profile = parsed, profile
 
@@ -1021,6 +1100,21 @@ class LocalProviderReader:
                 session_source["reason"] = "rate_limits ausente nas sessões lidas (comum em codex exec)"
 
         accounts = [_account(r, now_ms) for r in sorted(readings, key=lambda r: r["profile"])]
+        provenance = _ESTIMATED if capped else _MEASURED
+        scope = (
+            _scope(
+                self.lookback_hours,
+                sessions,
+                capped,
+                _session_scope_label(self.lookback_hours, capped),
+                tail_truncated=False,
+                files_read=len(picked),
+                files_found=len(candidates),
+                profiles=by_profile,
+            )
+            if sessions
+            else None
+        )
         return _reading(
             "codex",
             now_ms,
@@ -1028,15 +1122,16 @@ class LocalProviderReader:
             windows=windows,
             extra_windows=extras + (main["extra_windows"] if main else []),
             accounts=accounts,
-            tokens=_token_summary(totals, _MEASURED, sessions) if sessions else None,
-            usage_scope=_scope(self.lookback_hours, sessions, False, f"sessões locais atualizadas nas últimas {self.lookback_hours:g} h") if sessions else None,
+            tokens=_token_summary(totals, provenance, sessions) if sessions else None,
+            usage_scope=scope,
             context=_context(
                 latest_info["last"].get("total_tokens") if latest_info and latest_info["last"] else None,
                 latest_info["context_window"] if latest_info else None,
                 latest_info["model"] if latest_info else None,
                 latest_info["info_at_ms"] if latest_info else None,
+                info_profile if latest_info else None,
             ),
-            models=_models_list(per_model, _MEASURED),
+            models=_models_list(per_model, provenance),
             plan=plan,
             exhausted=bool(main and main["exhausted"]),
             exhausted_until_iso=main["exhausted_until_iso"] if main else None,
@@ -1098,7 +1193,7 @@ class LocalProviderReader:
             for row in db_rows:
                 if row["session"] not in seen_sessions:
                     seen_sessions.add(row["session"])
-                    rows.append(row)
+                    rows.append(dict(row, profile=profile))
         db_reason = "; ".join(db_reasons) or "banco local não encontrado"
         readings, quota_source = self._leituras(paths.quota_dir, "leitura-opencode-", "quota_reading", "Contagem local do OpenCode (aviso-cota)", now_ms)
         main = _freshest(readings)
@@ -1111,6 +1206,7 @@ class LocalProviderReader:
             mine = [r for r in rows or [] if (r["provider_id"] == "openrouter") == (pid == "openrouter")]
             per_model: Dict[str, Dict[str, Any]] = {}
             totals: Dict[str, Optional[int]] = {}
+            by_profile: Dict[str, Dict[str, Any]] = {}
             spent: Optional[float] = None
             last_activity: Optional[int] = None
             for row in mine:
@@ -1118,6 +1214,7 @@ class LocalProviderReader:
                 entry = per_model.setdefault(label, {"tokens": {}, "runs": 0, "cost": None})
                 _add_tokens(entry["tokens"], row["tokens"])
                 _add_tokens(totals, row["tokens"])
+                _add_profile_share(by_profile, row["profile"], row["tokens"], 1)
                 entry["runs"] += 1
                 if row["cost"] is not None:
                     entry["cost"] = (entry["cost"] or 0.0) + row["cost"]
@@ -1151,7 +1248,15 @@ class LocalProviderReader:
                 windows={"five_hour": _unsupported_window("five_hour", note), "weekly": _unsupported_window("weekly", note)},
                 extra_windows=openrouter_extras if pid == "openrouter" else opencode_extras,
                 tokens=_token_summary(totals, _MEASURED, len(mine)) if mine else None,
-                usage_scope=_scope(self.lookback_hours, len(mine), False, f"sessões do OpenCode atualizadas nas últimas {self.lookback_hours:g} h") if mine else None,
+                usage_scope=_scope(
+                    self.lookback_hours,
+                    len(mine),
+                    False,
+                    f"sessões do OpenCode atualizadas nas últimas {self.lookback_hours:g} h",
+                    profiles=by_profile,
+                )
+                if mine
+                else None,
                 cost={"spent_usd": round(spent, 6), "provenance": _MEASURED} if spent is not None else None,
                 models=_models_list(per_model, _MEASURED),
                 windows_supported=False,
@@ -1194,13 +1299,21 @@ class LocalProviderReader:
                 out.append((_safe_id(profile, "padrao"), quota_dir / name))
         return out
 
-    def _subdirs(self, root: Path, limit: int) -> List[Path]:
+    def _subdirs(self, root: Path, limit: int) -> Tuple[List[Path], int]:
+        """Subfolders changed most recently first (the cap keeps the active projects), and how many there are."""
+        found: List[Tuple[int, str]] = []
         try:
             with os.scandir(root) as entries:
-                dirs = [Path(e.path) for e in entries if e.is_dir(follow_symlinks=False)]
+                for entry in entries:
+                    try:
+                        if entry.is_dir(follow_symlinks=False):
+                            found.append((entry.stat(follow_symlinks=False).st_mtime_ns, entry.path))
+                    except OSError:
+                        continue
         except OSError:
-            return []
-        return sorted(dirs)[:limit]
+            return [], 0
+        found.sort(key=lambda d: (-d[0], d[1]))
+        return [Path(p) for _, p in found[:limit]], len(found)
 
     def _recent_files(self, dirs: Iterable[Path], now_ms: int) -> List[Tuple[int, int, Path]]:
         cutoff_ns = int((now_ms - self.lookback_hours * 3600 * 1000) * 1_000_000)

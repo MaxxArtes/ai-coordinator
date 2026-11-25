@@ -385,3 +385,9 @@ def test_rust_reads_the_command_line_only_for_wrappers_once_per_identity() -> No
     assert "detect_agent_kind(proc.name(), proc.cmd())" in cmdline_pass
     # The pass runs before the nodes are built, so no `self.sys` borrow is alive while it refreshes.
     assert pass_end < collect.index("let mut nodes: Vec<ProcessNodeMetrics>")
+    # As in the Core (`_agent_kind`): the name wins; the cached command-line kind only counts for a wrapper.
+    nodes_loop = collect[collect.index("let mut nodes: Vec<ProcessNodeMetrics>"):]
+    name_first = nodes_loop.index("let agent_kind = match detect_agent_kind(proc.name(), &[]) {")
+    cached = nodes_loop.index("None if agent_needs_cmdline(proc.name()) => {")
+    assert name_first < cached < nodes_loop.index("Self::classify_role(")
+    assert "self.cmdline_agent_kinds.get(&(pid_u32, start_time)).copied().flatten()" in nodes_loop[cached:]

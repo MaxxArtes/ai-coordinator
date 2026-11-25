@@ -99,6 +99,9 @@ export class Poller {
     }
     if (this.lastEndedAt === null) {
       if (!wasEnabled) this.dueAt = null;
+    } else if (!wasEnabled && this.failures > 0) {
+      // Shown again after a failure: retry at once instead of leaving the error up for the rest of the backoff.
+      this.dueAt = this.now();
     } else {
       this.dueAt = this.lastEndedAt + this.waitMs();
     }

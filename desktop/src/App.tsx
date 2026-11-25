@@ -33,7 +33,7 @@ import {
 import { MainNav, mainViewPanelId, type MainViewId } from "./components/shell/MainNav";
 import { MainViews } from "./components/shell/PlannedView";
 import { MonitoringView } from "./components/monitoring/MonitoringView";
-import { appendHistorySample, type HistorySample } from "./components/monitoring/history";
+import { appendHistorySample, isRepeatedReading, type HistorySample } from "./components/monitoring/history";
 import {
   DEFAULT_PROVIDERS_TTL_MS,
   METRICS_DETAIL_INTERVAL_MS,
@@ -790,7 +790,7 @@ export const App: React.FC = () => {
       if (m) {
         setMetrics(m);
         setMetricsFailed(false);
-        setMetricsHistory((prev) => appendHistorySample(prev, m, false));
+        setMetricsHistory((prev) => (isRepeatedReading(prev, m) ? prev : appendHistorySample(prev, m, false)));
         return true;
       }
     } catch {
