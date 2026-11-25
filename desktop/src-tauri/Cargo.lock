@@ -19,7 +19,7 @@ dependencies = [
 
 [[package]]
 name = "ai-coordinator-desktop"
-version = "0.6.1-alpha.50.diag.4"
+version = "0.6.1-alpha.52"
 dependencies = [
  "portable-pty",
  "serde",
