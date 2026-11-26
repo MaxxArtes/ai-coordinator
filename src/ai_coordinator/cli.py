@@ -8,6 +8,7 @@ import os
 from pathlib import Path
 import re
 import sqlite3
+import stat
 import subprocess
 import sys
 import tempfile
@@ -182,6 +183,17 @@ def run_worker(store, config, ident, category, input_file, max_attempts=None):
         for index, candidate in enumerate(candidates):
             if len(attempts) >= attempt_limit:
                 break
+            from .contracts import get_client_contract
+            if get_client_contract(candidate["client"], "worker") is None:
+                skipped.append({
+                    "client": candidate["client"],
+                    "model": candidate["model"],
+                    "reason": {
+                        "state": "contract_unsupported",
+                        "detail": f"Cliente '{candidate['client']}' nao suporta execucao headless como worker",
+                    },
+                })
+                continue
             problem = runtime.launcher_problem(runtime.launcher_command(config, candidate['client']))
             if problem:
                 skipped.append({'client': candidate['client'], 'model': candidate['model'],
@@ -675,21 +687,37 @@ def bootstrap(store, project):
     }
 
 
+def _verified_same_directory(a: str | os.PathLike[str], b: str | os.PathLike[str]) -> bool:
+    """Verify two paths resolve to the exact same OS directory with non-zero file identity."""
+    try:
+        st_a = os.stat(a)
+        st_b = os.stat(b)
+    except OSError as exc:
+        raise ValueError(f"Nao foi possivel verificar a identidade do diretorio: {exc}") from exc
+    if not stat.S_ISDIR(st_a.st_mode) or not stat.S_ISDIR(st_b.st_mode):
+        raise ValueError("Caminho informado nao e um diretorio valido")
+    if st_a.st_ino == 0 or st_a.st_dev == 0 or st_b.st_ino == 0 or st_b.st_dev == 0:
+        raise ValueError(
+            "Identidade do diretorio indeterminada (st_dev/st_ino nulo); operacao recusada fail-closed"
+        )
+    return (st_a.st_dev, st_a.st_ino) == (st_b.st_dev, st_b.st_ino)
+
+
 def launch(store, config, client, project, task_id=None, model=None):
     directory = Path(project).expanduser().resolve()
     key = project_path(directory)
     # Scope resolution still uses the legacy normalized key. On a
     # case-sensitive Windows directory, that spelling may name a different
     # checkout. Refuse the ambiguity before reading or creating a marker.
-    if not directory.samefile(key):
+    if not _verified_same_directory(directory, key):
         raise ValueError("Normalizacao do projeto aponta para outro diretorio")
     project = str(directory)
     if task_id:
         task = store.task(task_id)
         try:
-            same_project = directory.samefile(task["project"])
-        except OSError:
-            same_project = False
+            same_project = _verified_same_directory(directory, task["project"])
+        except ValueError as exc:
+            raise ValueError(f"Tarefa pertence a outro projeto: {exc}") from exc
         if not same_project:
             raise ValueError("Tarefa pertence a outro projeto")
         snapshot = {k: task[k] for k in ("id", "goal", "revision", "snapshot", "ai_memory_workstream_id")}
@@ -737,7 +765,7 @@ def _get_version() -> str:
             from importlib.metadata import version as package_version
             return package_version("ai-coordinator")
         except Exception:
-            return "0.6.0"
+            return "0.6.1"
 
 def parser():
     p = argparse.ArgumentParser(prog="ai-coordinator", description=__doc__)

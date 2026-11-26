@@ -25,7 +25,9 @@ from pathlib import Path
 import pytest
 
 from ai_coordinator import fs_sandbox
+from ai_coordinator import runtime
 from ai_coordinator.cli import run_worker
+from ai_coordinator.resource_ledger import ResourceAction, ResourceType
 from ai_coordinator.storage import RunState, Store
 
 pytestmark = pytest.mark.skipif(os.name != "nt", reason="cmd.exe worker and AppContainer spawn")
@@ -150,3 +152,91 @@ def test_rearm_does_not_reopen_cancelled_or_terminal_runs(env, terminal):
     store.update_run(run_id, pid=None, process_create_time=None)
     with pytest.raises(ValueError, match="Transicao de estado invalida"):
         store.begin_worker_attempt(run_id)
+
+
+def test_unsupported_worker_contract_skipped_before_attempt_or_budget_spend(env):
+    """B3-07: clients without a worker headless contract are skipped without consuming attempts_per_run."""
+    store, task_id, source, config = env
+    cfg = config(["ok_b"])
+    cfg["limits"]["attempts_per_run"] = 1
+    cfg["launchers"]["agy"] = ["cmd.exe", "/d", "/c", "echo", "should_not_run"]
+    cfg["routes"]["general"]["candidates"] = [
+        {"client": "agy", "model": "agy-coord", "plain_prompt": True},
+        {"client": "unknown_client", "model": "mystery-1", "plain_prompt": True},
+        *cfg["routes"]["general"]["candidates"],
+    ]
+
+    plan = runtime.route_plan(store, cfg, "general", refresh=False)
+    assert [c["client"] for c in plan["candidates"]] == ["geminiweb"]
+    assert [s["client"] for s in plan["skipped"]] == ["agy", "unknown_client"]
+    assert all(s["availability"]["state"] == "contract_unsupported" for s in plan["skipped"])
+
+    summary = run_worker(store, cfg, task_id, "general", str(source))
+    assert summary["status"] == "complete"
+    assert summary["client"] == "geminiweb"
+    assert [s["client"] for s in summary["skipped"]] == ["agy", "unknown_client"]
+    assert all(s["reason"]["state"] == "contract_unsupported" for s in summary["skipped"])
+    assert _attempts(store, summary["run_id"]) == [("ok_b", "complete")]
+    assert _event_types(store, summary["run_id"]) == [
+        "reserve", "transition_to_starting", "transition_to_running", "confirm_exit"
+    ]
+
+
+def test_all_candidates_contract_unsupported_fails_without_starting(env):
+    store, task_id, source, config = env
+    cfg = config([])
+    cfg["launchers"]["agy"] = ["cmd.exe", "/d", "/c", "echo", "should_not_run"]
+    cfg["routes"]["general"]["candidates"] = [
+        {"client": "agy", "model": "agy-coord", "plain_prompt": True},
+    ]
+
+    summary = run_worker(store, cfg, task_id, "general", str(source))
+    assert summary["status"] == "failed"
+    assert summary["attempts"] == []
+    assert summary["skipped"][0]["reason"]["state"] == "contract_unsupported"
+    runs = store.runs(task_id)
+    assert len(runs) == 1
+    assert runs[0]["status"] == RunState.FAILED
+    assert _event_types(store, runs[0]["id"]) == ["reserve", "confirm_exit"]
+
+
+def test_failover_preserves_authorizations_and_deduplicates_resource_ledger(env):
+    """Failover within the same run_id does not duplicate idempotent ledger intents and isolates per-attempt tokens."""
+    store, task_id, source, config = env
+    summary = run_worker(store, config(["empty_a", "ok_b"]), task_id, "general", str(source))
+    assert summary["status"] == "complete"
+    run_id = summary["run_id"]
+
+    # Authorizations / capability tokens issued during attempts remain bounded to their respective PIDs
+    tokens = store.db.execute("SELECT task_id, run_id, worker_pid FROM tool_broker_tokens WHERE run_id=?", (run_id,)).fetchall()
+    assert len(tokens) == 2
+    assert len({r["worker_pid"] for r in tokens}) == 2
+
+    # Resource Ledger idempotency prevents duplicated side effects across failover retries
+    idem_key = f"failover-side-effect-{run_id}"
+    rec1 = store.resource_ledger.record_intent(
+        task_id=task_id,
+        plan_revision=1,
+        resource_type=ResourceType.EXTERNAL,
+        raw_id="https://example.invalid/webhook",
+        action=ResourceAction.CALL,
+        idempotency_key=idem_key,
+        run_id=run_id,
+        requires_authorization=True,
+    )
+    rec2 = store.resource_ledger.record_intent(
+        task_id=task_id,
+        plan_revision=1,
+        resource_type=ResourceType.EXTERNAL,
+        raw_id="https://example.invalid/webhook",
+        action=ResourceAction.CALL,
+        idempotency_key=idem_key,
+        run_id=run_id,
+        requires_authorization=True,
+    )
+    assert rec1.id == rec2.id
+    rows = store.db.execute(
+        "SELECT COUNT(*) FROM resource_ledger WHERE task_id=? AND idempotency_key=?",
+        (task_id, idem_key),
+    ).fetchone()[0]
+    assert rows == 1

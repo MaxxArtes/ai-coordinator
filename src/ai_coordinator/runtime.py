@@ -9,6 +9,7 @@ import shutil
 import subprocess
 import time
 from .availability import Health, provider_of
+from .contracts import get_client_contract
 
 BASE_WORKER_ENV = {
     "PATH", "HOME", "USER", "LOGNAME", "SHELL", "TMP", "TEMP", "TMPDIR",
@@ -285,6 +286,15 @@ def route_plan(store,config,category,refresh=False):
     for candidate in route['candidates']:
         if candidate['client'] in config.get('disabled_worker_clients',[]):
             skipped.append({**candidate,'reason':{'state':'operator_disabled'}})
+            continue
+        if get_client_contract(candidate['client'], 'worker') is None:
+            skipped.append({
+                **candidate,
+                'availability': {
+                    'state': 'contract_unsupported',
+                    'detail': f"Cliente '{candidate['client']}' nao suporta execucao headless como worker",
+                },
+            })
             continue
         problem=launcher_problem(launcher_command(config,candidate['client']))
         if problem:

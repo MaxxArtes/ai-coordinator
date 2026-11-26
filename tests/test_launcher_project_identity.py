@@ -89,3 +89,62 @@ def test_normalization_cannot_switch_directories(dispatch, tmp_path, monkeypatch
         launch(requested, requested)
     scope.assert_not_called()
     start.assert_not_called()
+
+
+def test_verified_same_directory_fails_closed_on_zero_ino(dispatch, tmp_path, monkeypatch):
+    project = tmp_path / "project"
+    project.mkdir()
+    real_stat = os.stat
+    fake_stat = os.stat_result((real_stat(project).st_mode, 0, real_stat(project).st_dev, 1, 0, 0, 0, 0, 0, 0))
+    monkeypatch.setattr(cli.os, "stat", lambda _path: fake_stat)
+    with pytest.raises(ValueError, match="Identidade do diretorio indeterminada"):
+        cli._verified_same_directory(project, project)
+
+    launch, start, scope = dispatch
+    with pytest.raises(ValueError, match="Identidade do diretorio indeterminada"):
+        launch(project, project)
+    scope.assert_not_called()
+    start.assert_not_called()
+
+
+def test_verified_same_directory_fails_closed_on_zero_dev(dispatch, tmp_path, monkeypatch):
+    project = tmp_path / "project"
+    project.mkdir()
+    real_stat = os.stat
+    st = real_stat(project)
+    fake_stat = os.stat_result((st.st_mode, st.st_ino or 12345, 0, 1, 0, 0, 0, 0, 0, 0))
+    monkeypatch.setattr(cli.os, "stat", lambda _path: fake_stat)
+    with pytest.raises(ValueError, match="Identidade do diretorio indeterminada"):
+        cli._verified_same_directory(project, project)
+
+    launch, start, scope = dispatch
+    with pytest.raises(ValueError, match="Identidade do diretorio indeterminada"):
+        launch(project, project)
+    scope.assert_not_called()
+    start.assert_not_called()
+
+
+def test_verified_same_directory_fails_closed_on_oserror(tmp_path, monkeypatch):
+    project = tmp_path / "project"
+    project.mkdir()
+
+    def failing_stat(_path):
+        raise OSError("simulated stat failure")
+
+    monkeypatch.setattr(cli.os, "stat", failing_stat)
+    with pytest.raises(ValueError, match="Nao foi possivel verificar a identidade do diretorio"):
+        cli._verified_same_directory(project, project)
+
+
+def test_verified_same_directory_rejects_foreign_and_accepts_valid_alias(tmp_path):
+    project = tmp_path / "project"
+    foreign = tmp_path / "foreign"
+    project.mkdir()
+    foreign.mkdir()
+    assert cli._verified_same_directory(project, foreign) is False
+
+    if os.name == "nt":
+        alias = tmp_path / "alias"
+        subprocess.run(["cmd.exe", "/d", "/c", "mklink", "/J", str(alias), str(project)],
+                       check=True, capture_output=True)
+        assert cli._verified_same_directory(alias, project) is True

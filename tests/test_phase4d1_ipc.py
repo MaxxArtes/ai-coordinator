@@ -46,10 +46,12 @@ def test_live_ipc_public_ping(ipc_client: IPCClientProcess):
 
 def test_live_ipc_authenticated_status(ipc_client: IPCClientProcess):
     """Test 2: Authenticated method system.status succeeds with valid token."""
+    import ai_coordinator
+
     resp = ipc_client.request("system.status")
     assert resp.error is None
     assert resp.result["status"] == "ready"
-    assert resp.result["version"] == "0.6.0"
+    assert resp.result["version"] == ai_coordinator.__version__
     assert resp.result["authenticated"] is True
 
 

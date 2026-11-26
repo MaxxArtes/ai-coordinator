@@ -87,11 +87,13 @@ def test_runtime_probe_isolated_from_host_pollution():
 
 
 def test_core_v060_integration_in_isolated_runtime():
-    """Verify Core v0.6.0 imports cleanly and MetricProvenance matches canonical values."""
+    """Verify Core integrates cleanly and MetricProvenance matches canonical values."""
+    import ai_coordinator
+
     runtime = PrivatePythonRuntime()
     res = runtime.verify_core_integration()
 
-    assert res["core_version"] == "0.6.0"
+    assert res["core_version"] == ai_coordinator.__version__
     assert res["provenance_values"] == ["measured", "estimated", "unknown"]
     assert res["dag_available"] is True
     if sys.platform == "win32":

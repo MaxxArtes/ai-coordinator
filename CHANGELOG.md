@@ -7,6 +7,28 @@ e este projeto adere ao [Versionamento Semântico](https://semver.org/lang/pt-BR
 
 ---
 
+## [0.6.1] - 2026-11-26
+
+Release de correção de segurança e confiabilidade do **Core `ai-coordinator`** (preparada e homologada em ambiente privado antes da divulgação coordenada).
+
+### Segurança
+- **Fixação Obrigatória da Mailbox no Windows (`ToolBroker.process_mailbox`)**:
+  - No Windows, `process_mailbox` agora exige que todos os diretórios da hierarquia da mailbox (raiz da sandbox, `.broker`, `.broker/requests` e `.broker/responses`) estejam com handle fixado (`_require_pinned_nt` / `is_pinned()`), falhando fechado (`ReparseEscapeError` ou `SymlinkSecurityViolation`) se qualquer diretório desaparecer ou for substituído durante o ciclo.
+  - Declarados protótipos explícitos de `ctypes` (`wintypes.HANDLE`, `wintypes.DWORD`, `wintypes.BOOL`) para `kernel32.CreateFileW`, `GetFileAttributesW`, `GetFinalPathNameByHandleW` e `CloseHandle`, eliminando a falha silenciosa em Python 64 bits onde `-1` não correspondia a `INVALID_HANDLE_VALUE`.
+  - `_PinnedDirectory.pin()` no Windows falha fechado se `GetFinalPathNameByHandleW` não conseguir comprovar a contenção do handle dentro da sandbox.
+- **Identidade de Diretório Fail-Closed no Launcher (`cli.launch` / `_verified_same_directory`)**:
+  - Substituída a chamada direta a `samefile` por `_verified_same_directory(a, b)` usando `os.stat`, exigindo `stat.S_ISDIR`, `st_ino != 0` e `st_dev != 0` em ambos os caminhos e recusando fail-closed com `ValueError` explícito em caso de identidade indeterminada ou `OSError`, sem fallback por string.
+
+### Corrigido
+- **Failover de Workers Pós-Spawn (`run_worker` / `Store.begin_worker_attempt`)**:
+  - `run_worker` agora rearma a execução para `starting` via `Store.begin_worker_attempt` após falhas pós-spawn (saída vazia, erro ou timeout) apenas depois de limpar `pid` e `process_create_time`, mantendo o mesmo `run_id`, histórico de tentativas e trilha de eventos em `run_events`.
+- **Validação Antecipada de Contrato Headless (`run_worker` / `runtime.route_plan`)**:
+  - Candidatos sem contrato headless de `worker` (`get_client_contract(client, "worker") is None`, como coordenadores puros ou clientes desconhecidos) são filtrados antes de incrementar `attempts`, chamar `begin_worker_attempt` ou gastar `attempts_per_run`, sendo registrados em `skipped` com `state: "contract_unsupported"`.
+- **Hardening de Testes Adversariais (`test_14` e suíte `v0.6.1`)**:
+  - `test_14_mailbox_concurrent_directory_swap_race` verifica incondicionalmente `outside_victim` em bloco `finally:`, garantindo detecção de fuga mesmo sob exceções intermediárias.
+
+---
+
 ## [0.6.0] - 2026-11-10
 
 Release Candidate consolidando a implementação, endurecimento e homologação offline da **Fase 4C.2 (Fallback Multi-Modelo Governado e Especificação Técnica Offline)**.
