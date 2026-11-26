@@ -787,3 +787,51 @@ Em 25/11/2026, a **0.6.1-alpha.52** foi instalada localmente após aprovação d
 O teste do executável instalado confirmou Core conectado, terminal em projeto já autorizado, saída preservada na troca de vistas, provedores locais no Monitoramento e encerramento sem processos órfãos. O ensaio usou uma cópia do perfil em desktop Windows separado. A entrada nativa pelo Windows no desktop compartilhado continua como verificação complementar. A homologação funcional, a instalação local e o smoke encerram a entrega 4D.4 no Windows. O caso completo e as evidências estão na tarefa 1210ff494600475c, checkpoint 117, relatório resultado-alpha52.md.
 
 A revisão de identidade do launcher segue separada como futura revisão patch do Core. As fases posteriores permanecem planejadas, com uso local e Gateway sujeito aos gates do Apêndice J. O Core v0.6.0, o runtime central, o AI Memory e a frente SSW permaneceram fora da atualização.
+
+---
+
+## Apêndice K — Consolidação da `main`, Pre-Release `0.6.1-alpha.52` e Especificação do Instalador Unificado na `4D.6` (25/11/2026)
+
+### K.1 — Consolidação na `main` e estratégia de versionamento independente
+
+1. **Referência consolidada na `main`:** a consolidação das entregas homologadas das fases `4D.1` a `4D.4` e do Apêndice J (`4d81c3c`) sobre a `main` (`1fa1236`) preserva integralmente o código funcional compilado e validado no candidato `1b5d681` (`0.6.1-alpha.52`), sem alterar `src/ai_coordinator/`, `pyproject.toml` (`0.6.0`), `plugins/` ou `skills/`.
+2. **Versionamento independente entre Desktop e Core:**
+   - **Core (`v0.6.0`):** permanece preservado como release estável no GitHub e no PyPI.
+   - **Desktop (`0.6.1-alpha.52`):** publicado exclusivamente como GitHub Pre-Release Alpha (`prerelease: true`, tag `v0.6.1-alpha.52`), sem promoção automática para canais estáveis.
+   - **Isolamento de workflows:** `.github/workflows/release.yml` passou a ignorar tags `*-alpha*`, `*-beta*` e `desktop-*` e a bloquear publicação automática no PyPI e no GitHub Packages para pré-lançamentos.
+   - **Canal de auto-atualização:** `desktop/updates/alpha.json` na `main` foi atualizado para `0.6.1-alpha.52`. O binário compilado em `1b5d681` mantém `updater.endpoints` apontando para o canal histórico `feature/phase4d-m2-terminals/desktop/updates/alpha.json`; no próximo ciclo de build do Desktop (`4D.5` / `4D.6`), migrar `updater.endpoints` para canais dedicados na `main` (`alpha.json` / `stable.json`).
+3. **Avaliação separada das próximas versões do Core (sem implementação nesta entrega):**
+   - **`v0.6.1` (candidata a patch do Core):** avaliação separada da correção de identidade física de diretório do launcher Windows (`lab/launcher-identity-checkpoint113`, commit `7fae072`), sujeita a validação isolada em venv e registro nos manifestos do runtime central e do Desktop antes de qualquer promoção.
+   - **`v0.7.0` (candidata à evolução funcional da `4D.5`):** avaliação condicionada à análise arquitetural e de compatibilidade do Mission Control e do Gateway MCP local.
+   - **Itens preservados fora da consolidação:** `feature/phase4d-m3-alpha51-candidate` (`d29c483`), `prototype/phase4d-desktop-poc` (`df8b67b`), `lab/launcher-identity-checkpoint113` (`7fae072`), frente experimental do `ai-memory` e frente SSW.
+
+### K.2 — Proposta arquitetural para o Marco 4D.6 (`4D.6.3` / `4D.6.4`): Instalador Unificado, Modular e Gerenciador de Componentes
+
+Para reduzir o atrito de adoção por novos usuários (especialmente usuários que já possuem Claude Code, Codex, Antigravity ou OpenCode instalados), o planejamento do Marco **4D.6** incorpora os seguintes requisitos para o instalador oficial e gerenciamento modular pós-instalação:
+
+1. **Instalação completa por um único download:** um ponto de entrada único (`AI Coordinator Setup`) oferecendo a modalidade **Completa (recomendada)** com Desktop, Core, CLI, servidor MCP e integrações compatíveis.
+2. **Modalidade somente Desktop:** instalação isolada da interface gráfica com runtime Python privado embarcado.
+3. **Modalidade somente CLI/Core (+ MCP):** instalação enxuta para uso em terminal e servidores MCP sem interface gráfica.
+4. **Modalidade personalizada:** seleção granular por componente (Desktop, Core/CLI, MCP, Agent Skill e conectores individuais de agentes).
+5. **Detecção automática somente leitura:** inspeção não destrutiva das ferramentas e agentes já presentes no sistema (Claude Code, Codex, Antigravity/AGY, OpenCode, Git, Python), sem modificar arquivos durante a detecção.
+6. **Resolução determinística de dependências:** verificação de pré-requisitos por componente, usando runtime embarcado quando necessário e evitando conflitos com ambientes Python/Node existentes do usuário.
+7. **Configuração estritamente autorizada (*opt-in*):** ativação de MCP, plugins e skills somente após consentimento explícito por item na revisão do instalador, com backup prévio das configurações alteradas; proibição de instalar provedores externos ou habilitar integrações silenciosamente.
+8. **Distribuição online e opção offline completa:** instalador online enxuto que baixa os módulos selecionados sob demanda e pacote completo offline contendo os componentes locais redistribuíveis já verificados.
+9. **Gerenciador modular de componentes no Desktop:** painel em **Configurações** para visualizar versões instaladas, adicionar, atualizar ou remover módulos (Desktop, Core, MCP, plugins, skills e componentes opcionais) após a instalação inicial.
+10. **Atualizações independentes e controle de compatibilidade:** matriz de versões compatíveis entre Desktop, Core e conectores, permitindo atualizar um módulo sem obrigar reinstalação integral.
+11. **Verificação criptográfica obrigatória dos pacotes:** conferência de `SHA-256` e assinatura Ed25519/Minisign em todos os artefatos baixados ou embutidos (somada à avaliação de assinatura nativa de sistema operacional, como Authenticode no Windows e notarização no macOS).
+12. **Recuperação após falhas (*rollback*):** instalação transacional em estágios, preservando o estado anterior e restaurando automaticamente caso qualquer etapa de instalação ou atualização falhe.
+13. **Desinstalação seletiva preservando dados do usuário:** remoção de binários por componente sem apagar perfis, projetos autorizados, cofre de credenciais, banco `coordination.sqlite` ou checkpoints do usuário.
+14. **Conformidade estrita de licenças:** auditoria e empacotamento obrigatório de licenças e avisos (`PolyForm-Noncommercial-1.0.0`, `LICENSE`, `NOTICE`, Python Build Standalone e dependências de terceiros). Componentes opcionais externos (como `ai-memory`) só podem ser oferecidos no instalador após homologação própria e verificação de compatibilidade de licença.
+
+### K.3 — Aprendizados operacionais de supervisão, cotas e concorrência para o backlog da Fase 4D.5 (26/11/2026)
+
+Registro de requisitos operacionais observados durante a consolidação pré-4D.5 (sem implementação nesta entrega):
+
+1. **Detecção de processos estagnados:** identificar processos/tarefas vivos no sistema operacional sem avanço observável de saída, estado ou *heartbeat*.
+2. **Diferenciação semântica de estados de execução:** distinguir no Monitoramento e no escalonador entre *execução produtiva*, *espera legítima* (rede/CI externo), *espera bloqueada por entrada interativa* (ex.: prompt de credencial em `stdin`) e *ociosidade*.
+3. **Timeouts e modo não interativo obrigatório:** impor *timeouts* explícitos e variáveis não interativas (`GIT_TERMINAL_PROMPT=0`, `GCM_INTERACTIVE=never`, `stdin` fechado) em comandos automatizados.
+4. **Supervisão de subagentes e liberação adaptativa de recursos ociosos:** rastrear o ciclo de vida de subagentes e *workers* e encerrar imediatamente instâncias ociosas ao término de sua subtarefa.
+5. **Supervisão de baixo custo durante delegações prolongadas:** utilizar notificações reativas de conclusão em vez de consultas repetitivas de status que consumam cota do coordenador.
+6. **Previsão de consumo de cotas até a conclusão:** estimar se a janela restante (5 h e semanal) comporta toda a etapa antes de despachar, acionando *handoff* preventivo antes da interrupção em meio à execução.
+7. **Investigação estruturada de testes intermitentes e corrida pré-`pin` no Tool Broker:** distinguir instabilidade de sincronização do teste de regressão real. Registrar para futura revisão do Core (`v0.6.1+` / `4D.6`) o alinhamento de `test_14_mailbox_concurrent_directory_swap_race` (que inicia a *thread* atacante antes de `_PinnedDirectory.pin()`, podendo acionar rejeição *fail-closed* em `ntpath.realpath` / `validate_contained_path` antes da fixação do *handle* Win32, sem qualquer escrita fora da *sandbox*) e a avaliação de fixação do *handle* antes da resolução canônica do caminho final.

@@ -1,14 +1,67 @@
 # ai-coordinator
 
-Estado de tarefas compartilhado entre agentes de programação e operadores humanos, com retomada por checkpoints cognitivos, rotas configuráveis, avaliação comparável de candidatos, governança de ferramentas via Tool Broker com tokens HMAC e contenção física de workers em sandboxes nativas do sistema operacional. O núcleo funciona em Windows, macOS e Linux com Python 3.11 ou superior.
+Estado de tarefas compartilhado entre agentes de programação e operadores humanos, com retomada por checkpoints cognitivos, rotas configuráveis, avaliação comparável de candidatos, governança de ferramentas via Tool Broker com tokens HMAC e contenção física de workers em sandboxes nativas do sistema operacional. O núcleo funciona em Windows, macOS e Linux com Python `3.11` ou superior, e o **AI Coordinator Desktop** oferece interface gráfica nativa em Windows (Pre-release Alpha `0.6.1-alpha.52`).
+
+---
+
+## Instalação Rápida (Escolha sua modalidade)
+
+> [!NOTE]
+> A versão estável oficial do **Core / CLI / MCP** é a **[`v0.6.0`](https://github.com/MaxxArtes/ai-coordinator/releases/tag/v0.6.0)**. O **Desktop** está disponível como **Pre-release Alpha ([`v0.6.1-alpha.52`](https://github.com/MaxxArtes/ai-coordinator/releases/tag/v0.6.1-alpha.52))** para Windows x64. Um instalador gráfico unificado único (com seleção completa/desktop/CLI/personalizada e opção offline) está planejado para o **Marco 4D.6**.
+
+| Modalidade | O que inclui hoje | Status | Como começar |
+| --- | --- | --- | --- |
+| **Experiência Completa** | Desktop `0.6.1-alpha.52` (Core `0.6.0` e Python `3.11.9` embarcados) + CLI/MCP `v0.6.0` no terminal + plugin do seu agente | Disponível em etapas separadas (instalador único planejado na `4D.6`) | [Guia completo](docs/installation.md#3-instalação-completa-com-os-componentes-homologados-hoje) |
+| **Somente Desktop** | Aplicativo gráfico Windows x64 (Conversas ConPTY, Configurações e Monitoramento), sem precisar de Python/Node globais | Pre-release Alpha (`0.6.1-alpha.52`, Windows x64) | [Release `v0.6.1-alpha.52`](https://github.com/MaxxArtes/ai-coordinator/releases/tag/v0.6.1-alpha.52) · [Guia Desktop](docs/installation.md#4-instalação-individual--ai-coordinator-desktop-windows-x64-pre-release) |
+| **Somente Terminal / CLI + MCP** | Core Python `v0.6.0`, CLI e servidor MCP `stdio` | Estável (`v0.6.0`, Windows / macOS / Linux) | `python -m pip install "ai-coordinator[mcp]==0.6.0"` |
+| **Personalizada por Agente** | Plugin Claude Code, Plugin OpenCode V2, `SKILL.md` ou receita MCP para Codex/AGY | Empacotado / Documentado (`v0.6.0`) | [Guia de integrações](docs/installation.md#6-integração-com-agentes-já-instalados) |
+
+### Já tenho o Claude Code instalado — como testar em 3 comandos?
+
+Se você já utiliza o **Claude Code**, não precisa reconfigurar suas chaves nem instalar outros provedores de IA:
+
+```console
+python -m pip install "ai-coordinator[mcp]==0.6.0"
+claude plugin marketplace add MaxxArtes/ai-coordinator
+claude plugin install ai-coordinator@ai-coordinator-marketplace
+```
+
+Depois, dentro da pasta do seu projeto:
+
+```console
+ai-coordinator bootstrap --project .
+```
+
+Suas credenciais e configurações existentes permanecem intocadas, e nenhum provedor externo é instalado ou ativado sem autorização explícita.
+
+### Downloads Diretos
+
+- **Desktop Windows x64 (`0.6.1-alpha.52`, Pre-release):**
+  - [Instalador NSIS (`AI-Coordinator-Desktop_0.6.1-alpha.52_x64-setup.exe`)](https://github.com/MaxxArtes/ai-coordinator/releases/download/v0.6.1-alpha.52/AI-Coordinator-Desktop_0.6.1-alpha.52_x64-setup.exe) · [Assinatura `.sig`](https://github.com/MaxxArtes/ai-coordinator/releases/download/v0.6.1-alpha.52/AI-Coordinator-Desktop_0.6.1-alpha.52_x64-setup.exe.sig)
+  - [Pacote Portátil (`ai-coordinator-desktop-alpha-portable.zip`)](https://github.com/MaxxArtes/ai-coordinator/releases/download/v0.6.1-alpha.52/ai-coordinator-desktop-alpha-portable.zip) · [Checksums SHA-256](https://github.com/MaxxArtes/ai-coordinator/releases/download/v0.6.1-alpha.52/checksums-desktop-0.6.1-alpha.52.sha256)
+  - *Aviso de assinatura:* o instalador possui assinatura criptográfica **Minisign/Ed25519** (`499FF8912D665FE8`), porém **não** possui assinatura Microsoft Authenticode (`NotSigned`), podendo acionar o aviso do SmartScreen no Windows. Confira o SHA-256 antes de executar.
+- **Core Python, CLI, MCP, Skills e Plugins (`v0.6.0`, Estável):**
+  - [Release `v0.6.0` no GitHub](https://github.com/MaxxArtes/ai-coordinator/releases/tag/v0.6.0) · [Pacote no PyPI](https://pypi.org/project/ai-coordinator/)
+- **Documentação:** [Guia Completo de Instalação](docs/installation.md) · [Matriz de Suporte](docs/support-matrix.md) · [Arquitetura](docs/architecture.md) · [Roadmap Desktop](docs/desktop/phase4d-roadmap.md) · [Notas da Alpha.52](docs/releases/v0.6.1-alpha.52.md)
+
+### Situação real dos componentes (Disponível × Experimental × Planejado)
+
+| Situação | O que está incluído |
+| --- | --- |
+| **Disponível e Estável (`v0.6.0`)** | Biblioteca Python `ai-coordinator`, CLI, servidor MCP `ai-coordinator-mcp` e Agent Skill `SKILL.md` (Windows, macOS e Linux). |
+| **Pre-release Alpha (`0.6.1-alpha.52`)** | AI Coordinator Desktop no Windows x64 (4D.1 Fundação, 4D.2 Conversas/Terminais ConPTY, 4D.3 Configurações/Cofre DPAPI/Acessibilidade e 4D.4 Monitoramento com proveniência). |
+| **Empacotado / Documentado** | Plugin Claude Code, Plugin OpenCode V2 e receitas MCP+Skill para Codex e AGY (veja [Matriz de Suporte](docs/support-matrix.md)). |
+| **Em Laboratório (Não distribuído)** | Patch de identidade de diretório do launcher Windows (`7fae072`, candidato futuro para patch do Core) e versões experimentais do `ai-memory`. |
+| **Planejado** | **4D.5:** Mission Control (DAG mista) e Gateway MCP local · **4D.6:** Instalador unificado/modular, gerenciador de componentes no Desktop e suporte Linux/macOS · **4E:** Meta-Coordinator · **4F:** Ecossistema/acesso remoto opcional. |
 
 ---
 
 ## O que vem no repositório
 
-- **Biblioteca Python**: `Coordinator` para criar tarefas, ler contexto, gravar checkpoints cognitivos, consultar rotas e delegar execuções a workers isolados.
+- **AI Coordinator Desktop (`desktop/`)**: aplicativo gráfico em Tauri 2 (Rust + React/TypeScript + `xterm.js`) com runtime Python `3.11.9` isolado (`-I`), múltiplas abas e até 4 terminais ConPTY por aba, modal unificado de Configurações em 9 categorias com cofre DPAPI no Windows, modo de baixa estimulação sensorial e painel de Monitoramento da árvore de processos e telemetria local multi-perfil.
+- **Biblioteca Python (`src/ai_coordinator/`)**: `Coordinator` para criar tarefas, ler contexto, gravar checkpoints cognitivos, consultar rotas e delegar execuções a workers isolados.
 - **CLI**: bootstrap de projetos, retomada, checkpoints, consulta de disponibilidade, planejamento, execução e monitoramento de workers.
-- **Human-AI Cognitive Workspace**: sessões supervisionadas (`HumanPrincipal`, `HumanSession`), controle de acesso por papéis (RBAC), checkpoints cognitivos com hashes SHA-256 de árvores de arquivos e integração com o ecossistema `ai-memory`.
+- **Human-AI Cognitive Workspace**: sessões supervisionadas (`HumanPrincipal`, `HumanSession`), controle de acesso por papéis (RBAC), checkpoints cognitivos com hashes SHA-256 de árvores de arquivos e integração opcional com `ai-memory`.
 - **Sandboxes Nativas de SO**: isolamento físico de processos e sistema de arquivos em nível de kernel:
   - **Windows NT**: Win32 Job Objects suspensos (`CREATE_SUSPENDED`), cotas de recursos e perfis AppContainer com restrição NTFS.
   - **Linux**: Landlock LSM (Linux 5.13+) com `PR_SET_NO_NEW_PRIVS` e Trampoline seguro (`sys.executable -I -S -c`).
@@ -42,7 +95,7 @@ ai-coordinator routes
 ai-coordinator bootstrap --project .
 ```
 
-Na primeira execução, revise `routes.json` no diretório de dados do usuário e configure os executáveis locais dos agentes que pretende usar. Os nomes e modelos do arquivo de exemplo são configurações iniciais; catálogo ou rota configurada não confirma saldo, cota ou acesso.
+Na primeira execução, revise `routes.json` no diretório de dados do usuário e configure os executáveis locais dos agentes que pretende usar. Os nomes e modelos do arquivo de exemplo são configurações iniciais; catálogo ou rota configurada não confirma saldo, cota ou acesso. Veja todas as instruções detalhadas em [`docs/installation.md`](docs/installation.md).
 
 ---
 
@@ -135,7 +188,7 @@ O marketplace contém um plugin com skill e configuração MCP. Se instalar apen
 
 ## OpenCode V2
 
-O plugin está em `plugins/opencode`. Instale o pacote Python e a dependência do plugin, depois adicione o caminho do plugin à configuração OpenCode:
+O plugin está em `plugins/opencode`. Instale o pacote Python e a dependência do plugin (via pasta clonada ou tarball `.tgz` da Release `v0.6.0`), depois adicione o caminho do plugin à configuração OpenCode:
 
 ```json
 {
@@ -149,14 +202,14 @@ O plugin invoca a CLI por argumentos separados, sem passar comandos por um shell
 
 ## Releases
 
-Ao publicar uma tag `v*`, o workflow gera e anexa ao GitHub Release:
+Ao publicar uma tag estável `v*` (excluindo sufixos `-alpha*`, `-beta*` e `desktop-*`), o workflow gera e anexa ao GitHub Release:
 
 - wheel e source distribution Python;
 - ZIP da skill;
 - ZIP do plugin Claude Code;
 - tarball npm do plugin OpenCode.
 
-Cada formato é versionado a partir da tag e inclui `LICENSE` e `NOTICE`. O servidor MCP acompanha o pacote Python como extra opcional. Pull requests e releases executam verificações automatizadas; veja a [matriz de suporte](docs/support-matrix.md) para saber o que é validado no CI e o que ainda exige conferência no cliente nativo.
+Pre-releases do Desktop (`v*-alpha*`) publicam separadamente o instalador NSIS, sua assinatura Minisign `.sig`, o pacote portátil `.zip`, o `BUILD-MANIFEST.json` e os checksums SHA-256 sem disparar nova publicação do Core no PyPI ou npm. Cada formato inclui `LICENSE` e `NOTICE`. O servidor MCP acompanha o pacote Python como extra opcional. Pull requests e releases executam verificações automatizadas; veja a [matriz de suporte](docs/support-matrix.md) para saber o que é validado no CI e o que ainda exige conferência no cliente nativo.
 
 ---
 

@@ -4,6 +4,9 @@ on:
   push:
     tags:
       - "v*"
+      - "!*-alpha*"
+      - "!*-beta*"
+      - "!desktop-*"
   workflow_dispatch:
     inputs:
       release_tag:
@@ -96,7 +99,7 @@ jobs:
           TAG_NAME="${{ inputs.release_tag || github.ref_name }}"
           notes="docs/releases/${TAG_NAME}.md"
           PRERELEASE_FLAG=""
-          if [[ "$TAG_NAME" == *"-rc"* ]]; then
+          if [[ "$TAG_NAME" == *"-rc"* || "$TAG_NAME" == *"-alpha"* || "$TAG_NAME" == *"-beta"* ]]; then
             PRERELEASE_FLAG="--prerelease"
           fi
           if [ -f "$notes" ]; then
@@ -108,6 +111,8 @@ jobs:
       - name: Publish OpenCode npm package to GitHub Packages
         if: |
           !contains(inputs.release_tag || github.ref_name, '-rc') &&
+          !contains(inputs.release_tag || github.ref_name, '-alpha') &&
+          !contains(inputs.release_tag || github.ref_name, '-beta') &&
           (github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.confirm_publish == true))
         env:
           NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -116,6 +121,8 @@ jobs:
       - name: Publish Python distribution to PyPI
         if: |
           !contains(inputs.release_tag || github.ref_name, '-rc') &&
+          !contains(inputs.release_tag || github.ref_name, '-alpha') &&
+          !contains(inputs.release_tag || github.ref_name, '-beta') &&
           (github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.confirm_publish == true))
         env:
           TWINE_USERNAME: __token__
