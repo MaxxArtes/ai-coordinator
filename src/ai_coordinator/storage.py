@@ -1358,6 +1358,34 @@ class Store:
             self._record_event(run_id, row["task_id"], current_status, to_status, new_revision, ev_type, details)
             return dict(self.db.execute("SELECT * FROM runs WHERE id=?", (run_id,)).fetchone())
 
+    def begin_worker_attempt(self, run_id: str, **values) -> Dict[str, Any]:
+        """Move a run to STARTING for the next candidate of the same run.
+
+        The first attempt follows the regular state machine (RESERVED -> STARTING,
+        or STARTING -> STARTING after a pre-spawn failure). After a post-spawn
+        failure the run is still RUNNING; it may be re-armed as STARTING only when
+        the previous worker identity was cleared (pid and process_create_time are
+        NULL), so the run never claims a live process it no longer supervises.
+        Run id, attempts history and the event trail are preserved.
+        """
+        validate_id(run_id)
+        with self.transaction():
+            row = self.db.execute("SELECT * FROM runs WHERE id=?", (run_id,)).fetchone()
+            if not row:
+                raise ValueError("Execucao nao encontrada")
+            if row["status"] != RunState.RUNNING:
+                return self.transition_run(run_id, to_status=RunState.STARTING, **values)
+            if row["pid"] is not None or row["process_create_time"] is not None:
+                raise ValueError("Failover recusado: identidade do worker anterior ainda registrada na execucao")
+            return self.transition_run(
+                run_id,
+                to_status=RunState.STARTING,
+                expected_status=RunState.RUNNING,
+                event_type="failover_next_candidate",
+                details="Tentativa anterior encerrada; proximo candidato da mesma execucao",
+                **values,
+            )
+
     def record_heartbeat(self, run_id: str, expected_revision: Optional[int] = None) -> None:
         with self.transaction():
             row = self.db.execute("SELECT revision, status FROM runs WHERE id=?", (run_id,)).fetchone()

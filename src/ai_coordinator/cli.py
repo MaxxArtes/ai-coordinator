@@ -200,10 +200,9 @@ def run_worker(store, config, ident, category, input_file, max_attempts=None):
                 env['OPENCODE_EXPERIMENTAL_OUTPUT_TOKEN_MAX'] = str(candidate.get('max_tokens', limits.get('native_output_tokens', 4096)))
             attempts.append({**candidate, "started": now(), "status": "running",
                              "environment_policy": environment_policy})
-            # Two-phase phase 1: transition to starting
-            store.transition_run(
+            # Two-phase phase 1: transition to starting (re-armed after a failed post-spawn attempt)
+            store.begin_worker_attempt(
                 run_id,
-                to_status=RunState.STARTING,
                 client=candidate["client"],
                 model=candidate["model"],
                 attempts=json.dumps(attempts),
