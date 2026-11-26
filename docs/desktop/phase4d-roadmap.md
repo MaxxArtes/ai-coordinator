@@ -835,3 +835,36 @@ Registro de requisitos operacionais observados durante a consolidação pré-4D.
 5. **Supervisão de baixo custo durante delegações prolongadas:** utilizar notificações reativas de conclusão em vez de consultas repetitivas de status que consumam cota do coordenador.
 6. **Previsão de consumo de cotas até a conclusão:** estimar se a janela restante (5 h e semanal) comporta toda a etapa antes de despachar, acionando *handoff* preventivo antes da interrupção em meio à execução.
 7. **Investigação estruturada de testes intermitentes e corrida pré-`pin` no Tool Broker:** distinguir instabilidade de sincronização do teste de regressão real. Registrar para futura revisão do Core (`v0.6.1+` / `4D.6`) o alinhamento de `test_14_mailbox_concurrent_directory_swap_race` (que inicia a *thread* atacante antes de `_PinnedDirectory.pin()`, podendo acionar rejeição *fail-closed* em `ntpath.realpath` / `validate_contained_path` antes da fixação do *handle* Win32, sem qualquer escrita fora da *sandbox*) e a avaliação de fixação do *handle* antes da resolução canônica do caminho final.
+
+---
+
+## Apêndice L — Abertura da Fase 4D.5.0, backlog da instalação pública da alpha.52 para a 4D.6 e correção do K.3.7 (26/11/2026)
+
+Este registro é documental e não implementa nada. Ele preserva os Apêndices A a K. As decisões abaixo foram autorizadas pelo operador na instrução consolidada de 26/11/2026 e executadas na missão `4494783d8b3248ce` (Frentes A, B e C).
+
+### L.1 — Abertura da 4D.5.0 e documento arquitetural
+
+1. O diagnóstico arquitetural e o plano integrado da 4D.5 estão em [`phase4d5-0-architecture.md`](phase4d5-0-architecture.md) (tarefa `8c6c0932d1b2431a`, branch `phase4d5/0-architecture`, a partir da `main` `8750912`). O documento traz a matriz de cobertura de 16 componentes, a arquitetura de processamento, o Gateway local, as evidências para a 4E e as subetapas 4D.5.1 a 4D.5.8.
+2. A numeração aprovada da 4D.5 passa a ser: 4D.5.1 Mission Control, 4D.5.2 Processamento heterogêneo, 4D.5.3 Escalonamento adaptativo, 4D.5.4 Memória hierárquica, 4D.5.5 Coerência e segurança, 4D.5.6 Continuidade e handoff, 4D.5.7 Eficiência operacional e 4D.5.8 Homologação integrada. A reconciliação com as cinco subetapas do corpo deste roadmap (seção 5, Marco 4D.5) está na seção 5.1 do documento arquitetural. Nenhum conteúdo original foi descartado, e o Gate 4D.5 original foi incorporado à 4D.5.8.
+3. A implementação da 4D.5 depende de aprovação própria. A 4D.5.3 (despacho) e o Gateway G1 dependem dos pré-requisitos do Core avaliados na Frente B (tarefa `e5dd9201b45341aa`).
+
+### L.2 — Revisão e endurecimento preventivo do item K.3.7
+
+O item K.3.7 registrou uma corrida pré-fixação de handle observada no `test_14_mailbox_concurrent_directory_swap_race`. A revisão técnica de 26/11/2026, aprovada pelo operador, determinou a execução de auditoria e endurecimento preventivo de contenção e validação de handles no Windows (`B3-01`, patch `v0.6.1`, sob divulgação coordenada).
+
+**Desfecho registrado pela Frente B (`e5dd9201b45341aa`, 26/11/2026):** na branch isolada `lab/core-v0.6.1-candidate`, foram implementadas medidas de endurecimento preventivo de contenção e validação de handles no Windows (`B3-01`, patch `v0.6.1`, sob divulgação coordenada), além da correção do failover `D1` (`B3-02`) e identidade do launcher (`B3-15`), alcançando `pytest` completo com 1275 aprovados, 4 ignorados e 0 falhas. A homologação final e a publicação do patch `v0.6.1` aguardam decisão humana.
+
+### L.3 — Backlog da 4D.6: observações da instalação pública da `0.6.1-alpha.52`
+
+O operador instalou a Pre-Release pública como um usuário novo e concluiu os 11 itens do checklist de instalação pública. As observações abaixo ficam registradas para a 4D.6 (subetapas 4D.6.3 e 4D.6.4 e o instalador do K.2), sem implementação agora:
+
+| # | Observação | Destino na 4D.6 | Situação atual |
+|---|---|---|---|
+| 1 | **Assinatura Authenticode e reputação SmartScreen:** o instalador NSIS e o executável não têm Authenticode (`NotSigned`), e o SmartScreen avisa na primeira execução. A assinatura Minisign/Ed25519 do atualizador é independente e já está verificada. | 4D.6.3 | Ausente, documentado em `docs/releases/v0.6.1-alpha.52.md` |
+| 2 | **Localização do instalador em português e inglês:** telas do NSIS, mensagens de erro e licença, no idioma do sistema e com escolha manual. | 4D.6.3 | Não avaliado |
+| 3 | **Identidade visual do instalador e do aplicativo:** ícones, telas do instalador e consistência com o `BrandMark` do Desktop. | 4D.6.3 | A aprimorar |
+| 4 | **Arquivos de depuração desnecessários no pacote:** revisar o conteúdo do instalador e do portátil (4.359 arquivos no manifesto da alpha.52) e remover artefatos de depuração, símbolos e arquivos de teste não exigidos em execução, sem quebrar a verificação do `BUILD-MANIFEST.json`. | 4D.6.3 | A auditar |
+| 5 | **Homologação em máquinas limpas:** VMs Windows sem Python, Node ou agentes prévios, e depois Linux e macOS (I.2). Separar o teste clean-room automatizado da homologação nativa. | 4D.6.4 | Clean-room automatizado aprovado na consolidação; homologação nativa limpa pendente |
+| 6 | **Instalador unificado e modular:** conforme os 14 requisitos do K.2 (modalidades, detecção somente leitura, configuração opt-in, online e offline, gerenciador de componentes, verificação criptográfica, recuperação, desinstalação preservando dados e licenças). | 4D.6.3 / 4D.6.4 | Especificado no K.2; não implementado |
+
+Essas melhorias não fazem parte da 4D.5 e não autorizam nova publicação do Desktop.
