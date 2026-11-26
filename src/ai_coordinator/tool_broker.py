@@ -1124,10 +1124,25 @@ class ToolBroker:
         pinned_req: Optional[_PinnedDirectory] = None
         pinned_res: Optional[_PinnedDirectory] = None
 
+        def _require_pinned_nt(pinned: _PinnedDirectory, label: str) -> Optional[List[Dict[str, Any]]]:
+            # pin() returns without a handle when the directory is missing at that
+            # instant. A concurrent rename between the checks above and pin() would
+            # otherwise leave the directory unpinned, and the later path-based
+            # writes could follow a junction swapped in afterwards. Fail closed.
+            if pinned.is_pinned():
+                return None
+            message = f"Diretorio {label} nao pode ser fixado (removido ou substituido durante o ciclo): {pinned.raw_path}"
+            if raise_on_fatal:
+                raise ReparseEscapeError(message)
+            return [{"status": "error", "error": "SymlinkSecurityViolation", "message": message}]
+
         try:
             pinned_sbox.pin()
 
             if os.name == "nt":
+                denied = _require_pinned_nt(pinned_sbox, "raiz da sandbox")
+                if denied is not None:
+                    return denied
                 if not broker_dir.exists():
                     return []
                 if is_reparse_point_or_symlink(broker_dir):
@@ -1141,6 +1156,9 @@ class ToolBroker:
                 validate_contained_path(broker_dir, sbox)
                 pinned_broker = _PinnedDirectory(broker_dir, sbox, raise_on_fatal=raise_on_fatal)
                 pinned_broker.pin()
+                denied = _require_pinned_nt(pinned_broker, "base da mailbox (.broker)")
+                if denied is not None:
+                    return denied
 
                 if not req_dir.exists():
                     return []
@@ -1155,6 +1173,9 @@ class ToolBroker:
                 validate_contained_path(req_dir, sbox)
                 pinned_req = _PinnedDirectory(req_dir, sbox, raise_on_fatal=raise_on_fatal)
                 pinned_req.pin()
+                denied = _require_pinned_nt(pinned_req, "de requisicoes (.broker/requests)")
+                if denied is not None:
+                    return denied
 
                 if res_dir.exists():
                     if is_reparse_point_or_symlink(res_dir):
@@ -1173,6 +1194,9 @@ class ToolBroker:
                     validate_contained_path(res_dir, sbox)
                 pinned_res = _PinnedDirectory(res_dir, sbox, raise_on_fatal=raise_on_fatal)
                 pinned_res.pin()
+                denied = _require_pinned_nt(pinned_res, "de respostas (.broker/responses)")
+                if denied is not None:
+                    return denied
             else:
                 # POSIX: strict relative descriptor descent from pinned_sbox.dir_fd
                 if pinned_sbox.dir_fd is None:

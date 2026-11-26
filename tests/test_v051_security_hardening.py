@@ -763,16 +763,20 @@ class TestV051SecurityHardening(unittest.TestCase):
             finally:
                 pinned_check.close()
 
-            # 2. Concurrency check: background attacker thread attempts directory swap during mailbox processing
+            # 2. Concurrency check: background attacker thread attempts directory swap during mailbox processing.
+            # Each successful rename uses a fresh name, so a won race cannot turn into a
+            # FileExistsError on the next attempt and hide the outcome of the cycle.
             stop_attacker = threading.Event()
             tamper_attempts = [0]
+            tamper_successes = [0]
             tamper_blocked_errors = []
 
             def attacker_loop():
                 while not stop_attacker.is_set():
                     tamper_attempts[0] += 1
                     try:
-                        os.rename(res_dir, res_dir.with_name("responses_hijacked"))
+                        os.rename(res_dir, res_dir.with_name(f"responses_hijacked_{tamper_attempts[0]}"))
+                        tamper_successes[0] += 1
                         _create_symlink_or_junction(res_dir, self.outside_dir)
                     except (PermissionError, OSError) as e:
                         tamper_blocked_errors.append(e)
@@ -781,21 +785,52 @@ class TestV051SecurityHardening(unittest.TestCase):
             attacker_thread = threading.Thread(target=attacker_loop, daemon=True)
             attacker_thread.start()
 
+            results = None
+            fail_closed = None
             try:
-                results = self.broker.process_mailbox(
-                    self.sandbox_dir,
-                    expected_worker_pid=os.getpid(),
-                    raise_on_fatal=True,
-                )
+                try:
+                    results = self.broker.process_mailbox(
+                        self.sandbox_dir,
+                        expected_worker_pid=os.getpid(),
+                        raise_on_fatal=True,
+                    )
+                except (ReparseEscapeError, PathTraversalError, FileSandboxSecurityError) as sec_err:
+                    # The attacker won the race before the handle was pinned: the only
+                    # acceptable outcome is to refuse the cycle.
+                    fail_closed = sec_err
             finally:
                 stop_attacker.set()
                 attacker_thread.join(timeout=2.0)
+                # Mandatory in every outcome, including exceptions and failed assertions below.
+                self.assertEqual(len(list(self.outside_dir.iterdir())), 0, "Attacker succeeded in writing outside sandbox!")
 
-            if tamper_blocked_errors:
-                self.assertTrue(
-                    all(isinstance(err, PermissionError) or getattr(err, "winerror", None) == 32 for err in tamper_blocked_errors),
-                    f"Unexpected error in tamper attempts: {tamper_blocked_errors[:5]}"
-                )
+            # Pinned handle: sharing violation (5/32). Race lost by the attacker before or
+            # after its rename: path missing (2/3) or already recreated (183).
+            allowed_winerrors = {2, 3, 5, 32, 183}
+            unexpected = [
+                err for err in tamper_blocked_errors
+                if not isinstance(err, (PermissionError, FileNotFoundError, FileExistsError))
+                and getattr(err, "winerror", None) not in allowed_winerrors
+            ]
+            self.assertEqual(unexpected, [], f"Unexpected error in tamper attempts: {unexpected[:5]}")
+
+            if fail_closed is not None:
+                self.assertGreater(tamper_successes[0], 0, f"Fail-closed without any successful tamper: {fail_closed!r}")
+                return
+
+            self.assertEqual(len(results), 1)
+            self.assertEqual(results[0].get("status"), "success")
+            # After the cycle releases its handles the attacker may still rename the
+            # responses directory, so look for the response inside the sandbox mailbox
+            # without following junctions.
+            written = []
+            for root, dirs, files in os.walk(self.sandbox_dir / ".broker", followlinks=False):
+                dirs[:] = [d for d in dirs if not is_reparse_point_or_symlink(Path(root) / d)]
+                written += [Path(root) / f for f in files if f == f"res_{req_file.stem}.json"]
+            self.assertEqual(len(written), 1, f"Response file not found exactly once inside the sandbox: {written}")
+            res_data = json.loads(written[0].read_text(encoding="utf-8"))
+            self.assertEqual(res_data.get("response", {}).get("result", {}).get("echo"), "SAFE_CONCURRENT_DATA")
+            return
         else:
             # On POSIX: Pinned dir_fd with O_DIRECTORY | O_NOFOLLOW guarantees confinement
             results = self.broker.process_mailbox(
