@@ -157,6 +157,39 @@ def test_ancestor_renamed_before_pin_fails_closed(mailbox, component):
         assert mailbox["outside_files"]() == []
 
 
+def test_failed_createfile_is_not_taken_as_a_pinned_handle(mailbox, monkeypatch):
+    """responses vanishes after the attribute check and before CreateFileW inside pin().
+
+    Without ctypes prototypes CreateFileW returned -1 on failure, which never matched
+    INVALID_HANDLE_VALUE, so the cycle went on with a bogus handle and no pin.
+    """
+    res = mailbox["sandbox"] / ".broker" / "responses"
+    away = res.with_name("responses_away")
+    real_create = tb.kernel32.CreateFileW
+    fired = []
+
+    def create(path, *args):
+        if not (str(path).endswith("responses") and not fired):
+            return real_create(path, *args)
+        fired.append(path)
+        # The directory is gone only while CreateFileW runs; it is back before the
+        # attribute re-check, as in the escape observed with a separate-process attacker.
+        os.rename(res, away)
+        try:
+            return real_create(path, *args)
+        finally:
+            os.rename(away, res)
+
+    monkeypatch.setattr(tb.kernel32, "CreateFileW", create)
+    _arm_write_swap(mailbox)
+    try:
+        with pytest.raises(ReparseEscapeError):
+            _process(mailbox, True)
+    finally:
+        assert mailbox["outside_files"]() == []
+    assert fired
+
+
 def test_junction_swapped_in_before_pin_is_rejected(mailbox):
     mailbox["hooks"][("pre_pin", "responses")] = lambda: _swap_responses_for_junction(mailbox["sandbox"], mailbox["outside"])
     try:

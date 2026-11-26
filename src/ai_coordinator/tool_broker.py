@@ -48,6 +48,19 @@ if os.name == "nt":
     FILE_ATTRIBUTE_REPARSE_POINT = 0x00000400
     INVALID_HANDLE_VALUE = ctypes.c_void_p(-1).value
 
+    # Without explicit prototypes ctypes returns a C int: a failed CreateFileW came
+    # back as -1, which never equals INVALID_HANDLE_VALUE (2**64-1) on 64-bit
+    # Python, so a failed open was taken as a pinned handle.
+    kernel32.CreateFileW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, wintypes.LPVOID,
+                                     wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE]
+    kernel32.CreateFileW.restype = wintypes.HANDLE
+    kernel32.GetFileAttributesW.argtypes = [wintypes.LPCWSTR]
+    kernel32.GetFileAttributesW.restype = wintypes.DWORD
+    kernel32.GetFinalPathNameByHandleW.argtypes = [wintypes.HANDLE, wintypes.LPWSTR, wintypes.DWORD, wintypes.DWORD]
+    kernel32.GetFinalPathNameByHandleW.restype = wintypes.DWORD
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel32.CloseHandle.restype = wintypes.BOOL
+
 
 class _PinnedDirectory:
     """Pins a directory against concurrent replacement, deletion, or symlink/junction swaps.
@@ -122,16 +135,20 @@ class _PinnedDirectory:
 
             buf = ctypes.create_unicode_buffer(1024)
             res = kernel32.GetFinalPathNameByHandleW(self.handle, buf, 1024, 0)
-            if res > 0:
-                final_str = buf.value
-                if final_str.startswith("\\\\?\\"):
-                    final_str = final_str[4:]
-                final_path = Path(final_str).resolve()
-                try:
-                    final_path.relative_to(self.sbox)
-                except ValueError:
-                    self.close()
-                    raise ReparseEscapeError(f"Diretorio fixado '{self.raw_path}' escapa da sandbox: '{final_path}'")
+            if res == 0 or res >= 1024:
+                # The containment of the pinned object cannot be proven: fail closed.
+                err = ctypes.get_last_error()
+                self.close()
+                raise ReparseEscapeError(f"Nao foi possivel verificar o caminho final do diretorio fixado '{self.raw_path}' (WinError {err})")
+            final_str = buf.value
+            if final_str.startswith("\\\\?\\"):
+                final_str = final_str[4:]
+            final_path = Path(final_str).resolve()
+            try:
+                final_path.relative_to(self.sbox)
+            except ValueError:
+                self.close()
+                raise ReparseEscapeError(f"Diretorio fixado '{self.raw_path}' escapa da sandbox: '{final_path}'")
         else:
             flags = os.O_RDONLY
             if hasattr(os, "O_DIRECTORY"):
