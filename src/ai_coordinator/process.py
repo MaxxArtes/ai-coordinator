@@ -38,14 +38,23 @@ if os.name == "nt":
 
     # Job Object Constants
     JobObjectExtendedLimitInformation = 9
+    JobObjectCpuRateControlInformation = 15
     JOB_OBJECT_LIMIT_WORKINGSET = 0x00000001
     JOB_OBJECT_LIMIT_PROCESS_TIME = 0x00000002
     JOB_OBJECT_LIMIT_JOB_TIME = 0x00000004
     JOB_OBJECT_LIMIT_ACTIVE_PROCESS = 0x00000008
+    JOB_OBJECT_LIMIT_PRIORITY_CLASS = 0x00000020
     JOB_OBJECT_LIMIT_PROCESS_MEMORY = 0x00000100
     JOB_OBJECT_LIMIT_JOB_MEMORY = 0x00000200
     JOB_OBJECT_LIMIT_DIE_ON_UNHANDLED_EXCEPTION = 0x00000400
     JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x00002000
+
+    JOB_OBJECT_CPU_RATE_CONTROL_ENABLE = 0x00000001
+    JOB_OBJECT_CPU_RATE_CONTROL_HARD_CAP = 0x00000004
+
+    NORMAL_PRIORITY_CLASS = 0x00000020
+    IDLE_PRIORITY_CLASS = 0x00000040
+    BELOW_NORMAL_PRIORITY_CLASS = 0x00004000
 
     # Wait Constants
     WAIT_OBJECT_0 = 0x00000000
@@ -93,6 +102,12 @@ if os.name == "nt":
             ("JobMemoryLimit", ctypes.c_size_t),
             ("PeakProcessMemoryLimit", ctypes.c_size_t),
             ("PeakJobMemoryLimit", ctypes.c_size_t),
+        ]
+
+    class JOBOBJECT_CPU_RATE_CONTROL_INFORMATION(ctypes.Structure):
+        _fields_ = [
+            ("ControlFlags", wintypes.DWORD),
+            ("CpuRate", wintypes.DWORD),
         ]
 
     class PROCESSENTRY32(ctypes.Structure):
@@ -201,12 +216,16 @@ class ResourceLimits:
     max_memory_bytes: Optional[int] = None
     max_cpu_time_seconds: Optional[float] = None
     max_processes: Optional[int] = None
+    cpu_rate_percent: Optional[float] = None
+    priority_class: Optional[str] = None  # "normal", "below_normal", "idle"
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "max_memory_bytes": self.max_memory_bytes,
             "max_cpu_time_seconds": self.max_cpu_time_seconds,
             "max_processes": self.max_processes,
+            "cpu_rate_percent": self.cpu_rate_percent,
+            "priority_class": self.priority_class,
         }
 
 @dataclass(frozen=True)
@@ -399,6 +418,15 @@ class WindowsProcessController:
             if resource_limits.max_cpu_time_seconds and resource_limits.max_cpu_time_seconds > 0:
                 limit_flags |= JOB_OBJECT_LIMIT_JOB_TIME
                 info.BasicLimitInformation.PerJobUserTimeLimit = int(resource_limits.max_cpu_time_seconds * 10_000_000)
+            if resource_limits.priority_class:
+                prio_map = {
+                    "normal": NORMAL_PRIORITY_CLASS,
+                    "below_normal": BELOW_NORMAL_PRIORITY_CLASS,
+                    "idle": IDLE_PRIORITY_CLASS,
+                }
+                if resource_limits.priority_class in prio_map:
+                    limit_flags |= JOB_OBJECT_LIMIT_PRIORITY_CLASS
+                    info.BasicLimitInformation.PriorityClass = prio_map[resource_limits.priority_class]
 
         info.BasicLimitInformation.LimitFlags = limit_flags
         ok = kernel32.SetInformationJobObject(
@@ -410,7 +438,28 @@ class WindowsProcessController:
         if not ok:
             kernel32.CloseHandle(h_job)
             return None
+        if resource_limits and resource_limits.cpu_rate_percent is not None:
+            WindowsProcessController.set_job_cpu_rate(int(h_job), resource_limits.cpu_rate_percent)
         return int(h_job)
+
+    @staticmethod
+    def set_job_cpu_rate(job_handle: int, cpu_rate_percent: float) -> bool:
+        """Apply a Win32 Job Object hard CPU rate cap (1%..100%) to the entire job tree."""
+        if os.name != "nt" or not job_handle:
+            return False
+        clamped = max(1.0, min(100.0, float(cpu_rate_percent)))
+        cpu_info = JOBOBJECT_CPU_RATE_CONTROL_INFORMATION(
+            ControlFlags=JOB_OBJECT_CPU_RATE_CONTROL_ENABLE | JOB_OBJECT_CPU_RATE_CONTROL_HARD_CAP,
+            CpuRate=max(1, min(10000, int(round(clamped * 100)))),
+        )
+        return bool(
+            kernel32.SetInformationJobObject(
+                job_handle,
+                JobObjectCpuRateControlInformation,
+                ctypes.byref(cpu_info),
+                ctypes.sizeof(cpu_info),
+            )
+        )
 
     @staticmethod
     def assign_to_job(job_handle: int, pid: int, proc_handle: Optional[int] = None) -> bool:

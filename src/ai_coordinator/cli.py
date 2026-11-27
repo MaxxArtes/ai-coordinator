@@ -227,10 +227,15 @@ def run_worker(store, config, ident, category, input_file, max_attempts=None):
                 validate_headless_arguments(candidate["client"], "worker", cmd)
                 from .process import ProcessSupervisor, ResourceLimits
                 from .fs_sandbox import ExecutionSandbox, FileSandboxConfig
+                from .governor import SaturationBand, effective_worker_cpu_cap
+                gov_cfg, gov_band = store.governor.get_config()
+                eff_cpu_cap = effective_worker_cpu_cap(gov_band, gov_cfg)
                 worker_limits = ResourceLimits(
                     max_memory_bytes=limits.get("max_memory_bytes"),
                     max_cpu_time_seconds=float(limits.get("max_cpu_time_seconds", 0)) or None,
-                    max_processes=limits.get("max_processes"),
+                    max_processes=limits.get("max_processes") or gov_cfg.worker_max_subprocesses,
+                    cpu_rate_percent=eff_cpu_cap,
+                    priority_class="below_normal" if gov_band != SaturationBand.NORMAL else None,
                 )
                 enforce_fs = config.get("security", {}).get("enforce_filesystem_sandbox", True)
                 fs_sandbox = None
@@ -897,6 +902,18 @@ def parser():
     foc_show.add_argument("--supervisor-key-file", default=argparse.SUPPRESS, help="Path to supervisor key file")
     foc_show.add_argument("--session-token", default=argparse.SUPPRESS, help="Human session token")
     foc_show.add_argument("--session-token-file", default=argparse.SUPPRESS, help="Path to human session token file")
+
+    gov = sub.add_parser("governor", help="Emergency Resource Governor status and reserve configuration")
+    gov_sub = gov.add_subparsers(dest="governor_command", required=True)
+    gov_sub.add_parser("status", help="Show global CPU/RAM/disk snapshot, saturation band, and active leases")
+    gov_cfg = gov_sub.add_parser("config", help="Update configurable CPU/RAM reserves and cascade limits")
+    gov_cfg.add_argument("--min-free-cpu", type=float)
+    gov_cfg.add_argument("--min-free-ram", type=float)
+    gov_cfg.add_argument("--max-concurrent", type=int)
+    gov_cfg.add_argument("--max-depth", type=int)
+    gov_cfg.add_argument("--max-rate", type=int)
+    gov_cfg.add_argument("--worker-cpu-cap", type=float)
+    gov_cfg.add_argument("--worker-max-subprocesses", type=int)
     return p
 
 def main():
@@ -1258,6 +1275,26 @@ def main():
                     task_id=getattr(args, "task", None),
                 )
                 emit(res or {"status": "not_found", "message": "Nenhum checkpoint de foco encontrado"})
+        elif args.command == "governor":
+            if args.governor_command == "status":
+                emit(store.governor.status())
+            elif args.governor_command == "config":
+                updates = {}
+                if args.min_free_cpu is not None:
+                    updates["min_free_cpu_pct"] = args.min_free_cpu
+                if args.min_free_ram is not None:
+                    updates["min_free_ram_pct"] = args.min_free_ram
+                if args.max_concurrent is not None:
+                    updates["max_global_concurrent"] = args.max_concurrent
+                if args.max_depth is not None:
+                    updates["max_delegation_depth"] = args.max_depth
+                if args.max_rate is not None:
+                    updates["max_delegations_per_window"] = args.max_rate
+                if args.worker_cpu_cap is not None:
+                    updates["worker_cpu_cap_pct"] = args.worker_cpu_cap
+                if args.worker_max_subprocesses is not None:
+                    updates["worker_max_subprocesses"] = args.worker_max_subprocesses
+                emit(store.governor.update_config(**updates).to_dict())
         return 0
     finally:
         store.db.close()

@@ -379,6 +379,8 @@ class Store:
         self.worker_audit = WorkerAuditLogger(store=self, supervisor_key=self.supervisor_key)
         from .tool_broker import ToolBroker
         self.tool_broker = ToolBroker(store=self)
+        from .governor import ResourceGovernor
+        self.governor = ResourceGovernor(self.db, self.root)
         self._post_commit_scopes: List[List[Callable[[], Any]]] = []
 
     def enter_savepoint_scope(self) -> None:
@@ -1223,7 +1225,17 @@ class Store:
         self.task(ident)
         return [dict(row) for row in self.db.execute("SELECT * FROM runs WHERE task_id=? ORDER BY started DESC LIMIT 8", (ident,))]
 
-    def reserve(self, ident: str, category: str, prompt: str, max_calls: int) -> Tuple[str, Path, int]:
+    def reserve(
+        self,
+        ident: str,
+        category: str,
+        prompt: str,
+        max_calls: int,
+        *,
+        activity_weight: str = "medium",
+        delegation_depth: int = 0,
+        parent_lease_id: Optional[str] = None,
+    ) -> Tuple[str, Path, int]:
         ident = validate_id(ident)
         with self.transaction():
             task = self.task(ident)
@@ -1246,10 +1258,20 @@ class Store:
             if used >= max_calls:
                 raise ValueError("Limite de chamadas da tarefa atingido; reveja a tarefa, nao repita em loop")
 
+            run_id = uuid.uuid4().hex[:16]
+            # Emergency Resource Governor & Cascade Guard admission check
+            self.governor.acquire_lease(
+                task_id=ident,
+                project=task["project"],
+                run_id=run_id,
+                activity_weight=activity_weight,
+                delegation_depth=delegation_depth,
+                parent_lease_id=parent_lease_id,
+            )
+
             # Record step in mission control telemetry
             self.mission_control.record_step(ident, action_name=f"reserve_{category}", details=f"Prompt: {prompt[:60]}")
 
-            run_id = uuid.uuid4().hex[:16]
             folder = self.root / "tasks" / ident / "runs" / run_id
             folder.mkdir(parents=True, exist_ok=True)
             inp = folder / "input.md"
@@ -1404,6 +1426,7 @@ class Store:
             row = self.db.execute("SELECT * FROM runs WHERE id=?", (run_id,)).fetchone()
             if not row:
                 raise ValueError("Execucao nao encontrada")
+            self.governor.release_for_run(run_id)
             curr_status = row["status"]
             if curr_status in TERMINAL_RUN_STATES:
                 raise ValueError(f"Nao e possivel cancelar execucao com status terminal '{curr_status}'")
@@ -1426,6 +1449,7 @@ class Store:
             row = self.db.execute("SELECT * FROM runs WHERE id=?", (run_id,)).fetchone()
             if not row:
                 raise ValueError("Execucao nao encontrada")
+            self.governor.release_for_run(run_id)
             curr_status = row["status"]
             now_stamp = now()
 
