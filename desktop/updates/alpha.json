@@ -1,11 +1,11 @@
 {
-  "version": "0.6.1-alpha.52",
-  "notes": "AI Coordinator Desktop Pre-Release v0.6.1-alpha.52 (Windows x64): consolidação das fases 4D.1 a 4D.4 (Fundação Tauri 2 + Python 3.11.9 isolado, Conversas até 4 terminais ConPTY, Configurações em 9 categorias com cofre DPAPI e Monitoramento multi-perfil com proveniência), mantendo o Core v0.6.0 embarcado.",
-  "pub_date": "2026-11-25T21:20:00Z",
+  "version": "0.6.1-alpha.53",
+  "notes": "AI Coordinator Desktop 0.6.1-alpha.53: atualiza Core embarcado para v0.6.1 (correcao de seguranca GHSA-j9xw-7pjv-hrgh, launcher fail-closed e failover D1/B3-07), assinatura oficial Minisign 499FF8912D665FE8.",
+  "pub_date": "2026-11-27T15:15:00Z",
   "platforms": {
     "windows-x86_64": {
-      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVUb1gyWXRrZmlmU2IyNzNHbmlLNjhtNnZ4WEcwSFFjZHhwT3VLREY4OGpBcDlDWWgvMmZSZnRYNUVvNjQ3SDFjYm5YaUFycmhSWU1RSkwzbjFXM3NuVXBrWEJ4UElyNXdRPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzk1NjM4MzEzCWZpbGU6QUkgQ29vcmRpbmF0b3IgRGVza3RvcF8wLjYuMS1hbHBoYS41Ml94NjQtc2V0dXAuZXhlCXZlcnNpb246MC42LjEtYWxwaGEuNTIKYXpRSnArbWVZVmNRQVJTdHV1b3V4TUdYNFRiREZHU004ejBRa3d3RGk0WTRXYzdnK1hoWVYzUWVEM2YwZ2laVXlreXNIaXd4TlRVdHJIWkI0NUpZQmc9PQo=",
-      "url": "https://github.com/MaxxArtes/ai-coordinator/releases/download/v0.6.1-alpha.52/AI-Coordinator-Desktop_0.6.1-alpha.52_x64-setup.exe"
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVUb1gyWXRrZmlmU1pJUTVJdGUyenYxSW5DdlJsZkpNOG9pS2ErZ212WG53bmtTZHVYLzVDZTlabGpmc1ROeDcxTkxTMm53clludE9nUStNK0dUeDJIS0ZHMlYzRXljQlE4PQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzk1NzkyMTQyCWZpbGU6QUkgQ29vcmRpbmF0b3IgRGVza3RvcF8wLjYuMS1hbHBoYS41M194NjQtc2V0dXAuZXhlCXZlcnNpb246MC42LjEtYWxwaGEuNTMKa1RIVy9KM2xXVEpyd2JiaWhUVVFrb3BLcUdXa3V4bm1uSldISGpVdUhNTDJvRkxmTDBhWEkvUWIveHVGL2JHdjJCZlR0dFk2S0gyUjdEYk12SmNNQWc9PQo=",
+      "url": "https://github.com/MaxxArtes/ai-coordinator/releases/download/v0.6.1-alpha.53/AI-Coordinator-Desktop_0.6.1-alpha.53_x64-setup.exe"
     }
   }
 }
