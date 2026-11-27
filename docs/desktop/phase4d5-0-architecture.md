@@ -443,7 +443,7 @@ flowchart LR
 ### 5.5 Pré-requisitos do Core (classificação integrada da Frente B, `b3-classificacao.json`)
 
 > [!NOTE]
-> Classificação definitiva de **16 itens** pela Frente B (`e5dd9201b45341aa`, [b3-classificacao.json](../../../core-v061-lab-evidencias/b3-classificacao.json)), integrada aos pré-requisitos arquiteturais `P8`–`P10` da Frente A. Onde um item possui dupla classificação, ambas estão explícitas.
+> Classificação definitiva de **16 itens** pela Frente B (`e5dd9201b45341aa`, `b3-classificacao.json`), integrada aos pré-requisitos arquiteturais `P8`–`P10` da Frente A. Onde um item possui dupla classificação, ambas estão explícitas.
 
 #### Classe 1 — `patch_v0.6.1` (prioridade imediata; sem migração de esquema)
 

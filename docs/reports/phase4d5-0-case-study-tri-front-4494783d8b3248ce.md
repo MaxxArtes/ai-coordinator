@@ -2,7 +2,7 @@
 
 > [!NOTE]
 > **Tipo:** estudo de caso operacional e análise forense para a Fase `4D.5.0` e futura carga no `ExperienceStore` / `InsightEngine`.
-> **Missão analisada:** `4494783d8b3248ce` (`D:\ai-coordinator-diag\missao-tri-frente`, 26/11/2026, `11:15`–`18:15` UTC-4).
+> **Missão analisada:** `4494783d8b3248ce` (`<diag-workspace>/missao-tri-frente`, 26/11/2026, `11:15`–`18:15` UTC-4).
 > **Referência de sistema:** `main` `87509121170f548be58f20f90abd3397b9f94ed5`, Core `v0.6.0`, Desktop `0.6.1-alpha.52`, AI Memory `v2.5.2`.
 > **Documentos relacionados:** [`phase4d5-0-architecture.md`](../desktop/phase4d5-0-architecture.md) e [`phase4d5-0-impeditive-policies.md`](../desktop/phase4d5-0-impeditive-policies.md).
 
@@ -14,10 +14,10 @@ A missão `4494783d8b3248ce` foi aberta em `26/11/2026` às `11:15` (UTC-4) para
 
 | Frente | Tarefa Coordinator | Estado final | Ambiente / Branch | Commits locais |
 |---|---|---|---|---|
-| **Missão (nó `F`)** | `4494783d8b3248ce` | `complete` (`rev 6`) | `D:\ai-coordinator-diag\missao-tri-frente` | — |
-| **A — Arquitetura `4D.5.0`** | `8c6c0932d1b2431a` | `complete` (`rev 4`) | `D:\ai-coordinator-diag\phase4d5-0-arch` (`phase4d5/0-architecture`) | `6bc7035`, `f6ef632`, `e3252a3`, `9973ede` |
-| **B — Core `v0.6.1` (lab)** | `e5dd9201b45341aa` | `complete` (`rev 5`) | `D:\ai-coordinator-diag\core-v061-lab` (`lab/core-v0.6.1-candidate`) | `fa51228`, `47c9122` (+ endurecimento `B3-01` sob divulgação coordenada) |
-| **C — AI Memory Rodada 3** | `52e09fb9b0f24a91` | Lab concluído (`rev 10`, `active` até homologação) | `D:\ai-memory-dev` (`evolution/52e09fb9-round3`, base `6eeb88c1`) | `71a49d1a`, `a3173b0c`, `2459e3b6`, `f74667dc` |
+| **Missão (nó `F`)** | `4494783d8b3248ce` | `complete` (`rev 6`) | `<diag-workspace>/missao-tri-frente` | — |
+| **A — Arquitetura `4D.5.0`** | `8c6c0932d1b2431a` | `complete` (`rev 4`) | `<diag-workspace>/phase4d5-0-arch` (`phase4d5/0-architecture`) | `6bc7035`, `f6ef632`, `e3252a3`, `9973ede` |
+| **B — Core `v0.6.1` (lab)** | `e5dd9201b45341aa` | `complete` (`rev 5`) | `<diag-workspace>/core-v061-lab` (`lab/core-v0.6.1-candidate`) | `fa51228`, `47c9122` (+ endurecimento `B3-01` sob divulgação coordenada) |
+| **C — AI Memory Rodada 3** | `52e09fb9b0f24a91` | Lab concluído (`rev 10`, `active` até homologação) | `<ai-memory-workspace>` (`evolution/52e09fb9-round3`, base `6eeb88c1`) | `71a49d1a`, `a3173b0c`, `2459e3b6`, `f74667dc` |
 
 Todas as entregas permaneceram estritamente isoladas em laboratório e documentação: **nenhum** `git push`, merge na `main`, alteração do runtime central `v0.6.0`, troca do Desktop `0.6.1-alpha.52` ou reinício do AI Memory de produção (`PID 18072`) foi executado.
 
@@ -124,7 +124,7 @@ Naquela ocasião específica, o takeover não causou dano real apenas porque a F
 
 ### 6.2 Por que o modelo do `heavy_lock.py` é inseguro
 
-A inspeção de `D:\ai-coordinator-diag\missao-tri-frente\heavy_lock.py` (linhas 73–95) expõe três falhas graves de desenho:
+A inspeção de `<diag-workspace>/missao-tri-frente/heavy_lock.py` (linhas 73–95) expõe três falhas graves de desenho:
 
 1. **PID efêmero do CLI `acquire` (`"pid": os.getpid()`, linha 75):** o PID `24260` gravado no `heavy.lock` era o PID do próprio processo curto `python -I heavy_lock.py acquire ...`, que **terminou milissegundos após gravar o JSON** — não o PID do processo detentor da carga pesada (`cargo`, `pytest` ou subagente). Mesmo que se tentasse consultar se o PID `24260` estava vivo às `13:55:37`, ele sempre pareceria morto (ou pior: poderia ter sido **reciclado pelo Windows** para outro processo completamente distinto!).
 2. **Expiração cega apenas por relógio de parede (linha 92):** `time.time() - cur.get("since", 0) > cur.get("max_minutes", 60) * 60` remove `heavy.lock` assim que `max_minutes` vence, sem verificar se o proprietário real continua executando trabalho legítimo (por exemplo, um `cargo build` ou suíte `pytest` legítima que passou de `40` para `45` minutos sob contenção `0xC`/`BelowNormal`). Além disso, dependência pura de `time.time()` fica vulnerável a saltos de relógio NTP — exatamente como o salto de `+1.153,45 s` (`+19 min 13 s`) observado no mesmo host em `25/11` (`Kernel-General/1`, `svchost.exe` PID `1860`).
@@ -132,7 +132,7 @@ A inspeção de `D:\ai-coordinator-diag\missao-tri-frente\heavy_lock.py` (linhas
 
 ### 6.3 Como `heavy_lock_v2.py` e o futuro `ResourceLedger` (`4D.5.3`) resolvem
 
-O modelo implementado em `D:\ai-coordinator-diag\missao-homologacao-pos-trifrente\heavy_lock_v2.py` corrige as três lacunas para a janela operacional imediata e define o contrato que será internalizado no `ResourceLedger` da `4D.5.3`:
+O modelo implementado em `<diag-workspace>/missao-homologacao-pos-trifrente/heavy_lock_v2.py` corrige as três lacunas para a janela operacional imediata e define o contrato que será internalizado no `ResourceLedger` da `4D.5.3`:
 
 | Dimensão | `heavy_lock.py` (missão `4494783d8b3248ce`) | `heavy_lock_v2.py` (missão atual) | Futuro `ResourceLedger` (`4D.5.3`, [`phase4d5-0-impeditive-policies.md`](../desktop/phase4d5-0-impeditive-policies.md)) |
 |---|---|---|---|
@@ -177,7 +177,7 @@ Quando o perfil Claude Max atingiu `86%` da janela de `5h` às `17:49`, foi exec
 
 ## 9. Lições transferidas para `ExperienceStore` e para a `4D.5`
 
-Os achados desta missão foram estruturados no seed [`experience-seed-4494783d8b3248ce.json`](file:///D:/ai-coordinator-diag/missao-homologacao-pos-trifrente/frente-D/experience-seed-4494783d8b3248ce.json) para futura ingestão determinística no `ExperienceStore` (`experience.py`):
+Os achados desta missão foram estruturados no seed `experience-seed-4494783d8b3248ce.json` para futura ingestão determinística no `ExperienceStore` (`experience.py`):
 
 1. **Testes reais sem mock nos caminhos de falha (`D1` / `B3-02`):** mocks de `_run_worker` esconderam `RUNNING -> STARTING` na `v0.6.0`; toda subetapa da `4D.5` deve cobrir transições de falha com subprocessos reais.
 2. **Lock apenas por relógio é inseguro (`stale_takeover` `13:55:37`):** exige `(holder_pid, create_time_ns)` vivo, `fencing_token` monotônico e fila priorizada (`heavy_lock_v2.py` → `ResourceLedger` na `4D.5.3`).
