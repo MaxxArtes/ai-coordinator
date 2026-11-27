@@ -2897,14 +2897,10 @@ async fn mission_get(
     bridge: State<'_, Arc<IpcBridge>>,
 ) -> Result<Value, Value> {
     let bridge = bridge.inner().clone();
-    tauri::async_runtime::spawn_blocking(move || {
-        bridge.call_structured(
-            "mission.get",
-            json!({ "project_path": project_path, "mission_id": mission_id }),
-        )
-    })
-    .await
-    .unwrap_or_else(|_| Err(ipc_task_failed_structured()))
+    let params = json!({ "project_path": project_path, "mission_id": mission_id });
+    tauri::async_runtime::spawn_blocking(move || bridge.call_structured("mission.get", params))
+        .await
+        .unwrap_or_else(|_| Err(ipc_task_failed_structured()))
 }
 
 #[tauri::command]
