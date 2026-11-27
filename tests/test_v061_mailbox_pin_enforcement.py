@@ -17,11 +17,22 @@ import gc
 import json
 import os
 from pathlib import Path
+import stat
 
 if os.name == "nt":
     import _winapi
 else:
     _winapi = None  # type: ignore[assignment]
+
+
+def _is_junction(path: str | Path) -> bool:
+    fn = getattr(os.path, "isjunction", None)
+    if fn is not None:
+        return fn(path)
+    try:
+        return bool(os.lstat(path).st_file_attributes & stat.FILE_ATTRIBUTE_REPARSE_POINT)
+    except OSError:
+        return False
 
 import pytest
 
@@ -93,14 +104,14 @@ def mailbox(tmp_path, monkeypatch):
     gc.collect()
     for root, dirs, _ in os.walk(base, topdown=True):
         for name in list(dirs):
-            if os.path.isjunction(os.path.join(root, name)):
+            if _is_junction(os.path.join(root, name)):
                 os.rmdir(os.path.join(root, name))
                 dirs.remove(name)
 
 
 def _swap_responses_for_junction(sandbox, outside):
     res = sandbox / ".broker" / "responses"
-    if res.exists() and not os.path.isjunction(res):
+    if res.exists() and not _is_junction(res):
         os.rename(res, res.with_name("responses_parked"))
     _winapi.CreateJunction(str(outside), str(res))
 
