@@ -1,14 +1,14 @@
 import React, { useLayoutEffect, useRef } from "react";
 import { mainViewPanelId, mainViewTabId, type MainViewId } from "./MainNav";
+import { MissionsView } from "./MissionsView";
 
 /**
  * The three main views stacked in one grid cell (Etapa 5).
  * - Conversas stays mounted when another view is active: hidden by visibility (.is-invisible) and made inert, so its
  *   terminals are neither recreated nor resized (never display:none).
- * - Monitoramento and Missões are temporary screens, clearly identified, with no data and no controls until their
- *   milestones (4D.4 and 4D.5). Their texts were approved by the operator on 17/11.
+ * - Monitoramento can render its approved placeholder when its content is unavailable.
  */
-export type PlannedViewId = Exclude<MainViewId, "conversas">;
+export type PlannedViewId = "monitoramento";
 
 export const PLANNED_CONTENT: Record<PlannedViewId, { title: string; milestone: string; text: string }> = {
   monitoramento: {
@@ -17,13 +17,6 @@ export const PLANNED_CONTENT: Record<PlannedViewId, { title: string; milestone: 
     text:
       "Vai mostrar os recursos usados pela árvore de processos do aplicativo, as cotas e os custos dos provedores, " +
       "sempre com a origem de cada medida. Até lá, esta tela não mostra dados nem tem controles.",
-  },
-  missoes: {
-    title: "Missões",
-    milestone: "4D.5",
-    text:
-      "Vai acompanhar as operações reais do Core: o grafo de cada missão, as tarefas que esperam decisão humana e os " +
-      "checkpoints de retomada. Até lá, esta tela não mostra dados nem tem controles.",
   },
 };
 
@@ -61,9 +54,10 @@ export interface MainViewsProps {
   conversas: React.ReactNode;
   /** Content of Monitoramento (4D.4.2): renders in place of the temporary screen when provided. */
   monitoramento?: React.ReactNode;
+  missoes?: React.ReactNode;
 }
 
-export const MainViews: React.FC<MainViewsProps> = ({ active, conversas, monitoramento }) => {
+export const MainViews: React.FC<MainViewsProps> = ({ active, conversas, monitoramento, missoes }) => {
   const conversasRef = useRef<HTMLDivElement>(null);
   const conversasActive = active === "conversas";
 
@@ -87,7 +81,7 @@ export const MainViews: React.FC<MainViewsProps> = ({ active, conversas, monitor
         {conversas}
       </div>
       {monitoramento ?? <PlannedView view="monitoramento" active={active === "monitoramento"} />}
-      <PlannedView view="missoes" active={active === "missoes"} />
+      {missoes ?? <MissionsView active={active === "missoes"} />}
     </main>
   );
 };

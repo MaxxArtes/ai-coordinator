@@ -2878,6 +2878,36 @@ fn updater_restart_app(app: tauri::AppHandle, bridge: State<Arc<IpcBridge>>) -> 
 // ---- Settings and vault (Marco 4D.3, Etapa 3): validation happens in the Core IPC; structured errors
 // reach the UI as {code, message, data}. Vault commands never return secret values. ----
 #[tauri::command]
+async fn mission_list(
+    project_path: String,
+    bridge: State<'_, Arc<IpcBridge>>,
+) -> Result<Value, Value> {
+    let bridge = bridge.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        bridge.call_structured("mission.list", json!({ "project_path": project_path }))
+    })
+    .await
+    .unwrap_or_else(|_| Err(ipc_task_failed_structured()))
+}
+
+#[tauri::command]
+async fn mission_get(
+    project_path: String,
+    mission_id: String,
+    bridge: State<'_, Arc<IpcBridge>>,
+) -> Result<Value, Value> {
+    let bridge = bridge.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        bridge.call_structured(
+            "mission.get",
+            json!({ "project_path": project_path, "mission_id": mission_id }),
+        )
+    })
+    .await
+    .unwrap_or_else(|_| Err(ipc_task_failed_structured()))
+}
+
+#[tauri::command]
 async fn settings_get(bridge: State<'_, Arc<IpcBridge>>) -> Result<Value, Value> {
     let bridge = bridge.inner().clone();
     tauri::async_runtime::spawn_blocking(move || bridge.call_structured("settings.get", json!({})))
@@ -3049,6 +3079,8 @@ fn main() {
             updater_check,
             updater_download_and_install,
             updater_restart_app,
+            mission_list,
+            mission_get,
             settings_get,
             settings_update,
             vault_status,

@@ -407,6 +407,8 @@ class SecureIPCServer:
         self.register("terminal.close_session", self._handle_terminal_close_session)
         self.register("terminal.save_sessions", self._handle_terminal_save_sessions)
         self.register("terminal.list_tabs", self._handle_terminal_list_tabs)
+        self.register("mission.list", self._handle_mission_list)
+        self.register("mission.get", self._handle_mission_get)
         self.register("settings.get", self._handle_settings_get)
         self.register("settings.update", self._handle_settings_update)
         self.register("vault.status", self._handle_vault_status)
@@ -490,6 +492,31 @@ class SecureIPCServer:
         return {"resized": ok}
 
     # ---- Settings (Marco 4D.3, Etapa 3): versioned schema validated here, never only in the UI ----
+    def _mission_reader(self, params: Dict[str, Any], token: Optional[str]) -> Any:
+        from ai_coordinator.api import mission_reader
+
+        project = self._project_param(params)
+        authorizer = self._get_terminal_manager().authorizer
+        authorizer.authorize_project_access(token or self.session_token, project)
+        if not project.is_dir():
+            raise InvalidParamsError("O diretório do projeto não está disponível.", field="project_path",
+                                     reason="path_missing")
+        return mission_reader(project)
+
+    def _handle_mission_list(self, params: Dict[str, Any], token: Optional[str] = None) -> List[Dict[str, Any]]:
+        return self._mission_reader(params, token).list()
+
+    def _handle_mission_get(self, params: Dict[str, Any], token: Optional[str] = None) -> Dict[str, Any]:
+        reader = self._mission_reader(params, token)
+        mission_id = params.get("mission_id")
+        if not isinstance(mission_id, str):
+            raise InvalidParamsError("Informe o ID da missão.", field="mission_id", reason="invalid_value")
+        try:
+            return reader.get(mission_id)
+        except ValueError:
+            raise InvalidParamsError("Missão indisponível neste projeto.", field="mission_id",
+                                     reason="not_found") from None
+
     def _settings_store(self) -> Any:
         from desktop.settings import SettingsStore
 

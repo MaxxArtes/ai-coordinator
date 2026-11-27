@@ -20,12 +20,40 @@ import re
 import sqlite3
 from typing import Any, Dict, List, Optional, Set, Tuple, Union
 
+from .dag import PlanRevision, get_ready_nodes
+
 now = lambda: dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
 
 
 class MissionControlError(ValueError):
     """Base error for Mission Control violations."""
     pass
+
+
+@dataclass(frozen=True)
+class Mission:
+    """A project mission anchored to the task that owns its versioned DAG."""
+
+    id: str
+    title: str
+    project: str
+    status: str
+    created: str
+    updated: str
+
+    def to_dict(self) -> dict[str, str]:
+        return asdict(self)
+
+
+def mission_dag(revision: PlanRevision | None) -> dict[str, Any] | None:
+    """Read the existing DAG and compute its advisory ready set."""
+    if revision is None:
+        return None
+    return {
+        **revision.to_dict(),
+        "node_order": revision.validate(),
+        "ready_node_ids": get_ready_nodes(revision.nodes, revision.edges),
+    }
 
 
 class RadioSilenceError(MissionControlError):

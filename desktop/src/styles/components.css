@@ -2615,3 +2615,61 @@
   font-size: var(--fs-xs);
   color: var(--c-fg);
 }
+
+.missions-view {
+  overflow: auto;
+  padding: 1.25rem;
+}
+
+.missions-view h2 {
+  margin: 0;
+  font-size: var(--fs-xl);
+}
+
+.missions-view h3 {
+  font-size: var(--fs-lg);
+}
+
+.missions-view__heading,
+.missions-view__select {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  margin-bottom: 0.75rem;
+}
+
+.missions-view__select select {
+  max-width: min(35rem, 75%);
+}
+
+.missions-view__graph {
+  display: flex;
+  gap: 1rem;
+  overflow-x: auto;
+}
+
+.missions-view__column {
+  display: grid;
+  align-content: start;
+  gap: 0.5rem;
+  flex: 0 0 14rem;
+  list-style: none;
+  padding: 0;
+  margin: 0;
+}
+
+.missions-view__node {
+  padding: 0.75rem;
+  border: 1px solid var(--c-border-strong);
+  border-radius: 0.5rem;
+  overflow-wrap: anywhere;
+}
+
+.missions-view__node summary {
+  cursor: pointer;
+}
+
+.missions-view__node summary span {
+  display: block;
+  font-size: var(--fs-sm);
+}

@@ -797,6 +797,11 @@ def parser():
     canc = sub.add_parser("cancel"); canc.add_argument("--task", required=True); canc.add_argument("--run", required=True)
     la = sub.add_parser("launch"); la.add_argument("--client", required=True, choices=["codex", "claude", "opencode", "agy"]); la.add_argument("--project", required=True); la.add_argument("--task"); la.add_argument("--model")
     dr = sub.add_parser("dag-revision"); dr.add_argument("--task", required=True); dr.add_argument("--set"); dr.add_argument("--summary"); dr.add_argument("--parent-revision", type=int); dr.add_argument("--show", action="store_true"); dr.add_argument("--revision", type=int); dr.add_argument("--history", action="store_true")
+    mission = sub.add_parser("mission", help="Consultar missoes do projeto")
+    mission.add_argument("--project", required=True)
+    mission.add_argument("--id", help="ID da missao para mostrar tarefas e DAG")
+    gateway = sub.add_parser("gateway", help="Servir o Gateway G0 local via MCP stdio")
+    gateway.add_argument("--project", required=True)
     dp = sub.add_parser("dag-proposal"); dp.add_argument("--task"); dp.add_argument("--proposal"); dp.add_argument("--propose"); dp.add_argument("--base-revision", type=int); dp.add_argument("--reason"); dp.add_argument("--diff-summary", default=""); dp.add_argument("--list", action="store_true"); dp.add_argument("--status"); dp.add_argument("--resolve", choices=["approved", "rejected", "cancelled"]); dp.add_argument("--activate", action="store_true"); dp.add_argument("--expected-base-revision", type=int)
     tp = sub.add_parser("trajectory-predict"); tp.add_argument("--task", required=True); tp.add_argument("--revision", type=int); tp.add_argument("--node"); tp.add_argument("--horizon", type=int, default=3); tp.add_argument("--save", action="store_true")
     th = sub.add_parser("trajectory-history"); th.add_argument("--task", required=True); th.add_argument("--revision", type=int); th.add_argument("--limit", type=int, default=10)
@@ -901,6 +906,19 @@ def parser():
 
 def main():
     args = parser().parse_args()
+    if args.command in {"mission", "gateway"}:
+        try:
+            if args.command == "gateway":
+                from .gateway import create_gateway_server
+                create_gateway_server(args.project, args.root).run()
+            else:
+                from .api import mission_reader
+                reader = mission_reader(args.project, args.root)
+                emit(reader.get(args.id) if args.id is not None else reader.list())
+        except (OSError, ValueError, RuntimeError, sqlite3.Error) as exc:
+            print(f"Erro: {exc}", file=sys.stderr)
+            return 2
+        return 0
     root = initialize_data_dir(args.root)
     config_path = root / "routes.json"
     config = read_json(config_path)

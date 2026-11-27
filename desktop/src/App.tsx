@@ -32,6 +32,7 @@ import {
 } from "./components/shell/AppHeader";
 import { MainNav, mainViewPanelId, type MainViewId } from "./components/shell/MainNav";
 import { MainViews } from "./components/shell/PlannedView";
+import { MissionsView } from "./components/shell/MissionsView";
 import { MonitoringView } from "./components/monitoring/MonitoringView";
 import { appendHistorySample, isRepeatedReading, type HistorySample } from "./components/monitoring/history";
 import {
@@ -1077,6 +1078,14 @@ export const App: React.FC = () => {
       <MainViews
         active={mainView}
         conversas={conversasContent}
+        missoes={
+          <MissionsView
+            key={projectPath}
+            active={mainView === "missoes"}
+            projectPath={projectPath}
+            invoke={isTauri && connectionStatus === "connected" ? callTauri : undefined}
+          />
+        }
         monitoramento={
           <MonitoringView
             active={mainView === "monitoramento"}

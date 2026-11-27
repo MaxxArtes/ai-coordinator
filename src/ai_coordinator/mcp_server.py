@@ -1,6 +1,7 @@
 """Optional MCP server exposing task state and explicitly requested workers."""
 from __future__ import annotations
 
+from pathlib import Path
 import sys
 from typing import Any
 
@@ -8,7 +9,7 @@ from . import __version__
 from .api import Coordinator
 
 
-def create_server():
+def create_server(root: str | Path | None = None):
     try:
         from mcp.server import MCPServer
     except ImportError as exc:
@@ -29,13 +30,13 @@ def create_server():
     @server.tool()
     def bootstrap_project(project_path: str) -> dict[str, Any]:
         """Return shared protocol and active task summaries for a project directory."""
-        with Coordinator() as coordinator:
+        with Coordinator(root) as coordinator:
             return coordinator.bootstrap(project_path)
 
     @server.tool()
     def list_active_tasks(project_path: str) -> list[dict[str, Any]]:
         """List active coordinator tasks for a project directory."""
-        with Coordinator() as coordinator:
+        with Coordinator(root) as coordinator:
             return coordinator.active_tasks(project_path)
 
     @server.tool()
@@ -45,13 +46,13 @@ def create_server():
         ai_memory_workstream_id: str | None = None,
     ) -> dict[str, Any]:
         """Create a task and optionally link its ai-memory workstream UUID."""
-        with Coordinator() as coordinator:
+        with Coordinator(root) as coordinator:
             return coordinator.new_task(project_path, goal, ai_memory_workstream_id)
 
     @server.tool()
     def resume_task(task_id: str) -> dict[str, Any]:
         """Read one task checkpoint and its recent worker runs."""
-        with Coordinator() as coordinator:
+        with Coordinator(root) as coordinator:
             return coordinator.resume(task_id)
 
     @server.tool()
@@ -64,19 +65,19 @@ def create_server():
         """Save a bounded checkpoint; revision must match the latest read."""
         if status is not None and status not in {"active", "complete", "blocked"}:
             raise ValueError("Status deve ser active, complete ou blocked")
-        with Coordinator() as coordinator:
+        with Coordinator(root) as coordinator:
             return coordinator.checkpoint(task_id, revision, patch, status)
 
     @server.tool()
     def list_routes() -> dict[str, Any]:
         """List configured worker routes without calling external models."""
-        with Coordinator() as coordinator:
+        with Coordinator(root) as coordinator:
             return coordinator.routes()
 
     @server.tool()
     def plan_worker(category: str, refresh: bool = False) -> dict[str, Any]:
         """Inspect one worker route. Refresh checks local client catalogs only."""
-        with Coordinator() as coordinator:
+        with Coordinator(root) as coordinator:
             return coordinator.plan(category, refresh)
 
     @server.tool()
@@ -93,7 +94,7 @@ def create_server():
             raise ValueError("max_attempts deve ser 1 ou 2")
         if response_format is not None and response_format not in {"text", "json", "python", "code"}:
             raise ValueError("Formato deve ser text, json, python ou code")
-        with Coordinator() as coordinator:
+        with Coordinator(root) as coordinator:
             return coordinator.delegate(
                 task_id, category, input_text, max_attempts=max_attempts,
                 response_format=response_format, exclude_clients=exclude_clients,

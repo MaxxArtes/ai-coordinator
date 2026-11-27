@@ -8,7 +8,13 @@ from typing import Any
 
 from . import runtime
 from .cli import Store, bootstrap as _bootstrap, export_context as _export_context, run_worker as _run_worker
-from .data import initialize_data_dir
+from .data import default_data_dir, initialize_data_dir
+from .storage import MissionReader
+
+
+def mission_reader(project: str | Path, root: str | Path | None = None) -> MissionReader:
+    """Open project-scoped mission queries without initializing or migrating the store."""
+    return MissionReader(default_data_dir() if root is None else root, project)
 
 
 class Coordinator:

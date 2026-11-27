@@ -81,10 +81,10 @@ describe("MainNav", () => {
     expect(conversas.querySelector(".main-nav__count")).toHaveTextContent(String(n));
   });
 
-  it("only Missões is announced as planned while Monitoramento is active (4D.4.2)", () => {
+  it("the tabs announce the current screen names", () => {
     render(<Harness />);
     expect(screen.getByRole("tab", { name: /^Monitoramento$/ })).toBeInTheDocument();
-    expect(screen.getByRole("tab", { name: /^Missões\s*\(planejado\)$/ })).toBeInTheDocument();
+    expect(screen.getByRole("tab", { name: /^Missões$/ })).toBeInTheDocument();
     expect(screen.getByRole("tab", { name: /^Conversas/ }).textContent).not.toMatch(/planejado/);
   });
 });
@@ -121,28 +121,19 @@ describe("MainViews", () => {
     }
   });
 
-  it("the missoes screen is a clearly identified temporary screen, with no data and no control", async () => {
+  it("Missões asks for a project before showing data", async () => {
     const user = userEvent.setup();
     render(<Harness />);
-    await user.click(screen.getByRole("tab", { name: /^Missões/ }));
-    const view = document.getElementById("main-view-missoes")!;
-    expect(view).not.toHaveAttribute("hidden");
-    const badges = Array.from(view.querySelectorAll(".badge")).map((b) => b.textContent);
-    expect(badges).toEqual(["Tela temporária", "planejado", "4D.5"]);
+    await user.click(screen.getByRole("tab", { name: /^Missões$/ }));
+    const view = screen.getByRole("tabpanel", { name: "Missões" });
     expect(within(view).getByRole("heading", { level: 2, name: "Missões" })).toBeInTheDocument();
-    expect(view.querySelectorAll("button, a, input, select, textarea, progress, meter, [role=progressbar], [role=meter]")).toHaveLength(0);
-    expect((view.textContent ?? "").replace(/4D\.\d+/g, "")).not.toMatch(/\d/);
-    expect(view).toHaveTextContent("Até lá, esta tela não mostra dados nem tem controles.");
+    expect(view).toHaveTextContent("Abra um projeto para consultar suas missões.");
   });
 
   it("the approved texts (operator, 17/11)", () => {
     expect(PLANNED_CONTENT.monitoramento.text).toBe(
       "Vai mostrar os recursos usados pela árvore de processos do aplicativo, as cotas e os custos dos provedores, " +
         "sempre com a origem de cada medida. Até lá, esta tela não mostra dados nem tem controles.",
-    );
-    expect(PLANNED_CONTENT.missoes.text).toBe(
-      "Vai acompanhar as operações reais do Core: o grafo de cada missão, as tarefas que esperam decisão humana e os " +
-        "checkpoints de retomada. Até lá, esta tela não mostra dados nem tem controles.",
     );
   });
 });

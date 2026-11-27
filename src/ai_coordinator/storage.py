@@ -24,7 +24,9 @@ from .mission import (
     FlightBudget,
     FlightPlan,
     LandingCheck,
+    Mission,
     MissionControl,
+    mission_dag,
     MissionControlError,
     RadioSilenceError,
     BudgetExceededError,
@@ -311,6 +313,146 @@ VALID_STATUS_TRANSITIONS: Dict[str, Set[str]] = {
     RunState.FAILED: set(),
     RunState.CANCELLED: set(),
 }
+
+
+def _read_plan_revision(db: sqlite3.Connection, task_id: str, revision: Optional[int] = None) -> Optional[PlanRevision]:
+    """Fetch a specific or the latest active immutable plan revision."""
+    task_id = validate_id(task_id)
+    if revision is not None:
+        rev_row = db.execute(
+            "SELECT * FROM plan_revisions WHERE task_id=? AND revision=?",
+            (task_id, revision)
+        ).fetchone()
+    else:
+        rev_row = db.execute(
+            "SELECT * FROM plan_revisions WHERE task_id=? ORDER BY revision DESC LIMIT 1",
+            (task_id,)
+        ).fetchone()
+
+    if not rev_row:
+        return None
+
+    rev = rev_row["revision"]
+    node_rows = db.execute(
+        "SELECT * FROM plan_nodes WHERE task_id=? AND revision=? ORDER BY node_id ASC",
+        (task_id, rev)
+    ).fetchall()
+
+    nodes: Dict[str, PlanNode] = {}
+    for r in node_rows:
+        nodes[r["node_id"]] = PlanNode(
+            node_id=r["node_id"],
+            title=r["title"],
+            description=r["description"] or "",
+            entry_criteria=json.loads(r["entry_criteria"] or "[]"),
+            exit_criteria=json.loads(r["exit_criteria"] or "[]"),
+            deliverables=json.loads(r["deliverables"] or "[]"),
+            status=r["status"],
+            assigned_role=r["assigned_role"] or "worker",
+            metadata=json.loads(r["metadata"] or "{}"),
+        )
+
+    edge_rows = db.execute(
+        "SELECT * FROM plan_edges WHERE task_id=? AND revision=? ORDER BY from_node, to_node ASC",
+        (task_id, rev)
+    ).fetchall()
+
+    edges = [
+        PlanEdge(
+            from_node=r["from_node"],
+            to_node=r["to_node"],
+            edge_type=r["edge_type"] or "depends_on",
+            metadata=json.loads(r["metadata"] or "{}"),
+        )
+        for r in edge_rows
+    ]
+
+    return PlanRevision(
+        task_id=task_id,
+        revision=rev,
+        parent_revision=rev_row["parent_revision"],
+        summary=rev_row["summary"],
+        status=rev_row["status"],
+        created_at=rev_row["created_at"],
+        nodes=nodes,
+        edges=edges,
+        metadata=json.loads(rev_row["metadata"] or "{}"),
+    )
+
+class MissionReader:
+    """Project-scoped queries over an existing Coordinator SQLite database."""
+
+    def __init__(self, root: str | Path, project: str | Path):
+        self.path = Path(root).expanduser().resolve() / "coordination.sqlite"
+        self.project = project_path(project)
+
+    @contextlib.contextmanager
+    def _connection(self):
+        db = sqlite3.connect(self.path.as_uri() + "?mode=ro", uri=True, timeout=5)
+        db.row_factory = sqlite3.Row
+        try:
+            db.execute("BEGIN")
+            yield db
+        finally:
+            db.close()
+
+    @staticmethod
+    def _has_missions(db: sqlite3.Connection) -> bool:
+        return db.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='missions'"
+        ).fetchone() is not None
+
+    def list(self) -> list[dict[str, str]]:
+        if not self.path.is_file():
+            return []
+        with self._connection() as db:
+            if not self._has_missions(db):
+                return []
+            rows = db.execute(
+                """SELECT m.task_id AS id, m.title, t.project, t.status, m.created, t.updated
+                   FROM missions m JOIN tasks t ON t.id=m.task_id
+                   WHERE t.project=? ORDER BY t.updated DESC, m.task_id""",
+                (self.project,),
+            )
+            return [Mission(**dict(row)).to_dict() for row in rows]
+
+    def get(self, mission_id: str) -> dict[str, Any]:
+        mission_id = validate_id(mission_id)
+        if not self.path.is_file():
+            raise ValueError("Missao nao encontrada no projeto")
+        with self._connection() as db:
+            row = None
+            if self._has_missions(db):
+                row = db.execute(
+                    """SELECT m.task_id AS id, m.title, t.project, t.status, m.created, t.updated
+                       FROM missions m JOIN tasks t ON t.id=m.task_id WHERE m.task_id=? AND t.project=?""",
+                    (mission_id, self.project),
+                ).fetchone()
+            if row is None:
+                raise ValueError("Missao nao encontrada no projeto")
+            tasks = db.execute(
+                """SELECT t.id, t.goal, t.status, t.revision, t.updated
+                   FROM mission_tasks mt JOIN tasks t ON t.id=mt.task_id
+                   WHERE mt.mission_id=? AND t.project=? ORDER BY t.id""",
+                (mission_id, self.project),
+            )
+            return {
+                **Mission(**dict(row)).to_dict(),
+                "tasks": [dict(task) for task in tasks],
+                "dag": mission_dag(_read_plan_revision(db, mission_id)),
+            }
+
+    def task(self, task_id: str) -> dict[str, Any]:
+        task_id = validate_id(task_id)
+        if self.path.is_file():
+            with self._connection() as db:
+                row = db.execute(
+                    "SELECT id, project, goal, status, revision, updated FROM tasks WHERE id=? AND project=?",
+                    (task_id, self.project),
+                ).fetchone()
+                if row is not None:
+                    return dict(row)
+        raise ValueError("Tarefa nao encontrada no projeto")
 
 
 class Store:
@@ -620,6 +762,18 @@ class Store:
             step_count INTEGER DEFAULT 0,
             uncheckpointed_steps INTEGER DEFAULT 0,
             drift_status TEXT DEFAULT 'nominal'
+          );
+
+          CREATE TABLE IF NOT EXISTS missions (
+            task_id TEXT PRIMARY KEY REFERENCES tasks(id),
+            title TEXT NOT NULL,
+            created TEXT NOT NULL
+          );
+
+          CREATE TABLE IF NOT EXISTS mission_tasks (
+            mission_id TEXT NOT NULL REFERENCES missions(task_id),
+            task_id TEXT NOT NULL REFERENCES tasks(id),
+            PRIMARY KEY (mission_id, task_id)
           );
 
           CREATE TABLE IF NOT EXISTS runs (
@@ -1183,6 +1337,29 @@ class Store:
         if mirror:
             self.defer_post_commit(lambda: self.mirror(created_task))
         return created_task
+
+    def register_mission(self, task_id: str, title: str, task_ids: Sequence[str] = ()) -> None:
+        """Register a local mission and link existing tasks in the anchor's project."""
+        task_id = validate_id(task_id)
+        if not isinstance(title, str) or not title.strip() or len(title) > 1500:
+            raise ValueError("Titulo da missao deve ter 1 a 1500 caracteres")
+        title = title.strip()
+        members = sorted({task_id, *(validate_id(member) for member in task_ids)})
+        with self.transaction():
+            anchor = self.task(task_id)
+            if any(self.task(member)["project"] != anchor["project"] for member in members):
+                raise ValueError("Tarefas vinculadas devem pertencer ao projeto da missao")
+            previous = self.db.execute("SELECT title FROM missions WHERE task_id=?", (task_id,)).fetchone()
+            if previous is not None and previous["title"] != title:
+                raise ValueError("Missao ja registrada com outro titulo")
+            self.db.execute(
+                "INSERT INTO missions(task_id, title, created) VALUES (?, ?, ?) ON CONFLICT(task_id) DO NOTHING",
+                (task_id, title, now()),
+            )
+            self.db.executemany(
+                "INSERT INTO mission_tasks(mission_id, task_id) VALUES (?, ?) ON CONFLICT DO NOTHING",
+                ((task_id, member) for member in members),
+            )
 
     def context(self, project: Union[str, Path]) -> List[Dict[str, Any]]:
         rows = self.db.execute(
@@ -1803,68 +1980,7 @@ class Store:
             )
 
     def get_plan_revision(self, task_id: str, revision: Optional[int] = None) -> Optional[PlanRevision]:
-        """Fetch a specific or the latest active immutable plan revision."""
-        task_id = validate_id(task_id)
-        if revision is not None:
-            rev_row = self.db.execute(
-                "SELECT * FROM plan_revisions WHERE task_id=? AND revision=?",
-                (task_id, revision)
-            ).fetchone()
-        else:
-            rev_row = self.db.execute(
-                "SELECT * FROM plan_revisions WHERE task_id=? ORDER BY revision DESC LIMIT 1",
-                (task_id,)
-            ).fetchone()
-
-        if not rev_row:
-            return None
-
-        rev = rev_row["revision"]
-        node_rows = self.db.execute(
-            "SELECT * FROM plan_nodes WHERE task_id=? AND revision=? ORDER BY node_id ASC",
-            (task_id, rev)
-        ).fetchall()
-
-        nodes: Dict[str, PlanNode] = {}
-        for r in node_rows:
-            nodes[r["node_id"]] = PlanNode(
-                node_id=r["node_id"],
-                title=r["title"],
-                description=r["description"] or "",
-                entry_criteria=json.loads(r["entry_criteria"] or "[]"),
-                exit_criteria=json.loads(r["exit_criteria"] or "[]"),
-                deliverables=json.loads(r["deliverables"] or "[]"),
-                status=r["status"],
-                assigned_role=r["assigned_role"] or "worker",
-                metadata=json.loads(r["metadata"] or "{}"),
-            )
-
-        edge_rows = self.db.execute(
-            "SELECT * FROM plan_edges WHERE task_id=? AND revision=? ORDER BY from_node, to_node ASC",
-            (task_id, rev)
-        ).fetchall()
-
-        edges = [
-            PlanEdge(
-                from_node=r["from_node"],
-                to_node=r["to_node"],
-                edge_type=r["edge_type"] or "depends_on",
-                metadata=json.loads(r["metadata"] or "{}"),
-            )
-            for r in edge_rows
-        ]
-
-        return PlanRevision(
-            task_id=task_id,
-            revision=rev,
-            parent_revision=rev_row["parent_revision"],
-            summary=rev_row["summary"],
-            status=rev_row["status"],
-            created_at=rev_row["created_at"],
-            nodes=nodes,
-            edges=edges,
-            metadata=json.loads(rev_row["metadata"] or "{}"),
-        )
+        return _read_plan_revision(self.db, task_id, revision)
 
     def list_plan_revisions(self, task_id: str) -> List[Dict[str, Any]]:
         """List all immutable plan revisions in historical chronological order."""

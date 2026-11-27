@@ -4,7 +4,7 @@ import React, { useCallback, useRef } from "react";
  * Main navigation (Etapa 5): Conversas, Monitoramento and Missões as horizontal tabs.
  * - Arrow keys with wrap-around, Home and End; roving tabIndex and automatic activation (same pattern as the
  *   Configurações tabs).
- * - Conversas shows the real number of terminals; the other two are announced as planned.
+ * - Conversas shows the real number of terminals.
  * - The active tab is the F6 entry of the header region.
  */
 export type MainViewId = "conversas" | "monitoramento" | "missoes";
@@ -12,7 +12,7 @@ export type MainViewId = "conversas" | "monitoramento" | "missoes";
 export const MAIN_VIEWS: ReadonlyArray<{ id: MainViewId; label: string; planned: boolean }> = [
   { id: "conversas", label: "Conversas", planned: false },
   { id: "monitoramento", label: "Monitoramento", planned: false },
-  { id: "missoes", label: "Missões", planned: true },
+  { id: "missoes", label: "Missões", planned: false },
 ];
 
 export const mainViewTabId = (id: MainViewId): string => `main-tab-${id}`;
