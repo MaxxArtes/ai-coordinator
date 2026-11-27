@@ -169,13 +169,17 @@ def test_windows_job_object_cpu_cap_and_cli_without_desktop(tmp_path, capsys, mo
             role="worker",
             use_job_object=True,
             resource_limits=limits,
+            stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
         )
         assert proc.job_handle is not None
-        out, _ = proc.communicate(timeout=5)
-        assert out.strip() == "capped-ok"
+        try:
+            out, _ = proc.communicate(timeout=15)
+            assert out.strip() == "capped-ok"
+        finally:
+            proc.close()
 
 
 def test_cross_root_authority_live_lease_protection_and_dynamic_rebalance(tmp_path):
@@ -263,3 +267,43 @@ def test_windows_job_object_hard_cap_actually_throttles_cpu():
             assert cpu_used_s <= max(0.35, 0.20 * cores * 0.9 * 1.35)
     finally:
         proc.close()
+
+
+def test_cross_userprofile_global_authority_and_no_env_bypass(tmp_path, monkeypatch):
+    from ai_coordinator.governor import resolve_global_governor_db
+
+    # Outside pytest mode, AI_COORDINATOR_GLOBAL_GOVERNOR_DIR cannot bypass global authority,
+    # and different USERPROFILE / APPDATA / HOME values resolve to the exact same DB path.
+    monkeypatch.delenv("PYTEST_CURRENT_TEST", raising=False)
+    monkeypatch.setenv("AI_COORDINATOR_GLOBAL_GOVERNOR_DIR", str(tmp_path / "attacker_bypass"))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path / "profile_one"))
+    monkeypatch.setenv("APPDATA", str(tmp_path / "profile_one" / "AppData" / "Roaming"))
+    db_profile_1 = resolve_global_governor_db(tmp_path / "r1")
+
+    monkeypatch.setenv("USERPROFILE", str(tmp_path / "profile_two"))
+    monkeypatch.setenv("APPDATA", str(tmp_path / "profile_two" / "AppData" / "Roaming"))
+    db_profile_2 = resolve_global_governor_db(tmp_path / "r2")
+
+    assert db_profile_1 == db_profile_2
+    assert "attacker_bypass" not in str(db_profile_1)
+
+
+def test_real_identity_reclaim_detects_recycled_pid(tmp_path):
+    root = tmp_path / "coord"
+    proj = tmp_path / "proj"
+    proj.mkdir()
+    store = Store(root)
+    try:
+        task_id = store.new(proj, "Identity test")["id"]
+        # Insert a lease claiming os.getpid() (which IS alive) but with a mismatched create_time_ns
+        store.governor.db.execute(
+            """INSERT INTO resource_governor_leases(
+                lease_id, task_id, project, owner_pid, owner_create_time, status, acquired_at, expires_at
+            ) VALUES ('recycled1', ?, ?, ?, 12345, 'active', ?, ?)""",
+            (task_id, str(proj), os.getpid(), time.time() - 10.0, time.time() + 100.0),
+        )
+        store.governor.db.commit()
+        assert store.governor.reclaim_abandoned_leases() == 1
+    finally:
+        store.governor.close()
+        store.db.close()

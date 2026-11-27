@@ -17,6 +17,8 @@ import os
 from pathlib import Path
 import shutil
 import sqlite3
+import subprocess
+import sys
 import time
 from typing import Any, Callable, Dict, Optional, Tuple
 import uuid
@@ -177,6 +179,35 @@ def _sample_memory() -> Tuple[int, int, float]:
         if tot_kb > 0:
             used_pct = round(100.0 * (1.0 - (avail_kb / tot_kb)), 2)
             return tot_kb // 1024, avail_kb // 1024, used_pct
+    if sys.platform == "darwin":
+        try:
+            total_bytes = int(subprocess.check_output(["sysctl", "-n", "hw.memsize"], text=True, timeout=2).strip())
+            vm_out = subprocess.check_output(["vm_stat"], text=True, timeout=2)
+            page_size = 4096
+            pages: Dict[str, int] = {}
+            for line in vm_out.splitlines():
+                if "page size of" in line:
+                    for tok in line.split():
+                        if tok.isdigit():
+                            page_size = int(tok)
+                            break
+                elif ":" in line:
+                    k, v = line.split(":", 1)
+                    num = v.strip().rstrip(".")
+                    if num.isdigit():
+                        pages[k.strip()] = int(num)
+            free_pages = (
+                pages.get("Pages free", 0)
+                + pages.get("Pages inactive", 0)
+                + pages.get("Pages speculative", 0)
+            )
+            avail_bytes = free_pages * page_size
+            total_mb = total_bytes // (1024 * 1024)
+            avail_mb = min(total_mb, avail_bytes // (1024 * 1024))
+            used_pct = round(100.0 * (1.0 - (avail_mb / total_mb)), 2) if total_mb > 0 else 0.0
+            return total_mb, avail_mb, max(0.0, min(100.0, used_pct))
+        except Exception:
+            pass
     return 0, 0, 0.0
 
 
@@ -268,17 +299,35 @@ def effective_worker_cpu_cap(band: str, config: GovernorConfig) -> Optional[floa
 
 
 def resolve_global_governor_db(fallback_root: Path) -> Path:
-    """Resolve the machine-shared governor database across all roots/profiles/runtimes."""
-    override = os.environ.get("AI_COORDINATOR_GLOBAL_GOVERNOR_DIR")
-    if override:
-        base = Path(override).expanduser().resolve()
+    """Resolve the machine-shared governor database across all roots/profiles/USERPROFILEs.
+
+    AI_COORDINATOR_GLOBAL_GOVERNOR_DIR is honored only under pytest so production
+    sessions cannot bypass the shared machine authority via environment overrides.
+    """
+    if "PYTEST_CURRENT_TEST" in os.environ:
+        override = os.environ.get("AI_COORDINATOR_GLOBAL_GOVERNOR_DIR")
+        if override:
+            base = Path(override).expanduser().resolve()
+            base.mkdir(parents=True, exist_ok=True)
+            return base / "governor.sqlite"
+
+    candidates = []
+    if os.name == "nt":
+        prog_data = os.environ.get("ProgramData") or os.environ.get("ALLUSERSPROFILE") or r"C:\ProgramData"
+        sys_drive = os.environ.get("SystemDrive", "C:")
+        candidates.append(Path(prog_data) / "ai-coordinator" / "global_governor")
+        candidates.append(Path(sys_drive + r"\Users\Public\ai-coordinator\global_governor"))
     else:
-        base = Path.home() / ".ai-coordinator" / "global_governor"
-    try:
-        base.mkdir(parents=True, exist_ok=True)
-        return base / "governor.sqlite"
-    except OSError:
-        return fallback_root / "coordination.sqlite"
+        uid = os.getuid() if hasattr(os, "getuid") else 0
+        candidates.append(Path(f"/var/tmp/ai-coordinator-governor-{uid}"))
+
+    for base in candidates:
+        try:
+            base.mkdir(parents=True, exist_ok=True)
+            return base / "governor.sqlite"
+        except OSError:
+            continue
+    return fallback_root / "coordination.sqlite"
 
 
 class ResourceGovernor:

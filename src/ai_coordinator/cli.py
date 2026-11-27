@@ -768,7 +768,11 @@ def launch(store, config, client, project, task_id=None, model=None):
     )
     job_handle = None
     try:
-        proc = subprocess.Popen(cmd, cwd=project, env=env)
+        popen_kwargs: dict[str, Any] = {"cwd": project, "env": env}
+        if os.name == "nt":
+            # Start suspended so the process is assigned to the Job Object before executing any instruction
+            popen_kwargs["creationflags"] = 0x00000004  # CREATE_SUSPENDED
+        proc = subprocess.Popen(cmd, **popen_kwargs)
         if os.name == "nt":
             from .process import WindowsProcessController
             limits = ResourceLimits(
@@ -780,7 +784,9 @@ def launch(store, config, client, project, task_id=None, model=None):
                 resource_limits=limits,
             )
             if job_handle:
-                WindowsProcessController.assign_to_job(job_handle, proc.pid)
+                proc_handle = getattr(proc, "_handle", None)
+                WindowsProcessController.assign_to_job(job_handle, proc.pid, proc_handle=proc_handle)
+            WindowsProcessController.resume_process(getattr(proc, "_handle", None))
         while proc.poll() is None:
             time.sleep(1.0)
             if job_handle:
@@ -1344,6 +1350,8 @@ def main():
                 emit(store.governor.update_config(**updates).to_dict())
         return 0
     finally:
+        if hasattr(store, "governor") and store.governor:
+            store.governor.close()
         store.db.close()
 
 if __name__ == "__main__":
