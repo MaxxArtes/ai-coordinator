@@ -13,11 +13,15 @@ the cycle raises.
 
 from __future__ import annotations
 
-import _winapi
 import gc
 import json
 import os
 from pathlib import Path
+
+if os.name == "nt":
+    import _winapi
+else:
+    _winapi = None  # type: ignore[assignment]
 
 import pytest
 

@@ -95,8 +95,16 @@ def test_verified_same_directory_fails_closed_on_zero_ino(dispatch, tmp_path, mo
     project = tmp_path / "project"
     project.mkdir()
     real_stat = os.stat
-    fake_stat = os.stat_result((real_stat(project).st_mode, 0, real_stat(project).st_dev, 1, 0, 0, 0, 0, 0, 0))
-    monkeypatch.setattr(cli.os, "stat", lambda _path: fake_stat)
+    st = real_stat(project)
+    fake_stat = os.stat_result((st.st_mode, 0, st.st_dev, 1, 0, 0, 0, 0, 0, 0))
+    target_norm = os.path.normcase(os.fspath(project))
+
+    def stub_stat(path, *args, **kwargs):
+        if isinstance(path, (str, bytes, os.PathLike)) and os.path.normcase(os.fspath(path)) == target_norm:
+            return fake_stat
+        return real_stat(path, *args, **kwargs)
+
+    monkeypatch.setattr(cli.os, "stat", stub_stat)
     with pytest.raises(ValueError, match="Identidade do diretorio indeterminada"):
         cli._verified_same_directory(project, project)
 
@@ -113,7 +121,14 @@ def test_verified_same_directory_fails_closed_on_zero_dev(dispatch, tmp_path, mo
     real_stat = os.stat
     st = real_stat(project)
     fake_stat = os.stat_result((st.st_mode, st.st_ino or 12345, 0, 1, 0, 0, 0, 0, 0, 0))
-    monkeypatch.setattr(cli.os, "stat", lambda _path: fake_stat)
+    target_norm = os.path.normcase(os.fspath(project))
+
+    def stub_stat(path, *args, **kwargs):
+        if isinstance(path, (str, bytes, os.PathLike)) and os.path.normcase(os.fspath(path)) == target_norm:
+            return fake_stat
+        return real_stat(path, *args, **kwargs)
+
+    monkeypatch.setattr(cli.os, "stat", stub_stat)
     with pytest.raises(ValueError, match="Identidade do diretorio indeterminada"):
         cli._verified_same_directory(project, project)
 
@@ -127,9 +142,13 @@ def test_verified_same_directory_fails_closed_on_zero_dev(dispatch, tmp_path, mo
 def test_verified_same_directory_fails_closed_on_oserror(tmp_path, monkeypatch):
     project = tmp_path / "project"
     project.mkdir()
+    real_stat = os.stat
+    target_norm = os.path.normcase(os.fspath(project))
 
-    def failing_stat(_path):
-        raise OSError("simulated stat failure")
+    def failing_stat(path, *args, **kwargs):
+        if isinstance(path, (str, bytes, os.PathLike)) and os.path.normcase(os.fspath(path)) == target_norm:
+            raise OSError("simulated stat failure")
+        return real_stat(path, *args, **kwargs)
 
     monkeypatch.setattr(cli.os, "stat", failing_stat)
     with pytest.raises(ValueError, match="Nao foi possivel verificar a identidade do diretorio"):
