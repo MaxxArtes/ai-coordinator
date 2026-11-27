@@ -1,11 +1,11 @@
 {
-  "version": "0.6.1-alpha.50",
-  "notes": "AI Coordinator Desktop Alpha v0.6.1-alpha.50 (R52): exclusao mutua Rust/Python (UpdateFreezeGuard), contagem autoritativa multi-aba, invalidacao automatica de autorizacao e CI Run 43301672945.",
-  "pub_date": "2026-11-12T20:45:47Z",
+  "version": "0.6.1-alpha.53",
+  "notes": "AI Coordinator Desktop 0.6.1-alpha.53: atualiza Core embarcado para v0.6.1 (correcao de seguranca GHSA-j9xw-7pjv-hrgh, launcher fail-closed e failover D1/B3-07), assinatura oficial Minisign 499FF8912D665FE8.",
+  "pub_date": "2026-11-27T15:15:00Z",
   "platforms": {
     "windows-x86_64": {
-      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVUb1gyWXRrZmlmU1o1ejBQV3IvMm5DS3AxQUxXTU5yWFNMdGRVSmx4RlVLU2xzcml1ZUJaK2hra2RuQkJzM1lNdEkyUTkvMDRQa09nK3pEaXZCQUw2cDZOcFNwY2c1a2c4PQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzk0NTE2MDQxCWZpbGU6QUkgQ29vcmRpbmF0b3IgRGVza3RvcF8wLjYuMS1hbHBoYS41MF94NjQtc2V0dXAuZXhlCXZlcnNpb246MC42LjEtYWxwaGEuNTAKVVQzVEpwUFVlVFp1eUw2ZWI3T1ZPK0JrOXpvYkNjYzNwa0loTEowTitJRllkQXJRdTd1WUNCOW5aazNoTDA3ZGlManhGWlpSNlk4WVJ4cjRzNHpDQkE9PQo=",
-      "url": "https://github.com/MaxxArtes/ai-coordinator/releases/download/v0.6.1-alpha.50/AI-Coordinator-Desktop_0.6.1-alpha.50_x64-setup.exe"
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVUb1gyWXRrZmlmU1pJUTVJdGUyenYxSW5DdlJsZkpNOG9pS2ErZ212WG53bmtTZHVYLzVDZTlabGpmc1ROeDcxTkxTMm53clludE9nUStNK0dUeDJIS0ZHMlYzRXljQlE4PQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzk1NzkyMTQyCWZpbGU6QUkgQ29vcmRpbmF0b3IgRGVza3RvcF8wLjYuMS1hbHBoYS41M194NjQtc2V0dXAuZXhlCXZlcnNpb246MC42LjEtYWxwaGEuNTMKa1RIVy9KM2xXVEpyd2JiaWhUVVFrb3BLcUdXa3V4bm1uSldISGpVdUhNTDJvRkxmTDBhWEkvUWIveHVGL2JHdjJCZlR0dFk2S0gyUjdEYk12SmNNQWc9PQo=",
+      "url": "https://github.com/MaxxArtes/ai-coordinator/releases/download/v0.6.1-alpha.53/AI-Coordinator-Desktop_0.6.1-alpha.53_x64-setup.exe"
     }
   }
 }
