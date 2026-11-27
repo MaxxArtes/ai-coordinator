@@ -189,7 +189,7 @@ describe("StartupStatus", () => {
 
 describe("AppHeader", () => {
   const base = {
-    status: { core_version: "0.6.0", host_os: "windows", is_isolated: true, python_path: "C:\\app\\runtime\\python.exe" },
+    status: { core_version: "0.6.1", host_os: "windows", is_isolated: true, python_path: "C:\\app\\runtime\\python.exe" },
     appVersion: "0.6.1-alpha.50",
     isTauri: true,
     connectionStatus: "connected" as const,

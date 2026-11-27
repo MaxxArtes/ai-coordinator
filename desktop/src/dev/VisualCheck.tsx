@@ -44,7 +44,7 @@ const view = params.get("view") ?? "app-preview";
 if (params.get("stimulation") === "low") document.documentElement.dataset.stimulation = "low";
 
 const RUNTIME: RuntimeStatus = {
-  core_version: "0.6.0",
+  core_version: "0.6.1",
   python_version: "3.12.8",
   app_version: "0.6.1-alpha.50",
   license: "PolyForm-Noncommercial-1.0.0",

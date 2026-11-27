@@ -12,7 +12,7 @@ import { CONFIRM_ARM_DELAY_MS, armingClock } from "./VaultPanel";
 vi.mock("@tauri-apps/api/event", () => ({ listen: vi.fn(async () => () => {}) }));
 
 const RUNTIME: RuntimeStatus = {
-  core_version: "0.6.0",
+  core_version: "0.6.1",
   python_version: "3.12.8",
   app_version: "0.6.1-alpha.50",
   license: "PolyForm-Noncommercial-1.0.0",

@@ -125,7 +125,7 @@ sys.stdout.write(json.dumps(res))
         return result
 
     def verify_core_integration(self) -> Dict[str, Any]:
-        """Verify that Core v0.6.0 modules can be imported inside the isolated private runtime."""
+        """Verify that Core v0.6.1 modules can be imported inside the isolated private runtime."""
         src_dir = str(self.root_dir / "src")
         test_code = f"""
 import sys
@@ -136,7 +136,7 @@ from ai_coordinator.dag import validate_dag
 import json
 
 res = {{
-    'core_version': getattr(ai_coordinator, '__version__', '0.6.0'),
+    'core_version': getattr(ai_coordinator, '__version__', '0.6.1'),
     'provenance_values': [MetricProvenance.MEASURED, MetricProvenance.ESTIMATED, MetricProvenance.UNKNOWN],
     'dag_available': callable(validate_dag)
 }}

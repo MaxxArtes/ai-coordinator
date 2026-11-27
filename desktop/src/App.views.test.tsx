@@ -84,7 +84,7 @@ function host({ preview = false, authorized = true, metricsFail = false, setting
         if (preview) throw new Error("sem host Tauri");
         return "pong";
       case "get_runtime_status":
-        return { core_version: "0.6.0", app_version: "0.6.1-alpha.50", host_os: "windows", is_isolated: true, python_path: "C:\\app\\python.exe" };
+        return { core_version: "0.6.1", app_version: "0.6.1-alpha.50", host_os: "windows", is_isolated: true, python_path: "C:\\app\\python.exe" };
       case "terminal_list_interpreters":
         return { interpreters: [
           { id: "cmd", label: "CMD" },
@@ -361,7 +361,7 @@ describe("App views", () => {
       expect(bar()).toHaveTextContent("RAM da árvore: aguardando");
       await waitFor(() => expect(bar()).toHaveTextContent("RAM da árvore: 128,4 MB (medida)"), { timeout: 3500 });
       expect(bar()).toHaveTextContent("CPU: indisponível");
-      expect(bar()).toHaveTextContent("Core v0.6.0 · conectado");
+      expect(bar()).toHaveTextContent("Core v0.6.1 · conectado");
       expect(bar()).toHaveTextContent("Terminais: 1 de 4");
       expect(bar().querySelector(".status-bar__group--end .status-bar__item--hint")).toHaveTextContent("F6 alternar regiões");
       expect(document.body.textContent).not.toMatch(/37[,.]5/);

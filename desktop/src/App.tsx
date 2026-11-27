@@ -741,7 +741,7 @@ export const App: React.FC = () => {
           isTauriRef.current = false;
           setIsTauri(false);
           setStatus({
-            core_version: "0.6.0",
+            core_version: "0.6.1",
             host_os: "windows",
             is_isolated: true,
             python_path: "desktop/runtime/python_spec.json (preview)",

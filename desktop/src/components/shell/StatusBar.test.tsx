@@ -9,7 +9,7 @@ import { formatBytesPtBR, splitProjectPath, splitQualifier, StatusBar, type Stat
 const base: StatusBarProps = {
   isTauri: true,
   connectionStatus: "connected",
-  coreVersion: "0.6.0",
+  coreVersion: "0.6.1",
   paneCount: 2,
   metrics: { host_pid: 4242, host_ram_bytes: 61_000_000, total_tree_ram_bytes: 134_637_159, cpu_usage_percent: 37.5 },
   projectPath: "D:\\ai-coordinator",
@@ -20,7 +20,7 @@ const bar = () => screen.getByRole("contentinfo", { name: "Barra de status" });
 describe("StatusBar", () => {
   it("Core, terminals and the measured RAM, in pt-BR", () => {
     render(<StatusBar {...base} />);
-    expect(bar()).toHaveTextContent("Core v0.6.0 · conectado");
+    expect(bar()).toHaveTextContent("Core v0.6.1 · conectado");
     expect(bar()).toHaveTextContent("Terminais: 2 de 4");
     expect(bar()).toHaveTextContent("RAM da árvore: 128,4 MB (medida)");
     expect(bar().textContent).not.toMatch(/ativos/);
@@ -37,7 +37,7 @@ describe("StatusBar", () => {
     expect(bar()).toHaveTextContent("Preview: sem Core");
     expect(bar()).toHaveTextContent("RAM da árvore: indisponível (preview)");
     expect(bar()).toHaveTextContent("Terminais: 1 de 4 (preview)");
-    expect(bar().textContent).not.toMatch(/conectado|0\.6\.0/);
+    expect(bar().textContent).not.toMatch(/conectado|0\.6\.1/);
   });
 
   it("an unknown Core version leaves no lone 'v'", () => {
@@ -158,7 +158,7 @@ describe("StatusBar", () => {
     const details = Array.from(bar().querySelectorAll(".status-bar__detail"));
     expect(details.map((d) => d.textContent)).toEqual([" (3 ativos)", " da árvore", " (medida · privada)", " (medida)"]);
     expect(bar().querySelectorAll(".status-bar__detail--value")).toHaveLength(3);
-    for (const essential of ["Core v0.6.0 · conectado", "2 de 4", "128,4 MB", "4,5%"]) {
+    for (const essential of ["Core v0.6.1 · conectado", "2 de 4", "128,4 MB", "4,5%"]) {
       expect(details.some((d) => d.textContent?.includes(essential))).toBe(false);
     }
     const items = Array.from(bar().querySelectorAll(".status-bar__group:not(.status-bar__group--end) .status-bar__item[title]")).map(
