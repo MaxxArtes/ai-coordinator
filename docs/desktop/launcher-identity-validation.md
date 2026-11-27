@@ -1,6 +1,6 @@
 # Continuidade do launcher no Windows
 
-A tarefa 1210ff494600475c estava na revisão 113. Seu projeto registrado é D:\ai-coordinator. O launcher central 0.6.0 recebeu D:/ai-coordinator e produziu a chave d:\ai-coordinator. A comparação textual rejeitou a tarefa. A consulta de identidade do sistema de arquivos confirmou que os dois caminhos apontam para o mesmo diretório. O teste com o módulo instalado reproduziu o ValueError antes da leitura do marcador de escopo e antes da criação do processo.
+A tarefa de exemplo estava na revisão 113. Seu projeto registrado era `C:\workspace\projeto`. O launcher central `0.6.0` recebeu `C:/workspace/projeto` e produziu a chave textual normalizada diferente em caixa/separador. A comparação textual rejeitou a tarefa. A consulta de identidade do sistema de arquivos confirmou que os dois caminhos apontam para o mesmo diretório. O teste com o módulo instalado reproduziu o `ValueError` antes da leitura do marcador de escopo e antes da criação do processo.
 
 ## Correção proposta para o Core
 
@@ -20,7 +20,7 @@ O erro 5 da sessão anterior foi emitido na criação do processo do shell, com 
 | Build do atalho isolado | 0.6.1-alpha.50.diag.4, SHA-256 790DE18A7156B4B8F4EFD08854F1C2044EC83F4AE4B07364A13D0B92F2B0F074 |
 | Instalação atual | 0.6.1-alpha.51, SHA-256 começando em E356ADACBCC7DACF3 |
 | Consulta à origem Git | Nenhuma tag alpha.52 correspondente retornada |
-| Plano de execução | D:\ai-coordinator-diag\RELATORIO-PRE-FECHAMENTO-4D4-E-PLANO-ALPHA52.md |
+| Notas da release | `docs/releases/v0.6.1.md` |
 
 O plano já define o manifesto, o fluxo Windows, a assinatura, o backup de perfis e cofre DPAPI e a recuperação. Os três testes humanos do atalho e a aprovação para o bump são os gates atuais. A próxima decisão inclui escolher a revisão do Core para o artefato e para o runtime central. A instalação permanece sujeita ao gate do plano.
 
