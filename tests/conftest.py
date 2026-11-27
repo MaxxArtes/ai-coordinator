@@ -23,8 +23,12 @@ def _no_real_local_provider_sources(monkeypatch: pytest.MonkeyPatch) -> None:
 def _deterministic_governor_baseline(
     monkeypatch: pytest.MonkeyPatch,
     request: pytest.FixtureRequest,
+    tmp_path: pytest.TempPathFactory,
 ) -> None:
-    """Keep non-governor tests deterministic even when host CPU spikes during test runs."""
+    """Isolate global governor DB per test and keep non-governor tests deterministic."""
+    import os
+    if not os.environ.get("AI_COORDINATOR_GLOBAL_GOVERNOR_DIR"):
+        monkeypatch.setenv("AI_COORDINATOR_GLOBAL_GOVERNOR_DIR", str(tmp_path / "global_governor"))
     if request.path.name == "test_resource_governor.py":
         return
     from ai_coordinator import governor

@@ -129,13 +129,14 @@ def test_cascade_guard_depth_rate_limit_and_lease_recovery(tmp_path):
             store.governor.acquire_lease(task_id=task_id, project=str(proj), delegation_depth=1)
         assert exc_rate.value.reason == "rate_limit_exceeded"
 
-        # Abandoned lease with dead PID or expired TTL is automatically reclaimed
-        store.db.execute(
+        # Abandoned lease with dead PID is automatically reclaimed
+        store.governor.db.execute(
             """INSERT INTO resource_governor_leases(
                 lease_id, task_id, project, owner_pid, status, acquired_at, expires_at
             ) VALUES ('deadlease1', ?, ?, 99999999, 'active', ?, ?)""",
             (task_id, str(proj), time.time() - 100.0, time.time() - 10.0),
         )
+        store.governor.db.commit()
         reclaimed = store.governor.reclaim_abandoned_leases()
         assert reclaimed == 1
     finally:
@@ -175,3 +176,90 @@ def test_windows_job_object_cpu_cap_and_cli_without_desktop(tmp_path, capsys, mo
         assert proc.job_handle is not None
         out, _ = proc.communicate(timeout=5)
         assert out.strip() == "capped-ok"
+
+
+def test_cross_root_authority_live_lease_protection_and_dynamic_rebalance(tmp_path):
+    root_a = tmp_path / "root_a"
+    root_b = tmp_path / "root_b"
+    proj = tmp_path / "proj"
+    proj.mkdir()
+
+    # Two completely separate Store roots share the same global governor authority
+    store_a = Store(root_a)
+    store_b = Store(root_b)
+    try:
+        load = {"cpu": 30.0, "ram": 30.0}
+        store_a.governor._probe_fn = lambda: _snap(load["cpu"], load["ram"])
+        store_b.governor._probe_fn = lambda: _snap(load["cpu"], load["ram"])
+        store_a.governor.update_config(max_global_concurrent=2, worker_cpu_cap_pct=80.0, lease_ttl_seconds=1.0)
+
+        ta = store_a.new(proj, "Root A task")["id"]
+        tb = store_b.new(proj, "Root B task")["id"]
+        tc = store_a.new(proj, "Root A second task")["id"]
+
+        run_a, _, _ = store_a.reserve(ta, "code", "work A", 5)
+        run_b, _, _ = store_b.reserve(tb, "code", "work B", 5)
+
+        # Third reservation across different roots is blocked by shared global cap
+        with pytest.raises(ResourceGovernorError) as exc:
+            store_a.reserve(tc, "code", "work C", 5)
+        assert exc.value.reason == "concurrency_limit"
+
+        # Live-process lease protection: even if expires_at is in the past, alive PID renews instead of freeing
+        store_a.governor.db.execute("UPDATE resource_governor_leases SET expires_at=?", (time.time() - 50.0,))
+        store_a.governor.db.commit()
+        assert store_a.governor.reclaim_abandoned_leases() == 0
+
+        # Dynamic throttling of already-active processes when external load rises
+        reb_normal = store_a.governor.rebalance_active_job(None)
+        assert reb_normal["applied_cpu_cap_pct"] == 40.0  # 80% / 2 active leases
+        load["cpu"] = 87.0  # RESTRICTED (cap <= 50%)
+        reb_restricted = store_a.governor.rebalance_active_job(None)
+        assert reb_restricted["band"] == SaturationBand.RESTRICTED
+        assert reb_restricted["applied_cpu_cap_pct"] == 25.0  # 50% / 2 active leases
+
+        store_a.transition_run(run_a, to_status="running")
+        store_b.transition_run(run_b, to_status="running")
+        store_a.confirm_exit(run_a, exit_code=0)
+        store_b.confirm_exit(run_b, exit_code=0)
+    finally:
+        store_a.governor.close()
+        store_b.governor.close()
+        store_a.db.close()
+        store_b.db.close()
+
+
+def test_windows_job_object_hard_cap_actually_throttles_cpu():
+    if os.name != "nt":
+        pytest.skip("Win32 Job Object CPU rate control test is Windows-only")
+    import ctypes
+    from ai_coordinator.process import FILETIME
+
+    kernel32 = ctypes.windll.kernel32
+    limits = ResourceLimits(max_processes=4, cpu_rate_percent=20.0)
+    proc = ProcessSupervisor.spawn(
+        [sys.executable, "-c", "import time; t=time.monotonic()+0.9\nwhile time.monotonic()<t: pass"],
+        role="worker",
+        use_job_object=True,
+        resource_limits=limits,
+    )
+    try:
+        proc.wait(timeout=5)
+        h_proc = kernel32.OpenProcess(0x1000, False, proc.pid)
+        cpu_used_s = None
+        if h_proc:
+            try:
+                ct, et, kt, ut = FILETIME(), FILETIME(), FILETIME(), FILETIME()
+                if kernel32.GetProcessTimes(h_proc, ctypes.byref(ct), ctypes.byref(et), ctypes.byref(kt), ctypes.byref(ut)):
+                    k_ns = ((kt.dwHighDateTime << 32) + kt.dwLowDateTime) * 100
+                    u_ns = ((ut.dwHighDateTime << 32) + ut.dwLowDateTime) * 100
+                    cpu_used_s = (k_ns + u_ns) / 1e9
+            finally:
+                kernel32.CloseHandle(h_proc)
+        # On a 4-core CPU, 20% hard cap over 0.9s wall time allows <= ~0.72s total CPU time across cores
+        # (uncapped busy-loop uses ~0.9s on 1 core, capped at 20% system-wide allows <= 0.20 * 4 * 0.9 = 0.72s)
+        if cpu_used_s is not None:
+            cores = os.cpu_count() or 1
+            assert cpu_used_s <= max(0.35, 0.20 * cores * 0.9 * 1.35)
+    finally:
+        proc.close()

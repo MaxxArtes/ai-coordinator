@@ -360,9 +360,18 @@ def run_worker(store, config, ident, category, input_file, max_attempts=None):
                     max_log_bytes=limits.get("max_log_bytes", 1_048_576),
                 )
 
+                _last_rebalance = [0.0]
+
                 def _process_worker_mailbox():
                     if hasattr(store, "tool_broker") and store.tool_broker:
                         store.tool_broker.process_mailbox(folder, expected_worker_pid=proc.pid, raise_on_fatal=True)
+                    now_m = time.monotonic()
+                    if (now_m - _last_rebalance[0]) >= 1.0 and getattr(proc, "job_handle", None):
+                        _last_rebalance[0] = now_m
+                        try:
+                            store.governor.rebalance_active_job(proc.job_handle)
+                        except Exception:
+                            pass
 
                 stream_res = consumer.consume(
                     proc,
@@ -746,7 +755,45 @@ def launch(store, config, client, project, task_id=None, model=None):
     env["AI_COORDINATOR_ROLE"] = "coordinator"
     if task_id:
         env["AI_COORDINATOR_TASK_ID"] = task_id
-    return subprocess.call(cmd, cwd=project, env=env)
+
+    gov = getattr(store, "governor", None)
+    if gov is None:
+        return subprocess.call(cmd, cwd=project, env=env)
+
+    lease = gov.acquire_lease(
+        task_id=task_id or "interactive-session",
+        project=project,
+        profile=client,
+        activity_weight="medium",
+    )
+    job_handle = None
+    try:
+        proc = subprocess.Popen(cmd, cwd=project, env=env)
+        if os.name == "nt":
+            from .process import WindowsProcessController
+            limits = ResourceLimits(
+                max_processes=lease.get("worker_max_subprocesses"),
+                cpu_rate_percent=lease.get("effective_worker_cpu_cap_pct"),
+            )
+            job_handle = WindowsProcessController.create_job_object(
+                kill_on_close=(client != "agy"),
+                resource_limits=limits,
+            )
+            if job_handle:
+                WindowsProcessController.assign_to_job(job_handle, proc.pid)
+        while proc.poll() is None:
+            time.sleep(1.0)
+            if job_handle:
+                try:
+                    gov.rebalance_active_job(job_handle, lease["lease_id"])
+                except Exception:
+                    pass
+        return int(proc.returncode or 0)
+    finally:
+        if job_handle and os.name == "nt":
+            from .process import WindowsProcessController
+            WindowsProcessController.close_handle(job_handle)
+        gov.release_lease(lease["lease_id"])
 
 def export_context(store, config, ident, destination):
     task = store.task(ident)

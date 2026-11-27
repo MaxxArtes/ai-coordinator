@@ -21,7 +21,7 @@ import time
 from typing import Any, Callable, Dict, Optional, Tuple
 import uuid
 
-from .process import ProcessSupervisor, safe_process_alive
+from .process import ProcessSupervisor, WindowsProcessController, safe_process_alive
 
 if os.name == "nt":
     import ctypes
@@ -267,6 +267,20 @@ def effective_worker_cpu_cap(band: str, config: GovernorConfig) -> Optional[floa
     return cap
 
 
+def resolve_global_governor_db(fallback_root: Path) -> Path:
+    """Resolve the machine-shared governor database across all roots/profiles/runtimes."""
+    override = os.environ.get("AI_COORDINATOR_GLOBAL_GOVERNOR_DIR")
+    if override:
+        base = Path(override).expanduser().resolve()
+    else:
+        base = Path.home() / ".ai-coordinator" / "global_governor"
+    try:
+        base.mkdir(parents=True, exist_ok=True)
+        return base / "governor.sqlite"
+    except OSError:
+        return fallback_root / "coordination.sqlite"
+
+
 class ResourceGovernor:
     """Shared SQLite-coordinated admission controller and lease manager."""
 
@@ -276,11 +290,29 @@ class ResourceGovernor:
         root: Path,
         *,
         probe_fn: Optional[Callable[[], SystemSnapshot]] = None,
+        shared_db_path: Optional[Path] = None,
     ):
-        self.db = db
         self.root = root
+        self._owns_db = False
+        target_path = shared_db_path or resolve_global_governor_db(root)
+        if target_path == root / "coordination.sqlite":
+            self.db = db
+        else:
+            self.db = sqlite3.connect(target_path, timeout=20.0, check_same_thread=False)
+            self.db.row_factory = sqlite3.Row
+            self.db.execute("PRAGMA journal_mode=WAL")
+            self.db.execute("PRAGMA synchronous=NORMAL")
+            self.db.execute("PRAGMA busy_timeout=20000")
+            self._owns_db = True
         self._probe_fn = probe_fn or (lambda: probe_system_snapshot(self.root))
         self._init_schema()
+
+    def close(self) -> None:
+        if self._owns_db:
+            try:
+                self.db.close()
+            except Exception:
+                pass
 
     def _init_schema(self) -> None:
         self.db.executescript(
@@ -396,8 +428,9 @@ class ResourceGovernor:
         return self.get_config()[0]
 
     def reclaim_abandoned_leases(self, now_ts: Optional[float] = None) -> int:
-        """Expire leases whose TTL elapsed or whose owner/worker OS process exited."""
+        """Expire leases only when OS processes have actually exited; renew live leases."""
         ts = now_ts if now_ts is not None else time.time()
+        cfg, _ = self.get_config()
         rows = self.db.execute(
             "SELECT lease_id, owner_pid, owner_create_time, worker_pid, worker_create_time, expires_at "
             "FROM resource_governor_leases WHERE status='active'"
@@ -406,16 +439,25 @@ class ResourceGovernor:
         for r in rows:
             expired = float(r["expires_at"]) <= ts
             owner_dead = not safe_process_alive(int(r["owner_pid"]), r["owner_create_time"])
+            worker_pid = r["worker_pid"]
             worker_dead = (
-                r["worker_pid"] is not None
-                and not safe_process_alive(int(r["worker_pid"]), r["worker_create_time"])
+                worker_pid is not None
+                and not safe_process_alive(int(worker_pid), r["worker_create_time"])
             )
-            if expired or owner_dead or worker_dead:
+            # Never free a lease while either the owner or worker OS process is still alive
+            process_gone = owner_dead and (worker_pid is None or worker_dead)
+            if process_gone:
                 self.db.execute(
                     "UPDATE resource_governor_leases SET status='expired', released_at=? WHERE lease_id=?",
                     (ts, r["lease_id"]),
                 )
                 reclaimed += 1
+            elif expired:
+                # Process is still alive past initial TTL: renew lease instead of freeing its slot
+                self.db.execute(
+                    "UPDATE resource_governor_leases SET expires_at=? WHERE lease_id=? AND status='active'",
+                    (ts + cfg.lease_ttl_seconds, r["lease_id"]),
+                )
         return reclaimed
 
     def status(self) -> Dict[str, Any]:
@@ -461,6 +503,37 @@ class ResourceGovernor:
         parent_lease_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Atomically evaluate saturation, cascade limits, and acquire an execution lease."""
+        if self._owns_db:
+            self.db.execute("BEGIN IMMEDIATE")
+        try:
+            res = self._acquire_lease_locked(
+                task_id=task_id,
+                project=project,
+                run_id=run_id,
+                profile=profile,
+                activity_weight=activity_weight,
+                delegation_depth=delegation_depth,
+                parent_lease_id=parent_lease_id,
+            )
+            if self._owns_db:
+                self.db.commit()
+            return res
+        except Exception:
+            if self._owns_db:
+                self.db.rollback()
+            raise
+
+    def _acquire_lease_locked(
+        self,
+        *,
+        task_id: str,
+        project: str,
+        run_id: Optional[str] = None,
+        profile: str = "default",
+        activity_weight: str = "medium",
+        delegation_depth: int = 0,
+        parent_lease_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
         now_ts = time.time()
         cfg, prev_band = self.get_config()
         self.reclaim_abandoned_leases(now_ts)
@@ -573,9 +646,47 @@ class ResourceGovernor:
             "UPDATE resource_governor_leases SET status='released', released_at=? WHERE lease_id=? AND status='active'",
             (time.time(), lease_id),
         )
+        if self._owns_db:
+            self.db.commit()
 
     def release_for_run(self, run_id: str) -> None:
         self.db.execute(
             "UPDATE resource_governor_leases SET status='released', released_at=? WHERE run_id=? AND status='active'",
             (time.time(), run_id),
         )
+        if self._owns_db:
+            self.db.commit()
+
+    def rebalance_active_job(self, job_handle: Optional[int], lease_id: Optional[str] = None) -> Dict[str, Any]:
+        """Dynamically throttle an already-active Win32 Job Object based on current load & active leases."""
+        cfg, prev_band = self.get_config()
+        snap = self._probe_fn()
+        band = classify_saturation_band(snap, cfg, prev_band)
+        self.db.execute(
+            "UPDATE resource_governor_config SET last_band=?, updated_at=? WHERE id=1",
+            (band, _now_iso()),
+        )
+        active_count = max(
+            1,
+            int(self.db.execute("SELECT COUNT(*) FROM resource_governor_leases WHERE status='active'").fetchone()[0]),
+        )
+        base_cap = effective_worker_cpu_cap(band, cfg)
+        if base_cap is None:
+            base_cap = 100.0
+        if band == SaturationBand.EMERGENCY:
+            per_job_cap = max(5.0, round(min(15.0, base_cap / active_count), 2))
+        else:
+            per_job_cap = max(5.0, round(base_cap / active_count, 2))
+
+        applied = False
+        if os.name == "nt" and job_handle:
+            applied = WindowsProcessController.set_job_cpu_rate(job_handle, per_job_cap)
+        if self._owns_db:
+            self.db.commit()
+        return {
+            "band": band,
+            "active_leases": active_count,
+            "applied_cpu_cap_pct": per_job_cap,
+            "job_updated": applied,
+            "lease_id": lease_id,
+        }
